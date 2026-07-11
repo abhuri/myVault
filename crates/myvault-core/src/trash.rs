@@ -231,6 +231,13 @@ pub enum PrepareManifestOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StagePayloadOutcome {
+    Staged(crate::MoveDurability),
+    AlreadyStaged(crate::MoveDurability),
+    AlreadyPublished(crate::MoveDurability),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublishItemOutcome {
     Published(crate::MoveDurability),
     AlreadyPublished(crate::MoveDurability),

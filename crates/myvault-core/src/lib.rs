@@ -19,7 +19,7 @@ pub use path::VaultPath;
 pub use revision::FileRevision;
 pub use trash::{
     ManifestDigest, PayloadKind, PrepareManifestOutcome, PublishItemOutcome, RestoreItemOutcome,
-    TrashArea, TrashId, TrashManifestV1, TrashStore, MAX_TRASH_MANIFEST_BYTES,
+    StagePayloadOutcome, TrashArea, TrashId, TrashManifestV1, TrashStore, MAX_TRASH_MANIFEST_BYTES,
 };
 pub use vault::{
     DirectorySyncStatus, InventoryEntry, InventoryKind, InventoryLimits, MoveDurability, Vault,
