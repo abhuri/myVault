@@ -15,6 +15,7 @@ pub enum CoreError {
     NonCanonicalTrashManifest,
     TrashManifestCollision(PathBuf),
     TrashManifestDigestMismatch,
+    InvalidTrashTopology(&'static str),
     TrashManifestOutcomeUnknown {
         path: PathBuf,
         cause: Box<CoreError>,
@@ -105,6 +106,7 @@ impl fmt::Display for CoreError {
             | Self::NonCanonicalTrashManifest
             | Self::TrashManifestCollision(_)
             | Self::TrashManifestDigestMismatch
+            | Self::InvalidTrashTopology(_)
             | Self::TrashManifestOutcomeUnknown { .. }
             | Self::TrashPayloadOutcomeUnknown { .. }
             | Self::InvalidRevision
@@ -233,6 +235,9 @@ impl CoreError {
             )),
             Self::TrashManifestDigestMismatch => {
                 Some(formatter.write_str("trash manifest digest does not match"))
+            }
+            Self::InvalidTrashTopology(reason) => {
+                Some(write!(formatter, "invalid trash topology: {reason}"))
             }
             Self::TrashManifestOutcomeUnknown { path, cause } => Some(write!(
                 formatter,

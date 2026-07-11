@@ -18,8 +18,8 @@ pub use index::{DerivedIndex, NoteRecord, SCHEMA_VERSION, SQLITE_OPEN_RESIDUAL_R
 pub use path::VaultPath;
 pub use revision::FileRevision;
 pub use trash::{
-    ManifestDigest, PayloadKind, PrepareManifestOutcome, TrashArea, TrashId, TrashManifestV1,
-    TrashStore, MAX_TRASH_MANIFEST_BYTES,
+    ManifestDigest, PayloadKind, PrepareManifestOutcome, PublishItemOutcome, RestoreItemOutcome,
+    TrashArea, TrashId, TrashManifestV1, TrashStore, MAX_TRASH_MANIFEST_BYTES,
 };
 pub use vault::{
     DirectorySyncStatus, InventoryEntry, InventoryKind, InventoryLimits, MoveDurability, Vault,

@@ -230,6 +230,22 @@ pub enum PrepareManifestOutcome {
     AlreadyPrepared,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublishItemOutcome {
+    Published(crate::MoveDurability),
+    AlreadyPublished(crate::MoveDurability),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RestoreItemOutcome {
+    Restored(crate::MoveDurability),
+    AlreadyRestored(crate::MoveDurability),
+}
+
+pub(crate) fn item_directory_path(area: TrashArea, id: TrashId) -> Result<VaultPath> {
+    VaultPath::from_portable(format!(".trash/v1/{}/{id}", area.component()))
+}
+
 pub(crate) fn manifest_path(area: TrashArea, id: TrashId) -> Result<VaultPath> {
     VaultPath::from_portable(format!(".trash/v1/{}/{id}/manifest.json", area.component()))
 }
