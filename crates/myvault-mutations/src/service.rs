@@ -1,6 +1,6 @@
 use std::io;
 
-use crate::revision::to_recovery;
+use crate::revision::{to_core, to_recovery};
 use crate::{MutationError, OperationId, TrashOperation};
 use myvault_core::{
     CoreError, ManifestDigest, PrepareManifestOutcome, PublishItemOutcome, StagePayloadOutcome,
@@ -36,7 +36,7 @@ impl<'service> MutationService<'service> {
     /// Returns an error for an invalid timestamp, internal/non-file source, or
     /// a source exceeding the bounded trash payload limit.
     pub fn plan_trash(
-        &self,
+        vault: &Vault,
         source: &VaultPath,
         trashed_at_unix_ms: i64,
     ) -> Result<TrashOperation, MutationError> {
@@ -45,7 +45,7 @@ impl<'service> MutationService<'service> {
                 "trash timestamp must be nonnegative",
             ));
         }
-        let revision = self.vault.revision(source, MAX_TRASH_PAYLOAD_BYTES)?;
+        let revision = vault.revision(source, MAX_TRASH_PAYLOAD_BYTES)?;
         TrashOperation::new(
             OperationId::new(),
             TrashId::new(),
@@ -75,12 +75,9 @@ impl<'service> MutationService<'service> {
         let manifest = operation.rebuild_manifest()?;
         let digest = manifest.digest()?;
         let intent = build_intent(operation, &digest)?;
-        let prepared = self
-            .vault
-            .trash_store()
-            .prepare_staging_manifest(operation.trash_id(), &manifest)?;
         self.journal.publish(&intent)?;
-        self.continue_trash(operation, &digest, &intent, Some(prepared))
+        let prepared = self.ensure_manifest(operation, &digest)?;
+        self.continue_trash(operation, &digest, &intent, prepared)
     }
 
     /// Retries an operation only when its immutable journal evidence matches exactly.
@@ -97,7 +94,7 @@ impl<'service> MutationService<'service> {
         self.retry_from_evidence(operation, evidence)
     }
 
-    /// Reconstructs and resumes one supported v3 trash intent.
+    /// Reconstructs and resumes one supported v4 trash intent.
     ///
     /// # Errors
     /// Unsupported evidence and every manifest/intent mismatch fail before mutation.
@@ -107,14 +104,13 @@ impl<'service> MutationService<'service> {
     ) -> Result<TrashExecutionOutcome, MutationError> {
         let evidence = self.journal.read_evidence(operation_id.as_uuid())?;
         let intent = supported_trash_intent(evidence)?;
-        let (trash_id, digest) = trash_binding(&intent)?;
-        let manifest = self.read_unique_manifest(trash_id)?;
-        let operation = TrashOperation::from_manifest(&manifest)?;
+        let (operation, digest) = operation_from_intent(&intent)?;
         if operation.operation_id() != operation_id {
             return Err(MutationError::IntentMismatch);
         }
         validate_intent(&operation, &digest, &intent)?;
-        self.continue_trash(&operation, &digest, &intent, None)
+        let prepared = self.ensure_manifest(&operation, &digest)?;
+        self.continue_trash(&operation, &digest, &intent, prepared)
     }
 
     fn retry_from_evidence(
@@ -126,7 +122,8 @@ impl<'service> MutationService<'service> {
         let manifest = operation.rebuild_manifest()?;
         let digest = manifest.digest()?;
         validate_intent(operation, &digest, &intent)?;
-        self.continue_trash(operation, &digest, &intent, None)
+        let prepared = self.ensure_manifest(operation, &digest)?;
+        self.continue_trash(operation, &digest, &intent, prepared)
     }
 
     fn continue_trash(
@@ -158,7 +155,34 @@ impl<'service> MutationService<'service> {
         })
     }
 
-    fn read_unique_manifest(&self, trash_id: TrashId) -> Result<TrashManifestV1, MutationError> {
+    fn ensure_manifest(
+        &self,
+        operation: &TrashOperation,
+        digest: &ManifestDigest,
+    ) -> Result<Option<PrepareManifestOutcome>, MutationError> {
+        let expected = operation.rebuild_manifest()?;
+        if expected.digest()? != *digest {
+            return Err(MutationError::IntentMismatch);
+        }
+        match self.read_unique_manifest(operation.trash_id())? {
+            Some(observed) => {
+                if observed != expected || observed.digest()? != *digest {
+                    return Err(MutationError::IntentMismatch);
+                }
+                Ok(None)
+            }
+            None => Ok(Some(
+                self.vault
+                    .trash_store()
+                    .prepare_staging_manifest(operation.trash_id(), &expected)?,
+            )),
+        }
+    }
+
+    fn read_unique_manifest(
+        &self,
+        trash_id: TrashId,
+    ) -> Result<Option<TrashManifestV1>, MutationError> {
         let store = self.vault.trash_store();
         let items = store.read_manifest(TrashArea::Items, trash_id);
         let staging = store.read_manifest(TrashArea::Staging, trash_id);
@@ -166,14 +190,18 @@ impl<'service> MutationService<'service> {
             (Ok(_), Ok(_)) => Err(MutationError::InvalidOperation(
                 "staging and items manifests both exist",
             )),
-            (Ok(manifest), Err(error)) if is_not_found(&error) => Ok(manifest),
-            (Err(error), Ok(manifest)) if is_not_found(&error) => Ok(manifest),
-            (Err(items_error), Err(staging_error))
-                if is_not_found(&items_error) && is_not_found(&staging_error) =>
-            {
-                Err(MutationError::InvalidOperation("trash manifest is missing"))
+            (Ok(manifest), Err(error)) if is_not_found(&error) => Ok(Some(manifest)),
+            (Err(error), Ok(manifest)) if is_not_found(&error) => Ok(Some(manifest)),
+            (Ok(_), Err(error)) | (Err(error), Ok(_)) => Err(error.into()),
+            (Err(items_error), Err(staging_error)) => {
+                if !is_not_found(&items_error) {
+                    Err(items_error.into())
+                } else if !is_not_found(&staging_error) {
+                    Err(staging_error.into())
+                } else {
+                    Ok(None)
+                }
             }
-            (Err(error), _) | (_, Err(error)) => Err(error.into()),
         }
     }
 }
@@ -186,6 +214,7 @@ fn build_intent(
         operation.operation_id().as_uuid(),
         operation.trash_id().as_uuid(),
         digest.as_str().to_owned(),
+        operation.trashed_at_unix_ms(),
         operation.source(),
         to_recovery(operation.revision()),
     )?)
@@ -224,10 +253,13 @@ fn supported_trash_intent(evidence: JournalEvidence) -> Result<RenameMoveIntent,
     }
 }
 
-fn trash_binding(intent: &RenameMoveIntent) -> Result<(TrashId, ManifestDigest), MutationError> {
+fn operation_from_intent(
+    intent: &RenameMoveIntent,
+) -> Result<(TrashOperation, ManifestDigest), MutationError> {
     let RecoveryOperationKind::Trash {
         trash_id,
         manifest_blake3,
+        trashed_at_unix_ms,
     } = &intent.kind
     else {
         return Err(MutationError::InvalidOperation(
@@ -236,7 +268,16 @@ fn trash_binding(intent: &RenameMoveIntent) -> Result<(TrashId, ManifestDigest),
     };
     let trash_id = TrashId::parse(&trash_id.to_string())?;
     let digest = ManifestDigest::parse(manifest_blake3.clone())?;
-    Ok((trash_id, digest))
+    let operation_id = OperationId::parse(&intent.operation_id.to_string())?;
+    let source = VaultPath::from_portable(&intent.from)?;
+    let operation = TrashOperation::new(
+        operation_id,
+        trash_id,
+        &source,
+        to_core(&intent.expected)?,
+        *trashed_at_unix_ms,
+    )?;
+    Ok((operation, digest))
 }
 
 fn is_not_found(error: &CoreError) -> bool {

@@ -75,18 +75,6 @@ impl TrashOperation {
         Ok(operation)
     }
 
-    pub(crate) fn from_manifest(manifest: &TrashManifestV1) -> Result<Self, MutationError> {
-        let operation_id = OperationId::parse(&manifest.operation_id.to_string())?;
-        let source = VaultPath::from_portable(&manifest.original_path)?;
-        Self::new(
-            operation_id,
-            manifest.trash_id,
-            &source,
-            manifest.revision.clone(),
-            manifest.trashed_at_unix_ms,
-        )
-    }
-
     pub(crate) fn source_path(&self) -> Result<VaultPath, MutationError> {
         let path = VaultPath::from_portable(&self.source)?;
         if path.as_str() != self.source {

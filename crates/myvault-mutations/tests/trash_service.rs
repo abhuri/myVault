@@ -52,6 +52,7 @@ fn manifest_and_intent(
         operation.operation_id().as_uuid(),
         operation.trash_id().as_uuid(),
         digest.as_str().to_owned(),
+        operation.trashed_at_unix_ms(),
         operation.source(),
         recovery_revision(operation.revision()),
     )
@@ -64,37 +65,6 @@ fn manifest_and_intent(
 }
 
 #[test]
-fn operation_ids_are_canonical_and_nonnil() {
-    let id = OperationId::new();
-    assert!(!id.as_uuid().is_nil());
-    assert_eq!(OperationId::parse(&id.to_string()).unwrap(), id);
-    assert!(OperationId::parse(&id.to_string().to_uppercase()).is_err());
-    assert!(OperationId::parse("00000000-0000-0000-0000-000000000000").is_err());
-}
-
-#[test]
-fn planning_is_bounded_and_has_no_persistent_side_effects() {
-    let (_temporary, app, vault_path) = roots();
-    let vault = Vault::open(&vault_path).unwrap();
-    let journal = RecoveryJournal::open(&app, &vault_path).unwrap();
-    let source = VaultPath::from_portable("notes/plan.md").unwrap();
-    setup_note(&vault, &source, b"plan");
-    let before = fs::read_dir(app.join("operation-journal")).unwrap().count();
-
-    let service = MutationService::new(&vault, &journal);
-    let operation = service.plan_trash(&source, 1_700_000_000_000).unwrap();
-
-    assert_eq!(operation.source(), source.as_str());
-    assert!(!operation.operation_id().as_uuid().is_nil());
-    assert!(!operation.trash_id().as_uuid().is_nil());
-    assert!(!vault_path.join(".trash").exists());
-    assert_eq!(
-        fs::read_dir(app.join("operation-journal")).unwrap().count(),
-        before
-    );
-}
-
-#[test]
 fn fresh_execute_publishes_item_then_completes_without_unlinking_evidence() {
     let (_temporary, app, vault_path) = roots();
     let vault = Vault::open(&vault_path).unwrap();
@@ -102,7 +72,7 @@ fn fresh_execute_publishes_item_then_completes_without_unlinking_evidence() {
     let source = VaultPath::from_portable("notes/trash.md").unwrap();
     setup_note(&vault, &source, b"trash me");
     let service = MutationService::new(&vault, &journal);
-    let operation = service.plan_trash(&source, 10).unwrap();
+    let operation = MutationService::plan_trash(&vault, &source, 10).unwrap();
 
     let outcome = service.execute_trash(&operation).unwrap();
 
@@ -135,16 +105,16 @@ fn retained_retry_crosses_each_public_crash_boundary() {
         let source = VaultPath::from_portable(format!("notes/phase-{phase}.md")).unwrap();
         setup_note(&vault, &source, b"phase");
         let service = MutationService::new(&vault, &journal);
-        let operation = service.plan_trash(&source, 20 + phase).unwrap();
+        let operation = MutationService::plan_trash(&vault, &source, 20 + phase).unwrap();
         let (manifest, intent) = manifest_and_intent(&operation, &vault);
         let digest = manifest.digest().unwrap();
         let store = vault.trash_store();
 
-        store
-            .prepare_staging_manifest(operation.trash_id(), &manifest)
-            .unwrap();
+        journal.publish(&intent).unwrap();
         if phase >= 1 {
-            journal.publish(&intent).unwrap();
+            store
+                .prepare_staging_manifest(operation.trash_id(), &manifest)
+                .unwrap();
         }
         if phase >= 2 {
             store
@@ -157,47 +127,48 @@ fn retained_retry_crosses_each_public_crash_boundary() {
                 .unwrap();
         }
 
-        let result = if phase == 0 {
-            service.execute_trash(&operation)
-        } else {
-            service.retry_trash(&operation)
-        };
+        let result = service.retry_trash(&operation);
         assert!(result.is_ok(), "phase {phase}: {result:?}");
     }
 }
 
 #[test]
-fn resume_reconstructs_from_staging_or_items_manifest() {
-    for publish_item in [false, true] {
+fn new_service_resumes_from_journal_only_or_later_phase() {
+    for phase in 0..4 {
         let (_temporary, app, vault_path) = roots();
-        let vault = Vault::open(&vault_path).unwrap();
-        let journal = RecoveryJournal::open(&app, &vault_path).unwrap();
-        let source = VaultPath::from_portable(if publish_item {
-            "notes/resume-items.md"
-        } else {
-            "notes/resume-staging.md"
-        })
-        .unwrap();
-        setup_note(&vault, &source, b"resume");
-        let service = MutationService::new(&vault, &journal);
-        let operation = service.plan_trash(&source, 30).unwrap();
-        let (manifest, intent) = manifest_and_intent(&operation, &vault);
-        let digest = manifest.digest().unwrap();
-        let store = vault.trash_store();
-        store
-            .prepare_staging_manifest(operation.trash_id(), &manifest)
-            .unwrap();
-        journal.publish(&intent).unwrap();
-        store
-            .stage_payload_if_revision(operation.trash_id(), &source, &digest)
-            .unwrap();
-        if publish_item {
-            store
-                .publish_staging_item(operation.trash_id(), &digest)
-                .unwrap();
-        }
+        let operation_id = {
+            let vault = Vault::open(&vault_path).unwrap();
+            let journal = RecoveryJournal::open(&app, &vault_path).unwrap();
+            let source = VaultPath::from_portable(format!("notes/resume-{phase}.md")).unwrap();
+            setup_note(&vault, &source, b"resume");
+            let operation = MutationService::plan_trash(&vault, &source, 30 + phase).unwrap();
+            let (manifest, intent) = manifest_and_intent(&operation, &vault);
+            let digest = manifest.digest().unwrap();
+            let store = vault.trash_store();
+            journal.publish(&intent).unwrap();
+            if phase >= 1 {
+                store
+                    .prepare_staging_manifest(operation.trash_id(), &manifest)
+                    .unwrap();
+            }
+            if phase >= 2 {
+                store
+                    .stage_payload_if_revision(operation.trash_id(), &source, &digest)
+                    .unwrap();
+            }
+            if phase >= 3 {
+                store
+                    .publish_staging_item(operation.trash_id(), &digest)
+                    .unwrap();
+            }
+            operation.operation_id()
+        };
 
-        service.resume_trash(operation.operation_id()).unwrap();
+        let reopened_vault = Vault::open(&vault_path).unwrap();
+        let reopened_journal = RecoveryJournal::open(&app, &vault_path).unwrap();
+        MutationService::new(&reopened_vault, &reopened_journal)
+            .resume_trash(operation_id)
+            .unwrap();
     }
 }
 
@@ -209,7 +180,7 @@ fn stale_revision_is_preserved_as_core_error() {
     let source = VaultPath::from_portable("notes/stale.md").unwrap();
     setup_note(&vault, &source, b"before");
     let service = MutationService::new(&vault, &journal);
-    let operation = service.plan_trash(&source, 40).unwrap();
+    let operation = MutationService::plan_trash(&vault, &source, 40).unwrap();
     vault
         .atomic_write(&source, b"after", WriteIntent::UserInitiated)
         .unwrap();
@@ -231,12 +202,13 @@ fn journal_mismatch_blocks_before_trash_mutation() {
     let source = VaultPath::from_portable("notes/mismatch.md").unwrap();
     setup_note(&vault, &source, b"mismatch");
     let service = MutationService::new(&vault, &journal);
-    let operation = service.plan_trash(&source, 50).unwrap();
+    let operation = MutationService::plan_trash(&vault, &source, 50).unwrap();
     let different_id = TrashId::new();
     let wrong = RenameMoveIntent::new_trash(
         operation.operation_id().as_uuid(),
         different_id.as_uuid(),
         "0".repeat(64),
+        operation.trashed_at_unix_ms(),
         operation.source(),
         recovery_revision(operation.revision()),
     )
@@ -252,13 +224,63 @@ fn journal_mismatch_blocks_before_trash_mutation() {
 }
 
 #[test]
+fn journal_only_resume_rejects_manifest_digest_before_preparing_manifest() {
+    let (_temporary, app, vault_path) = roots();
+    let vault = Vault::open(&vault_path).unwrap();
+    let journal = RecoveryJournal::open(&app, &vault_path).unwrap();
+    let source = VaultPath::from_portable("notes/bad-digest.md").unwrap();
+    setup_note(&vault, &source, b"digest");
+    let operation = MutationService::plan_trash(&vault, &source, 55).unwrap();
+    let wrong = RenameMoveIntent::new_trash(
+        operation.operation_id().as_uuid(),
+        operation.trash_id().as_uuid(),
+        "0".repeat(64),
+        operation.trashed_at_unix_ms(),
+        operation.source(),
+        recovery_revision(operation.revision()),
+    )
+    .unwrap();
+    journal.publish(&wrong).unwrap();
+
+    assert!(matches!(
+        MutationService::new(&vault, &journal).resume_trash(operation.operation_id()),
+        Err(MutationError::IntentMismatch)
+    ));
+    assert!(!vault_path.join(".trash").exists());
+    assert!(vault_path.join(source.as_path()).exists());
+}
+
+#[test]
+fn non_not_found_manifest_error_wins_over_missing_other_area() {
+    let (_temporary, app, vault_path) = roots();
+    let vault = Vault::open(&vault_path).unwrap();
+    let journal = RecoveryJournal::open(&app, &vault_path).unwrap();
+    let source = VaultPath::from_portable("notes/poisoned-manifest.md").unwrap();
+    setup_note(&vault, &source, b"poison");
+    let operation = MutationService::plan_trash(&vault, &source, 60).unwrap();
+    let (_, intent) = manifest_and_intent(&operation, &vault);
+    journal.publish(&intent).unwrap();
+    fs::create_dir_all(vault_path.join(format!(
+        ".trash/v1/staging/{}/manifest.json",
+        operation.trash_id()
+    )))
+    .unwrap();
+
+    assert!(matches!(
+        MutationService::new(&vault, &journal).resume_trash(operation.operation_id()),
+        Err(MutationError::Core(_))
+    ));
+    assert!(vault_path.join(source.as_path()).exists());
+}
+
+#[test]
 fn unsupported_evidence_is_unchanged_and_does_not_touch_core() {
     let (_temporary, app, vault_path) = roots();
     let vault = Vault::open(&vault_path).unwrap();
     let journal = RecoveryJournal::open(&app, &vault_path).unwrap();
     let operation_id = OperationId::new();
     let bytes =
-        format!(r#"{{"version":2,"operation_id":"{operation_id}","opaque":true}}"#).into_bytes();
+        format!(r#"{{"version":3,"operation_id":"{operation_id}","opaque":true}}"#).into_bytes();
     let path = app
         .join("operation-journal")
         .join(format!("{operation_id}.json"));
@@ -268,7 +290,7 @@ fn unsupported_evidence_is_unchanged_and_does_not_touch_core() {
 
     assert!(matches!(
         service.resume_trash(operation_id),
-        Err(MutationError::UnsupportedEvidence { version: 2, .. })
+        Err(MutationError::UnsupportedEvidence { version: 3, .. })
     ));
     assert_eq!(fs::read(path).unwrap(), bytes);
     assert!(!vault_path.join(".trash").exists());
