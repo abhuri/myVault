@@ -1346,11 +1346,18 @@ impl TrashStore<'_> {
         let (staging_parent, staging_name) = self.vault.open_parent_checked(&staging_path)?;
         let (items_parent, items_name) = self.vault.open_parent_checked(&items_path)?;
         let destination = payload_path(TrashArea::Staging, id)?;
-        let items_container_sync = sync(MoveSyncParent::Destination, &items_parent);
-        let staging_container_sync = sync(MoveSyncParent::Source, &staging_parent);
-        if items_container_sync.is_err() || staging_container_sync.is_err() {
-            return Err(CoreError::MoveDurabilitySyncFailed);
+        let container_report = MoveSyncReport {
+            destination: sync(MoveSyncParent::Destination, &items_parent),
+            source: Some(sync(MoveSyncParent::Source, &staging_parent)),
+        };
+        if container_report.has_failure() {
+            return Err(container_report.into_verified_unknown(
+                &staging_path,
+                &items_path,
+                CoreError::MoveDurabilitySyncFailed,
+            ));
         }
+        let container_durability = container_report.into_result(&staging_path, &items_path)?;
         let staging_exists = Self::entry_exists(&staging_parent, &staging_name)?;
         let items_exists = Self::entry_exists(&items_parent, &items_name)?;
         match (staging_exists, items_exists) {
@@ -1373,6 +1380,7 @@ impl TrashStore<'_> {
                 &items_name,
                 &mut sync,
                 after_move,
+                container_durability,
             ),
             (false, true) => {
                 let published_destination = payload_path(TrashArea::Items, id)?;
@@ -1388,6 +1396,7 @@ impl TrashStore<'_> {
                     &staging_parent,
                     &staging_name,
                     &mut sync,
+                    container_durability,
                 )
             }
         }
@@ -1408,6 +1417,7 @@ impl TrashStore<'_> {
         items_name: &OsString,
         sync: &mut F,
         after_move: G,
+        container_durability: MoveDurability,
     ) -> Result<StagePayloadOutcome>
     where
         F: FnMut(MoveSyncParent, &Dir) -> std::io::Result<MoveDurability>,
@@ -1438,6 +1448,13 @@ impl TrashStore<'_> {
             Ok(value) => value,
             Err(cause) => return Err(report.into_verified_unknown(source, destination, cause)),
         };
+        if report.has_failure() {
+            return Err(report.into_verified_unknown(
+                source,
+                destination,
+                CoreError::MoveDurabilitySyncFailed,
+            ));
+        }
         match (source_exists, payload_exists) {
             (true, true) => Err(CoreError::AlreadyExists(destination.as_path().to_owned())),
             (false, false) => {
@@ -1467,6 +1484,7 @@ impl TrashStore<'_> {
                 items_name,
                 report,
                 true,
+                container_durability,
             ),
             (true, false) => {
                 let validated = self.validate_item_contents(
@@ -1541,6 +1559,7 @@ impl TrashStore<'_> {
                         items_name,
                         confirmation_report,
                         false,
+                        container_durability,
                     );
                 }
                 self.finish_stage_confirmation(
@@ -1557,6 +1576,7 @@ impl TrashStore<'_> {
                     items_name,
                     move_report,
                     false,
+                    container_durability,
                 )
             }
         }
@@ -1576,6 +1596,7 @@ impl TrashStore<'_> {
         staging_parent: &Dir,
         staging_name: &OsString,
         sync: &mut F,
+        container_durability: MoveDurability,
     ) -> Result<StagePayloadOutcome>
     where
         F: FnMut(MoveSyncParent, &Dir) -> std::io::Result<MoveDurability>,
@@ -1619,6 +1640,7 @@ impl TrashStore<'_> {
             staging_name,
             report,
             true,
+            container_durability,
         )
     }
 
@@ -1638,6 +1660,7 @@ impl TrashStore<'_> {
         other_name: &OsString,
         report: MoveSyncReport,
         already: bool,
+        container_durability: MoveDurability,
     ) -> Result<StagePayloadOutcome> {
         let verification = (|| {
             let (authoritative_source_parent, source_name) =
@@ -1682,7 +1705,7 @@ impl TrashStore<'_> {
                 CoreError::MoveDurabilitySyncFailed,
             ));
         }
-        let durability = report.into_result(source, destination)?;
+        let durability = container_durability.combine(report.into_result(source, destination)?);
         Ok(match (area, already) {
             (TrashArea::Staging, false) => StagePayloadOutcome::Staged(durability),
             (TrashArea::Staging, true) => StagePayloadOutcome::AlreadyStaged(durability),
@@ -2355,7 +2378,7 @@ impl TrashStore<'_> {
         let actual_identity = myvault_platform_fs::directory_identity(actual)?;
         if expected_identity != actual_identity {
             return Err(CoreError::InvalidTrashTopology(
-                "items directory identity changed",
+                "trash item directory identity changed",
             ));
         }
         Ok(())
@@ -3122,6 +3145,157 @@ mod tests {
     }
 
     #[test]
+    fn stage_container_sync_failures_preserve_exact_statuses_and_paths() {
+        for (label, fail_destination, fail_source) in [
+            ("destination", true, false),
+            ("source", false, true),
+            ("both", true, true),
+        ] {
+            let (base, vault, id, manifest, digest) =
+                staged_publish_fault_fixture(&format!("stage-container-{label}"));
+            let source = VaultPath::from_portable(&manifest.original_path).expect("source");
+            let mut attempts = Vec::new();
+            let error = vault
+                .trash_store()
+                .stage_payload_with_hooks(
+                    id,
+                    &source,
+                    &digest,
+                    |parent, _| {
+                        attempts.push(parent);
+                        if (parent == MoveSyncParent::Destination && fail_destination)
+                            || (parent == MoveSyncParent::Source && fail_source)
+                        {
+                            Err(injected_sync_failure(parent))
+                        } else {
+                            Ok(MoveDurability::FullySynced)
+                        }
+                    },
+                    || {},
+                )
+                .expect_err("container sync failure");
+
+            assert_eq!(
+                attempts,
+                [MoveSyncParent::Destination, MoveSyncParent::Source]
+            );
+            assert!(matches!(
+                error,
+                CoreError::VerifiedMoveOutcomeUnknown {
+                    source_path,
+                    destination_path,
+                    destination_sync,
+                    source_sync,
+                    verification,
+                } if source_path == Path::new(&format!(".trash/v1/staging/{id}"))
+                    && destination_path == Path::new(&format!(".trash/v1/items/{id}"))
+                    && matches!(*verification, CoreError::MoveDurabilitySyncFailed)
+                    && matches!(destination_sync, DirectorySyncStatus::Failed(_)) == fail_destination
+                    && matches!(source_sync, DirectorySyncStatus::Failed(_)) == fail_source
+            ));
+            fs::remove_dir_all(base).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn stage_endpoint_sync_failure_never_publishes_or_loses_status() {
+        let (base, vault, id, manifest) = manifest_fault_fixture("stage-endpoint-sync");
+        fs::write(base.join("note.md"), b"note").expect("source");
+        let digest = manifest.digest().expect("digest");
+        vault
+            .trash_store()
+            .prepare_staging_manifest(id, &manifest)
+            .expect("prepare");
+        let source = VaultPath::from_portable(&manifest.original_path).expect("source");
+        let mut call = 0_u8;
+        let error = vault
+            .trash_store()
+            .stage_payload_with_hooks(
+                id,
+                &source,
+                &digest,
+                |parent, _| {
+                    call = call.saturating_add(1);
+                    if call == 3 {
+                        Err(injected_sync_failure(parent))
+                    } else {
+                        Ok(MoveDurability::FullySynced)
+                    }
+                },
+                || {},
+            )
+            .expect_err("endpoint destination sync failure");
+
+        assert_eq!(call, 4);
+        assert!(matches!(
+            error,
+            CoreError::VerifiedMoveOutcomeUnknown {
+                source_path,
+                destination_path,
+                destination_sync: DirectorySyncStatus::Failed(_),
+                source_sync: DirectorySyncStatus::Synced,
+                verification,
+            } if source_path == source.as_path()
+                && destination_path == Path::new(&format!(".trash/v1/staging/{id}/payload"))
+                && matches!(*verification, CoreError::MoveDurabilitySyncFailed)
+        ));
+        assert!(base.join("note.md").is_file());
+        assert!(!base
+            .join(format!(".trash/v1/staging/{id}/payload"))
+            .exists());
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn stage_container_unsupported_propagates_to_all_retry_outcomes() {
+        for (label, publish, expected_published) in [
+            ("already-staged", false, false),
+            ("already-published", true, true),
+        ] {
+            let (base, vault, id, manifest, digest) =
+                staged_publish_fault_fixture(&format!("stage-container-{label}"));
+            if publish {
+                vault
+                    .trash_store()
+                    .publish_staging_item(id, &digest)
+                    .expect("publish");
+            }
+            let source = VaultPath::from_portable(&manifest.original_path).expect("source");
+            let mut call = 0_u8;
+            let outcome = vault
+                .trash_store()
+                .stage_payload_with_hooks(
+                    id,
+                    &source,
+                    &digest,
+                    |_, _| {
+                        call = call.saturating_add(1);
+                        if call == 1 {
+                            Ok(MoveDurability::DirectorySyncUnsupported)
+                        } else {
+                            Ok(MoveDurability::FullySynced)
+                        }
+                    },
+                    || {},
+                )
+                .expect("retry outcome");
+
+            if expected_published {
+                assert_eq!(
+                    outcome,
+                    StagePayloadOutcome::AlreadyPublished(MoveDurability::DirectorySyncUnsupported)
+                );
+            } else {
+                assert_eq!(
+                    outcome,
+                    StagePayloadOutcome::AlreadyStaged(MoveDurability::DirectorySyncUnsupported)
+                );
+            }
+            fs::remove_dir_all(base).expect("cleanup");
+        }
+    }
+
+    #[test]
     fn stage_postmove_rejects_exact_looking_directory_swap() {
         let (base, vault, id, manifest) = manifest_fault_fixture("stage-directory-swap");
         fs::write(base.join("note.md"), b"note").expect("source");
@@ -3160,7 +3334,7 @@ mod tests {
                 verification,
                 ..
             } if matches!(*verification, CoreError::InvalidTrashTopology(
-                "items directory identity changed"
+                "trash item directory identity changed"
             ))
         ));
         fs::remove_dir_all(base).expect("cleanup");
@@ -3458,7 +3632,7 @@ mod tests {
                 verification,
                 ..
             } if matches!(*verification, CoreError::InvalidTrashTopology(
-                "items directory identity changed"
+                "trash item directory identity changed"
             ))
         ));
         fs::remove_dir_all(base).expect("cleanup");
@@ -3952,7 +4126,7 @@ mod tests {
                     verification,
                     ..
                 } if matches!(*verification, CoreError::InvalidTrashTopology(
-                    "items directory identity changed"
+                    "trash item directory identity changed"
                 ))
             ));
             fs::remove_dir_all(base).expect("cleanup");
@@ -4013,7 +4187,7 @@ mod tests {
                 verification,
                 ..
             } if matches!(*verification, CoreError::InvalidTrashTopology(
-                "items directory identity changed"
+                "trash item directory identity changed"
             ))
         ));
         fs::remove_dir_all(base).expect("cleanup");

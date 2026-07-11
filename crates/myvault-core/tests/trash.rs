@@ -391,6 +391,29 @@ fn stage_retry_rejects_ambiguous_and_missing_topologies() {
         ),
         Err(CoreError::InvalidTrashTopology(_))
     ));
+
+    let (root, vault) = fixture();
+    let (_manifest, digest) = prepare_staged_file(&root, &vault);
+    fs::remove_dir_all(staging_directory(&root)).unwrap();
+    assert!(matches!(
+        vault.trash_store().stage_payload_if_revision(
+            id(),
+            &VaultPath::from_portable("note.md").unwrap(),
+            &digest
+        ),
+        Err(CoreError::InvalidTrashTopology(_))
+    ));
+
+    let (root, vault) = fixture();
+    let (_manifest, digest) = prepare_staged_file(&root, &vault);
+    fs::write(staging_directory(&root).join("manifest.json"), b"{").unwrap();
+    assert!(matches!(
+        vault
+            .trash_store()
+            .stage_payload_if_revision(id(), &VaultPath::from_portable("note.md").unwrap(), &digest),
+        Err(CoreError::VerifiedMoveOutcomeUnknown { verification, .. })
+            if matches!(*verification, CoreError::InvalidTrashManifest(_))
+    ));
 }
 
 #[test]
