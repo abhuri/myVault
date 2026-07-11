@@ -469,12 +469,13 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - Rust Android targets ทั้งสี่ architecture ถูกติดตั้งแล้วค่ะ
 - `tauri android init` และ ARM64 debug APK build ผ่านแล้วค่ะ
 - ยังไม่มีอุปกรณ์ Android เชื่อมต่อ จึงยังไม่ทดสอบ Thai IME, lifecycle และ WebView บนมือถือจริงค่ะ
-- เครื่องยังไม่มี full Xcode และพื้นที่ว่างเหลือประมาณ 29 GiB ซึ่งต่ำกว่าเกณฑ์ปลอดภัยสำหรับติดตั้งค่ะ
+- project tree, Android SDK และ Gradle cache ถูกย้ายไป `AWB-Apps` โดยคง compatibility path เดิมผ่าน symlink ค่ะ
+- พื้นที่ภายในเพิ่มเป็นประมาณ 38 GiB และ full Xcode ยังไม่จำเป็นต่อ target Windows/macOS/Ubuntu/Android ใน Phase 0 จึงชะลอไว้ค่ะ
 - OAuth และ Drive API implementation ยังไม่เริ่มจนกว่า platform boundary และ Google Cloud configuration จะพร้อมค่ะ
 
 ## 15. Next Actions
 
-1. push branch `agent/phase-0-bootstrap` และเปิด draft PR ค่ะ
+1. ปิดและเปิด Codex ใหม่ แล้วลบ `/Users/awb/My Apps.internal-backup` หลังยืนยันว่าไม่มี process ถือ working directory เดิม เพื่อคืนพื้นที่อีกประมาณ 8.8 GiB ค่ะ
 2. เชื่อมต่อมือถือ Android จริงด้วย USB หรือ wireless debugging ค่ะ
 3. สร้าง Kotlin Tauri plugin spike สำหรับ Google Identity Services `AuthorizationClient` ค่ะ
 4. ตั้ง Google Cloud Android OAuth client สำหรับ package และ debug SHA-1 ค่ะ
@@ -482,14 +483,13 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 6. สร้าง desktop OAuth loopback + PKCE spike ที่ไม่ส่ง token เข้า JavaScript ค่ะ
 7. เพิ่ม filesystem atomic-write/watcher และ SQLite recovery spike ค่ะ
 8. สร้าง Google Drive fixture folder หลัง Google Cloud OAuth configuration พร้อมค่ะ
-9. เพิ่มพื้นที่ว่างเป็นอย่างน้อย 70 GiB ก่อนติดตั้ง full Xcode ค่ะ
-10. รัน platform gates บน Windows และ Ubuntu ผ่าน native machines หรือ manual CI workflow ค่ะ
+9. รัน platform gates บน Windows และ Ubuntu ผ่าน native machines หรือ manual CI workflow ค่ะ
 
 ## 16. Session Handoff
 
 ### Current Handoff
 
-- วันที่อัปเดตคือ 2026-07-11 เวลา 21:42 เขตเวลา Asia/Bangkok ค่ะ
+- วันที่อัปเดตคือ 2026-07-11 เวลา 22:12 เขตเวลา Asia/Bangkok ค่ะ
 - ผู้ใช้เรียกว่า คุณโอ หรือบอส ค่ะ
 - Sunday เป็นหัวหน้าทีมและเจ้าของ architecture, logic, mechanics และ final integration ค่ะ
 - Sunday สามารถ spawn sub-agents สำหรับ bounded parallel tasks ตาม Operating Model ในเอกสารนี้ค่ะ
@@ -497,18 +497,23 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - รุ่นแรกเป็น personal-use native application แบบ zero-cash-cost ค่ะ
 - architecture ที่ล็อกคือ Tauri 2, React, TypeScript, Rust, native SQLite และ direct Google Drive API ค่ะ
 - ไม่มี backend, hosting, VPN หรือ Store distribution ในรุ่นแรกค่ะ
-- project directory คือ `/Users/awb/My Apps/myVault` ค่ะ
+- compatibility project path คือ `/Users/awb/My Apps/myVault` และ physical path คือ `/Volumes/AWB-Apps/My Apps/myVault` ค่ะ
+- `/Users/awb/My Apps` เป็น symlink ไป `/Volumes/AWB-Apps/My Apps` ค่ะ
+- Android SDK physical path คือ `/Volumes/AWB-Apps/Developer/Android/sdk` และ `~/Library/Android/sdk` เป็น symlink ค่ะ
+- Gradle cache physical path คือ `/Volumes/AWB-Apps/Developer/Gradle` และ `~/.gradle` เป็น symlink ค่ะ
 - remote repository คือ `https://github.com/abhuri/myVault.git` ค่ะ
 - `main` มี initial commit `6597e18` ค่ะ
 - active branch คือ `agent/phase-0-bootstrap` ค่ะ
 - Phase 0 diagnostic shell และ contracts ถูกสร้างแล้วค่ะ
 - local checks ที่ผ่านคือ TypeScript, Vitest 6 tests, Vite build, Rust fmt, clippy, Rust test และ Tauri debug build/launch ค่ะ
 - GitHub quality check ของ Draft PR #1 ผ่านแล้วค่ะ
-- Android toolchain พร้อมและ ARM64 debug APK build ผ่านแล้วค่ะ
+- Android toolchain พร้อมและ ARM64 debug APK build ผ่านจาก external SSD แล้วค่ะ
+- frontend, Rust, macOS native debug build และ Android build ผ่านหลัง migration ค่ะ
+- พื้นที่ internal เหลือประมาณ 38 GiB; ยังมี `/Users/awb/My Apps.internal-backup` 8.8 GiB รอลบหลัง restart Codex ค่ะ
 - Android device test ยัง blocked เพราะไม่มีอุปกรณ์เชื่อมต่อค่ะ
-- full macOS packaging ยัง blocked เพราะไม่มี full Xcode และพื้นที่ว่างไม่พอค่ะ
+- full Xcode ถูกชะลอโดยตั้งใจเพราะยังไม่มี iOS target และ Command Line Tools เพียงพอสำหรับ macOS Phase 0 ค่ะ
 - ข้อค้นพบสำคัญคือ Android Google OAuth ต้องใช้ GIS `AuthorizationClient` ผ่าน Kotlin Tauri plugin ค่ะ
-- งานถัดไปคือ commit Android generated project, เชื่อมต่อมือถือจริง และ implement GIS plugin spike ค่ะ
+- งานถัดไปคือ finalize backup cleanup หลัง restart, เชื่อมต่อมือถือจริง และ implement GIS plugin spike ค่ะ
 
 ### Handoff Update Template
 
@@ -562,3 +567,6 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - ติดตั้ง Android Studio และ Android minimal toolchain โดยไม่ติดตั้ง Emulator ค่ะ
 - สร้าง Android project และ ARM64 debug APK สำเร็จค่ะ
 - ชะลอ full Xcode เพราะพื้นที่ว่างต่ำกว่าเกณฑ์ปลอดภัยค่ะ
+- ย้าย `My Apps`, Android SDK และ Gradle cache ไป `AWB-Apps` พร้อมสร้าง symlink compatibility paths ค่ะ
+- ยืนยันหลัง migration ด้วย frontend typecheck/Vitest/Vite build, Rust fmt/clippy/tests, macOS native debug build และ Android ARM64 APK build ค่ะ
+- ลบ backup ของ Android SDK และ Gradle แล้ว; คง `My Apps.internal-backup` ชั่วคราวจนกว่า Codex จะ restart ค่ะ
