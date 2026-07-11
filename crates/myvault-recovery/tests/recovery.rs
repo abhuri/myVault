@@ -55,6 +55,26 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn add_extended_acl(path: &std::path::Path, mode: u32) {
+    use exacl::{AclEntry, Perm};
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut entries = exacl::getfacl(path, None).unwrap();
+    entries.push(AclEntry::allow_user(
+        &rustix::process::geteuid().as_raw().to_string(),
+        Perm::READ,
+        None,
+    ));
+    exacl::setfacl(&[path], &entries, None).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    assert_eq!(
+        fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        mode
+    );
+    assert!(!exacl::getfacl(path, None).unwrap().is_empty());
+}
+
 #[test]
 fn classifies_every_recovery_topology() {
     let intent = intent();
@@ -156,7 +176,10 @@ fn round_trips_thai_paths_and_lists_entries() {
     let intent = intent();
     journal.publish(&intent).unwrap();
     assert_eq!(journal.read(intent.operation_id).unwrap(), intent);
-    assert_eq!(journal.list().unwrap(), vec![intent]);
+    assert_eq!(
+        journal.list_page(None, MAX_PAGE_SIZE).unwrap().entries,
+        vec![intent]
+    );
 }
 
 #[test]
@@ -194,7 +217,11 @@ fn crash_temporary_file_is_ignored() {
         b"partial",
     )
     .unwrap();
-    assert!(journal.list().unwrap().is_empty());
+    assert!(journal
+        .list_page(None, MAX_PAGE_SIZE)
+        .unwrap()
+        .entries
+        .is_empty());
 }
 
 #[test]
@@ -252,6 +279,63 @@ fn reconciles_crash_before_and_after_hard_link() {
     );
     assert!(!after_temp.exists());
     assert_eq!(journal.read(after_link.operation_id).unwrap(), after_link);
+}
+
+#[test]
+#[cfg(unix)]
+fn reconciles_zero_and_partial_crash_temps() {
+    let (_temporary, app, vault) = roots();
+    let journal_dir = app.join("operation-journal");
+    let journal = RecoveryJournal::open(&app, &vault).unwrap();
+
+    for partial in [b"".as_slice(), b"{\"version\":".as_slice()] {
+        let expected = intent();
+        let temp = journal_dir.join(format!(".{}.json.tmp", expected.operation_id));
+        write_private(&temp, partial);
+        assert_eq!(
+            journal.publish(&expected).unwrap(),
+            PublishOutcome::Published
+        );
+        assert!(!temp.exists());
+        assert_eq!(journal.read(expected.operation_id).unwrap(), expected);
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn preserves_symlink_hardlink_and_insecure_crash_temps() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let (_temporary, app, vault) = roots();
+    let journal_dir = app.join("operation-journal");
+    let journal = RecoveryJournal::open(&app, &vault).unwrap();
+
+    let symlink_intent = intent();
+    let symlink_temp = journal_dir.join(format!(".{}.json.tmp", symlink_intent.operation_id));
+    let symlink_target = app.join("symlink-target");
+    write_private(&symlink_target, b"partial");
+    symlink(&symlink_target, &symlink_temp).unwrap();
+    assert!(journal.publish(&symlink_intent).is_err());
+    assert!(fs::symlink_metadata(&symlink_temp)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+
+    let hardlink_intent = intent();
+    let hardlink_temp = journal_dir.join(format!(".{}.json.tmp", hardlink_intent.operation_id));
+    let hardlink_target = app.join("hardlink-target");
+    write_private(&hardlink_target, b"partial");
+    fs::hard_link(&hardlink_target, &hardlink_temp).unwrap();
+    assert!(journal.publish(&hardlink_intent).is_err());
+    assert!(hardlink_temp.exists());
+    assert!(hardlink_target.exists());
+
+    let insecure_intent = intent();
+    let insecure_temp = journal_dir.join(format!(".{}.json.tmp", insecure_intent.operation_id));
+    write_private(&insecure_temp, b"partial");
+    fs::set_permissions(&insecure_temp, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(journal.publish(&insecure_intent).is_err());
+    assert!(insecure_temp.exists());
 }
 
 #[test]
@@ -377,7 +461,6 @@ fn pagination_is_bounded_and_junk_does_not_consume_committed_limit() {
     let second = journal.list_page(first.next_after, MAX_PAGE_SIZE).unwrap();
     assert_eq!(second.entries.len(), 2);
     assert!(second.next_after.is_none());
-    assert_eq!(journal.list().unwrap().len(), MAX_PAGE_SIZE + 2);
     assert!(matches!(
         journal.list_page(None, 0),
         Err(Error::InvalidPageSize)
@@ -411,6 +494,53 @@ fn paths_are_canonical_and_case_rename_requires_explicit_contract() {
     )
     .unwrap();
     assert!(case.case_rename);
+
+    for temp in ["folder/source.md", "FOLDER/source.md", "other/target.md"] {
+        assert!(matches!(
+            RenameMoveIntent::new(
+                "folder/source.md",
+                "other/target.md",
+                revision("note"),
+                Some(temp.into()),
+            ),
+            Err(Error::InvalidCaseRenameContract)
+        ));
+    }
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn rejects_extended_acls_while_modes_remain_private() {
+    let (_temporary, app, vault) = roots();
+    add_extended_acl(&app, 0o700);
+    assert!(matches!(
+        RecoveryJournal::open(&app, &vault),
+        Err(Error::ExtendedAcl)
+    ));
+
+    let (_temporary, app, vault) = roots();
+    let _journal = RecoveryJournal::open(&app, &vault).unwrap();
+    let journal_dir = app.join("operation-journal");
+    add_extended_acl(&journal_dir, 0o700);
+    assert!(matches!(
+        RecoveryJournal::open(&app, &vault),
+        Err(Error::ExtendedAcl)
+    ));
+
+    let expected = intent();
+    // Use a clean root because the journal-directory ACL above deliberately
+    // prevents any further trusted journal operation.
+    let (_temporary, app, vault) = roots();
+    let journal = RecoveryJournal::open(&app, &vault).unwrap();
+    journal.publish(&expected).unwrap();
+    let final_path = app
+        .join("operation-journal")
+        .join(format!("{}.json", expected.operation_id));
+    add_extended_acl(&final_path, 0o600);
+    assert!(matches!(
+        journal.read(expected.operation_id),
+        Err(Error::ExtendedAcl)
+    ));
 }
 
 #[cfg(unix)]

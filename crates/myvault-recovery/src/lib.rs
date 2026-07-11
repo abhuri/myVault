@@ -33,6 +33,7 @@ pub enum Error {
     Json(serde_json::Error),
     InvalidRoot(&'static str),
     PrivacyValidationRequired,
+    ExtendedAcl,
     InvalidRevision,
     InvalidPortablePath,
     IdenticalPaths,
@@ -60,6 +61,7 @@ impl fmt::Display for Error {
             Self::PrivacyValidationRequired => formatter.write_str(
                 "recovery journal disabled: robust platform privacy validation is required",
             ),
+            Self::ExtendedAcl => formatter.write_str("recovery journal object has an extended ACL"),
             Self::InvalidRevision => formatter.write_str("invalid BLAKE3 revision"),
             Self::InvalidPortablePath => formatter.write_str("invalid portable vault path"),
             Self::IdenticalPaths => formatter.write_str("rename source and destination are equal"),
@@ -353,75 +355,91 @@ impl RecoveryJournal {
         let final_name = entry_name(intent.operation_id);
         let temporary_name = temporary_entry_name(intent.operation_id);
 
-        let final_present = self.name_exists(&final_name)?;
-        let temp_present = self.name_exists(&temporary_name)?;
-        let final_observed = if final_present {
-            Some(if temp_present {
-                self.read_raw_allow_recovery_link(&final_name)?
+        loop {
+            let final_present = self.name_exists(&final_name)?;
+            let temp_present = self.name_exists(&temporary_name)?;
+            let final_observed = if final_present {
+                Some(if temp_present {
+                    self.read_raw_allow_recovery_link(&final_name)?
+                } else {
+                    self.read_raw(&final_name)?
+                })
             } else {
-                self.read_raw(&final_name)?
-            })
-        } else {
-            None
-        };
-        let temp_observed = if temp_present {
-            Some(if final_present {
-                self.read_raw_allow_recovery_link(&temporary_name)?
+                None
+            };
+            let temp_observed = if temp_present {
+                Some(if final_present {
+                    self.read_raw_allow_recovery_link(&temporary_name)?
+                } else {
+                    self.read_raw(&temporary_name)?
+                })
             } else {
-                self.read_raw(&temporary_name)?
-            })
-        } else {
-            None
-        };
-        match (final_observed, temp_observed) {
-            (Some(final_bytes), None) => return compare_published(&final_bytes, &bytes),
-            (Some(final_bytes), Some(temp_bytes)) => {
-                if final_bytes != bytes {
+                None
+            };
+            match (final_observed, temp_observed) {
+                (Some(final_bytes), None) => return compare_published(&final_bytes, &bytes),
+                (Some(final_bytes), Some(temp_bytes)) => {
+                    if final_bytes != bytes {
+                        if temp_bytes != bytes {
+                            return Err(Error::ExternalMutation);
+                        }
+                        self.remove_temp_and_sync(&temporary_name)?;
+                        return Err(Error::JournalCollision);
+                    }
                     if temp_bytes != bytes {
                         return Err(Error::ExternalMutation);
                     }
                     self.remove_temp_and_sync(&temporary_name)?;
-                    return Err(Error::JournalCollision);
+                    return Ok(PublishOutcome::AlreadyPublishedAndCleanedTemp);
                 }
-                if temp_bytes != bytes {
-                    return Err(Error::ExternalMutation);
+                (None, Some(temp_bytes)) => {
+                    if temp_bytes != bytes {
+                        self.remove_verified_orphan_temp(&temporary_name)?;
+                        continue;
+                    }
+                    return self.link_sync_cleanup(
+                        &temporary_name,
+                        &final_name,
+                        &bytes,
+                        true,
+                        false,
+                    );
                 }
-                self.remove_temp_and_sync(&temporary_name)?;
-                return Ok(PublishOutcome::AlreadyPublishedAndCleanedTemp);
+                (None, None) => {}
             }
-            (None, Some(temp_bytes)) => {
-                if temp_bytes != bytes {
-                    return Err(Error::ExternalMutation);
-                }
-                return self.link_sync_cleanup(&temporary_name, &final_name, &bytes, true, false);
-            }
-            (None, None) => {}
-        }
 
-        let mut options = OpenOptions::new();
-        options
-            .write(true)
-            .create_new(true)
-            .follow(FollowSymlinks::No);
-        let mut file = match self.directory.open_with(&temporary_name, &options) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let observed = self
-                    .read_raw_if_exists(&temporary_name)?
-                    .ok_or(Error::ExternalMutation)?;
-                if observed != bytes {
-                    return Err(Error::ExternalMutation);
+            let mut options = OpenOptions::new();
+            options
+                .write(true)
+                .create_new(true)
+                .follow(FollowSymlinks::No);
+            let mut file = match self.directory.open_with(&temporary_name, &options) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let observed = self
+                        .read_raw_if_exists(&temporary_name)?
+                        .ok_or(Error::ExternalMutation)?;
+                    if observed != bytes {
+                        self.remove_verified_orphan_temp(&temporary_name)?;
+                        continue;
+                    }
+                    return self.link_sync_cleanup(
+                        &temporary_name,
+                        &final_name,
+                        &bytes,
+                        true,
+                        false,
+                    );
                 }
-                return self.link_sync_cleanup(&temporary_name, &final_name, &bytes, true, false);
-            }
-            Err(error) => return Err(error.into()),
-        };
-        set_held_file_permissions(&file)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        verify_private_file(&file, 1)?;
-        drop(file);
-        self.link_sync_cleanup(&temporary_name, &final_name, &bytes, false, true)
+                Err(error) => return Err(error.into()),
+            };
+            set_held_file_permissions(&file)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            verify_private_file(&file, 1)?;
+            drop(file);
+            return self.link_sync_cleanup(&temporary_name, &final_name, &bytes, false, true);
+        }
     }
 
     /// Removes a committed intent only when it exactly matches the caller's
@@ -498,22 +516,6 @@ impl RecoveryJournal {
             entries,
             next_after,
         })
-    }
-
-    /// Lists all committed entries using bounded pages.
-    ///
-    /// # Errors
-    /// Returns an error for excessive counts or any invalid committed entry.
-    pub fn list(&self) -> Result<Vec<RenameMoveIntent>, Error> {
-        let mut all = Vec::new();
-        let mut after = None;
-        loop {
-            let page = self.list_page(after, MAX_PAGE_SIZE)?;
-            all.extend(page.entries);
-            let Some(next) = page.next_after else { break };
-            after = Some(next);
-        }
-        Ok(all)
     }
 
     fn committed_ids(&self) -> Result<Vec<Uuid>, Error> {
@@ -631,6 +633,39 @@ impl RecoveryJournal {
             .map_err(Error::PublishedCleanupFailed)?;
         sync_held_directory(&self.directory).map_err(published_sync_error)
     }
+
+    /// Removes only a canonical, private, single-link crash temp while the final
+    /// name is absent. The held descriptor is verified before and after reading;
+    /// symlinks, hardlinks, insecure files, or a concurrently-created final fail closed.
+    fn remove_verified_orphan_temp(&self, temporary_name: &str) -> Result<(), Error> {
+        let Some(operation_id) = parse_temporary_entry_name(temporary_name) else {
+            return Err(Error::InvalidEntryName);
+        };
+        if temporary_entry_name(operation_id) != temporary_name {
+            return Err(Error::InvalidEntryName);
+        }
+        let final_name = entry_name(operation_id);
+        if self.name_exists(&final_name)? {
+            return Err(Error::JournalCollision);
+        }
+
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let file = self.directory.open_with(temporary_name, &options)?;
+        verify_private_file(&file, 1)?;
+        let held_before = file_identity(&file)?;
+        if self.name_exists(&final_name)? {
+            return Err(Error::JournalCollision);
+        }
+        let named = self.directory.symlink_metadata(temporary_name)?;
+        if !named.file_type().is_file() || file_identity_from_metadata(&named) != held_before {
+            return Err(Error::ExternalMutation);
+        }
+        self.directory
+            .remove_file(temporary_name)
+            .map_err(Error::PublishedCleanupFailed)?;
+        sync_held_directory(&self.directory).map_err(published_sync_error)
+    }
 }
 
 fn canonical_portable(path: &str) -> Result<String, Error> {
@@ -665,6 +700,13 @@ fn validate_path_relationship(
         {
             return Err(Error::InvalidCaseRenameContract);
         }
+    } else if let Some(temp) = temp {
+        let temp_path = VaultPath::from_portable(temp).map_err(|_| Error::InvalidPortablePath)?;
+        if temp_path.collision_key() == from_path.collision_key()
+            || temp_path.collision_key() == to_path.collision_key()
+        {
+            return Err(Error::InvalidCaseRenameContract);
+        }
     }
     Ok(())
 }
@@ -691,6 +733,12 @@ fn entry_name(operation_id: Uuid) -> String {
 
 fn temporary_entry_name(operation_id: Uuid) -> String {
     format!(".{operation_id}.json.tmp")
+}
+
+fn parse_temporary_entry_name(name: &str) -> Option<Uuid> {
+    let id_text = name.strip_prefix('.')?.strip_suffix(".json.tmp")?;
+    let id = Uuid::parse_str(id_text).ok()?;
+    (id.to_string() == id_text).then_some(id)
 }
 
 fn parse_entry_name(name: &str) -> Option<Uuid> {
@@ -798,7 +846,8 @@ fn verify_root_identity(_directory: &Dir, _canonical: &Path) -> Result<(), Error
 #[cfg(unix)]
 fn require_private_directory(directory: &Dir) -> Result<(), Error> {
     use std::os::unix::fs::MetadataExt;
-    let metadata = directory.try_clone()?.into_std_file().metadata()?;
+    let held = directory.try_clone()?.into_std_file();
+    let metadata = held.metadata()?;
     if metadata.uid() != rustix::process::geteuid().as_raw() {
         return Err(Error::InvalidRoot(
             "private directory is not owned by current user",
@@ -809,6 +858,7 @@ fn require_private_directory(directory: &Dir) -> Result<(), Error> {
             "private directory grants group or world access",
         ));
     }
+    verify_no_extended_acl(&held)?;
     Ok(())
 }
 
@@ -847,7 +897,8 @@ fn set_held_file_permissions(_file: &cap_std::fs::File) -> Result<(), Error> {
 #[cfg(unix)]
 fn verify_private_file(file: &cap_std::fs::File, max_links: u64) -> Result<(), Error> {
     use std::os::unix::fs::MetadataExt;
-    let metadata = file.try_clone()?.into_std().metadata()?;
+    let held = file.try_clone()?.into_std();
+    let metadata = held.metadata()?;
     if !metadata.is_file()
         || metadata.uid() != rustix::process::geteuid().as_raw()
         || metadata.mode() & 0o777 != 0o600
@@ -855,7 +906,46 @@ fn verify_private_file(file: &cap_std::fs::File, max_links: u64) -> Result<(), E
     {
         return Err(Error::ExternalMutation);
     }
+    verify_no_extended_acl(&held)?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn file_identity(file: &cap_std::fs::File) -> Result<(u64, u64), Error> {
+    use cap_fs_ext::MetadataExt;
+    let metadata = file.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(unix)]
+fn file_identity_from_metadata(metadata: &cap_std::fs::Metadata) -> (u64, u64) {
+    use cap_fs_ext::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_no_extended_acl(file: &std::fs::File) -> Result<(), Error> {
+    if myvault_platform_acl::has_extended_acl(file)? {
+        return Err(Error::ExtendedAcl);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_no_extended_acl(file: &std::fs::File) -> Result<(), Error> {
+    use xattr::FileExt;
+
+    if file.get_xattr("system.posix_acl_access")?.is_some()
+        || file.get_xattr("system.posix_acl_default")?.is_some()
+    {
+        return Err(Error::ExtendedAcl);
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn verify_no_extended_acl(_file: &std::fs::File) -> Result<(), Error> {
+    Err(Error::PrivacyValidationRequired)
 }
 
 #[cfg(not(unix))]
