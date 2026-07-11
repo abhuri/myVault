@@ -252,95 +252,64 @@ fn uuid_collision_preserves_existing_committed_entry() {
 
 #[test]
 #[cfg(unix)]
-fn reconciles_crash_before_and_after_hard_link() {
+fn stale_partial_temps_are_ignored_and_preserved() {
     let (_temporary, app, vault) = roots();
     let journal_dir = app.join("operation-journal");
     let journal = RecoveryJournal::open(&app, &vault).unwrap();
 
-    let before_link = intent();
-    let before_bytes = serde_json::to_vec(&before_link).unwrap();
-    let before_temp = journal_dir.join(format!(".{}.json.tmp", before_link.operation_id));
-    write_private(&before_temp, &before_bytes);
-    assert_eq!(
-        journal.publish(&before_link).unwrap(),
-        PublishOutcome::ReconciledAfterTempWrite
-    );
-    assert!(!before_temp.exists());
-
-    let after_link = intent();
-    let after_bytes = serde_json::to_vec(&after_link).unwrap();
-    let after_temp = journal_dir.join(format!(".{}.json.tmp", after_link.operation_id));
-    let after_final = journal_dir.join(format!("{}.json", after_link.operation_id));
-    write_private(&after_temp, &after_bytes);
-    fs::hard_link(&after_temp, &after_final).unwrap();
-    assert_eq!(
-        journal.publish(&after_link).unwrap(),
-        PublishOutcome::AlreadyPublishedAndCleanedTemp
-    );
-    assert!(!after_temp.exists());
-    assert_eq!(journal.read(after_link.operation_id).unwrap(), after_link);
-}
-
-#[test]
-#[cfg(unix)]
-fn reconciles_zero_and_partial_crash_temps() {
-    let (_temporary, app, vault) = roots();
-    let journal_dir = app.join("operation-journal");
-    let journal = RecoveryJournal::open(&app, &vault).unwrap();
-
-    for partial in [b"".as_slice(), b"{\"version\":".as_slice()] {
+    for (index, partial) in [b"".as_slice(), b"{\"version\":".as_slice()]
+        .into_iter()
+        .enumerate()
+    {
         let expected = intent();
-        let temp = journal_dir.join(format!(".{}.json.tmp", expected.operation_id));
+        let temp = journal_dir.join(format!(".publish-stale-{index}.tmp"));
         write_private(&temp, partial);
         assert_eq!(
             journal.publish(&expected).unwrap(),
             PublishOutcome::Published
         );
-        assert!(!temp.exists());
+        assert_eq!(fs::read(&temp).unwrap(), partial);
         assert_eq!(journal.read(expected.operation_id).unwrap(), expected);
     }
 }
 
 #[test]
 #[cfg(unix)]
-fn preserves_symlink_hardlink_and_insecure_crash_temps() {
+fn publish_never_unlinks_symlink_hardlink_or_insecure_stale_temps() {
     use std::os::unix::fs::{symlink, PermissionsExt};
 
     let (_temporary, app, vault) = roots();
     let journal_dir = app.join("operation-journal");
     let journal = RecoveryJournal::open(&app, &vault).unwrap();
 
-    let symlink_intent = intent();
-    let symlink_temp = journal_dir.join(format!(".{}.json.tmp", symlink_intent.operation_id));
+    let symlink_temp = journal_dir.join(".publish-swapped-symlink.tmp");
     let symlink_target = app.join("symlink-target");
     write_private(&symlink_target, b"partial");
     symlink(&symlink_target, &symlink_temp).unwrap();
-    assert!(journal.publish(&symlink_intent).is_err());
+    journal.publish(&intent()).unwrap();
     assert!(fs::symlink_metadata(&symlink_temp)
         .unwrap()
         .file_type()
         .is_symlink());
 
-    let hardlink_intent = intent();
-    let hardlink_temp = journal_dir.join(format!(".{}.json.tmp", hardlink_intent.operation_id));
+    let hardlink_temp = journal_dir.join(".publish-swapped-hardlink.tmp");
     let hardlink_target = app.join("hardlink-target");
     write_private(&hardlink_target, b"partial");
     fs::hard_link(&hardlink_target, &hardlink_temp).unwrap();
-    assert!(journal.publish(&hardlink_intent).is_err());
+    journal.publish(&intent()).unwrap();
     assert!(hardlink_temp.exists());
     assert!(hardlink_target.exists());
 
-    let insecure_intent = intent();
-    let insecure_temp = journal_dir.join(format!(".{}.json.tmp", insecure_intent.operation_id));
+    let insecure_temp = journal_dir.join(".publish-insecure.tmp");
     write_private(&insecure_temp, b"partial");
     fs::set_permissions(&insecure_temp, fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(journal.publish(&insecure_intent).is_err());
+    journal.publish(&intent()).unwrap();
     assert!(insecure_temp.exists());
 }
 
 #[test]
 #[cfg(unix)]
-fn publish_fails_closed_on_collisions_and_unexpected_temp() {
+fn publish_fails_closed_on_collision_without_unlinking_any_evidence() {
     let (_temporary, app, vault) = roots();
     let journal = RecoveryJournal::open(&app, &vault).unwrap();
     let expected = intent();
@@ -355,22 +324,21 @@ fn publish_fails_closed_on_collisions_and_unexpected_temp() {
         Err(Error::JournalCollision)
     ));
 
-    let temp_path = app
-        .join("operation-journal")
-        .join(format!(".{}.json.tmp", expected.operation_id));
-    write_private(&temp_path, &serde_json::to_vec(&expected).unwrap());
+    let temp_path = app.join("operation-journal/.publish-unrelated.tmp");
+    write_private(&temp_path, b"unrelated");
     assert!(matches!(
         journal.publish(&expected),
         Err(Error::JournalCollision)
     ));
-    assert!(!temp_path.exists());
-
-    write_private(&temp_path, b"external");
-    assert!(matches!(
-        journal.publish(&expected),
-        Err(Error::ExternalMutation)
-    ));
-    assert_eq!(fs::read(temp_path).unwrap(), b"external");
+    assert_eq!(fs::read(&temp_path).unwrap(), b"unrelated");
+    assert_eq!(
+        fs::read(&final_path).unwrap(),
+        serde_json::to_vec(&collision).unwrap()
+    );
+    assert!(fs::read_dir(app.join("operation-journal"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_name().to_string_lossy().starts_with(".publish-")));
 }
 
 #[cfg(unix)]
@@ -397,7 +365,7 @@ fn committed_file_privacy_is_verified_not_repaired() {
 
 #[test]
 #[cfg(unix)]
-fn complete_requires_exact_expected_intent_and_syncs_removal() {
+fn complete_publishes_tombstone_and_preserves_journal() {
     let (_temporary, app, vault) = roots();
     let journal = RecoveryJournal::open(&app, &vault).unwrap();
     let expected = intent();
@@ -416,23 +384,55 @@ fn complete_requires_exact_expected_intent_and_syncs_removal() {
         journal.complete(expected.operation_id, &expected).unwrap(),
         CompleteOutcome::AlreadyCompleted
     );
+    assert_eq!(journal.read(expected.operation_id).unwrap(), expected);
+    assert!(journal
+        .list_page(None, MAX_PAGE_SIZE)
+        .unwrap()
+        .entries
+        .is_empty());
+    assert!(app
+        .join("operation-journal/completed")
+        .join(format!("{}.json", expected.operation_id))
+        .exists());
 }
 
 #[test]
 #[cfg(unix)]
-fn complete_rejects_a_crash_temp_instead_of_authorizing_cleanup() {
+fn complete_ignores_and_preserves_stale_temp_evidence() {
     let (_temporary, app, vault) = roots();
     let journal = RecoveryJournal::open(&app, &vault).unwrap();
     let expected = intent();
     journal.publish(&expected).unwrap();
-    let temp_path = app
-        .join("operation-journal")
-        .join(format!(".{}.json.tmp", expected.operation_id));
-    write_private(&temp_path, &serde_json::to_vec(&expected).unwrap());
-    assert!(matches!(
-        journal.complete(expected.operation_id, &expected),
-        Err(Error::ExternalMutation)
-    ));
+    let temp_path = app.join("operation-journal/.publish-stale-complete.tmp");
+    write_private(&temp_path, b"partial");
+    assert_eq!(
+        journal.complete(expected.operation_id, &expected).unwrap(),
+        CompleteOutcome::Completed
+    );
+    assert_eq!(fs::read(temp_path).unwrap(), b"partial");
+}
+
+#[test]
+#[cfg(unix)]
+fn completion_collision_preserves_journal_tombstone_and_unrelated_file() {
+    let (_temporary, app, vault) = roots();
+    let journal = RecoveryJournal::open(&app, &vault).unwrap();
+    let expected = intent();
+    journal.publish(&expected).unwrap();
+    let completed = app.join("operation-journal/completed");
+    let tombstone = completed.join(format!("{}.json", expected.operation_id));
+    write_private(&tombstone, b"{}");
+    let unrelated = completed.join("unrelated.keep");
+    write_private(&unrelated, b"keep");
+
+    assert!(journal.complete(expected.operation_id, &expected).is_err());
+    assert_eq!(fs::read(&tombstone).unwrap(), b"{}");
+    assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
+    assert_eq!(journal.read(expected.operation_id).unwrap(), expected);
+    assert_eq!(
+        journal.list_page(None, MAX_PAGE_SIZE).unwrap().entries,
+        vec![expected]
+    );
 }
 
 #[test]
@@ -440,8 +440,14 @@ fn complete_rejects_a_crash_temp_instead_of_authorizing_cleanup() {
 fn pagination_is_bounded_and_junk_does_not_consume_committed_limit() {
     let (_temporary, app, vault) = roots();
     let journal = RecoveryJournal::open(&app, &vault).unwrap();
-    for _ in 0..(MAX_PAGE_SIZE + 2) {
-        journal.publish(&intent()).unwrap();
+    let mut published = Vec::new();
+    for _ in 0..(MAX_PAGE_SIZE + 4) {
+        let entry = intent();
+        journal.publish(&entry).unwrap();
+        published.push(entry);
+    }
+    for entry in &published[..2] {
+        journal.complete(entry.operation_id, entry).unwrap();
     }
     for index in 0..4_200 {
         write_private(

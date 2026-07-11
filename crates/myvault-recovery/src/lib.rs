@@ -19,6 +19,8 @@ use uuid::Uuid;
 
 #[cfg(not(windows))]
 const JOURNAL_DIRECTORY: &str = "operation-journal";
+#[cfg(not(windows))]
+const COMPLETED_DIRECTORY: &str = "completed";
 const MAX_ENTRY_BYTES: u64 = 64 * 1024;
 const MAX_ENTRY_COUNT: usize = 4096;
 pub const MAX_PAGE_SIZE: usize = 128;
@@ -48,8 +50,6 @@ pub enum Error {
     IntentMismatch,
     ExternalMutation,
     PublishedButNotSynced(io::Error),
-    PublishedCleanupFailed(io::Error),
-    CompletedButNotSynced(io::Error),
 }
 
 impl fmt::Display for Error {
@@ -89,18 +89,6 @@ impl fmt::Display for Error {
                 write!(
                     formatter,
                     "journal published but directory sync failed: {error}"
-                )
-            }
-            Self::PublishedCleanupFailed(error) => {
-                write!(
-                    formatter,
-                    "journal published but temp cleanup failed: {error}"
-                )
-            }
-            Self::CompletedButNotSynced(error) => {
-                write!(
-                    formatter,
-                    "journal removed but directory sync failed: {error}"
                 )
             }
         }
@@ -279,9 +267,7 @@ pub fn decide_recovery(intent: &RenameMoveIntent, topology: &RecoveryTopology) -
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublishOutcome {
     Published,
-    ReconciledAfterTempWrite,
     AlreadyPublished,
-    AlreadyPublishedAndCleanedTemp,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -296,8 +282,40 @@ pub struct JournalPage {
     pub next_after: Option<Uuid>,
 }
 
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompletionTombstone {
+    version: u32,
+    operation_id: Uuid,
+    intent_blake3_hex: String,
+}
+
+impl CompletionTombstone {
+    const VERSION: u32 = 1;
+
+    fn for_intent(intent: &RenameMoveIntent) -> Result<Self, Error> {
+        Ok(Self {
+            version: Self::VERSION,
+            operation_id: intent.operation_id,
+            intent_blake3_hex: blake3::hash(&canonical_bytes(intent)?).to_hex().to_string(),
+        })
+    }
+
+    fn validate_for(&self, intent: &RenameMoveIntent) -> Result<(), Error> {
+        let expected = Self::for_intent(intent)?;
+        if self == &expected {
+            Ok(())
+        } else {
+            Err(Error::IntentMismatch)
+        }
+    }
+}
+
+/// Append-only recovery evidence. Physical retention/garbage collection is
+/// deliberately deferred; completion is represented only by tombstones.
 pub struct RecoveryJournal {
     directory: Dir,
+    completed: Dir,
 }
 
 impl RecoveryJournal {
@@ -341,11 +359,26 @@ impl RecoveryJournal {
                 sync_held_directory(&app_directory)?;
             }
             require_private_directory(&directory)?;
-            Ok(Self { directory })
+            let completed_created = match directory.create_dir(COMPLETED_DIRECTORY) {
+                Ok(()) => true,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+                Err(error) => return Err(error.into()),
+            };
+            let completed = open_child_dir_nofollow(&directory, COMPLETED_DIRECTORY)?;
+            if completed_created {
+                set_held_directory_permissions(&completed)?;
+                sync_held_directory(&directory)?;
+            }
+            require_private_directory(&completed)?;
+            Ok(Self {
+                directory,
+                completed,
+            })
         }
     }
 
-    /// Durably publishes or reconciles an intent under deterministic temp/final names.
+    /// Durably publishes an intent using a fresh temp and atomic no-replace rename.
+    /// Stale temps are immutable crash evidence and are never removed or reused.
     ///
     /// # Errors
     /// Fails closed on collisions, unexpected topology, insecure files, or I/O errors.
@@ -353,97 +386,18 @@ impl RecoveryJournal {
         intent.validate()?;
         let bytes = canonical_bytes(intent)?;
         let final_name = entry_name(intent.operation_id);
-        let temporary_name = temporary_entry_name(intent.operation_id);
-
-        loop {
-            let final_present = self.name_exists(&final_name)?;
-            let temp_present = self.name_exists(&temporary_name)?;
-            let final_observed = if final_present {
-                Some(if temp_present {
-                    self.read_raw_allow_recovery_link(&final_name)?
-                } else {
-                    self.read_raw(&final_name)?
-                })
-            } else {
-                None
-            };
-            let temp_observed = if temp_present {
-                Some(if final_present {
-                    self.read_raw_allow_recovery_link(&temporary_name)?
-                } else {
-                    self.read_raw(&temporary_name)?
-                })
-            } else {
-                None
-            };
-            match (final_observed, temp_observed) {
-                (Some(final_bytes), None) => return compare_published(&final_bytes, &bytes),
-                (Some(final_bytes), Some(temp_bytes)) => {
-                    if final_bytes != bytes {
-                        if temp_bytes != bytes {
-                            return Err(Error::ExternalMutation);
-                        }
-                        self.remove_temp_and_sync(&temporary_name)?;
-                        return Err(Error::JournalCollision);
-                    }
-                    if temp_bytes != bytes {
-                        return Err(Error::ExternalMutation);
-                    }
-                    self.remove_temp_and_sync(&temporary_name)?;
-                    return Ok(PublishOutcome::AlreadyPublishedAndCleanedTemp);
-                }
-                (None, Some(temp_bytes)) => {
-                    if temp_bytes != bytes {
-                        self.remove_verified_orphan_temp(&temporary_name)?;
-                        continue;
-                    }
-                    return self.link_sync_cleanup(
-                        &temporary_name,
-                        &final_name,
-                        &bytes,
-                        true,
-                        false,
-                    );
-                }
-                (None, None) => {}
-            }
-
-            let mut options = OpenOptions::new();
-            options
-                .write(true)
-                .create_new(true)
-                .follow(FollowSymlinks::No);
-            let mut file = match self.directory.open_with(&temporary_name, &options) {
-                Ok(file) => file,
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    let observed = self
-                        .read_raw_if_exists(&temporary_name)?
-                        .ok_or(Error::ExternalMutation)?;
-                    if observed != bytes {
-                        self.remove_verified_orphan_temp(&temporary_name)?;
-                        continue;
-                    }
-                    return self.link_sync_cleanup(
-                        &temporary_name,
-                        &final_name,
-                        &bytes,
-                        true,
-                        false,
-                    );
-                }
-                Err(error) => return Err(error.into()),
-            };
-            set_held_file_permissions(&file)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            verify_private_file(&file, 1)?;
-            drop(file);
-            return self.link_sync_cleanup(&temporary_name, &final_name, &bytes, false, true);
+        if let Some(actual) = Self::read_raw_if_exists(&self.directory, &final_name)? {
+            return compare_published(&actual, &bytes);
+        }
+        if Self::publish_bytes(&self.directory, &final_name, &bytes)? {
+            Ok(PublishOutcome::Published)
+        } else {
+            Ok(PublishOutcome::AlreadyPublished)
         }
     }
 
-    /// Removes a committed intent only when it exactly matches the caller's
-    /// independently-held expected intent.
+    /// Publishes an immutable completion tombstone after verifying the original
+    /// journal bytes. Neither the journal nor stale temp evidence is deleted.
     ///
     /// # Errors
     /// Fails on mismatched intent, unexpected temp files, insecure files, or I/O errors.
@@ -457,19 +411,28 @@ impl RecoveryJournal {
             return Err(Error::IntentMismatch);
         }
         let final_name = entry_name(operation_id);
-        let temporary_name = temporary_entry_name(operation_id);
-        if self.read_raw_if_exists(&temporary_name)?.is_some() {
-            return Err(Error::ExternalMutation);
-        }
-        let Some(actual) = self.read_raw_if_exists(&final_name)? else {
-            return Ok(CompleteOutcome::AlreadyCompleted);
+        let Some(actual) = Self::read_raw_if_exists(&self.directory, &final_name)? else {
+            return Err(Error::IntentMismatch);
         };
         if actual != canonical_bytes(expected_intent)? {
             return Err(Error::IntentMismatch);
         }
-        self.directory.remove_file(&final_name)?;
-        sync_held_directory(&self.directory).map_err(completed_sync_error)?;
-        Ok(CompleteOutcome::Completed)
+        let tombstone = CompletionTombstone::for_intent(expected_intent)?;
+        let tombstone_bytes = serde_json::to_vec(&tombstone)?;
+        let tombstone_name = entry_name(operation_id);
+        if let Some(actual) = Self::read_raw_if_exists(&self.completed, &tombstone_name)? {
+            let observed: CompletionTombstone = serde_json::from_slice(&actual)?;
+            observed.validate_for(expected_intent)?;
+            if serde_json::to_vec(&observed)? != actual {
+                return Err(Error::IntentMismatch);
+            }
+            return Ok(CompleteOutcome::AlreadyCompleted);
+        }
+        if Self::publish_bytes(&self.completed, &tombstone_name, &tombstone_bytes)? {
+            Ok(CompleteOutcome::Completed)
+        } else {
+            Ok(CompleteOutcome::AlreadyCompleted)
+        }
     }
 
     /// Reads and validates one bounded, private journal entry.
@@ -477,7 +440,7 @@ impl RecoveryJournal {
     /// # Errors
     /// Returns an error for an absent, malformed, oversized, insecure, or mismatched entry.
     pub fn read(&self, operation_id: Uuid) -> Result<RenameMoveIntent, Error> {
-        let bytes = self.read_raw(&entry_name(operation_id))?;
+        let bytes = Self::read_raw(&self.directory, &entry_name(operation_id))?;
         let intent: RenameMoveIntent = serde_json::from_slice(&bytes)?;
         intent.validate()?;
         if intent.operation_id != operation_id || canonical_bytes(&intent)? != bytes {
@@ -486,8 +449,9 @@ impl RecoveryJournal {
         Ok(intent)
     }
 
-    /// Lists a deterministic page of committed entries. Junk and temp names do
-    /// not count toward the committed-entry limit.
+    /// Lists a deterministic page of logically active entries. Only an exact,
+    /// valid completion tombstone suppresses an entry. Journal records and stale
+    /// temps are physically retained; bounded garbage collection is deferred.
     ///
     /// # Errors
     /// Returns an error for invalid limits, excessive committed entries, or invalid entries.
@@ -495,7 +459,7 @@ impl RecoveryJournal {
         if !(1..=MAX_PAGE_SIZE).contains(&limit) {
             return Err(Error::InvalidPageSize);
         }
-        let ids = self.committed_ids()?;
+        let ids = self.active_ids()?;
         let mut selected = ids
             .into_iter()
             .filter(|id| after.is_none_or(|cursor| *id > cursor))
@@ -518,7 +482,7 @@ impl RecoveryJournal {
         })
     }
 
-    fn committed_ids(&self) -> Result<Vec<Uuid>, Error> {
+    fn active_ids(&self) -> Result<Vec<Uuid>, Error> {
         let mut ids = Vec::new();
         for entry in self.directory.entries()? {
             let entry = entry?;
@@ -527,6 +491,9 @@ impl RecoveryJournal {
             let Some(id) = parse_entry_name(name) else {
                 continue;
             };
+            if self.has_valid_completion(id)? {
+                continue;
+            }
             ids.push(id);
             if ids.len() > MAX_ENTRY_COUNT {
                 return Err(Error::TooManyEntries);
@@ -537,32 +504,29 @@ impl RecoveryJournal {
         Ok(ids)
     }
 
-    fn read_raw_if_exists(&self, name: &str) -> Result<Option<Vec<u8>>, Error> {
-        match self.read_raw(name) {
+    fn has_valid_completion(&self, operation_id: Uuid) -> Result<bool, Error> {
+        let intent = self.read(operation_id)?;
+        let name = entry_name(operation_id);
+        let Ok(Some(bytes)) = Self::read_raw_if_exists(&self.completed, &name) else {
+            return Ok(false);
+        };
+        let Ok(tombstone) = serde_json::from_slice::<CompletionTombstone>(&bytes) else {
+            return Ok(false);
+        };
+        Ok(tombstone.validate_for(&intent).is_ok()
+            && serde_json::to_vec(&tombstone).is_ok_and(|canonical| canonical == bytes))
+    }
+
+    fn read_raw_if_exists(directory: &Dir, name: &str) -> Result<Option<Vec<u8>>, Error> {
+        match Self::read_raw(directory, name) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
     }
 
-    fn name_exists(&self, name: &str) -> Result<bool, Error> {
-        match self.directory.symlink_metadata(name) {
-            Ok(_) => Ok(true),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    fn read_raw(&self, name: &str) -> Result<Vec<u8>, Error> {
-        self.read_raw_with_link_limit(name, 1)
-    }
-
-    fn read_raw_allow_recovery_link(&self, name: &str) -> Result<Vec<u8>, Error> {
-        self.read_raw_with_link_limit(name, 2)
-    }
-
-    fn read_raw_with_link_limit(&self, name: &str, max_links: u64) -> Result<Vec<u8>, Error> {
-        let metadata = self.directory.symlink_metadata(name)?;
+    fn read_raw(directory: &Dir, name: &str) -> Result<Vec<u8>, Error> {
+        let metadata = directory.symlink_metadata(name)?;
         if !metadata.file_type().is_file() {
             return Err(Error::InvalidEntryName);
         }
@@ -571,8 +535,8 @@ impl RecoveryJournal {
         }
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
-        let file = self.directory.open_with(name, &options)?;
-        verify_private_file(&file, max_links)?;
+        let file = directory.open_with(name, &options)?;
+        verify_private_file(&file, 1)?;
         let capacity = usize::try_from(metadata.len()).map_err(|_| Error::EntryTooLarge)?;
         let mut bytes = Vec::with_capacity(capacity);
         file.take(MAX_ENTRY_BYTES + 1).read_to_end(&mut bytes)?;
@@ -582,89 +546,34 @@ impl RecoveryJournal {
         Ok(bytes)
     }
 
-    fn link_sync_cleanup(
-        &self,
-        temporary_name: &str,
-        final_name: &str,
-        expected_bytes: &[u8],
-        recovered: bool,
-        owned_temp: bool,
-    ) -> Result<PublishOutcome, Error> {
-        match self
-            .directory
-            .hard_link(temporary_name, &self.directory, final_name)
-        {
-            Ok(()) => {
-                sync_held_directory(&self.directory).map_err(published_sync_error)?;
-                self.remove_temp_and_sync(temporary_name)?;
-                let final_bytes = self.read_raw(final_name)?;
-                if final_bytes != expected_bytes {
-                    return Err(Error::ExternalMutation);
-                }
-                Ok(if recovered {
-                    PublishOutcome::ReconciledAfterTempWrite
-                } else {
-                    PublishOutcome::Published
-                })
-            }
-            Err(link_error) => {
-                let temp_bytes = self.read_raw_if_exists(temporary_name)?;
-                if owned_temp && temp_bytes.as_deref() != Some(expected_bytes) {
-                    return Err(Error::ExternalMutation);
-                }
-                if temp_bytes.as_deref() == Some(expected_bytes) {
-                    self.remove_temp_and_sync(temporary_name)?;
-                }
-                let final_bytes = self.read_raw_if_exists(final_name)?;
-                match final_bytes {
-                    Some(bytes) if bytes == expected_bytes => {
-                        Ok(PublishOutcome::AlreadyPublishedAndCleanedTemp)
-                    }
-                    Some(_) => Err(Error::JournalCollision),
-                    None => Err(Error::Io(link_error)),
-                }
-            }
-        }
-    }
-
-    fn remove_temp_and_sync(&self, temporary_name: &str) -> Result<(), Error> {
-        self.directory
-            .remove_file(temporary_name)
-            .map_err(Error::PublishedCleanupFailed)?;
-        sync_held_directory(&self.directory).map_err(published_sync_error)
-    }
-
-    /// Removes only a canonical, private, single-link crash temp while the final
-    /// name is absent. The held descriptor is verified before and after reading;
-    /// symlinks, hardlinks, insecure files, or a concurrently-created final fail closed.
-    fn remove_verified_orphan_temp(&self, temporary_name: &str) -> Result<(), Error> {
-        let Some(operation_id) = parse_temporary_entry_name(temporary_name) else {
-            return Err(Error::InvalidEntryName);
-        };
-        if temporary_entry_name(operation_id) != temporary_name {
-            return Err(Error::InvalidEntryName);
-        }
-        let final_name = entry_name(operation_id);
-        if self.name_exists(&final_name)? {
-            return Err(Error::JournalCollision);
-        }
-
+    fn publish_bytes(directory: &Dir, final_name: &str, bytes: &[u8]) -> Result<bool, Error> {
+        let temporary_name = format!(".publish-{}.tmp", Uuid::new_v4());
         let mut options = OpenOptions::new();
-        options.read(true).follow(FollowSymlinks::No);
-        let file = self.directory.open_with(temporary_name, &options)?;
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        let mut file = directory.open_with(&temporary_name, &options)?;
+        set_held_file_permissions(&file)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
         verify_private_file(&file, 1)?;
-        let held_before = file_identity(&file)?;
-        if self.name_exists(&final_name)? {
-            return Err(Error::JournalCollision);
+        drop(file);
+        match atomic_rename_noreplace(directory, &temporary_name, final_name) {
+            Ok(()) => {
+                sync_held_directory(directory).map_err(published_sync_error)?;
+                Ok(true)
+            }
+            Err(Error::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let actual = Self::read_raw(directory, final_name)?;
+                if actual == bytes {
+                    Ok(false)
+                } else {
+                    Err(Error::JournalCollision)
+                }
+            }
+            Err(error) => Err(error),
         }
-        let named = self.directory.symlink_metadata(temporary_name)?;
-        if !named.file_type().is_file() || file_identity_from_metadata(&named) != held_before {
-            return Err(Error::ExternalMutation);
-        }
-        self.directory
-            .remove_file(temporary_name)
-            .map_err(Error::PublishedCleanupFailed)?;
-        sync_held_directory(&self.directory).map_err(published_sync_error)
     }
 }
 
@@ -729,16 +638,6 @@ fn compare_published(actual: &[u8], expected: &[u8]) -> Result<PublishOutcome, E
 
 fn entry_name(operation_id: Uuid) -> String {
     format!("{operation_id}.json")
-}
-
-fn temporary_entry_name(operation_id: Uuid) -> String {
-    format!(".{operation_id}.json.tmp")
-}
-
-fn parse_temporary_entry_name(name: &str) -> Option<Uuid> {
-    let id_text = name.strip_prefix('.')?.strip_suffix(".json.tmp")?;
-    let id = Uuid::parse_str(id_text).ok()?;
-    (id.to_string() == id_text).then_some(id)
 }
 
 fn parse_entry_name(name: &str) -> Option<Uuid> {
@@ -814,13 +713,6 @@ fn open_child_dir_nofollow(parent: &Dir, name: impl AsRef<Path>) -> Result<Dir, 
 fn published_sync_error(error: Error) -> Error {
     match error {
         Error::Io(error) => Error::PublishedButNotSynced(error),
-        other => other,
-    }
-}
-
-fn completed_sync_error(error: Error) -> Error {
-    match error {
-        Error::Io(error) => Error::CompletedButNotSynced(error),
         other => other,
     }
 }
@@ -910,19 +802,6 @@ fn verify_private_file(file: &cap_std::fs::File, max_links: u64) -> Result<(), E
     Ok(())
 }
 
-#[cfg(unix)]
-fn file_identity(file: &cap_std::fs::File) -> Result<(u64, u64), Error> {
-    use cap_fs_ext::MetadataExt;
-    let metadata = file.metadata()?;
-    Ok((metadata.dev(), metadata.ino()))
-}
-
-#[cfg(unix)]
-fn file_identity_from_metadata(metadata: &cap_std::fs::Metadata) -> (u64, u64) {
-    use cap_fs_ext::MetadataExt;
-    (metadata.dev(), metadata.ino())
-}
-
 #[cfg(target_os = "macos")]
 fn verify_no_extended_acl(file: &std::fs::File) -> Result<(), Error> {
     if myvault_platform_acl::has_extended_acl(file)? {
@@ -956,4 +835,26 @@ fn verify_private_file(_file: &cap_std::fs::File, _max_links: u64) -> Result<(),
 fn sync_held_directory(directory: &Dir) -> Result<(), Error> {
     directory.try_clone()?.into_std_file().sync_all()?;
     Ok(())
+}
+
+#[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
+fn atomic_rename_noreplace(directory: &Dir, source: &str, destination: &str) -> Result<(), Error> {
+    let held = directory.try_clone()?.into_std_file();
+    rustix::fs::renameat_with(
+        &held,
+        source,
+        &held,
+        destination,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| Error::Io(io::Error::from(error)))
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux", target_os = "macos")))]
+fn atomic_rename_noreplace(
+    _directory: &Dir,
+    _source: &str,
+    _destination: &str,
+) -> Result<(), Error> {
+    Err(Error::PrivacyValidationRequired)
 }
