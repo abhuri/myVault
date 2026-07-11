@@ -12,4 +12,3 @@
     "tauri:info": "pnpm --dir apps/tauri tauri info"
   }
 }
-

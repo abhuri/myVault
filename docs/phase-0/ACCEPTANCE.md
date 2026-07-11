@@ -70,4 +70,3 @@ The fixture must contain the followingค่ะ
 - `.obsidian/ignored.json` as a preservation probeค่ะ
 
 Permanent deletion is forbidden during Phase 0ค่ะ
-

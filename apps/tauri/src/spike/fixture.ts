@@ -9,4 +9,3 @@ export function assertAllowedSpikeFolder(name: string): void {
     throw new Error("Refusing to operate outside an allowlisted Phase 0 fixture folder");
   }
 }
-

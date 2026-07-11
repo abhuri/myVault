@@ -27,4 +27,3 @@ Recorded on 2026-07-11 in Asia/Bangkokค่ะ
 - Prefer an NDK version meeting current Android 16 KB page-size guidanceค่ะ
 
 Environment installation is intentionally separate from source bootstrap so missing tools remain visible rather than being silently assumedค่ะ
-

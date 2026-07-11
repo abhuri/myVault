@@ -73,4 +73,3 @@ Changes entries represent current state rather than a deltaค่ะ Removed ite
 - Create one Desktop OAuth client for macOS, Windows, and Ubuntu spike buildsค่ะ
 - Create Android OAuth clients for the debug and release package/signing combinationsค่ะ
 - Keep exported credential files and all tokens outside Gitค่ะ
-
