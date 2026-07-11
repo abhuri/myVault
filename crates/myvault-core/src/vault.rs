@@ -1334,18 +1334,20 @@ impl TrashStore<'_> {
         source: &VaultPath,
         manifest_digest: &ManifestDigest,
     ) -> Result<MoveDurability> {
-        self.stage_payload_with_after_move(id, source, manifest_digest, || {})
+        self.stage_payload_with_hooks(id, source, manifest_digest, || {}, |durability| durability)
     }
 
-    fn stage_payload_with_after_move<F>(
+    fn stage_payload_with_hooks<F, G>(
         &self,
         id: TrashId,
         source: &VaultPath,
         manifest_digest: &ManifestDigest,
         after_move: F,
+        observe_durability: G,
     ) -> Result<MoveDurability>
     where
         F: FnOnce(),
+        G: FnOnce(MoveDurability) -> MoveDurability,
     {
         let _guard = self.vault.lock_mutations()?;
         let relative = manifest_path(TrashArea::Staging, id)?;
@@ -1365,11 +1367,14 @@ impl TrashStore<'_> {
         let durability =
             self.vault
                 .move_verified_to_internal_locked(source, &destination, &expected)?;
+        let durability = observe_durability(durability);
         after_move();
         let reread =
             Self::read_manifest_from_directory(id, &directory, false).map_err(|cause| {
                 CoreError::TrashPayloadOutcomeUnknown {
-                    path: destination.as_path().to_owned(),
+                    source_path: source.as_path().to_owned(),
+                    destination_path: destination.as_path().to_owned(),
+                    durability,
                     cause: Box::new(cause),
                 }
             })?;
@@ -1377,7 +1382,9 @@ impl TrashStore<'_> {
             || ManifestDigest::from_bytes(&reread.bytes) != *manifest_digest
         {
             return Err(CoreError::TrashPayloadOutcomeUnknown {
-                path: destination.as_path().to_owned(),
+                source_path: source.as_path().to_owned(),
+                destination_path: destination.as_path().to_owned(),
+                durability,
                 cause: Box::new(CoreError::TrashManifestDigestMismatch),
             });
         }
@@ -1858,35 +1865,51 @@ mod tests {
 
     #[test]
     fn stage_reread_mismatch_after_move_is_payload_outcome_unknown() {
-        let (base, vault, id, manifest) = manifest_fault_fixture("payload-reread");
-        fs::write(base.join("note.md"), b"note").expect("source");
-        vault
-            .trash_store()
-            .prepare_staging_manifest(id, &manifest)
-            .expect("prepare manifest");
-        let digest = manifest.digest().expect("digest");
-        let manifest_path = base.join(format!(".trash/v1/staging/{id}/manifest.json"));
+        for (label, injected_durability) in [
+            ("fully-synced", MoveDurability::FullySynced),
+            (
+                "directory-sync-unsupported",
+                MoveDurability::DirectorySyncUnsupported,
+            ),
+        ] {
+            let (base, vault, id, manifest) = manifest_fault_fixture(label);
+            fs::write(base.join("note.md"), b"note").expect("source");
+            vault
+                .trash_store()
+                .prepare_staging_manifest(id, &manifest)
+                .expect("prepare manifest");
+            let digest = manifest.digest().expect("digest");
+            let manifest_path = base.join(format!(".trash/v1/staging/{id}/manifest.json"));
+            let source = VaultPath::from_portable("note.md").expect("source path");
+            let destination = format!(".trash/v1/staging/{id}/payload");
 
-        let error = vault
-            .trash_store()
-            .stage_payload_with_after_move(
-                id,
-                &VaultPath::from_portable("note.md").expect("source path"),
-                &digest,
-                || fs::write(&manifest_path, b"{").expect("external manifest mutation"),
-            )
-            .expect_err("post-move manifest mutation");
+            let error = vault
+                .trash_store()
+                .stage_payload_with_hooks(
+                    id,
+                    &source,
+                    &digest,
+                    || fs::write(&manifest_path, b"{").expect("external manifest mutation"),
+                    |_| injected_durability,
+                )
+                .expect_err("post-move manifest mutation");
 
-        assert!(matches!(
-            error,
-            CoreError::TrashPayloadOutcomeUnknown { cause, .. }
-                if matches!(*cause, CoreError::InvalidTrashManifest(_))
-        ));
-        assert!(base
-            .join(format!(".trash/v1/staging/{id}/payload"))
-            .is_file());
-        assert!(!base.join("note.md").exists());
-        fs::remove_dir_all(base).expect("cleanup");
+            assert!(matches!(
+                error,
+                CoreError::TrashPayloadOutcomeUnknown {
+                    source_path,
+                    destination_path,
+                    durability,
+                    cause,
+                } if source_path == source.as_path()
+                    && destination_path == Path::new(&destination)
+                    && durability == injected_durability
+                    && matches!(*cause, CoreError::InvalidTrashManifest(_))
+            ));
+            assert!(base.join(&destination).is_file());
+            assert!(!base.join("note.md").exists());
+            fs::remove_dir_all(base).expect("cleanup");
+        }
     }
 
     #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]

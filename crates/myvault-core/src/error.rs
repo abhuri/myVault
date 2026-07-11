@@ -20,7 +20,9 @@ pub enum CoreError {
         cause: Box<CoreError>,
     },
     TrashPayloadOutcomeUnknown {
-        path: PathBuf,
+        source_path: PathBuf,
+        destination_path: PathBuf,
+        durability: crate::MoveDurability,
         cause: Box<CoreError>,
     },
     InvalidRevision,
@@ -237,10 +239,16 @@ impl CoreError {
                 "trash manifest may be published at {}: {cause}",
                 path.display()
             )),
-            Self::TrashPayloadOutcomeUnknown { path, cause } => Some(write!(
+            Self::TrashPayloadOutcomeUnknown {
+                source_path,
+                destination_path,
+                durability,
+                cause,
+            } => Some(write!(
                 formatter,
-                "trash payload may be published at {}: {cause}",
-                path.display()
+                "trash payload move from {} to {} is published with {durability:?}, but manifest revalidation failed: {cause}",
+                source_path.display(),
+                destination_path.display()
             )),
             Self::InvalidRevision => Some(formatter.write_str("invalid BLAKE3 file revision")),
             Self::RevisionTargetNotFile(path) => Some(write!(
