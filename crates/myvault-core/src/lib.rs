@@ -8,15 +8,20 @@ mod capability;
 mod error;
 mod index;
 mod path;
+mod revision;
+mod trash;
 mod vault;
 mod watcher;
 
 pub use error::{CoreError, Result};
 pub use index::{DerivedIndex, NoteRecord, SCHEMA_VERSION, SQLITE_OPEN_RESIDUAL_RISK};
 pub use path::VaultPath;
+pub use revision::FileRevision;
+pub use trash::{TrashArea, TrashEntryKind, TrashId, TrashPath};
 pub use vault::{
     DirectorySyncStatus, InventoryEntry, InventoryKind, InventoryLimits, MoveDurability, Vault,
-    WriteIntent, DEFAULT_READ_LIMIT, MUTATION_EXTERNAL_PROCESS_RESIDUAL_RISK,
+    WriteIntent, DEFAULT_READ_LIMIT, MAX_TRASH_PAYLOAD_BYTES,
+    MUTATION_EXTERNAL_PROCESS_RESIDUAL_RISK, TRASH_REVISION_EXTERNAL_PROCESS_RESIDUAL_RISK,
 };
 pub use watcher::{
     BurstNormalizer, NormalizedEvent, RawEvent, SelfWriteSuppressor, WriteFingerprint,

@@ -474,7 +474,8 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - initial repository safeguards ถูก push ไปที่ `main` ใน commit `6597e18` แล้วค่ะ
 - Phase 0 ถูก merge เข้า `main` ผ่าน PR #1 ที่ merge commit `dab395a` แล้วค่ะ
 - Phase 1 portable core ถูก merge เข้า `main` ผ่าน PR #2 ที่ merge commit `838e220` แล้วค่ะ
-- งาน mutation/recovery อยู่บน branch `agent/phase-1-mutations` ค่ะ
+- Phase 1 mutation/recovery ถูก merge เข้า `main` ผ่าน PR #3 ที่ merge commit `5470e2c` แล้วค่ะ
+- งาน revision-checked Trash/Restore boundary อยู่บน branch `agent/phase-1-trash` ค่ะ
 - package manager ที่เลือกคือ `pnpm` ค่ะ
 - Tauri 2, React, TypeScript และ Rust scaffold ถูกสร้างที่ `apps/tauri` ค่ะ
 - diagnostic shell มี Rust platform bridge, CodeMirror, Mermaid strict mode, Sigma 1,000/5,000-node probes, runtime evidence และ Android Google authorization controls แล้วค่ะ
@@ -501,11 +502,14 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - Phase 1 portable path contract, Unicode/case collision policy, bounded inventory/read, create-new แบบ no-overwrite และ SQLite derived-index schema v2 ทำเสร็จแล้วค่ะ
 - atomic no-replace file/directory move พร้อม held-directory capabilities ทำเสร็จสำหรับ macOS, Linux, Android และ Windows native `NtSetInformationFile` boundary ค่ะ
 - append-only recovery journal, immutable completion tombstones, directory durability retry และ descriptor-native ACL validation ทำเสร็จแล้วค่ะ Physical journal GC ถูกเลื่อนไว้โดยตั้งใจเพื่อไม่ให้มี check-to-unlink race ค่ะ
-- `myvault-core` ผ่าน 54 tests และ recovery ผ่าน 21 tests รวม fault injection, adversarial symlink/reparse, collision, ACL, malformed-index recovery และ concurrent Vault instances ค่ะ
+- `myvault-core` ผ่าน 68 tests และ recovery ผ่าน 28 tests รวม fault injection, adversarial symlink/reparse, collision, ACL, malformed-index recovery, typed operation topology และ concurrent Vault instances ค่ะ
+- file revision ใช้ bounded streaming BLAKE3 และ privileged Trash/Restore payload move ผูก expected revision ไว้ภายใต้ root mutation lock เดียวกันค่ะ
+- post-publication move failures เก็บสถานะ durability ของ source/destination แยกกัน และไม่ปลอมเป็น stale precondition ค่ะ
+- recovery journal schema v3 ใช้ caller-supplied stable operation ID และบังคับ endpoint topology ของ `NormalMove`, `CaseRename`, `Trash` และ `Restore` ค่ะ
 
 ## 15. Next Actions
 
-1. เชื่อม expected revision + append-only journal เข้ากับ rename/move service แล้วทำ `.trash/` staging/items/restore ค่ะ
+1. สร้าง manifest-bound `TrashStore` สำหรับ canonical manifest, staging payload, publish staging → items และ restore โดยไม่มี unlink/GC ค่ะ
 2. หลังคุณโอยืนยัน Google API Services User Data Policy ให้ Sunday สร้าง Desktop/Android OAuth clients และเพิ่มบัญชีส่วนตัวเป็น test user ค่ะ
 3. รัน Desktop OAuth และ live Drive acceptance fixture แล้ว Trash เฉพาะ folder ID/marker ที่ยืนยันแล้วค่ะ
 4. เลื่อนการเชื่อมต่อมือถือ Android และ physical-device matrix ไว้จนกว่าคุณโอจะมีอุปกรณ์ค่ะ
@@ -529,7 +533,7 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - Gradle cache physical path คือ `/Volumes/AWB-Apps/Developer/Gradle` และ `~/.gradle` เป็น symlink ค่ะ
 - remote repository คือ `https://github.com/abhuri/myVault.git` ค่ะ
 - `main` มี initial commit `6597e18` ค่ะ
-- active branch คือ `agent/phase-1-mutations` ค่ะ Phase 0 PR #1 และ portable-core PR #2 merge เข้า `main` แล้วค่ะ
+- active branch คือ `agent/phase-1-trash` ค่ะ Phase 0 PR #1, portable-core PR #2 และ mutation/recovery PR #3 merge เข้า `main` แล้วค่ะ
 - Phase 0 diagnostic shell และ contracts ถูกสร้างแล้วค่ะ
 - local checks ที่ผ่านคือ TypeScript, Vitest 8 tests, Vite build, Rust fmt/clippy, Rust 49 tests, macOS Keychain live probe และ Tauri debug build ค่ะ
 - GitHub quality, Android compile + 16 KB alignment, Windows NSIS และ Ubuntu AppImage checks ของ Draft PR #1 ผ่านที่ commit `0aecda5` แล้วค่ะ
@@ -543,9 +547,9 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - Drive live harness ไม่มี permanent-delete API, จำกัด Google origin และตรวจ random marker ก่อน Trash ค่ะ
 - คุณโอเลือก Vault-local `.trash/` ซึ่งต้องไม่ปรากฏใน index, search, backlinks หรือ graph ปกติค่ะ
 - Google Cloud project `myVault Personal` (`myvault-personal-0aecda5`) และ Drive API พร้อมแล้วค่ะ Google Auth Platform รอยืนยัน User Data Policy ก่อนสร้าง OAuth clients ค่ะ
-- Phase 1 portable paths, bounded inventory/read, no-overwrite create, derived index schema v2 และ atomic no-replace move พร้อมแล้วและผ่าน core 54 tests ค่ะ
-- append-only recovery journal ผ่าน 21 tests และไม่มี production unlink/hardlink cleanup API ค่ะ Windows recovery privacy ยังคง fail closed จนกว่าจะเพิ่ม ACL validator ค่ะ
-- งานถัดไปคือ revision-checked rename/move service → `.trash/`/restore → snapshots ควบคู่กับ OAuth client configuration และ Desktop live-Drive validation ค่ะ
+- Phase 1 portable paths, bounded inventory/read, no-overwrite create, derived index schema v2, atomic no-replace move และ revision-checked Trash/Restore payload boundary พร้อมแล้วและผ่าน core 68 tests ค่ะ
+- append-only recovery journal schema v3 ผ่าน 28 tests ไม่มี production unlink/hardlink cleanup API และ typed operation ทุกชนิดบังคับ endpoint topology ค่ะ
+- งานถัดไปคือ manifest-bound `TrashStore` → mutation service/recovery dispatcher → snapshots ควบคู่กับ OAuth client configuration และ Desktop live-Drive validation ค่ะ
 
 ### Handoff Update Template
 
@@ -596,6 +600,9 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - merge portable core เข้า `main` ผ่าน PR #2 ที่ merge commit `838e220` และแยก branch `agent/phase-1-mutations` แล้วค่ะ
 - เพิ่ม atomic no-replace move สำหรับ Unix/Android/macOS ผ่าน `rustix` และ Windows ผ่าน native `NtSetInformationFile` ใน isolated unsafe crate ค่ะ
 - เพิ่ม append-only recovery journal, completion tombstones, retry durability, ACL validation และ native-platform runtime tests ใน CI ค่ะ
+- merge mutation/recovery เข้า `main` ผ่าน PR #3 ที่ merge commit `5470e2c` ค่ะ
+- เพิ่ม bounded file revision, exact `.trash/v1` payload paths และ post-publication durability outcomes ที่รักษาสถานะราย parent ค่ะ
+- เพิ่ม recovery journal schema v3 พร้อม stable operation ID และ exact endpoint topology สำหรับ NormalMove, CaseRename, Trash และ Restore ค่ะ
 
 ### 2026-07-11
 

@@ -1,6 +1,6 @@
 use myvault_recovery::{
-    decide_recovery, Error, FileRevision, RecoveryDecision, RecoveryJournal, RecoveryTopology,
-    RenameMoveIntent,
+    decide_recovery, Error, FileRevision, RecoveryDecision, RecoveryJournal, RecoveryOperationKind,
+    RecoveryTopology, RenameMoveIntent,
 };
 #[cfg(unix)]
 use myvault_recovery::{CompleteOutcome, PublishOutcome, MAX_PAGE_SIZE};
@@ -8,7 +8,6 @@ use std::fs;
 #[cfg(unix)]
 use std::io::Write;
 use tempfile::TempDir;
-#[cfg(unix)]
 use uuid::Uuid;
 
 fn revision(text: &str) -> FileRevision {
@@ -17,10 +16,10 @@ fn revision(text: &str) -> FileRevision {
 
 fn intent() -> RenameMoveIntent {
     RenameMoveIntent::new(
+        Uuid::new_v4(),
         "บันทึก/ต้นทาง.md",
         "คลัง/ปลายทาง.md",
         revision("note"),
-        Some(".tmp/ย้าย.md".into()),
     )
     .unwrap()
 }
@@ -476,42 +475,446 @@ fn pagination_is_bounded_and_junk_does_not_consume_committed_limit() {
 #[test]
 fn paths_are_canonical_and_case_rename_requires_explicit_contract() {
     let canonical = RenameMoveIntent::new(
+        Uuid::new_v4(),
         "folder//source.md",
         "other/./target.md",
         revision("note"),
-        None,
     )
     .unwrap();
     assert_eq!(canonical.from, "folder/source.md");
     assert_eq!(canonical.to, "other/target.md");
     assert!(matches!(
-        RenameMoveIntent::new("Note.md", "note.md", revision("note"), None),
+        RenameMoveIntent::new(Uuid::new_v4(), "Note.md", "note.md", revision("note")),
         Err(Error::CaseRenameContractRequired)
     ));
     assert!(matches!(
-        RenameMoveIntent::new("same.md", "same.md", revision("note"), None),
+        RenameMoveIntent::new(Uuid::new_v4(), "same.md", "same.md", revision("note")),
         Err(Error::IdenticalPaths)
     ));
+    let operation_id = Uuid::new_v4();
+    let expected_temp = format!(".rename-stage/{operation_id}.tmp");
     let case = RenameMoveIntent::new_case_rename(
+        operation_id,
         "Note.md",
         "note.md",
         revision("note"),
-        ".rename-stage/unique.md",
+        &expected_temp,
     )
     .unwrap();
-    assert!(case.case_rename);
+    assert_eq!(case.kind, RecoveryOperationKind::CaseRename);
+    assert_eq!(case.temp.as_deref(), Some(expected_temp.as_str()));
+}
 
-    for temp in ["folder/source.md", "FOLDER/source.md", "other/target.md"] {
-        assert!(matches!(
-            RenameMoveIntent::new(
-                "folder/source.md",
-                "other/target.md",
-                revision("note"),
-                Some(temp.into()),
-            ),
-            Err(Error::InvalidCaseRenameContract)
-        ));
+#[test]
+fn caller_supplied_operation_id_is_stable_and_identifiers_are_validated() {
+    let operation_id = Uuid::new_v4();
+    let expected = RenameMoveIntent::new(
+        operation_id,
+        "source.md",
+        "destination.md",
+        revision("note"),
+    )
+    .unwrap();
+    assert_eq!(expected.operation_id, operation_id);
+    assert!(matches!(
+        RenameMoveIntent::new(Uuid::nil(), "source.md", "destination.md", revision("note"),),
+        Err(Error::InvalidOperationId)
+    ));
+
+    let manifest = blake3::hash(b"manifest").to_hex().to_string();
+    assert!(matches!(
+        RenameMoveIntent::new_trash(
+            Uuid::new_v4(),
+            Uuid::nil(),
+            manifest.clone(),
+            "source.md",
+            revision("note"),
+        ),
+        Err(Error::InvalidTrashId)
+    ));
+    assert!(matches!(
+        RenameMoveIntent::new_trash(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            manifest.to_uppercase(),
+            "source.md",
+            revision("note"),
+        ),
+        Err(Error::InvalidManifestDigest)
+    ));
+}
+
+#[test]
+#[cfg(unix)]
+fn every_operation_kind_round_trips_deterministically() {
+    let (_temporary, app, vault) = roots();
+    let journal = RecoveryJournal::open(&app, &vault).unwrap();
+    let trash_id = Uuid::new_v4();
+    let manifest = blake3::hash(b"manifest").to_hex().to_string();
+    let cases = vec![
+        RenameMoveIntent::new(
+            Uuid::new_v4(),
+            "source.md",
+            "destination.md",
+            revision("note"),
+        )
+        .unwrap(),
+        RenameMoveIntent::new_case_rename(
+            Uuid::new_v4(),
+            "Note.md",
+            "note.md",
+            revision("note"),
+            ".rename-stage/roundtrip.tmp",
+        )
+        .unwrap(),
+        RenameMoveIntent::new_trash(
+            Uuid::new_v4(),
+            trash_id,
+            manifest.clone(),
+            "source.md",
+            revision("note"),
+        )
+        .unwrap(),
+        RenameMoveIntent::new_restore(
+            Uuid::new_v4(),
+            trash_id,
+            manifest,
+            "restored.md",
+            revision("note"),
+        )
+        .unwrap(),
+    ];
+
+    let expected_staging = format!(".trash/v1/staging/{trash_id}/payload");
+    let expected_item = format!(".trash/v1/items/{trash_id}/payload");
+    assert_eq!(cases[2].temp.as_deref(), Some(expected_staging.as_str()));
+    assert_eq!(cases[2].to, expected_item);
+    assert_eq!(cases[3].from, expected_item);
+    assert!(cases[3].temp.is_none());
+
+    for expected in cases {
+        let canonical = serde_json::to_vec(&expected).unwrap();
+        assert_eq!(serde_json::to_vec(&expected).unwrap(), canonical);
+        assert_eq!(
+            journal.publish(&expected).unwrap(),
+            PublishOutcome::Published
+        );
+        assert_eq!(journal.read(expected.operation_id).unwrap(), expected);
+        assert_eq!(
+            journal.publish(&expected).unwrap(),
+            PublishOutcome::AlreadyPublished
+        );
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn same_id_with_different_kind_or_payload_is_a_collision() {
+    let (_temporary, app, vault) = roots();
+    let journal = RecoveryJournal::open(&app, &vault).unwrap();
+    let operation_id = Uuid::new_v4();
+    let normal = RenameMoveIntent::new(
+        operation_id,
+        "source.md",
+        "destination.md",
+        revision("note"),
+    )
+    .unwrap();
+    journal.publish(&normal).unwrap();
+    let trash = RenameMoveIntent::new_trash(
+        operation_id,
+        Uuid::new_v4(),
+        blake3::hash(b"manifest").to_hex().to_string(),
+        "source.md",
+        revision("note"),
+    )
+    .unwrap();
+    assert!(matches!(
+        journal.publish(&trash),
+        Err(Error::JournalCollision)
+    ));
+
+    let mut changed_payload = normal.clone();
+    changed_payload.expected = revision("different");
+    assert!(matches!(
+        journal.publish(&changed_payload),
+        Err(Error::JournalCollision)
+    ));
+}
+
+#[test]
+fn constructors_reject_protected_endpoint_aliases() {
+    assert!(matches!(
+        RenameMoveIntent::new(
+            Uuid::new_v4(),
+            ".ＴＲＡＳＨ/file.md",
+            "destination.md",
+            revision("note"),
+        ),
+        Err(Error::InvalidOperationTopology)
+    ));
+    assert!(matches!(
+        RenameMoveIntent::new(
+            Uuid::new_v4(),
+            "source.md",
+            ".Obsidian/plugin.json",
+            revision("note"),
+        ),
+        Err(Error::InvalidOperationTopology)
+    ));
+    assert!(matches!(
+        RenameMoveIntent::new_case_rename(
+            Uuid::new_v4(),
+            ".trash/Note.md",
+            ".trash/note.md",
+            revision("note"),
+            ".rename-stage/protected-endpoints.tmp",
+        ),
+        Err(Error::InvalidOperationTopology)
+    ));
+    assert!(matches!(
+        RenameMoveIntent::new_case_rename(
+            Uuid::new_v4(),
+            "Note.md",
+            "note.md",
+            revision("note"),
+            ".trash/v1/staging/not-allowed/payload",
+        ),
+        Err(Error::InvalidOperationTopology)
+    ));
+    assert!(matches!(
+        RenameMoveIntent::new_restore(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            blake3::hash(b"manifest").to_hex().to_string(),
+            ".trash/restored.md",
+            revision("note"),
+        ),
+        Err(Error::InvalidOperationTopology)
+    ));
+}
+
+#[test]
+#[cfg(unix)]
+fn decoded_public_structs_reject_cross_kind_endpoint_topologies() {
+    let (_temporary, app, vault) = roots();
+    let journal = RecoveryJournal::open(&app, &vault).unwrap();
+    let manifest = blake3::hash(b"manifest").to_hex().to_string();
+
+    let reject = |candidate: RenameMoveIntent| {
+        write_private(
+            &app.join("operation-journal")
+                .join(format!("{}.json", candidate.operation_id)),
+            &serde_json::to_vec(&candidate).unwrap(),
+        );
+        assert!(matches!(
+            journal.read(candidate.operation_id),
+            Err(Error::InvalidOperationTopology
+                | Error::CaseRenameContractRequired
+                | Error::InvalidCaseRenameContract)
+        ));
+    };
+
+    let trash_id = Uuid::new_v4();
+    let trash_item = format!(".trash/v1/items/{trash_id}/payload");
+    let trash_stage = format!(".trash/v1/staging/{trash_id}/payload");
+
+    let normal = || {
+        RenameMoveIntent::new(
+            Uuid::new_v4(),
+            "source.md",
+            "destination.md",
+            revision("note"),
+        )
+        .unwrap()
+    };
+    let mut candidate = normal();
+    candidate.from = trash_item.clone();
+    reject(candidate);
+    let mut candidate = normal();
+    candidate.to = trash_item.clone();
+    reject(candidate);
+    let mut candidate = normal();
+    candidate.temp = Some(trash_stage.clone());
+    reject(candidate);
+
+    let case = || {
+        RenameMoveIntent::new_case_rename(
+            Uuid::new_v4(),
+            "Note.md",
+            "note.md",
+            revision("note"),
+            ".rename-stage/mutation.tmp",
+        )
+        .unwrap()
+    };
+    let mut candidate = case();
+    candidate.from = trash_item.clone();
+    reject(candidate);
+    let mut candidate = case();
+    candidate.to = trash_item.clone();
+    reject(candidate);
+    let mut candidate = case();
+    candidate.temp = Some(trash_stage.clone());
+    reject(candidate);
+
+    let trash = || {
+        RenameMoveIntent::new_trash(
+            Uuid::new_v4(),
+            trash_id,
+            manifest.clone(),
+            "source.md",
+            revision("note"),
+        )
+        .unwrap()
+    };
+    let mut candidate = trash();
+    candidate.from = trash_item.clone();
+    reject(candidate);
+    let mut candidate = trash();
+    candidate.to = trash_stage.clone();
+    reject(candidate);
+    let mut candidate = trash();
+    candidate.temp = Some(trash_item.clone());
+    reject(candidate);
+    let restore = || {
+        RenameMoveIntent::new_restore(
+            Uuid::new_v4(),
+            trash_id,
+            manifest.clone(),
+            "restored.md",
+            revision("note"),
+        )
+        .unwrap()
+    };
+    let mut candidate = restore();
+    candidate.from = trash_stage.clone();
+    reject(candidate);
+    let mut candidate = restore();
+    candidate.to = trash_item.clone();
+    reject(candidate);
+    let mut candidate = restore();
+    candidate.temp = Some(trash_stage);
+    reject(candidate);
+}
+
+#[test]
+#[cfg(unix)]
+fn decoded_endpoint_shape_cannot_be_relabeled_as_another_kind() {
+    let (_temporary, app, vault) = roots();
+    let journal = RecoveryJournal::open(&app, &vault).unwrap();
+    let manifest = blake3::hash(b"manifest").to_hex().to_string();
+    let trash_id = Uuid::new_v4();
+    let reject = |candidate: RenameMoveIntent| {
+        write_private(
+            &app.join("operation-journal")
+                .join(format!("{}.json", candidate.operation_id)),
+            &serde_json::to_vec(&candidate).unwrap(),
+        );
+        assert!(journal.read(candidate.operation_id).is_err());
+    };
+
+    // Every valid endpoint shape is rejected when relabeled as any other kind.
+    for source_shape in 0..4 {
+        for target_kind in 0..4 {
+            if source_shape == target_kind {
+                continue;
+            }
+            let operation_id = Uuid::new_v4();
+            let mut candidate = match source_shape {
+                0 => RenameMoveIntent::new(
+                    operation_id,
+                    "source.md",
+                    "destination.md",
+                    revision("note"),
+                )
+                .unwrap(),
+                1 => RenameMoveIntent::new_case_rename(
+                    operation_id,
+                    "Note.md",
+                    "note.md",
+                    revision("note"),
+                    format!(".rename-stage/{operation_id}.tmp"),
+                )
+                .unwrap(),
+                2 => RenameMoveIntent::new_trash(
+                    operation_id,
+                    trash_id,
+                    manifest.clone(),
+                    "source.md",
+                    revision("note"),
+                )
+                .unwrap(),
+                3 => RenameMoveIntent::new_restore(
+                    operation_id,
+                    trash_id,
+                    manifest.clone(),
+                    "restored.md",
+                    revision("note"),
+                )
+                .unwrap(),
+                _ => unreachable!(),
+            };
+            candidate.kind = match target_kind {
+                0 => RecoveryOperationKind::NormalMove,
+                1 => RecoveryOperationKind::CaseRename,
+                2 => RecoveryOperationKind::Trash {
+                    trash_id,
+                    manifest_blake3: manifest.clone(),
+                },
+                3 => RecoveryOperationKind::Restore {
+                    trash_id,
+                    manifest_blake3: manifest.clone(),
+                },
+                _ => unreachable!(),
+            };
+            reject(candidate);
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn legacy_and_noncanonical_journal_bytes_are_never_reinterpreted() {
+    let (_temporary, app, vault) = roots();
+    let journal = RecoveryJournal::open(&app, &vault).unwrap();
+
+    let legacy_id = Uuid::new_v4();
+    let legacy = serde_json::json!({
+        "version": 2,
+        "operation_id": legacy_id,
+        "from": "source.md",
+        "to": "destination.md",
+        "expected": revision("note"),
+        "temp": null,
+        "case_rename": false
+    });
+    write_private(
+        &app.join("operation-journal")
+            .join(format!("{legacy_id}.json")),
+        &serde_json::to_vec(&legacy).unwrap(),
+    );
+    assert!(matches!(
+        journal.read(legacy_id),
+        Err(Error::UnsupportedVersion(2))
+    ));
+
+    let expected = intent();
+    let canonical = serde_json::to_string(&expected).unwrap();
+    let noncanonical = canonical.replacen(
+        &expected.operation_id.to_string(),
+        &expected.operation_id.to_string().to_uppercase(),
+        1,
+    );
+    write_private(
+        &app.join("operation-journal")
+            .join(format!("{}.json", expected.operation_id)),
+        noncanonical.as_bytes(),
+    );
+    assert!(matches!(
+        journal.read(expected.operation_id),
+        Err(Error::InvalidEntryName)
+    ));
 }
 
 #[test]

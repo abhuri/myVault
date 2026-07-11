@@ -13,15 +13,20 @@ use cap_std::fs::{Dir, OpenOptions};
 use crate::atomic_move::rename_noreplace;
 use crate::capability::{open_absolute_dir_nofollow, open_child_dir_nofollow};
 use crate::path::{classify_component, component_collision_key, VaultPathClass};
-use crate::{CoreError, Result, VaultPath};
+use crate::{CoreError, FileRevision, Result, TrashArea, TrashEntryKind, TrashPath, VaultPath};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 static MUTATION_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
 pub const DEFAULT_READ_LIMIT: usize = 16 * 1024 * 1024;
+pub const MAX_TRASH_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 /// In-process vault instances share a mutation lock, but another process can
 /// still alter the filesystem between descriptor-relative validation and commit.
 pub const MUTATION_EXTERNAL_PROCESS_RESIDUAL_RISK: &str =
     "external processes are not serialized with myVault's per-root mutation lock";
+/// Revision checks and moves share the in-process root lock, but another process
+/// can still change an opened file between verification and the atomic rename.
+pub const TRASH_REVISION_EXTERNAL_PROCESS_RESIDUAL_RISK: &str =
+    "an external process can mutate a payload between descriptor-relative revision verification and rename";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InventoryLimits {
@@ -74,13 +79,16 @@ pub enum DirectorySyncStatus {
     Unsupported,
     Failed(std::io::Error),
     SharedWithDestination,
+    NotAttempted,
 }
 
 impl DirectorySyncStatus {
     pub(crate) fn error(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Failed(error) => Some(error),
-            Self::Synced | Self::Unsupported | Self::SharedWithDestination => None,
+            Self::Synced | Self::Unsupported | Self::SharedWithDestination | Self::NotAttempted => {
+                None
+            }
         }
     }
 }
@@ -94,6 +102,7 @@ impl std::fmt::Display for DirectorySyncStatus {
             Self::SharedWithDestination => {
                 formatter.write_str("same parent; destination result applies")
             }
+            Self::NotAttempted => formatter.write_str("not attempted"),
         }
     }
 }
@@ -148,6 +157,7 @@ impl Vault {
     /// Returns an error for unsafe paths, filesystem failures, or when the
     /// content exceeds `limit`.
     pub fn read_bounded(&self, relative: &VaultPath, limit: usize) -> Result<Vec<u8>> {
+        Self::validate_generic_access(relative)?;
         let (parent, name) = self.open_parent(relative)?;
         self.reject_final_symlink(&parent, &name, relative)?;
         let mut options = OpenOptions::new();
@@ -172,6 +182,32 @@ impl Vault {
             });
         }
         Ok(bytes)
+    }
+
+    /// Computes a descriptor-relative, no-follow BLAKE3 revision while reading
+    /// no more than `max_bytes + 1` bytes.
+    ///
+    /// # Errors
+    /// Returns an error for internal trash paths, non-files, symlinks, unsafe
+    /// components, I/O failures, or content larger than `max_bytes`.
+    pub fn revision(&self, relative: &VaultPath, max_bytes: usize) -> Result<FileRevision> {
+        Self::validate_generic_access(relative)?;
+        self.revision_inner(relative, max_bytes)
+    }
+
+    /// Verifies a file against a caller-held expected revision.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::StaleRevision`] on a digest or byte-length mismatch,
+    /// or another bounded/no-follow revision error.
+    pub fn verify_expected(
+        &self,
+        relative: &VaultPath,
+        expected: &FileRevision,
+        max_bytes: usize,
+    ) -> Result<()> {
+        Self::validate_generic_access(relative)?;
+        self.verify_expected_inner(relative, expected, max_bytes)
     }
 
     /// Inventories regular vault files without following symbolic links.
@@ -348,12 +384,77 @@ impl Vault {
         })
     }
 
+    /// Moves one verified content file into an exact staging payload path.
+    /// Generic APIs remain denied access to `.trash`.
+    ///
+    /// # Errors
+    /// Returns an error for stale revisions, non-files, wrong trash layout,
+    /// symlinks, collisions, unsupported atomic moves, or durability failures.
+    pub fn move_content_to_trash_payload(
+        &self,
+        source: &VaultPath,
+        staging_payload: &TrashPath,
+        expected: &FileRevision,
+    ) -> Result<MoveDurability> {
+        let _guard = self.lock_mutations()?;
+        Self::require_content_path(source)?;
+        Self::require_trash_payload(staging_payload, TrashArea::Staging)?;
+        self.verify_expected_inner(source, expected, MAX_TRASH_PAYLOAD_BYTES)?;
+        let destination = staging_payload.as_vault_path();
+        let report = self.atomic_move_locked_report(source, destination, |_, directory| {
+            sync_directory_for_move(directory)
+        })?;
+        if report.has_failure() {
+            self.confirm_move_durability(source, destination, expected, MAX_TRASH_PAYLOAD_BYTES)
+        } else {
+            self.finish_verified_move(
+                source,
+                destination,
+                expected,
+                MAX_TRASH_PAYLOAD_BYTES,
+                report,
+            )
+        }
+    }
+
+    /// Restores one verified committed trash payload to a content path.
+    ///
+    /// # Errors
+    /// Returns an error for stale revisions, non-files, wrong trash layout,
+    /// symlinks, collisions, unsupported atomic moves, or durability failures.
+    pub fn restore_trash_payload(
+        &self,
+        payload: &TrashPath,
+        destination: &VaultPath,
+        expected: &FileRevision,
+    ) -> Result<MoveDurability> {
+        let _guard = self.lock_mutations()?;
+        Self::require_trash_payload(payload, TrashArea::Items)?;
+        Self::require_content_path(destination)?;
+        let source = payload.as_vault_path();
+        self.verify_expected_inner(source, expected, MAX_TRASH_PAYLOAD_BYTES)?;
+        let report = self.atomic_move_locked_report(source, destination, |_, directory| {
+            sync_directory_for_move(directory)
+        })?;
+        if report.has_failure() {
+            self.confirm_move_durability(source, destination, expected, MAX_TRASH_PAYLOAD_BYTES)
+        } else {
+            self.finish_verified_move(
+                source,
+                destination,
+                expected,
+                MAX_TRASH_PAYLOAD_BYTES,
+                report,
+            )
+        }
+    }
+
     fn atomic_move_inner<F>(
         &self,
         source: &VaultPath,
         destination: &VaultPath,
         intent: WriteIntent,
-        mut sync: F,
+        sync: F,
     ) -> Result<MoveDurability>
     where
         F: FnMut(MoveSyncParent, &Dir) -> std::io::Result<MoveDurability>,
@@ -361,6 +462,19 @@ impl Vault {
         let _guard = self.lock_mutations()?;
         Self::validate_mutation_policy(source, intent)?;
         Self::validate_mutation_policy(destination, intent)?;
+        self.atomic_move_locked_report(source, destination, sync)?
+            .into_result(source, destination)
+    }
+
+    fn atomic_move_locked_report<F>(
+        &self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        mut sync: F,
+    ) -> Result<MoveSyncReport>
+    where
+        F: FnMut(MoveSyncParent, &Dir) -> std::io::Result<MoveDurability>,
+    {
         if source == destination {
             return Err(CoreError::AlreadyExists(destination.as_path().to_owned()));
         }
@@ -423,7 +537,257 @@ impl Vault {
         } else {
             Some(sync(MoveSyncParent::Source, &source_parent))
         };
-        Self::finish_atomic_move_sync(source, destination, destination_sync, source_sync)
+        Ok(MoveSyncReport {
+            destination: destination_sync,
+            source: source_sync,
+        })
+    }
+
+    fn revision_inner(&self, relative: &VaultPath, max_bytes: usize) -> Result<FileRevision> {
+        let (parent, name) = self.open_parent_checked(relative)?;
+        self.revision_from_parent(&parent, &name, relative, max_bytes)
+    }
+
+    fn revision_from_parent(
+        &self,
+        parent: &Dir,
+        name: &OsString,
+        relative: &VaultPath,
+        max_bytes: usize,
+    ) -> Result<FileRevision> {
+        self.reject_final_symlink(parent, name, relative)?;
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let mut file = parent.open_with(name, &options)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(CoreError::RevisionTargetNotFile(
+                relative.as_path().to_owned(),
+            ));
+        }
+        let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+        if metadata.len() > max_bytes_u64 {
+            return Err(CoreError::ResourceLimitExceeded {
+                resource: "revision bytes",
+                limit: max_bytes,
+            });
+        }
+
+        let mut hasher = blake3::Hasher::new();
+        let mut total = 0_usize;
+        let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+        loop {
+            let remaining_with_probe = max_bytes.saturating_sub(total).saturating_add(1);
+            let read_limit = buffer.len().min(remaining_with_probe);
+            let count = file.read(&mut buffer[..read_limit])?;
+            if count == 0 {
+                break;
+            }
+            total = total.saturating_add(count);
+            if total > max_bytes {
+                return Err(CoreError::ResourceLimitExceeded {
+                    resource: "revision bytes",
+                    limit: max_bytes,
+                });
+            }
+            hasher.update(&buffer[..count]);
+        }
+        Ok(FileRevision {
+            hex: hasher.finalize().to_hex().to_string(),
+            byte_len: u64::try_from(total).unwrap_or(u64::MAX),
+        })
+    }
+
+    fn verify_expected_inner(
+        &self,
+        relative: &VaultPath,
+        expected: &FileRevision,
+        max_bytes: usize,
+    ) -> Result<()> {
+        expected.validate()?;
+        let actual = self.revision_inner(relative, max_bytes)?;
+        if &actual == expected {
+            Ok(())
+        } else {
+            Err(CoreError::StaleRevision {
+                path: relative.as_path().to_owned(),
+                expected: expected.clone(),
+                actual,
+            })
+        }
+    }
+
+    /// Confirms and re-syncs an outcome-unknown verified move. The caller must
+    /// hold the shared root mutation lock and must have already validated the
+    /// privileged endpoint roles.
+    fn confirm_move_durability(
+        &self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        expected: &FileRevision,
+        max_bytes: usize,
+    ) -> Result<MoveDurability> {
+        self.confirm_move_durability_with_sync(
+            source,
+            destination,
+            expected,
+            max_bytes,
+            |_, directory| sync_directory_for_move(directory),
+        )
+    }
+
+    fn confirm_move_durability_with_sync<F>(
+        &self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        expected: &FileRevision,
+        max_bytes: usize,
+        mut sync: F,
+    ) -> Result<MoveDurability>
+    where
+        F: FnMut(MoveSyncParent, &Dir) -> std::io::Result<MoveDurability>,
+    {
+        let (destination_parent, destination_name) = self
+            .open_parent_checked(destination)
+            .map_err(|verification| {
+                Self::verified_move_unknown(
+                    source,
+                    destination,
+                    DirectorySyncStatus::NotAttempted,
+                    DirectorySyncStatus::NotAttempted,
+                    verification,
+                )
+            })?;
+        let (source_parent, source_name) =
+            self.open_parent_checked(source).map_err(|verification| {
+                Self::verified_move_unknown(
+                    source,
+                    destination,
+                    DirectorySyncStatus::NotAttempted,
+                    DirectorySyncStatus::NotAttempted,
+                    verification,
+                )
+            })?;
+        let same_parent = source
+            .as_str()
+            .rsplit_once('/')
+            .map_or("", |(parent, _)| parent)
+            == destination
+                .as_str()
+                .rsplit_once('/')
+                .map_or("", |(parent, _)| parent);
+        // Durability closure comes first. Both attempts are made before any
+        // revision/topology observation can fail or be influenced by an
+        // external writer.
+        let report = MoveSyncReport {
+            destination: sync(MoveSyncParent::Destination, &destination_parent),
+            source: (!same_parent).then(|| sync(MoveSyncParent::Source, &source_parent)),
+        };
+
+        let verification = self
+            .verify_expected_from_parent(
+                &destination_parent,
+                &destination_name,
+                destination,
+                expected,
+                max_bytes,
+            )
+            .and_then(|()| {
+                Self::verify_source_absent(&source_parent, &source_name, source, destination)
+            });
+        if let Err(verification) = verification {
+            return Err(report.into_verified_unknown(source, destination, verification));
+        }
+        if report.has_failure() {
+            return Err(report.into_verified_unknown(
+                source,
+                destination,
+                CoreError::MoveDurabilitySyncFailed,
+            ));
+        }
+        report.into_result(source, destination)
+    }
+
+    fn verify_expected_from_parent(
+        &self,
+        parent: &Dir,
+        name: &OsString,
+        relative: &VaultPath,
+        expected: &FileRevision,
+        max_bytes: usize,
+    ) -> Result<()> {
+        expected.validate()?;
+        let actual = self.revision_from_parent(parent, name, relative, max_bytes)?;
+        if &actual == expected {
+            Ok(())
+        } else {
+            Err(CoreError::StaleRevision {
+                path: relative.as_path().to_owned(),
+                expected: expected.clone(),
+                actual,
+            })
+        }
+    }
+
+    fn verify_published_topology(
+        &self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        expected: &FileRevision,
+        max_bytes: usize,
+    ) -> Result<()> {
+        self.verify_expected_inner(destination, expected, max_bytes)?;
+        let (source_parent, source_name) = self.open_parent_checked(source)?;
+        Self::verify_source_absent(&source_parent, &source_name, source, destination)
+    }
+
+    fn verify_source_absent(
+        source_parent: &Dir,
+        source_name: &OsString,
+        source: &VaultPath,
+        destination: &VaultPath,
+    ) -> Result<()> {
+        match source_parent.symlink_metadata(source_name) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+            Ok(_) => Err(CoreError::InvalidMove {
+                source_path: source.as_path().to_owned(),
+                destination_path: destination.as_path().to_owned(),
+                reason: "cannot confirm move durability while the source still exists",
+            }),
+        }
+    }
+
+    fn finish_verified_move(
+        &self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        expected: &FileRevision,
+        max_bytes: usize,
+        report: MoveSyncReport,
+    ) -> Result<MoveDurability> {
+        if let Err(verification) =
+            self.verify_published_topology(source, destination, expected, max_bytes)
+        {
+            return Err(report.into_verified_unknown(source, destination, verification));
+        }
+        report.into_result(source, destination)
+    }
+
+    fn verified_move_unknown(
+        source: &VaultPath,
+        destination: &VaultPath,
+        destination_sync: DirectorySyncStatus,
+        source_sync: DirectorySyncStatus,
+        verification: CoreError,
+    ) -> CoreError {
+        CoreError::VerifiedMoveOutcomeUnknown {
+            source_path: source.as_path().to_owned(),
+            destination_path: destination.as_path().to_owned(),
+            destination_sync,
+            source_sync,
+            verification: Box::new(verification),
+        }
     }
 
     fn atomic_write_inner<F>(
@@ -643,6 +1007,36 @@ impl Vault {
         }
     }
 
+    fn validate_generic_access(relative: &VaultPath) -> Result<()> {
+        if relative.classify() == VaultPathClass::Trash {
+            Err(CoreError::TrashAccessDenied(relative.as_path().to_owned()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn require_content_path(relative: &VaultPath) -> Result<()> {
+        if relative.classify() == VaultPathClass::Content {
+            Ok(())
+        } else {
+            Err(CoreError::InvalidMove {
+                source_path: relative.as_path().to_owned(),
+                destination_path: relative.as_path().to_owned(),
+                reason: "privileged trash moves require a content path",
+            })
+        }
+    }
+
+    fn require_trash_payload(path: &TrashPath, area: TrashArea) -> Result<()> {
+        if path.area() == area && path.kind() == TrashEntryKind::Payload {
+            Ok(())
+        } else {
+            Err(CoreError::InvalidTrashPath(
+                path.as_vault_path().as_path().to_owned(),
+            ))
+        }
+    }
+
     fn commit_unknown(path: PathBuf, error: CoreError) -> CoreError {
         match error {
             CoreError::Io(source) => CoreError::CommitOutcomeUnknown { path, source },
@@ -757,6 +1151,44 @@ enum CreateStage {
 enum MoveSyncParent {
     Destination,
     Source,
+}
+
+#[derive(Debug)]
+struct MoveSyncReport {
+    destination: std::io::Result<MoveDurability>,
+    source: Option<std::io::Result<MoveDurability>>,
+}
+
+impl MoveSyncReport {
+    fn has_failure(&self) -> bool {
+        self.destination.is_err()
+            || self
+                .source
+                .as_ref()
+                .is_some_and(std::result::Result::is_err)
+    }
+
+    fn into_result(self, source: &VaultPath, destination: &VaultPath) -> Result<MoveDurability> {
+        Vault::finish_atomic_move_sync(source, destination, self.destination, self.source)
+    }
+
+    fn into_verified_unknown(
+        self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        verification: CoreError,
+    ) -> CoreError {
+        Vault::verified_move_unknown(
+            source,
+            destination,
+            directory_sync_status(self.destination),
+            self.source.map_or(
+                DirectorySyncStatus::SharedWithDestination,
+                directory_sync_status,
+            ),
+            verification,
+        )
+    }
 }
 
 fn sync_directory(directory: &Dir) -> Result<()> {
@@ -1055,6 +1487,252 @@ mod tests {
             }
         ));
         fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn confirm_move_durability_requires_expected_destination_and_absent_source() {
+        let temp_root = fs::canonicalize(std::env::temp_dir()).expect("canonical temp root");
+        let base = temp_root.join(format!(
+            "myvault-confirm-move-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(base.join("from")).expect("source parent");
+        fs::create_dir(base.join("to")).expect("destination parent");
+        fs::write(base.join("to/note.md"), b"note").expect("destination");
+        let vault = Vault::open(&base).expect("open vault");
+        let source = VaultPath::new("from/note.md").expect("source");
+        let destination = VaultPath::new("to/note.md").expect("destination");
+        let expected = FileRevision::from_bytes(b"note");
+        let guard = vault.lock_mutations().expect("lock");
+
+        vault
+            .confirm_move_durability(&source, &destination, &expected, 4)
+            .expect("confirmed durability");
+        fs::write(base.join("from/note.md"), b"duplicate").expect("duplicate source");
+        assert!(matches!(
+            vault.confirm_move_durability(&source, &destination, &expected, 4),
+            Err(CoreError::VerifiedMoveOutcomeUnknown {
+                verification,
+                ..
+            }) if matches!(*verification, CoreError::InvalidMove { .. })
+        ));
+        drop(guard);
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn confirm_resyncs_both_parents_before_reporting_mutated_destination() {
+        let (base, vault, source, destination) = atomic_move_sync_fixture("confirm-destination");
+        let guard = vault.lock_mutations().expect("lock");
+        let initial = vault
+            .atomic_move_locked_report(&source, &destination, |parent, _| {
+                if parent == MoveSyncParent::Destination {
+                    Err(injected_sync_failure(parent))
+                } else {
+                    Ok(MoveDurability::FullySynced)
+                }
+            })
+            .and_then(|report| report.into_result(&source, &destination));
+        assert!(matches!(
+            initial,
+            Err(CoreError::AtomicMoveOutcomeUnknown { .. })
+        ));
+        fs::write(base.join(destination.as_path()), b"external").expect("mutate destination");
+
+        let mut attempts = Vec::new();
+        let error = vault
+            .confirm_move_durability_with_sync(
+                &source,
+                &destination,
+                &FileRevision::from_bytes(b"note"),
+                64,
+                |parent, _| {
+                    attempts.push(parent);
+                    Ok(MoveDurability::FullySynced)
+                },
+            )
+            .expect_err("mutated destination is outcome unknown");
+
+        assert_eq!(
+            attempts,
+            [MoveSyncParent::Destination, MoveSyncParent::Source]
+        );
+        assert!(matches!(
+            error,
+            CoreError::VerifiedMoveOutcomeUnknown {
+                destination_sync: DirectorySyncStatus::Synced,
+                source_sync: DirectorySyncStatus::Synced,
+                verification,
+                ..
+            } if matches!(*verification, CoreError::StaleRevision { .. })
+        ));
+        drop(guard);
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn confirm_resyncs_both_parents_before_reporting_recreated_source() {
+        let (base, vault, source, destination) = atomic_move_sync_fixture("confirm-source");
+        let guard = vault.lock_mutations().expect("lock");
+        let initial = vault
+            .atomic_move_locked_report(&source, &destination, |parent, _| {
+                if parent == MoveSyncParent::Source {
+                    Err(injected_sync_failure(parent))
+                } else {
+                    Ok(MoveDurability::FullySynced)
+                }
+            })
+            .and_then(|report| report.into_result(&source, &destination));
+        assert!(matches!(
+            initial,
+            Err(CoreError::AtomicMoveOutcomeUnknown { .. })
+        ));
+        fs::write(base.join(source.as_path()), b"external duplicate").expect("recreate source");
+
+        let mut attempts = Vec::new();
+        let error = vault
+            .confirm_move_durability_with_sync(
+                &source,
+                &destination,
+                &FileRevision::from_bytes(b"note"),
+                64,
+                |parent, _| {
+                    attempts.push(parent);
+                    Ok(MoveDurability::FullySynced)
+                },
+            )
+            .expect_err("recreated source is outcome unknown");
+
+        assert_eq!(
+            attempts,
+            [MoveSyncParent::Destination, MoveSyncParent::Source]
+        );
+        assert!(matches!(
+            error,
+            CoreError::VerifiedMoveOutcomeUnknown {
+                destination_sync: DirectorySyncStatus::Synced,
+                source_sync: DirectorySyncStatus::Synced,
+                verification,
+                ..
+            } if matches!(*verification, CoreError::InvalidMove { .. })
+        ));
+        drop(guard);
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn final_verification_preserves_exact_mixed_parent_sync_statuses() {
+        for (label, destination_result, source_result) in [
+            (
+                "destination-synced",
+                MoveDurability::FullySynced,
+                MoveDurability::DirectorySyncUnsupported,
+            ),
+            (
+                "source-synced",
+                MoveDurability::DirectorySyncUnsupported,
+                MoveDurability::FullySynced,
+            ),
+        ] {
+            let (base, vault, source, destination) = atomic_move_sync_fixture(label);
+            let guard = vault.lock_mutations().expect("lock");
+            let report = vault
+                .atomic_move_locked_report(&source, &destination, |parent, _| match parent {
+                    MoveSyncParent::Destination => Ok(destination_result),
+                    MoveSyncParent::Source => Ok(source_result),
+                })
+                .expect("published move report");
+            fs::write(base.join(destination.as_path()), b"external")
+                .expect("mutate destination after sync");
+
+            let error = vault
+                .finish_verified_move(
+                    &source,
+                    &destination,
+                    &FileRevision::from_bytes(b"note"),
+                    64,
+                    report,
+                )
+                .expect_err("final verification must be outcome unknown");
+
+            let expected_destination = match destination_result {
+                MoveDurability::FullySynced => DirectorySyncStatus::Synced,
+                MoveDurability::DirectorySyncUnsupported => DirectorySyncStatus::Unsupported,
+            };
+            let expected_source = match source_result {
+                MoveDurability::FullySynced => DirectorySyncStatus::Synced,
+                MoveDurability::DirectorySyncUnsupported => DirectorySyncStatus::Unsupported,
+            };
+            assert!(matches!(
+                error,
+                CoreError::VerifiedMoveOutcomeUnknown {
+                    destination_sync,
+                    source_sync,
+                    verification,
+                    ..
+                } if std::mem::discriminant(&destination_sync)
+                    == std::mem::discriminant(&expected_destination)
+                    && std::mem::discriminant(&source_sync)
+                        == std::mem::discriminant(&expected_source)
+                    && matches!(*verification, CoreError::StaleRevision { .. })
+            ));
+            drop(guard);
+            fs::remove_dir_all(base).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn confirm_sync_failure_after_valid_topology_is_verified_outcome_unknown() {
+        for (label, fail_source_too) in [("one-sync-fails", false), ("both-sync-fail", true)] {
+            let (base, vault, source, destination) = atomic_move_sync_fixture(label);
+            fs::rename(
+                base.join(source.as_path()),
+                base.join(destination.as_path()),
+            )
+            .expect("published topology");
+            let guard = vault.lock_mutations().expect("lock");
+            let mut attempts = Vec::new();
+
+            let error = vault
+                .confirm_move_durability_with_sync(
+                    &source,
+                    &destination,
+                    &FileRevision::from_bytes(b"note"),
+                    64,
+                    |parent, _| {
+                        attempts.push(parent);
+                        if parent == MoveSyncParent::Destination
+                            || (parent == MoveSyncParent::Source && fail_source_too)
+                        {
+                            Err(injected_sync_failure(parent))
+                        } else {
+                            Ok(MoveDurability::FullySynced)
+                        }
+                    },
+                )
+                .expect_err("sync-only failure remains known-published outcome unknown");
+
+            assert_eq!(
+                attempts,
+                [MoveSyncParent::Destination, MoveSyncParent::Source]
+            );
+            assert!(matches!(
+                error,
+                CoreError::VerifiedMoveOutcomeUnknown {
+                    destination_sync: DirectorySyncStatus::Failed(_),
+                    source_sync,
+                    verification,
+                    ..
+                } if (fail_source_too
+                    && matches!(source_sync, DirectorySyncStatus::Failed(_))
+                    || !fail_source_too
+                        && matches!(source_sync, DirectorySyncStatus::Synced))
+                    && matches!(*verification, CoreError::MoveDurabilitySyncFailed)
+            ));
+            drop(guard);
+            fs::remove_dir_all(base).expect("cleanup");
+        }
     }
 
     #[test]
