@@ -73,6 +73,13 @@ fn canonical_reader_rejects_format_aliases_duplicates_unknown_and_oversize() {
         reordered,
         canonical_text.replacen("\"version\":1", "\"version\":1,\"version\":1", 1),
         canonical_text.replacen("\"version\":1", "\"version\":1,\"unknown\":true", 1),
+        canonical_text.replacen(
+            &format!("\"hex\":\"{HELLO_BLAKE3}\",\"byte_len\":5"),
+            &format!("\"byte_len\":5,\"hex\":\"{HELLO_BLAKE3}\""),
+            1,
+        ),
+        canonical_text.replacen("\"byte_len\":5", "\"byte_len\":5,\"byte_len\":5", 1),
+        canonical_text.replacen("\"byte_len\":5", "\"byte_len\":5,\"nested_unknown\":0", 1),
     ];
     for bytes in variants {
         write_manifest_raw(&root, bytes.as_bytes());
@@ -108,6 +115,11 @@ fn semantic_reader_rejects_version_kind_path_hash_and_uuid() {
         canonical.replacen(
             "\"original_path\":\"note.md\"",
             "\"original_path\":\".trash/x\"",
+            1,
+        ),
+        canonical.replacen(
+            "\"original_path\":\"note.md\"",
+            "\"original_path\":\".ｔｒａｓｈ/x\"",
             1,
         ),
         canonical.replacen(
@@ -319,6 +331,59 @@ fn stage_rejects_payload_collision_and_64mib_plus_one_source() {
             ..
         })
     ));
+}
+
+#[test]
+fn stage_rejects_directory_source() {
+    let (root, vault) = fixture();
+    let source = VaultPath::from_portable("folder").unwrap();
+    fs::create_dir(root.path().join(source.as_path())).unwrap();
+    let manifest = manifest(source.as_str(), b"");
+    let store = vault.trash_store();
+    store.prepare_staging_manifest(id(), &manifest).unwrap();
+    assert!(matches!(
+        store.stage_payload_if_revision(id(), &source, &manifest.digest().unwrap()),
+        Err(CoreError::RevisionTargetNotFile(_))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn stage_rejects_symlink_and_nonregular_source() {
+    use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixDatagram;
+
+    let (root, vault) = fixture();
+    let source = VaultPath::from_portable("source.md").unwrap();
+    fs::write(root.path().join("target.md"), b"hello").unwrap();
+    symlink(
+        root.path().join("target.md"),
+        root.path().join(source.as_path()),
+    )
+    .unwrap();
+    let first = manifest(source.as_str(), b"hello");
+    vault
+        .trash_store()
+        .prepare_staging_manifest(id(), &first)
+        .unwrap();
+    assert!(vault
+        .trash_store()
+        .stage_payload_if_revision(id(), &source, &first.digest().unwrap())
+        .is_err());
+
+    fs::remove_file(root.path().join(source.as_path())).unwrap();
+    let short = std::path::PathBuf::from(format!(
+        "/tmp/myvault-trash-source-socket-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&short);
+    let socket = UnixDatagram::bind(&short).unwrap();
+    fs::rename(&short, root.path().join(source.as_path())).unwrap();
+    assert!(vault
+        .trash_store()
+        .stage_payload_if_revision(id(), &source, &first.digest().unwrap())
+        .is_err());
+    drop(socket);
 }
 
 #[cfg(unix)]

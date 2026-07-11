@@ -19,6 +19,10 @@ pub enum CoreError {
         path: PathBuf,
         cause: Box<CoreError>,
     },
+    TrashPayloadOutcomeUnknown {
+        path: PathBuf,
+        cause: Box<CoreError>,
+    },
     InvalidRevision,
     RevisionTargetNotFile(PathBuf),
     StaleRevision {
@@ -100,6 +104,7 @@ impl fmt::Display for CoreError {
             | Self::TrashManifestCollision(_)
             | Self::TrashManifestDigestMismatch
             | Self::TrashManifestOutcomeUnknown { .. }
+            | Self::TrashPayloadOutcomeUnknown { .. }
             | Self::InvalidRevision
             | Self::RevisionTargetNotFile(_)
             | Self::StaleRevision { .. }
@@ -232,6 +237,11 @@ impl CoreError {
                 "trash manifest may be published at {}: {cause}",
                 path.display()
             )),
+            Self::TrashPayloadOutcomeUnknown { path, cause } => Some(write!(
+                formatter,
+                "trash payload may be published at {}: {cause}",
+                path.display()
+            )),
             Self::InvalidRevision => Some(formatter.write_str("invalid BLAKE3 file revision")),
             Self::RevisionTargetNotFile(path) => Some(write!(
                 formatter,
@@ -283,7 +293,8 @@ impl std::error::Error for CoreError {
                 ..
             } => destination_sync.error().or_else(|| source_sync.error()),
             Self::VerifiedMoveOutcomeUnknown { verification, .. } => Some(verification.as_ref()),
-            Self::TrashManifestOutcomeUnknown { cause, .. } => Some(cause.as_ref()),
+            Self::TrashManifestOutcomeUnknown { cause, .. }
+            | Self::TrashPayloadOutcomeUnknown { cause, .. } => Some(cause.as_ref()),
             Self::Sqlite(error) => Some(error),
             _ => None,
         }
