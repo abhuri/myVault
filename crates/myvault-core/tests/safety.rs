@@ -168,6 +168,86 @@ fn sqlite_migration_is_idempotent_and_unicode_records_round_trip() {
 }
 
 #[test]
+fn sqlite_v1_migration_discards_legacy_paths_and_reopens_as_schema_v2() {
+    let vault_root = TestDir::new("sqlite-v1-vault");
+    let app_data = TestDir::new("sqlite-v1-app-data");
+    let vault = Vault::open(&vault_root).expect("open vault");
+    let database_path = app_data.as_ref().join("myvault-index.sqlite3");
+
+    {
+        let connection = rusqlite::Connection::open(&database_path).expect("create v1 database");
+        connection
+            .execute_batch(
+                "CREATE TABLE notes (
+                    path TEXT PRIMARY KEY NOT NULL,
+                    title TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    modified_ms INTEGER NOT NULL,
+                    byte_len INTEGER NOT NULL CHECK (byte_len >= 0)
+                 );
+                 CREATE INDEX notes_title_idx ON notes(title COLLATE NOCASE);
+                 INSERT INTO notes(path, title, content_hash, modified_ms, byte_len)
+                 VALUES ('legacy\\windows\\note.md', 'legacy', 'old', 1, 2);
+                 PRAGMA user_version = 1;",
+            )
+            .expect("seed v1 database");
+    }
+
+    {
+        let index = DerivedIndex::open(&app_data, &vault).expect("migrate v1 database");
+        assert_eq!(index.schema_version().expect("schema version"), 2);
+        assert_eq!(index.count().expect("v1 rows were discarded"), 0);
+    }
+
+    let index = DerivedIndex::open(&app_data, &vault).expect("idempotent schema v2 reopen");
+    assert_eq!(index.schema_version().expect("schema version"), 2);
+    assert_eq!(index.count().expect("still empty"), 0);
+}
+
+#[test]
+fn portable_path_collisions_are_rejected_and_rebuild_rolls_back() {
+    let vault_root = TestDir::new("collision-vault");
+    let app_data = TestDir::new("collision-app-data");
+    let vault = Vault::open(&vault_root).expect("open vault");
+    let mut index = DerivedIndex::open(&app_data, &vault).expect("open index");
+    let existing = note("Notes/Ｃａｆé.md", "existing", "first");
+    let collision = note("notes/Cafe\u{301}.md", "collision", "second");
+    assert_eq!(
+        existing.path.collision_key(),
+        collision.path.collision_key()
+    );
+
+    index.upsert(&existing).expect("seed collision key");
+    assert!(matches!(
+        index.upsert(&collision),
+        Err(CoreError::PortablePathCollision {
+            existing: stored,
+            incoming
+        }) if stored == existing.path.as_str() && incoming == collision.path.as_str()
+    ));
+    assert_eq!(index.count().expect("failed upsert count"), 1);
+    assert_eq!(
+        index.get(&existing.path).expect("existing after upsert"),
+        Some(existing.clone())
+    );
+
+    let unrelated = note("unrelated.md", "unrelated", "third");
+    assert!(matches!(
+        index.rebuild([&unrelated, &existing, &collision]),
+        Err(CoreError::PortablePathCollision { .. })
+    ));
+    assert_eq!(index.count().expect("failed rebuild count"), 1);
+    assert_eq!(
+        index.get(&existing.path).expect("existing after rebuild"),
+        Some(existing)
+    );
+    assert_eq!(
+        index.get(&unrelated.path).expect("unrelated rolled back"),
+        None
+    );
+}
+
+#[test]
 fn failed_rebuild_rolls_back_and_successful_rebuild_replaces_derived_rows() {
     let vault_root = TestDir::new("rebuild-vault");
     let app_data = TestDir::new("rebuild-app-data");

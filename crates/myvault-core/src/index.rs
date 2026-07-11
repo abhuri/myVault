@@ -12,7 +12,7 @@ use crate::capability::open_absolute_dir_nofollow;
 use crate::path::VaultPathClass;
 use crate::{CoreError, Result, Vault, VaultPath};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 const DATABASE_NAME: &str = "myvault-index.sqlite3";
 
 /// Rebuildable metadata extracted from a source Markdown file.
@@ -152,7 +152,7 @@ impl DerivedIndex {
         let byte_len = u64::try_from(byte_len)
             .map_err(|_| CoreError::InvalidRecord("negative byte length"))?;
         Ok(Some(NoteRecord {
-            path: VaultPath::new(stored_path)?,
+            path: VaultPath::from_portable(stored_path)?,
             title: row.get(1)?,
             content_hash: row.get(2)?,
             modified_ms: row.get(3)?,
@@ -264,21 +264,35 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             "database schema is newer than this application",
         ));
     }
-    if current < 1 {
+    if current == 0 {
         let transaction = connection.transaction()?;
-        transaction.execute_batch(
-            "CREATE TABLE notes (
-                path TEXT PRIMARY KEY NOT NULL,
-                title TEXT NOT NULL,
-                content_hash TEXT NOT NULL,
-                modified_ms INTEGER NOT NULL,
-                byte_len INTEGER NOT NULL CHECK (byte_len >= 0)
-             );
-             CREATE INDEX notes_title_idx ON notes(title COLLATE NOCASE);
-             PRAGMA user_version = 1;",
-        )?;
+        create_schema_v2(&transaction)?;
+        transaction.commit()?;
+    } else if current == 1 {
+        let transaction = connection.transaction()?;
+        // This database contains rebuildable derived data only. Discard v1
+        // rows instead of trying to preserve legacy lossy or Windows-separated
+        // paths that cannot satisfy the portable path contract reliably.
+        transaction.execute_batch("DROP INDEX IF EXISTS notes_title_idx; DROP TABLE notes;")?;
+        create_schema_v2(&transaction)?;
         transaction.commit()?;
     }
+    Ok(())
+}
+
+fn create_schema_v2(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE notes (
+            path TEXT PRIMARY KEY NOT NULL,
+            collision_key TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            modified_ms INTEGER NOT NULL,
+            byte_len INTEGER NOT NULL CHECK (byte_len >= 0)
+         );
+         CREATE INDEX notes_title_idx ON notes(title COLLATE NOCASE);
+         PRAGMA user_version = 2;",
+    )?;
     Ok(())
 }
 
@@ -293,16 +307,34 @@ fn insert_record(transaction: &Transaction<'_>, record: &NoteRecord) -> Result<(
     }
     let byte_len = i64::try_from(record.byte_len)
         .map_err(|_| CoreError::InvalidRecord("byte length exceeds SQLite INTEGER"))?;
+    let collision_key = record.path.collision_key();
+    let existing_collision = transaction.query_row(
+        "SELECT path FROM notes WHERE collision_key = ?1 AND path <> ?2 LIMIT 1",
+        params![collision_key, record.path.as_str()],
+        |row| row.get::<_, String>(0),
+    );
+    match existing_collision {
+        Ok(existing) => {
+            return Err(CoreError::PortablePathCollision {
+                existing,
+                incoming: record.path.as_str().to_owned(),
+            });
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => {}
+        Err(error) => return Err(error.into()),
+    }
     transaction.execute(
-        "INSERT INTO notes(path, title, content_hash, modified_ms, byte_len)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO notes(path, collision_key, title, content_hash, modified_ms, byte_len)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(path) DO UPDATE SET
+            collision_key = excluded.collision_key,
             title = excluded.title,
             content_hash = excluded.content_hash,
             modified_ms = excluded.modified_ms,
             byte_len = excluded.byte_len",
         params![
             record.path.as_str(),
+            collision_key,
             record.title,
             record.content_hash,
             record.modified_ms,
