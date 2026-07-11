@@ -122,6 +122,7 @@ pub enum RecoveryOperationKind {
     Trash {
         trash_id: Uuid,
         manifest_blake3: String,
+        trashed_at_unix_ms: i64,
     },
     Restore {
         trash_id: Uuid,
@@ -136,8 +137,17 @@ impl RecoveryOperationKind {
             Self::Trash {
                 trash_id,
                 manifest_blake3,
+                trashed_at_unix_ms,
+            } => {
+                if trash_id.is_nil() {
+                    return Err(Error::InvalidTrashId);
+                }
+                if *trashed_at_unix_ms < 0 {
+                    return Err(Error::InvalidOperationTopology);
+                }
+                validate_blake3_hex(manifest_blake3).map_err(|()| Error::InvalidManifestDigest)
             }
-            | Self::Restore {
+            Self::Restore {
                 trash_id,
                 manifest_blake3,
             } => {
@@ -200,10 +210,10 @@ pub struct RenameMoveIntent {
 }
 
 impl RenameMoveIntent {
-    /// Version 3 replaces the ambiguous v2 `case_rename` flag with an explicit
-    /// operation kind. Older records are rejected as unsupported rather than
-    /// being silently reinterpreted.
-    pub const VERSION: u32 = 3;
+    /// Version 4 makes a trash manifest durably reconstructable from journal
+    /// evidence by binding its timestamp. Older records are rejected as
+    /// unsupported rather than being silently reinterpreted.
+    pub const VERSION: u32 = 4;
 
     /// Creates a normal rename/move intent. Case-only renames must use
     /// [`Self::new_case_rename`]. Input paths are stored canonically.
@@ -256,6 +266,7 @@ impl RenameMoveIntent {
         operation_id: Uuid,
         trash_id: Uuid,
         manifest_blake3: impl Into<String>,
+        trashed_at_unix_ms: i64,
         from: impl AsRef<str>,
         expected: FileRevision,
     ) -> Result<Self, Error> {
@@ -266,6 +277,7 @@ impl RenameMoveIntent {
             RecoveryOperationKind::Trash {
                 trash_id,
                 manifest_blake3: manifest_blake3.into(),
+                trashed_at_unix_ms,
             },
             from,
             to,
