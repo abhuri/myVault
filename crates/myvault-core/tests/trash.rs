@@ -183,7 +183,7 @@ fn prepare_is_idempotent_preserves_stale_temps_and_detects_collision() {
         store.prepare_staging_manifest(id(), &first).unwrap(),
         PrepareManifestOutcome::Prepared
     );
-    let stale = staging_directory(&root).join(".manifest-stale.tmp");
+    let stale = staging_directory(&root).join(".manifest-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.tmp");
     fs::write(&stale, b"stale").expect("stale temp");
     assert_eq!(
         store.prepare_staging_manifest(id(), &first).unwrap(),
@@ -210,6 +210,63 @@ fn prepare_is_idempotent_preserves_stale_temps_and_detects_collision() {
         store.read_manifest(TrashArea::Staging, id()).unwrap(),
         first
     );
+}
+
+#[test]
+fn prepare_after_publish_is_idempotent_and_never_recreates_staging() {
+    let (root, vault) = fixture();
+    let (manifest, digest) = prepare_staged_file(&root, &vault);
+    vault
+        .trash_store()
+        .publish_staging_item(id(), &digest)
+        .unwrap();
+
+    assert_eq!(
+        vault
+            .trash_store()
+            .prepare_staging_manifest(id(), &manifest)
+            .unwrap(),
+        PrepareManifestOutcome::AlreadyPublished
+    );
+    assert!(!staging_directory(&root).exists());
+}
+
+#[test]
+fn concurrent_prepare_and_publish_never_leave_both_uuid_directories() {
+    use std::sync::{Arc, Barrier};
+
+    let (root, vault) = fixture();
+    let (manifest, digest) = prepare_staged_file(&root, &vault);
+    let canonical = fs::canonicalize(root.path()).unwrap();
+    let prepare_vault = Vault::open(&canonical).unwrap();
+    let publish_vault = Vault::open(&canonical).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let prepare_barrier = Arc::clone(&barrier);
+    let publish_barrier = Arc::clone(&barrier);
+    let prepare = std::thread::spawn(move || {
+        prepare_barrier.wait();
+        prepare_vault
+            .trash_store()
+            .prepare_staging_manifest(id(), &manifest)
+    });
+    let publish = std::thread::spawn(move || {
+        publish_barrier.wait();
+        publish_vault
+            .trash_store()
+            .publish_staging_item(id(), &digest)
+    });
+
+    let prepare_outcome = prepare.join().unwrap().unwrap();
+    publish.join().unwrap().unwrap();
+    assert!(matches!(
+        prepare_outcome,
+        PrepareManifestOutcome::AlreadyPrepared | PrepareManifestOutcome::AlreadyPublished
+    ));
+    assert!(!staging_directory(&root).exists());
+    assert!(root
+        .path()
+        .join(format!(".trash/v1/items/{TRASH_ID}"))
+        .is_dir());
 }
 
 #[cfg(unix)]

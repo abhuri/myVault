@@ -228,6 +228,7 @@ impl<'vault> TrashStore<'vault> {
 pub enum PrepareManifestOutcome {
     Prepared,
     AlreadyPrepared,
+    AlreadyPublished,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
