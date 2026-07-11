@@ -205,6 +205,53 @@ fn sqlite_v1_migration_discards_legacy_paths_and_reopens_as_schema_v2() {
 }
 
 #[test]
+fn sqlite_recreates_partial_or_malformed_rebuildable_schemas() {
+    const V2_WITHOUT_REQUIRED_TITLE_INDEX: &str = "CREATE TABLE notes (
+            path TEXT PRIMARY KEY NOT NULL,
+            collision_key TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            modified_ms INTEGER NOT NULL,
+            byte_len INTEGER NOT NULL CHECK (byte_len >= 0)
+         );
+         INSERT INTO notes(path, collision_key, title, content_hash, modified_ms, byte_len)
+         VALUES ('stale.md', 'stale.md', 'stale', 'old', 1, 2);
+         PRAGMA user_version = 2;";
+    let fixtures = [
+        (
+            "v0-existing-table",
+            "CREATE TABLE notes (legacy_path TEXT); PRAGMA user_version = 0;",
+        ),
+        ("v1-missing-table", "PRAGMA user_version = 1;"),
+        ("v2-missing-index", V2_WITHOUT_REQUIRED_TITLE_INDEX),
+    ];
+
+    for (label, fixture) in fixtures {
+        let vault_root = TestDir::new(&format!("{label}-vault"));
+        let app_data = TestDir::new(&format!("{label}-app-data"));
+        let vault = Vault::open(&vault_root).expect("open vault");
+        {
+            let connection =
+                rusqlite::Connection::open(app_data.as_ref().join("myvault-index.sqlite3"))
+                    .expect("create malformed database");
+            connection
+                .execute_batch(fixture)
+                .expect("seed malformed schema");
+        }
+
+        let mut index = DerivedIndex::open(&app_data, &vault).expect("recreate derived schema");
+        assert_eq!(index.schema_version().expect("schema version"), 2);
+        assert_eq!(index.count().expect("discard malformed rows"), 0);
+        let expected = note("healthy.md", "healthy", "new");
+        index.upsert(&expected).expect("usable recreated schema");
+        assert_eq!(
+            index.get(&expected.path).expect("round trip"),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
 fn portable_path_collisions_are_rejected_and_rebuild_rolls_back() {
     let vault_root = TestDir::new("collision-vault");
     let app_data = TestDir::new("collision-app-data");
@@ -316,6 +363,33 @@ fn index_rejects_app_data_inside_the_synced_vault() {
         DerivedIndex::open(vault_root.as_ref().join(".myvault-data"), &vault),
         Err(CoreError::AppDataInsideVault { .. })
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn index_rejects_app_data_ancestor_without_mutating_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let app_data = TestDir::new("ancestor-app-data");
+    fs::set_permissions(app_data.as_ref(), fs::Permissions::from_mode(0o755))
+        .expect("set observable original permissions");
+    let vault_path = app_data.as_ref().join("nested-vault");
+    fs::create_dir(&vault_path).expect("create nested vault");
+    let vault = Vault::open(&vault_path).expect("open nested vault");
+
+    assert!(matches!(
+        DerivedIndex::open(&app_data, &vault),
+        Err(CoreError::AppDataInsideVault { .. })
+    ));
+    assert_eq!(
+        fs::metadata(app_data.as_ref())
+            .expect("ancestor metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    assert!(!app_data.as_ref().join("myvault-index.sqlite3").exists());
 }
 
 #[cfg(unix)]
