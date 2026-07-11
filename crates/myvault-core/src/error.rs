@@ -18,6 +18,7 @@ pub enum CoreError {
         expected: crate::FileRevision,
         actual: crate::FileRevision,
     },
+    MoveDurabilitySyncFailed,
     AppDataInsideVault {
         app_data: PathBuf,
         vault: PathBuf,
@@ -93,6 +94,7 @@ impl fmt::Display for CoreError {
             | Self::InvalidRevision
             | Self::RevisionTargetNotFile(_)
             | Self::StaleRevision { .. }
+            | Self::MoveDurabilitySyncFailed
             | Self::VerifiedMoveOutcomeUnknown { .. } => {
                 unreachable!("handled before main error formatting")
             }
@@ -215,6 +217,9 @@ impl CoreError {
                 expected.hex,
                 actual.byte_len,
                 actual.hex
+            )),
+            Self::MoveDurabilitySyncFailed => Some(formatter.write_str(
+                "one or more post-publication directory sync attempts failed",
             )),
             Self::VerifiedMoveOutcomeUnknown {
                 source_path,
