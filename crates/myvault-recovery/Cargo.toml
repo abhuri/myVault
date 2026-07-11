@@ -1,0 +1,25 @@
+[package]
+name = "myvault-recovery"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Durable recovery journal and conservative recovery decisions for myVault"
+
+[dependencies]
+blake3 = "=1.8.2"
+cap-fs-ext = "=4.0.2"
+cap-std = "=4.0.2"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.149"
+uuid = { version = "=1.20.0", features = ["serde", "v4"] }
+
+[dev-dependencies]
+tempfile = "=3.23.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"
