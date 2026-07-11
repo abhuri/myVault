@@ -23,6 +23,10 @@ const JOURNAL_DIRECTORY: &str = "operation-journal";
 const COMPLETED_DIRECTORY: &str = "completed";
 const MAX_ENTRY_BYTES: u64 = 64 * 1024;
 const MAX_ENTRY_COUNT: usize = 4096;
+/// Maximum physical children inspected in the journal directory, including
+/// committed records, stale temps, junk, non-UTF-8 names, and `completed`.
+/// This is deliberately separate from the logical active-evidence bound.
+pub const MAX_DIRECTORY_ENTRY_COUNT: usize = 8192;
 pub const MAX_PAGE_SIZE: usize = 128;
 
 /// Recovery records are untrusted hints. They never authorize a vault mutation.
@@ -48,6 +52,7 @@ pub enum Error {
     InvalidEntryName,
     EntryTooLarge,
     TooManyEntries,
+    TooManyDirectoryEntries,
     InvalidPageSize,
     UnsupportedVersion(u32),
     JournalCollision,
@@ -86,6 +91,8 @@ impl fmt::Display for Error {
             Self::InvalidEntryName => formatter.write_str("invalid journal entry name"),
             Self::EntryTooLarge => formatter.write_str("journal entry exceeds size limit"),
             Self::TooManyEntries => formatter.write_str("journal contains too many entries"),
+            Self::TooManyDirectoryEntries => formatter
+                .write_str("journal directory contains too many physical entries (limit 8192)"),
             Self::InvalidPageSize => formatter.write_str("journal page size must be 1..=128"),
             Self::UnsupportedVersion(version) => {
                 write!(formatter, "unsupported journal version {version}")
@@ -669,8 +676,7 @@ impl RecoveryJournal {
             return Err(Error::InvalidPageSize);
         }
         let mut entries = Vec::new();
-        for entry in self.directory.entries()? {
-            let entry = entry?;
+        for entry in self.directory_entries_bounded()? {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             let Some(operation_id) = parse_entry_name(name) else {
@@ -710,8 +716,7 @@ impl RecoveryJournal {
 
     fn active_ids(&self) -> Result<Vec<Uuid>, Error> {
         let mut ids = Vec::new();
-        for entry in self.directory.entries()? {
-            let entry = entry?;
+        for entry in self.directory_entries_bounded()? {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             let Some(id) = parse_entry_name(name) else {
@@ -728,6 +733,17 @@ impl RecoveryJournal {
         ids.sort_unstable();
         ids.dedup();
         Ok(ids)
+    }
+
+    fn directory_entries_bounded(&self) -> Result<Vec<cap_std::fs::DirEntry>, Error> {
+        let mut entries = Vec::new();
+        for entry in self.directory.entries()? {
+            if entries.len() == MAX_DIRECTORY_ENTRY_COUNT {
+                return Err(Error::TooManyDirectoryEntries);
+            }
+            entries.push(entry?);
+        }
+        Ok(entries)
     }
 
     fn has_valid_completion(&self, operation_id: Uuid) -> Result<bool, Error> {
@@ -818,7 +834,10 @@ impl RecoveryJournal {
 }
 
 fn classify_evidence(operation_id: Uuid, bytes: &[u8]) -> Result<JournalEvidence, Error> {
-    let envelope: VersionEnvelope = serde_json::from_slice(bytes)?;
+    let envelope: RoutingEnvelope = serde_json::from_slice(bytes)?;
+    if envelope.operation_id != operation_id {
+        return Err(Error::InvalidEntryName);
+    }
     if envelope.version != RenameMoveIntent::VERSION {
         return Ok(JournalEvidence::Unsupported {
             operation_id,
@@ -831,6 +850,27 @@ fn classify_evidence(operation_id: Uuid, bytes: &[u8]) -> Result<JournalEvidence
         return Err(Error::InvalidEntryName);
     }
     Ok(JournalEvidence::Supported(intent))
+}
+
+#[derive(Deserialize)]
+struct RoutingEnvelope {
+    version: u32,
+    #[serde(deserialize_with = "deserialize_canonical_nonnil_uuid")]
+    operation_id: Uuid,
+}
+
+fn deserialize_canonical_nonnil_uuid<'de, D>(deserializer: D) -> Result<Uuid, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let text = String::deserialize(deserializer)?;
+    let operation_id = Uuid::parse_str(&text).map_err(serde::de::Error::custom)?;
+    if operation_id.is_nil() || operation_id.to_string() != text {
+        return Err(serde::de::Error::custom(
+            "operation_id must be a canonical lowercase nonnil UUID",
+        ));
+    }
+    Ok(operation_id)
 }
 
 fn canonical_portable(path: &str) -> Result<String, Error> {
