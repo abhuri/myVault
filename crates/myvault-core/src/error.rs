@@ -29,6 +29,17 @@ pub enum CoreError {
         destination_path: PathBuf,
         source: std::io::Error,
     },
+    InvalidMove {
+        source_path: PathBuf,
+        destination_path: PathBuf,
+        reason: &'static str,
+    },
+    AtomicMoveOutcomeUnknown {
+        source_path: PathBuf,
+        destination_path: PathBuf,
+        destination_sync: crate::DirectorySyncStatus,
+        source_sync: crate::DirectorySyncStatus,
+    },
     CommitOutcomeUnknown {
         path: PathBuf,
         source: std::io::Error,
@@ -100,6 +111,27 @@ impl fmt::Display for CoreError {
                 source_path.display(),
                 destination_path.display()
             ),
+            Self::InvalidMove {
+                source_path,
+                destination_path,
+                reason,
+            } => write!(
+                formatter,
+                "invalid move from {} to {}: {reason}",
+                source_path.display(),
+                destination_path.display()
+            ),
+            Self::AtomicMoveOutcomeUnknown {
+                source_path,
+                destination_path,
+                destination_sync,
+                source_sync,
+            } => write!(
+                formatter,
+                "move from {} to {} was published but directory durability is unknown (destination: {destination_sync}; source: {source_sync})",
+                source_path.display(),
+                destination_path.display()
+            ),
             Self::CommitOutcomeUnknown { path, source } => write!(
                 formatter,
                 "publication outcome for {} is unknown: {source}",
@@ -126,6 +158,11 @@ impl std::error::Error for CoreError {
             Self::Io(error) | Self::AtomicNoReplaceUnsupported { source: error, .. } => Some(error),
             Self::CommitOutcomeUnknown { source, .. }
             | Self::PublishedCleanupPending { source, .. } => Some(source),
+            Self::AtomicMoveOutcomeUnknown {
+                destination_sync,
+                source_sync,
+                ..
+            } => destination_sync.error().or_else(|| source_sync.error()),
             Self::Sqlite(error) => Some(error),
             _ => None,
         }

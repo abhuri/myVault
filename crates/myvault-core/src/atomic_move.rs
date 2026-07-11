@@ -46,9 +46,12 @@ fn rename_noreplace_platform(
     destination_parent: &Dir,
     destination_name: &OsStr,
 ) -> io::Result<()> {
-    // cap-std resolves both names beneath these held directory capabilities.
-    // The Windows rename primitive rejects an existing destination.
-    source_parent.rename(source_name, destination_parent, destination_name)
+    myvault_platform_fs::rename_noreplace(
+        source_parent,
+        source_name,
+        destination_parent,
+        destination_name,
+    )
 }
 
 #[cfg(not(any(

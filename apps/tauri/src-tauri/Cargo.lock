@@ -2275,6 +2275,7 @@ version = "0.1.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
+ "myvault-platform-fs",
  "rusqlite",
  "rustix",
  "unicode-casefold",
@@ -2292,6 +2293,15 @@ dependencies = [
  "sha2",
  "subtle",
  "url",
+]
+
+[[package]]
+name = "myvault-platform-fs"
+version = "0.1.0"
+dependencies = [
+ "cap-fs-ext",
+ "cap-std",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

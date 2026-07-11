@@ -100,3 +100,41 @@ fn same_path_is_an_existing_destination_and_source_survives() {
         b"same"
     );
 }
+
+#[test]
+fn rejects_directory_move_into_own_descendant_before_syscall() {
+    let (root, vault) = fixture();
+    fs::create_dir_all(root.path().join("notes/child")).expect("directory fixture");
+
+    let error = vault
+        .atomic_move(
+            &VaultPath::new("notes").expect("source path"),
+            &VaultPath::new("notes/child/moved").expect("destination path"),
+            WriteIntent::UserInitiated,
+        )
+        .expect_err("descendant move must fail");
+
+    assert!(matches!(error, CoreError::InvalidMove { .. }));
+    assert!(root.path().join("notes/child").is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_non_file_and_non_directory_source() {
+    use std::os::unix::net::UnixDatagram;
+
+    let (root, vault) = fixture();
+    let socket_path = root.path().join("local.socket");
+    let _socket = UnixDatagram::bind(&socket_path).expect("socket fixture");
+
+    let error = vault
+        .atomic_move(
+            &VaultPath::new("local.socket").expect("source path"),
+            &VaultPath::new("moved.socket").expect("destination path"),
+            WriteIntent::UserInitiated,
+        )
+        .expect_err("special source must fail");
+
+    assert!(matches!(error, CoreError::InvalidMove { .. }));
+    assert!(socket_path.exists());
+}
