@@ -464,25 +464,32 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - Phase 0 acceptance, OAuth/Drive และ environment contracts อยู่ใน `docs/phase-0` ค่ะ
 - frontend typecheck, unit tests, production build, Rust fmt, clippy และ tests ผ่านบน macOS host ค่ะ
 - Tauri debug binary build และ native launch ผ่านบน macOS host ค่ะ
-- เครื่องยังไม่มี full Xcode, Java และ Android SDK/NDK จึงยังทดสอบ Android ไม่ได้ค่ะ
+- GitHub quality check ของ Draft PR #1 ผ่านแล้วค่ะ
+- Android Studio, JBR 21, API 36, Platform Tools, Build Tools, Command-line Tools และ NDK ถูกติดตั้งแล้วค่ะ
+- Rust Android targets ทั้งสี่ architecture ถูกติดตั้งแล้วค่ะ
+- `tauri android init` และ ARM64 debug APK build ผ่านแล้วค่ะ
+- ยังไม่มีอุปกรณ์ Android เชื่อมต่อ จึงยังไม่ทดสอบ Thai IME, lifecycle และ WebView บนมือถือจริงค่ะ
+- เครื่องยังไม่มี full Xcode และพื้นที่ว่างเหลือประมาณ 29 GiB ซึ่งต่ำกว่าเกณฑ์ปลอดภัยสำหรับติดตั้งค่ะ
 - OAuth และ Drive API implementation ยังไม่เริ่มจนกว่า platform boundary และ Google Cloud configuration จะพร้อมค่ะ
 
 ## 15. Next Actions
 
 1. push branch `agent/phase-0-bootstrap` และเปิด draft PR ค่ะ
-2. ให้คุณโอตรวจและอนุมัติการติดตั้ง full Xcode และ Android Studio/JDK/SDK/NDK ค่ะ
-3. รัน `tauri android init` หลัง Android toolchain พร้อมค่ะ
-4. สร้าง Kotlin Tauri plugin spike สำหรับ Google Identity Services `AuthorizationClient` ค่ะ
-5. สร้าง desktop OAuth loopback + PKCE spike ที่ไม่ส่ง token เข้า JavaScript ค่ะ
-6. เพิ่ม filesystem atomic-write/watcher และ SQLite recovery spike ค่ะ
-7. สร้าง Google Drive fixture folder หลัง Google Cloud OAuth configuration พร้อมค่ะ
-8. รัน platform gates บน Windows และ Ubuntu ผ่าน native machines หรือ manual CI workflow ค่ะ
+2. เชื่อมต่อมือถือ Android จริงด้วย USB หรือ wireless debugging ค่ะ
+3. สร้าง Kotlin Tauri plugin spike สำหรับ Google Identity Services `AuthorizationClient` ค่ะ
+4. ตั้ง Google Cloud Android OAuth client สำหรับ package และ debug SHA-1 ค่ะ
+5. ทดสอบ APK, Thai IME, lifecycle, Mermaid และ Sigma บนมือถือจริงค่ะ
+6. สร้าง desktop OAuth loopback + PKCE spike ที่ไม่ส่ง token เข้า JavaScript ค่ะ
+7. เพิ่ม filesystem atomic-write/watcher และ SQLite recovery spike ค่ะ
+8. สร้าง Google Drive fixture folder หลัง Google Cloud OAuth configuration พร้อมค่ะ
+9. เพิ่มพื้นที่ว่างเป็นอย่างน้อย 70 GiB ก่อนติดตั้ง full Xcode ค่ะ
+10. รัน platform gates บน Windows และ Ubuntu ผ่าน native machines หรือ manual CI workflow ค่ะ
 
 ## 16. Session Handoff
 
 ### Current Handoff
 
-- วันที่อัปเดตคือ 2026-07-11 เวลา 21:15 เขตเวลา Asia/Bangkok ค่ะ
+- วันที่อัปเดตคือ 2026-07-11 เวลา 21:42 เขตเวลา Asia/Bangkok ค่ะ
 - ผู้ใช้เรียกว่า คุณโอ หรือบอส ค่ะ
 - Sunday เป็นหัวหน้าทีมและเจ้าของ architecture, logic, mechanics และ final integration ค่ะ
 - Sunday สามารถ spawn sub-agents สำหรับ bounded parallel tasks ตาม Operating Model ในเอกสารนี้ค่ะ
@@ -496,10 +503,12 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - active branch คือ `agent/phase-0-bootstrap` ค่ะ
 - Phase 0 diagnostic shell และ contracts ถูกสร้างแล้วค่ะ
 - local checks ที่ผ่านคือ TypeScript, Vitest 6 tests, Vite build, Rust fmt, clippy, Rust test และ Tauri debug build/launch ค่ะ
-- Android ยัง blocked เพราะไม่มี Java, Android SDK/NDK และ Android Studio ค่ะ
-- full macOS packaging ยัง blocked เพราะไม่มี full Xcode ค่ะ
+- GitHub quality check ของ Draft PR #1 ผ่านแล้วค่ะ
+- Android toolchain พร้อมและ ARM64 debug APK build ผ่านแล้วค่ะ
+- Android device test ยัง blocked เพราะไม่มีอุปกรณ์เชื่อมต่อค่ะ
+- full macOS packaging ยัง blocked เพราะไม่มี full Xcode และพื้นที่ว่างไม่พอค่ะ
 - ข้อค้นพบสำคัญคือ Android Google OAuth ต้องใช้ GIS `AuthorizationClient` ผ่าน Kotlin Tauri plugin ค่ะ
-- งานถัดไปคือ push draft PR แล้วขออนุมัติติดตั้ง platform toolchains ค่ะ
+- งานถัดไปคือ commit Android generated project, เชื่อมต่อมือถือจริง และ implement GIS plugin spike ค่ะ
 
 ### Handoff Update Template
 
@@ -549,3 +558,7 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - เพิ่ม Phase 0 acceptance, OAuth/Drive และ environment contracts ค่ะ
 - ยืนยันว่า desktop OAuth ใช้ loopback + PKCE และ Android ใช้ GIS `AuthorizationClient` ค่ะ
 - เพิ่ม pinned-action Linux quality workflow ค่ะ
+- แก้ pnpm v11 build allowlist และยืนยัน GitHub quality check ค่ะ
+- ติดตั้ง Android Studio และ Android minimal toolchain โดยไม่ติดตั้ง Emulator ค่ะ
+- สร้าง Android project และ ARM64 debug APK สำเร็จค่ะ
+- ชะลอ full Xcode เพราะพื้นที่ว่างต่ำกว่าเกณฑ์ปลอดภัยค่ะ
