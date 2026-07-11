@@ -1,0 +1,531 @@
+# myVault — Project Plan and Session Handoff
+
+> เอกสารหลักสำหรับกำหนดทิศทาง วางแผน ติดตามสถานะ และส่งต่องานข้าม session ค่ะ
+
+## 1. Project Summary
+
+`myVault` เป็นแอปจัดการ Markdown Vault แบบ local-first ที่มีประสบการณ์ใกล้เคียง Obsidian และ Sync กับ Vault บน Google Drive ได้โดยตรงค่ะ
+
+รุ่นแรกเป็น Native cross-platform application สำหรับผู้ใช้คนเดียว รองรับ Windows, macOS, Ubuntu และ Android โดยไม่มี backend, hosting, VPN, App Store หรือ Play Store ค่ะ
+
+เป้าหมายสูงสุดของรุ่นแรกคือข้อมูลต้องไม่สูญหาย ทำงาน offline ได้ และจัดการ conflict อย่างโปร่งใสค่ะ
+
+## 2. Locked Decisions
+
+- ใช้ Tauri 2 เป็น application shell ค่ะ
+- ใช้ React และ TypeScript สำหรับ UI ร่วมกันทุก platform ค่ะ
+- ใช้ Rust สำหรับ filesystem, SQLite, secure storage, file watcher และ platform integration ค่ะ
+- ใช้ Google Drive REST API เป็นระบบ Sync กลางค่ะ
+- เชื่อม Google Drive โดยตรงจากแต่ละอุปกรณ์ค่ะ
+- ไม่มี application backend ในรุ่นแรกค่ะ
+- ไม่มี hosting, domain หรือ VPN ในรุ่นแรกค่ะ
+- ใช้งานส่วนตัวเพียงคนเดียวในรุ่นแรกค่ะ
+- ไม่เผยแพร่ผ่าน App Store, Play Store หรือ Microsoft Store ในรุ่นแรกค่ะ
+- แจก build ผ่าน GitHub Releases หรือติดตั้งด้วยไฟล์ที่ build เองค่ะ
+- ใช้ Existing Vault บน Google Drive ได้ค่ะ
+- ไฟล์ Markdown และ attachment ยังคงเป็นไฟล์ปกติและไม่ผูกขาดกับแอปค่ะ
+- Obsidian บน desktop สามารถเปิด local Vault เดียวกันกับ myVault ได้ค่ะ
+- SQLite เป็นเพียง index และ operational state ที่สร้างใหม่ได้ ไม่ใช่ source of truth ค่ะ
+- ห้ามใช้ silent last-write-wins เมื่อเกิด Sync conflict ค่ะ
+- เลื่อน Canvas, plugin system, collaboration, public sharing และ E2EE ออกจากรุ่นแรกค่ะ
+
+## 3. Zero-cost Constraint
+
+เป้าหมายค่าใช้จ่ายเงินสดของรุ่นแรกคือ 0 บาทค่ะ
+
+- Windows ใช้ unsigned installer หรือ portable build และยอมรับ SmartScreen warning บนเครื่องส่วนตัวค่ะ
+- macOS ใช้ local build หรือ unsigned/ad-hoc signed build และอนุญาตผ่าน Gatekeeper ด้วยตัวเองค่ะ
+- Ubuntu ใช้ AppImage หรือ `.deb` ที่สร้างเองค่ะ
+- Android ใช้ signed APK และ sideload ด้วยตัวเองค่ะ
+- ใช้ GitHub repository และ GitHub Releases ภายในโควตาฟรีค่ะ
+- ใช้ GitHub Actions ภายในโควตาฟรี หรือใช้ self-hosted/local runners ค่ะ
+- ใช้ Google Drive API ภายใน personal usage quota ค่ะ
+- ใช้พื้นที่ Google Drive ที่มีอยู่แล้วค่ะ
+
+ค่าใช้จ่ายที่อาจพิจารณาภายหลัง ได้แก่ Google Play Developer account, Apple Developer Program, Windows code signing และ infrastructure สำหรับ public distribution ค่ะ
+
+## 4. Product Scope
+
+### 4.1 MVP Features
+
+- Google OAuth และเลือก Existing Drive Vault folder ค่ะ
+- เลือกหรือสร้าง local Vault ค่ะ
+- File explorer และ folder tree ค่ะ
+- สร้าง แก้ไข rename move trash และ restore note ค่ะ
+- Edit Mode และ Reader Mode ค่ะ
+- Markdown headings, lists, task lists และ tables ค่ะ
+- Syntax-highlighted code blocks ค่ะ
+- Mermaid diagrams ค่ะ
+- Images และ attachments ค่ะ
+- YAML frontmatter และ properties ค่ะ
+- `[[Wiki Links]]` และ `![[Embeds]]` ค่ะ
+- Backlinks และ unlinked mentions รุ่นพื้นฐานค่ะ
+- Full-text search และ quick switcher ค่ะ
+- Local Graph และ Global Graph รุ่นพื้นฐานค่ะ
+- Offline editing และ durable sync queue ค่ะ
+- Three-way merge และ conflict copies ค่ะ
+- Local recovery snapshots ค่ะ
+- Sync status, history, retry และ diagnostics ค่ะ
+- Dark mode และ responsive desktop/Android layout ค่ะ
+
+### 4.2 Deferred Features
+
+- Obsidian plugin API compatibility ค่ะ
+- Arbitrary JavaScript plugins ค่ะ
+- Canvas แบบเต็มรูปแบบค่ะ
+- Real-time multi-user collaboration ค่ะ
+- End-to-end encryption ค่ะ
+- Public publishing ค่ะ
+- Dataview-compatible query engine แบบเต็มรูปแบบค่ะ
+- Store distribution และ polished code signing ค่ะ
+
+## 5. Architecture
+
+```mermaid
+flowchart TB
+    UI["React และ TypeScript UI"] --> CORE["Shared Application Core"]
+    CORE --> EDITOR["Editor และ Reader"]
+    CORE --> INDEX["Search, Links และ Graph"]
+    CORE --> SYNC["Drive Sync Engine"]
+    CORE --> PLATFORM["Platform API"]
+
+    PLATFORM --> DESKTOP["Windows, macOS และ Ubuntu"]
+    PLATFORM --> ANDROID["Android"]
+
+    DESKTOP --> LOCALFS["Local Vault และ Native SQLite"]
+    ANDROID --> APPFS["App-managed Vault และ Native SQLite"]
+    SYNC <--> DRIVE["Google Drive API"]
+```
+
+### 5.1 Recommended Repository Structure
+
+```text
+myVault/
+├── apps/
+│   └── tauri/
+│       ├── frontend/
+│       └── src-tauri/
+├── packages/
+│   ├── core/
+│   ├── editor/
+│   ├── markdown/
+│   ├── search/
+│   ├── graph/
+│   ├── sync/
+│   ├── platform-api/
+│   └── ui/
+├── crates/
+│   ├── vault-fs/
+│   ├── vault-db/
+│   ├── drive-client/
+│   ├── secure-storage/
+│   └── sync-engine/
+├── tests/
+│   ├── fixtures/
+│   ├── sync-scenarios/
+│   └── cross-platform/
+└── PROJECT_PLAN.md
+```
+
+โครงสร้างจริงอาจปรับหลัง Technical Spike แต่ต้องรักษาหลักการแบ่ง shared logic ออกจาก platform-specific mechanics ค่ะ
+
+## 6. Vault and Storage Model
+
+### 6.1 Source of Truth
+
+- Markdown และ attachment ใน Vault เป็นข้อมูลจริงค่ะ
+- Google Drive เป็น remote copy และจุดแลกเปลี่ยนข้อมูลระหว่างอุปกรณ์ค่ะ
+- Local Vault เป็น working copy ของแต่ละอุปกรณ์ค่ะ
+- SQLite เก็บข้อมูลที่คำนวณใหม่หรือกู้คืนจาก Vault และ Drive ได้ค่ะ
+
+### 6.2 Desktop Behavior
+
+- myVault เปิด local folder จริงค่ะ
+- Obsidian สามารถเปิด local folder เดียวกันได้ค่ะ
+- file watcher ตรวจจับการเปลี่ยนแปลงจาก Obsidian หรือโปรแกรมอื่นค่ะ
+- ห้ามใช้ Google Drive Desktop Sync กับ working folder เดียวกันพร้อมกับ myVault Sync Engine ค่ะ
+
+### 6.3 Android Behavior
+
+- รุ่นแรกเก็บ Vault ใน app-managed storage ค่ะ
+- myVault เป็น editor หลักของ local Android Vault ค่ะ
+- Android Sync กับ Drive ผ่าน Drive API โดยตรงค่ะ
+- การเปิด arbitrary external folder บน Android เป็นงานที่ต้องพิสูจน์ใน Technical Spike ค่ะ
+
+### 6.4 Obsidian Compatibility Rules
+
+- รักษา Markdown ที่ไม่รู้จักไว้โดยไม่ rewrite ทั้งไฟล์โดยไม่จำเป็นค่ะ
+- รักษา YAML frontmatter และ unknown fields ค่ะ
+- รองรับ wiki links, embeds, tags, callouts และ relative attachment paths ค่ะ
+- ไม่แก้หรือลบไฟล์ใน `.obsidian` โดยอัตโนมัติค่ะ
+- ไม่พยายามโหลด Obsidian community plugins ในรุ่นแรกค่ะ
+
+## 7. Sync Mechanics
+
+### 7.1 Local-first Write Path
+
+1. เขียนไฟล์ลง local storage แบบ atomic write ค่ะ
+2. บันทึก local revision และ content hash ค่ะ
+3. เพิ่มงานลง durable sync queue ค่ะ
+4. ตรวจ remote metadata และ revision ก่อน upload ค่ะ
+5. upload เมื่อยืนยันว่าไม่มี remote conflict ค่ะ
+6. ตรวจ remote revision หลัง upload ค่ะ
+7. ลบงานออกจาก queue เมื่อ verify สำเร็จเท่านั้นค่ะ
+
+### 7.2 Pull Path
+
+1. เรียก Drive Changes API จาก page token ล่าสุดค่ะ
+2. ดึง metadata เฉพาะไฟล์ที่เปลี่ยนค่ะ
+3. เปรียบเทียบ remote state กับ base และ local state ค่ะ
+4. ดาวน์โหลดเฉพาะเมื่อ local ไม่ dirty ค่ะ
+5. ทำ three-way merge หรือสร้าง conflict copy เมื่อทั้งสองฝั่งเปลี่ยนค่ะ
+6. re-index เฉพาะไฟล์ที่ได้รับผลกระทบค่ะ
+
+### 7.3 Sync State
+
+```text
+Clean
+LocalDirty
+RemoteChanged
+Uploading
+Downloading
+Conflict
+Merging
+NeedsReview
+RetryScheduled
+AuthRequired
+```
+
+### 7.4 Conflict Rules
+
+- ถ้าเปลี่ยนเฉพาะ local ให้อัปโหลดค่ะ
+- ถ้าเปลี่ยนเฉพาะ remote ให้ดาวน์โหลดค่ะ
+- ถ้าทั้ง local และ remote เปลี่ยน ให้ใช้ three-way merge ค่ะ
+- ถ้า merge ไม่ปลอดภัย ให้รักษาทั้งสองฉบับค่ะ
+- ถ้าฝั่งหนึ่งลบแต่อีกฝั่งแก้ ให้รักษาฉบับที่ถูกแก้ค่ะ
+- delete ต้องย้ายเข้า Trash ก่อนค่ะ
+- ห้ามลบ conflict copy อัตโนมัติค่ะ
+- ต้องมีประวัติว่า conflict เกิดจาก device ใดและเวลาใดค่ะ
+
+ตัวอย่างชื่อไฟล์ conflict ค่ะ
+
+```text
+Project (conflict from Android 2026-07-11 18-30).md
+```
+
+## 8. Security Rules
+
+- เปิด Google OAuth ผ่าน system browser ค่ะ
+- ใช้ PKCE และ native-app authorization flow ตาม platform ค่ะ
+- เก็บ refresh token ใน OS secure storage ค่ะ
+- ห้ามเก็บ refresh token ใน repository, log หรือ plaintext settings ค่ะ
+- ห้าม commit Android signing keystore หรือรหัสผ่านค่ะ
+- sanitize rendered HTML ก่อนแสดงใน Reader Mode ค่ะ
+- ใช้ CSP และปิด `eval` ค่ะ
+- ใช้ Mermaid security mode แบบ strict หรือ sandbox ค่ะ
+- จำกัดสิทธิ์ Tauri commands และ filesystem scopes ตาม least privilege ค่ะ
+- ตรวจ MIME type, file size และ path traversal สำหรับ attachments ค่ะ
+- log ต้องไม่บันทึก note content หรือ token โดยปริยายค่ะ
+
+## 9. Team Operating Model
+
+### 9.1 Leadership
+
+Sunday เป็นหัวหน้าทีมและเป็นผู้รับผิดชอบผลลัพธ์สุดท้ายของโครงการค่ะ
+
+Sunday มีหน้าที่ดังนี้ค่ะ
+
+- กำหนด architecture, domain boundaries, data flow และ public contracts ค่ะ
+- กำหนด logic ของระบบและ mechanics ที่ sub-agents ต้องปฏิบัติตามค่ะ
+- แยกงานเป็น bounded tasks ที่มี input, output และ acceptance criteria ชัดเจนค่ะ
+- เลือกงานที่สามารถทำขนานกันได้โดยลดโอกาสแก้ไฟล์ชนกันค่ะ
+- spawn sub-agents เพื่อทำงานย่อยที่เป็นอิสระเมื่อคุ้มค่ากับเวลาและ context ค่ะ
+- ระบุไฟล์ที่แต่ละ sub-agent มีสิทธิ์แก้และไฟล์ที่ห้ามแตะค่ะ
+- ตรวจ assumption, design choice, patch และ test result ของ sub-agents ค่ะ
+- ตัดสินใจเมื่อผลจากหลาย sub-agents ขัดแย้งกันค่ะ
+- แก้ไขสถานการณ์เมื่อเกิด blocker, regression หรือ scope drift ค่ะ
+- รวมผลงานและรักษาความสอดคล้องของระบบทั้งหมดค่ะ
+- เป็นผู้อนุมัติขั้นสุดท้ายก่อนถือว่างานย่อยเสร็จค่ะ
+- อัปเดตเอกสาร handoff และสถานะโครงการเมื่อจบแต่ละช่วงงานค่ะ
+
+### 9.2 Sub-agent Task Brief
+
+ทุกงานที่มอบหมายให้ sub-agent ต้องระบุข้อมูลต่อไปนี้ค่ะ
+
+- เป้าหมายที่วัดผลได้ค่ะ
+- ขอบเขตไฟล์และ module ที่รับผิดชอบค่ะ
+- interface หรือ contract ที่ต้องรักษาค่ะ
+- สิ่งที่ห้ามเปลี่ยนค่ะ
+- dependency และ assumption ค่ะ
+- acceptance criteria ค่ะ
+- test commands ที่ต้องรันค่ะ
+- รูปแบบรายงานผลกลับค่ะ
+
+### 9.3 Parallel Work Rules
+
+- งานขนานต้องแยกตาม module หรือ file ownership ให้ชัดเจนค่ะ
+- ห้ามให้ sub-agents หลายตัวแก้ไฟล์เดียวกันพร้อมกันโดยไม่มี coordination ค่ะ
+- Architecture decision และ cross-module contract ต้องผ่าน Sunday ค่ะ
+- Sub-agent สามารถเสนอทางเลือกได้ แต่ห้ามเปลี่ยน architecture เองนอกขอบเขตที่ได้รับค่ะ
+- งานที่เสี่ยงต่อข้อมูลสูญหายต้องมี design review ก่อน implementation ค่ะ
+- งาน Sync, migration, deletion และ security ต้องได้รับ review เพิ่มเป็นพิเศษค่ะ
+- Sunday ต้องตรวจ diff และผลทดสอบก่อน integration ทุกครั้งค่ะ
+
+### 9.4 Incident Handling
+
+เมื่อเกิด test failure, regression หรือ implementation ไม่ตรง contract ให้ดำเนินการดังนี้ค่ะ
+
+1. หยุดการรวม patch ที่เกี่ยวข้องค่ะ
+2. บันทึกอาการ วิธี reproduce และผลกระทบค่ะ
+3. แยกว่าปัญหาอยู่ที่ requirement, contract หรือ implementation ค่ะ
+4. Sunday กำหนด corrective action และเจ้าของงานค่ะ
+5. เพิ่ม regression test ก่อนหรือพร้อมการแก้ไขค่ะ
+6. ตรวจผลซ้ำบน platform ที่ได้รับผลกระทบค่ะ
+7. อัปเดต handoff และ risk register ค่ะ
+
+### 9.5 Definition of Done
+
+งานจะถือว่าเสร็จเมื่อมีเงื่อนไขครบดังนี้ค่ะ
+
+- ตรงตาม acceptance criteria ค่ะ
+- ไม่มีการเปลี่ยน scope โดยไม่ได้รับอนุมัติค่ะ
+- มี test ตามระดับความเสี่ยงค่ะ
+- test ที่เกี่ยวข้องผ่านค่ะ
+- error path และ recovery path ได้รับการพิจารณาค่ะ
+- Sunday ตรวจ diff และ integration impact แล้วค่ะ
+- เอกสารหรือ handoff ได้รับการอัปเดตเมื่อจำเป็นค่ะ
+
+## 10. Delivery Roadmap
+
+### Phase 0 — Technical Spike
+
+ระยะเวลาเป้าหมาย 1–2 สัปดาห์ค่ะ
+
+- bootstrap Tauri 2, React, TypeScript และ Rust workspace ค่ะ
+- เปิด application shell บน macOS, Windows, Ubuntu และ Android ค่ะ
+- ทดลอง local filesystem และ native SQLite ค่ะ
+- ทดลอง Android app-managed storage ค่ะ
+- ทดลอง Google OAuth ผ่าน system browser ค่ะ
+- ทดลองเลือก Existing Drive folder ค่ะ
+- upload, download และตรวจ changes ของ Markdown หนึ่งไฟล์ค่ะ
+- ทดลอง secure token storage ค่ะ
+- ทดลอง CodeMirror, Mermaid และ Sigma.js บน Android WebView ค่ะ
+- ทดสอบภาษาไทย, IME, selection และ virtual keyboard ค่ะ
+
+จุดตัดสินใจคือ Tauri Android และ library stack ต้องผ่านก่อนลงทุนสร้าง UI เต็มระบบค่ะ
+
+### Phase 1 — Local Vault Core
+
+ระยะเวลาเป้าหมาย 2 สัปดาห์ค่ะ
+
+- local Vault selection และ creation ค่ะ
+- file explorer และ file operations ค่ะ
+- desktop file watcher ค่ะ
+- atomic writes และ crash recovery ค่ะ
+- SQLite metadata schema และ migrations ค่ะ
+- local recovery snapshots ค่ะ
+- `.obsidian` preservation policy ค่ะ
+
+### Phase 2 — Editor and Reader
+
+ระยะเวลาเป้าหมาย 2–3 สัปดาห์ค่ะ
+
+- CodeMirror 6 editor ค่ะ
+- Reader Mode และ sanitized rendering ค่ะ
+- GFM tables และ task lists ค่ะ
+- code highlighting และ Mermaid ค่ะ
+- images และ attachments ค่ะ
+- frontmatter, wiki links และ embeds ค่ะ
+- responsive desktop/Android layout ค่ะ
+
+### Phase 3 — Drive Sync Engine
+
+ระยะเวลาเป้าหมาย 3–4 สัปดาห์ค่ะ
+
+- initial Drive scan ค่ะ
+- upload และ download paths ค่ะ
+- Changes API cursor ค่ะ
+- durable queue และ retry policy ค่ะ
+- rename, move, delete และ attachment handling ค่ะ
+- three-way merge และ conflict copies ค่ะ
+- token expiry และ re-authentication ค่ะ
+- Sync UI, history และ diagnostics ค่ะ
+
+### Phase 4 — Knowledge Features
+
+ระยะเวลาเป้าหมาย 2–3 สัปดาห์ค่ะ
+
+- wiki link autocomplete ค่ะ
+- backlinks และ unlinked mentions ค่ะ
+- tags และ properties ค่ะ
+- full-text search และ quick switcher ค่ะ
+- outline, Local Graph และ Global Graph ค่ะ
+- incremental indexing ค่ะ
+
+### Phase 5 — Cross-platform Hardening
+
+ระยะเวลาเป้าหมาย 2–3 สัปดาห์ค่ะ
+
+- Windows portable/installer build ค่ะ
+- macOS app/DMG build ค่ะ
+- Ubuntu AppImage build ค่ะ
+- Android signed APK ค่ะ
+- platform permissions และ lifecycle handling ค่ะ
+- database upgrade testing ค่ะ
+- import, export และ recovery testing ค่ะ
+
+### Phase 6 — Personal Release
+
+ระยะเวลาเป้าหมาย 1–2 สัปดาห์ค่ะ
+
+- GitHub release workflow ค่ะ
+- versioning และ changelog ค่ะ
+- manual update process ค่ะ
+- installation guides ค่ะ
+- signing-key backup procedure ค่ะ
+- known limitations และ recovery guide ค่ะ
+
+ระยะรวมเป้าหมายสำหรับงานเต็มเวลาคือประมาณ 13–17 สัปดาห์ค่ะ
+
+## 11. Required Test Scenarios
+
+### 11.1 Data Safety
+
+- ปิดแอประหว่าง atomic write ค่ะ
+- ปิดเครื่องระหว่าง upload ค่ะ
+- อินเทอร์เน็ตหลุดระหว่าง download ค่ะ
+- token หมดอายุระหว่าง Sync ค่ะ
+- Drive ตอบ `403`, `429` และ `5xx` ค่ะ
+- SQLite เสียและ rebuild จาก Vault ค่ะ
+- local disk หรือ Drive storage เต็มค่ะ
+
+### 11.2 Conflict Matrix
+
+- แก้บรรทัดเดียวกันจากสองอุปกรณ์ค่ะ
+- แก้คนละส่วนของไฟล์ค่ะ
+- rename พร้อม edit ค่ะ
+- move พร้อม edit ค่ะ
+- delete พร้อม edit ค่ะ
+- สร้างชื่อไฟล์เดียวกันพร้อมกันค่ะ
+- Android offline หลายวันแล้วกลับมา Sync ค่ะ
+- Obsidian แก้ไฟล์ขณะ myVault เปิดอยู่ค่ะ
+
+### 11.3 Compatibility and Scale
+
+- ภาษาไทยและ Unicode ค่ะ
+- path ที่มีช่องว่างและชื่อไฟล์ภาษาไทยค่ะ
+- YAML frontmatter และ wiki links ค่ะ
+- relative attachments ค่ะ
+- Markdown ขนาดใหญ่ค่ะ
+- image และ PDF attachments ค่ะ
+- Vault ขนาด 1,000, 5,000 และ 10,000 notes ค่ะ
+
+## 12. Risk Register
+
+| Risk | Impact | Mitigation |
+|---|---|---|
+| Tauri Android plugin หรือ WebView มีข้อจำกัดค่ะ | สูงค่ะ | พิสูจน์ใน Phase 0 ก่อนสร้าง UI เต็มระบบค่ะ |
+| Sync race ทำให้ข้อมูลสูญหายค่ะ | วิกฤตค่ะ | three-way merge, conflict copy, revision verification และ destructive-operation tests ค่ะ |
+| Android background task ถูกจำกัดค่ะ | สูงค่ะ | Sync ตอน launch, foreground, manual action และใช้ background schedule เท่าที่ระบบอนุญาตค่ะ |
+| Existing Vault มี syntax ที่ parser ไม่รู้จักค่ะ | สูงค่ะ | preserve raw content และหลีกเลี่ยง full-document rewrite ค่ะ |
+| OAuth token ถูกเปิดเผยค่ะ | วิกฤตค่ะ | PKCE, OS secure storage, redacted logs และ secret scanning ค่ะ |
+| Multi-platform build แตกต่างกันค่ะ | กลางค่ะ | platform matrix CI และทดสอบ spike ตั้งแต่ต้นค่ะ |
+| `.obsidian` ถูกแก้โดยไม่ตั้งใจค่ะ | สูงค่ะ | deny-by-default write policy และ integration tests ค่ะ |
+| GitHub Actions เกินโควตาฟรีค่ะ | ต่ำค่ะ | local/self-hosted builds และลด artifact retention ค่ะ |
+
+## 13. Git and GitHub Strategy
+
+ควรเริ่ม local Git repository และสร้าง private GitHub repository หลังเอกสารแผนนี้ได้รับอนุมัติ และก่อนเริ่มสร้าง source code ค่ะ
+
+ลำดับที่แนะนำมีดังนี้ค่ะ
+
+1. สร้าง `PROJECT_PLAN.md` ค่ะ
+2. `git init` ใน project folder ค่ะ
+3. เพิ่ม `.gitignore`, `.editorconfig` และ security-safe defaults ค่ะ
+4. commit เอกสารแผนเป็น initial commit ค่ะ
+5. สร้าง private GitHub repository ชื่อ `myVault` ค่ะ
+6. เพิ่ม remote และ push initial commit ค่ะ
+7. เปิด branch protection หรือกำหนด workflow ตามความเหมาะสมค่ะ
+8. เริ่ม Phase 0 บน feature branches ค่ะ
+
+เหตุผลที่ควรเปิด repo ก่อนเขียน source code คือสามารถย้อนดู architecture decision, review patch จาก sub-agents, เปรียบเทียบ regression และใช้ GitHub Releases ภายหลังได้ง่ายค่ะ
+
+ห้าม commit credential, refresh token, `.env`, Android keystore, signing password หรือ Vault จริงค่ะ
+
+## 14. Current Status
+
+- สถานะโครงการคือ Planning Approved ค่ะ
+- project folder ยังไม่มี source code ค่ะ
+- `PROJECT_PLAN.md` ถูกสร้างเป็นเอกสารหลักแล้วค่ะ
+- ยังไม่ได้ `git init` ค่ะ
+- ยังไม่ได้สร้าง GitHub repository ค่ะ
+- ยังไม่ได้เลือก package manager หรือกำหนด exact dependency versions ค่ะ
+- Phase ถัดไปคือ Repository Bootstrap และ Phase 0 Technical Spike ค่ะ
+
+## 15. Next Actions
+
+1. ขออนุมัติให้ `git init` และสร้าง repository bootstrap files ค่ะ
+2. ให้คุณโอสร้าง private GitHub repository หรืออนุญาตให้ Sunday สร้างเมื่อมี GitHub access ที่เหมาะสมค่ะ
+3. เลือก package manager โดยค่าแนะนำคือ `pnpm` ค่ะ
+4. กำหนด supported OS baseline ของ Windows, macOS, Ubuntu และ Android ค่ะ
+5. สร้าง Phase 0 acceptance checklist แบบ executable ค่ะ
+6. scaffold Tauri workspace หลังได้รับอนุมัติค่ะ
+
+## 16. Session Handoff
+
+### Current Handoff
+
+- วันที่อัปเดตคือ 2026-07-11 เขตเวลา Asia/Bangkok ค่ะ
+- ผู้ใช้เรียกว่า คุณโอ หรือบอส ค่ะ
+- Sunday เป็นหัวหน้าทีมและเจ้าของ architecture, logic, mechanics และ final integration ค่ะ
+- Sunday สามารถ spawn sub-agents สำหรับ bounded parallel tasks ตาม Operating Model ในเอกสารนี้ค่ะ
+- ทุก implementation plan ต้องขออนุมัติคุณโอก่อนลงมือค่ะ
+- รุ่นแรกเป็น personal-use native application แบบ zero-cash-cost ค่ะ
+- architecture ที่ล็อกคือ Tauri 2, React, TypeScript, Rust, native SQLite และ direct Google Drive API ค่ะ
+- ไม่มี backend, hosting, VPN หรือ Store distribution ในรุ่นแรกค่ะ
+- project directory คือ `/Users/awb/My Apps/myVault` ค่ะ
+- ขณะสร้างเอกสารนี้ project directory ว่างและยังไม่เป็น Git repository ค่ะ
+- งานถัดไปที่เสนอคือ Git bootstrap และ Phase 0 Technical Spike ค่ะ
+
+### Handoff Update Template
+
+```markdown
+## Session Handoff — YYYY-MM-DD HH:mm Asia/Bangkok
+
+### Objective
+- เป้าหมายของ session ค่ะ
+
+### Completed
+- งานที่เสร็จแล้วค่ะ
+
+### Files Changed
+- `path/to/file` — สรุปการเปลี่ยนแปลงค่ะ
+
+### Decisions Made
+- การตัดสินใจและเหตุผลค่ะ
+
+### Commands and Tests
+- `command` — ผลลัพธ์ค่ะ
+
+### Known Issues and Risks
+- ปัญหา ความเสี่ยง และวิธี reproduce ค่ะ
+
+### Active Sub-agents
+- ชื่อ task, ขอบเขต และสถานะค่ะ
+
+### Next Actions
+1. งานถัดไปค่ะ
+
+### Approval Required
+- สิ่งที่ต้องขออนุมัติคุณโอก่อนดำเนินการค่ะ
+```
+
+## 17. Change Log
+
+### 2026-07-11
+
+- สร้าง Project Plan และ Session Handoff ฉบับแรกค่ะ
+- ล็อก Native zero-cost architecture สำหรับ personal use ค่ะ
+- เพิ่ม Team Operating Model โดย Sunday เป็นหัวหน้าทีมค่ะ
+- กำหนดแนวทาง parallel sub-agent delegation, review และ incident handling ค่ะ
+- กำหนดจังหวะสร้าง Git และ private GitHub repository ก่อนเริ่ม source code ค่ะ

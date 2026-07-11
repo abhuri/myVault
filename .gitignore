@@ -1,0 +1,47 @@
+# Dependencies and generated frontend output
+node_modules/
+dist/
+.vite/
+coverage/
+*.tsbuildinfo
+
+# Rust and Tauri build output
+target/
+src-tauri/target/
+gen/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.jks
+secrets/
+
+# Local application data and real vaults
+.myvault/
+vaults/
+test-vault-local/
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+
+# IDE and operating-system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs and temporary files
+*.log
+tmp/
+temp/
+
