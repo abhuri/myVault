@@ -1,0 +1,15 @@
+[package]
+name = "myvault-desktop-auth"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Desktop Google OAuth and OS credential storage spike for myVault"
+
+[dependencies]
+base64 = "0.22"
+keyring = "4.1"
+rand = "0.9"
+secrecy = "0.10"
+sha2 = "0.10"
+subtle = "2.6"
+url = "2.5"

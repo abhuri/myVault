@@ -454,42 +454,45 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 
 ## 14. Current Status
 
-- สถานะโครงการคือ Phase 0 In Progress ค่ะ
+- สถานะโครงการคือ Phase 0 Automated Spike Complete — External Validation Pending ค่ะ
 - Git repository เชื่อมกับ `https://github.com/abhuri/myVault.git` แล้วค่ะ
 - initial repository safeguards ถูก push ไปที่ `main` ใน commit `6597e18` แล้วค่ะ
 - งาน Phase 0 อยู่บน branch `agent/phase-0-bootstrap` ค่ะ
 - package manager ที่เลือกคือ `pnpm` ค่ะ
 - Tauri 2, React, TypeScript และ Rust scaffold ถูกสร้างที่ `apps/tauri` ค่ะ
-- diagnostic shell มี Rust platform bridge, CodeMirror, Mermaid strict mode และ Sigma graph แล้วค่ะ
+- diagnostic shell มี Rust platform bridge, CodeMirror, Mermaid strict mode, Sigma 1,000/5,000-node probes, runtime evidence และ Android Google authorization controls แล้วค่ะ
 - Phase 0 acceptance, OAuth/Drive และ environment contracts อยู่ใน `docs/phase-0` ค่ะ
-- frontend typecheck, unit tests, production build, Rust fmt, clippy และ tests ผ่านบน macOS host ค่ะ
+- frontend typecheck, 8 Vitest tests, production build, Rust fmt, clippy และ Rust suites รวม 49 tests ผ่านบน macOS host ค่ะ
 - Tauri debug binary build และ native launch ผ่านบน macOS host ค่ะ
 - GitHub quality check ของ Draft PR #1 ผ่านแล้วค่ะ
 - Android Studio, JBR 21, API 36, Platform Tools, Build Tools, Command-line Tools และ NDK ถูกติดตั้งแล้วค่ะ
 - Rust Android targets ทั้งสี่ architecture ถูกติดตั้งแล้วค่ะ
 - `tauri android init` และ ARM64 debug APK build ผ่านแล้วค่ะ
+- Android GIS `AuthorizationClient` plugin และ native-only zeroizing token boundary ถูก implement และ compile ใน APK แล้วค่ะ
+- descriptor-relative filesystem safety, atomic writes, watcher normalization และ SQLite derived-index spike ผ่าน 13 tests ค่ะ
+- desktop loopback OAuth + PKCE, exact Drive scope และ OS keyring adapter ผ่าน 9 tests พร้อม macOS Keychain live probe ค่ะ
+- Drive REST fixture harness, resumable upload, changes/cursor, hash verification และ verified trash-only cleanup ผ่าน 25 tests ค่ะ
+- Security audit P0/P1 ถูกแก้แล้ว โดยเฉพาะ symlink TOCTOU และ Drive cleanup identity ค่ะ
 - ยังไม่มีอุปกรณ์ Android เชื่อมต่อ จึงยังไม่ทดสอบ Thai IME, lifecycle และ WebView บนมือถือจริงค่ะ
-- project tree, Android SDK และ Gradle cache ถูกย้ายไป `AWB-Apps` โดยคง compatibility path เดิมผ่าน symlink ค่ะ
-- พื้นที่ภายในเพิ่มเป็นประมาณ 38 GiB และ full Xcode ยังไม่จำเป็นต่อ target Windows/macOS/Ubuntu/Android ใน Phase 0 จึงชะลอไว้ค่ะ
-- OAuth และ Drive API implementation ยังไม่เริ่มจนกว่า platform boundary และ Google Cloud configuration จะพร้อมค่ะ
+- project tree, Android SDK, Emulator/AVD และ Gradle cache อยู่บน `AWB-Apps` โดยคง compatibility path เดิมผ่าน symlink ค่ะ
+- backup ภายในถูกลบหลัง migration verification และพื้นที่ภายในเหลือประมาณ 42 GiB ค่ะ
+- full Xcode ยังไม่จำเป็นต่อ target Windows/macOS/Ubuntu/Android ใน Phase 0 จึงชะลอไว้ค่ะ
+- OAuth/Drive code และ env-gated live fixture harness พร้อมแล้ว แต่ consent และ live round trip ยัง blocked จนกว่า Google Cloud OAuth clients และมือถือจริงพร้อมค่ะ
 
 ## 15. Next Actions
 
-1. ปิดและเปิด Codex ใหม่ แล้วลบ `/Users/awb/My Apps.internal-backup` หลังยืนยันว่าไม่มี process ถือ working directory เดิม เพื่อคืนพื้นที่อีกประมาณ 8.8 GiB ค่ะ
-2. เชื่อมต่อมือถือ Android จริงด้วย USB หรือ wireless debugging ค่ะ
-3. สร้าง Kotlin Tauri plugin spike สำหรับ Google Identity Services `AuthorizationClient` ค่ะ
-4. ตั้ง Google Cloud Android OAuth client สำหรับ package และ debug SHA-1 ค่ะ
-5. ทดสอบ APK, Thai IME, lifecycle, Mermaid และ Sigma บนมือถือจริงค่ะ
-6. สร้าง desktop OAuth loopback + PKCE spike ที่ไม่ส่ง token เข้า JavaScript ค่ะ
-7. เพิ่ม filesystem atomic-write/watcher และ SQLite recovery spike ค่ะ
-8. สร้าง Google Drive fixture folder หลัง Google Cloud OAuth configuration พร้อมค่ะ
-9. รัน platform gates บน Windows และ Ubuntu ผ่าน native machines หรือ manual CI workflow ค่ะ
+1. push ชุด Phase 0 spike และรอ quality, Android compile, Windows NSIS และ Ubuntu AppImage workflows ค่ะ
+2. ตั้ง Google Cloud project, เปิด Drive API และสร้าง Android/Desktop OAuth clients ตาม `docs/phase-0/DEVICE_TEST.md` ค่ะ
+3. เชื่อมต่อมือถือ Android จริงด้วย USB หรือ wireless debugging ค่ะ
+4. ทดสอบ consent/cancel/reconnect/revoke, Thai IME p95, lifecycle, Mermaid และ Sigma บนมือถือจริงค่ะ
+5. รัน live Drive acceptance fixture round trip แล้ว Trash เฉพาะ folder ID/marker ที่ยืนยันแล้วค่ะ
+6. บันทึกผลใน `docs/phase-0/RESULTS.md` และตัดสิน Phase 0 Go/No-Go ค่ะ
 
 ## 16. Session Handoff
 
 ### Current Handoff
 
-- วันที่อัปเดตคือ 2026-07-11 เวลา 22:12 เขตเวลา Asia/Bangkok ค่ะ
+- วันที่อัปเดตคือ 2026-07-11 เวลา 22:50 เขตเวลา Asia/Bangkok ค่ะ
 - ผู้ใช้เรียกว่า คุณโอ หรือบอส ค่ะ
 - Sunday เป็นหัวหน้าทีมและเจ้าของ architecture, logic, mechanics และ final integration ค่ะ
 - Sunday สามารถ spawn sub-agents สำหรับ bounded parallel tasks ตาม Operating Model ในเอกสารนี้ค่ะ
@@ -505,15 +508,17 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - `main` มี initial commit `6597e18` ค่ะ
 - active branch คือ `agent/phase-0-bootstrap` ค่ะ
 - Phase 0 diagnostic shell และ contracts ถูกสร้างแล้วค่ะ
-- local checks ที่ผ่านคือ TypeScript, Vitest 6 tests, Vite build, Rust fmt, clippy, Rust test และ Tauri debug build/launch ค่ะ
+- local checks ที่ผ่านคือ TypeScript, Vitest 8 tests, Vite build, Rust fmt/clippy, Rust 49 tests, macOS Keychain live probe และ Tauri debug build ค่ะ
 - GitHub quality check ของ Draft PR #1 ผ่านแล้วค่ะ
 - Android toolchain พร้อมและ ARM64 debug APK build ผ่านจาก external SSD แล้วค่ะ
-- frontend, Rust, macOS native debug build และ Android build ผ่านหลัง migration ค่ะ
-- พื้นที่ internal เหลือประมาณ 38 GiB; ยังมี `/Users/awb/My Apps.internal-backup` 8.8 GiB รอลบหลัง restart Codex ค่ะ
+- Android Emulator API 36, WebView 133, Mermaid และ Sigma 1,000 nodes ผ่าน; 5,000 nodes ทำให้ headless surface ดำและถูกบันทึกเป็น non-gating capacity result ค่ะ
+- frontend, Rust, macOS native debug build และ Android build ผ่านหลังรวม core/auth/Drive dependencies ค่ะ
+- พื้นที่ internal เหลือประมาณ 42 GiB และ migration backup ถูกลบแล้วค่ะ
 - Android device test ยัง blocked เพราะไม่มีอุปกรณ์เชื่อมต่อค่ะ
 - full Xcode ถูกชะลอโดยตั้งใจเพราะยังไม่มี iOS target และ Command Line Tools เพียงพอสำหรับ macOS Phase 0 ค่ะ
-- ข้อค้นพบสำคัญคือ Android Google OAuth ต้องใช้ GIS `AuthorizationClient` ผ่าน Kotlin Tauri plugin ค่ะ
-- งานถัดไปคือ finalize backup cleanup หลัง restart, เชื่อมต่อมือถือจริง และ implement GIS plugin spike ค่ะ
+- Android Google OAuth ใช้ GIS `AuthorizationClient` ผ่าน Kotlin Tauri plugin โดย access token อยู่ใน memory/native layer เท่านั้นค่ะ
+- Drive live harness ไม่มี permanent-delete API, จำกัด Google origin และตรวจ random marker ก่อน Trash ค่ะ
+- งานถัดไปคือ push/CI, Google Cloud configuration และ physical-device/live-Drive validation ค่ะ
 
 ### Handoff Update Template
 
@@ -569,4 +574,10 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - ชะลอ full Xcode เพราะพื้นที่ว่างต่ำกว่าเกณฑ์ปลอดภัยค่ะ
 - ย้าย `My Apps`, Android SDK และ Gradle cache ไป `AWB-Apps` พร้อมสร้าง symlink compatibility paths ค่ะ
 - ยืนยันหลัง migration ด้วย frontend typecheck/Vitest/Vite build, Rust fmt/clippy/tests, macOS native debug build และ Android ARM64 APK build ค่ะ
-- ลบ backup ของ Android SDK และ Gradle แล้ว; คง `My Apps.internal-backup` ชั่วคราวจนกว่า Codex จะ restart ค่ะ
+- ลบ backup ของ Android SDK และ Gradle แล้ว และลบ `My Apps.internal-backup` หลัง Codex restart/verification ค่ะ
+- ลบ migration backup ภายในสำเร็จและย้าย Android Emulator/AVD ไป `AWB-Apps` ค่ะ
+- เพิ่ม Android GIS plugin, desktop OAuth/Keyring, capability filesystem/SQLite และ Drive REST fixture harness ค่ะ
+- เพิ่ม 57 automated tests รวม frontend และ Rust พร้อม macOS Keychain live probe ค่ะ
+- เพิ่ม API 36 emulator evidence, Thai composition instrumentation และ Sigma 1,000/5,000-node capacity controls ค่ะ
+- ปิด Security Audit P0/P1 สำหรับ symlink TOCTOU, Drive cleanup identity/origin, cursor IDs, OAuth parser/lifecycle และ Gradle verification ค่ะ
+- เพิ่ม native Windows NSIS, Ubuntu AppImage และ Android compile CI gates ค่ะ

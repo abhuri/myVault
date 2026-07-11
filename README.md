@@ -6,7 +6,7 @@ The first release targets macOS, Windows, Ubuntu, and Android through Tauri 2 wi
 
 ## Status
 
-The project is in Phase 0, which is focused on validating platform support, local storage, OAuth, Google Drive access, and the editor stack before full product developmentค่ะ
+The project is in Phase 0, which is focused on validating platform support, local storage, OAuth, Google Drive access, and the editor stack before full product developmentค่ะ Automated spike results and honest external blockers are tracked in [docs/phase-0/RESULTS.md](docs/phase-0/RESULTS.md)ค่ะ
 
 See [PROJECT_PLAN.md](PROJECT_PLAN.md) for architecture decisions, delivery phases, safety rules, and the current session handoffค่ะ
 
@@ -36,7 +36,10 @@ pnpm build
 cargo fmt --manifest-path apps/tauri/src-tauri/Cargo.toml --all -- --check
 cargo clippy --manifest-path apps/tauri/src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
 cargo test --manifest-path apps/tauri/src-tauri/Cargo.toml
+pnpm test:rust
 pnpm tauri:info
 ```
 
 Phase 0 platform gates and environment gaps are documented in [docs/phase-0](docs/phase-0)ค่ะ
+
+The Google Drive live harness and physical-device tests are opt-in and may touch only a verified `myVault-spike-<date>-<random>` fixture folderค่ะ Follow [docs/phase-0/DEVICE_TEST.md](docs/phase-0/DEVICE_TEST.md) before enabling themค่ะ

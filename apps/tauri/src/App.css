@@ -193,6 +193,99 @@ h2 {
   background: radial-gradient(circle at center, #131e2e 0, #0a0f17 68%);
 }
 
+.probe-metrics,
+.probe-controls,
+.runtime-evidence {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  color: #9fb0c8;
+  font-size: 0.78rem;
+}
+
+.auth-probe {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 12px;
+  border: 1px solid #243247;
+  border-radius: 14px;
+  background: #0d141f;
+  padding: 14px 16px;
+}
+
+.auth-probe > div {
+  display: grid;
+  gap: 4px;
+}
+
+.auth-probe span {
+  color: #9fb0c8;
+  font-size: 0.82rem;
+}
+
+.auth-probe button {
+  border: 1px solid #71e1c4;
+  border-radius: 10px;
+  background: #14251f;
+  color: #71e1c4;
+  cursor: pointer;
+  padding: 9px 12px;
+}
+
+.auth-probe button:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+@media (max-width: 640px) {
+  .auth-probe {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
+
+.probe-metrics {
+  padding-top: 10px;
+}
+
+.metric-pass {
+  color: #71e1c4;
+}
+
+.metric-fail {
+  color: #ff8f8f;
+}
+
+.probe-controls {
+  align-items: center;
+  padding-bottom: 10px;
+}
+
+.probe-controls button {
+  border: 1px solid #34455c;
+  border-radius: 999px;
+  background: #101824;
+  color: #b8c5d8;
+  cursor: pointer;
+  padding: 6px 10px;
+}
+
+.probe-controls button.active {
+  border-color: #71e1c4;
+  color: #71e1c4;
+}
+
+.runtime-evidence {
+  margin-top: 18px;
+  border: 1px solid #243247;
+  border-radius: 14px;
+  background: #0d141f;
+  padding: 12px 16px;
+  overflow-wrap: anywhere;
+}
+
 .probe-error {
   padding: 16px;
   color: #ff9898;

@@ -7,6 +7,7 @@ import { EditorView, keymap } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import Graph from "graphology";
 import Sigma from "sigma";
+import { formatMilliseconds, percentile } from "./spike/metrics";
 import "./App.css";
 
 type PlatformInfo = {
@@ -14,6 +15,12 @@ type PlatformInfo = {
   arch: string;
   family: string;
   debugBuild: boolean;
+};
+
+type GoogleAuthStatus = {
+  supported: boolean;
+  connected: boolean;
+  grantedScopeCount: number;
 };
 
 const sampleMarkdown = `# myVault Phase 0
@@ -33,6 +40,8 @@ flowchart LR
 
 function EditorProbe() {
   const hostRef = useRef<HTMLDivElement>(null);
+  const [compositionSamples, setCompositionSamples] = useState<number[]>([]);
+  const [documentChanges, setDocumentChanges] = useState(0);
 
   useEffect(() => {
     if (!hostRef.current) return;
@@ -45,6 +54,9 @@ function EditorProbe() {
         keymap.of([...defaultKeymap, ...historyKeymap]),
         markdown(),
         EditorView.lineWrapping,
+        EditorView.updateListener.of((update) => {
+          if (update.docChanged) setDocumentChanges((count) => count + 1);
+        }),
         EditorView.theme({
           "&": { height: "100%", background: "#10151f", color: "#ecf2ff" },
           ".cm-content": { caretColor: "#71e1c4", padding: "16px" },
@@ -56,10 +68,41 @@ function EditorProbe() {
     });
 
     const view = new EditorView({ state, parent: hostRef.current });
-    return () => view.destroy();
+    let compositionStartedAt: number | null = null;
+    const onCompositionStart = () => {
+      compositionStartedAt = performance.now();
+    };
+    const onCompositionEnd = () => {
+      if (compositionStartedAt === null) return;
+      const startedAt = compositionStartedAt;
+      compositionStartedAt = null;
+      requestAnimationFrame(() => {
+        setCompositionSamples((samples) => [...samples.slice(-99), performance.now() - startedAt]);
+      });
+    };
+    view.contentDOM.addEventListener("compositionstart", onCompositionStart);
+    view.contentDOM.addEventListener("compositionend", onCompositionEnd);
+
+    return () => {
+      view.contentDOM.removeEventListener("compositionstart", onCompositionStart);
+      view.contentDOM.removeEventListener("compositionend", onCompositionEnd);
+      view.destroy();
+    };
   }, []);
 
-  return <div className="editor-host" ref={hostRef} aria-label="Markdown editor probe" />;
+  const p95 = percentile(compositionSamples, 0.95);
+  return (
+    <>
+      <div className="editor-host" ref={hostRef} aria-label="Markdown editor probe" />
+      <div className="probe-metrics" aria-live="polite">
+        <span>Thai composition samples: {compositionSamples.length}</span>
+        <span className={p95 !== null && p95 >= 50 ? "metric-fail" : "metric-pass"}>
+          p95 composition-to-paint: {formatMilliseconds(p95)}
+        </span>
+        <span>Document changes: {documentChanges}</span>
+      </div>
+    </>
+  );
 }
 
 function MermaidProbe() {
@@ -96,12 +139,15 @@ function MermaidProbe() {
 
 function GraphProbe() {
   const hostRef = useRef<HTMLDivElement>(null);
+  const [nodeCount, setNodeCount] = useState(1_000);
+  const [renderTime, setRenderTime] = useState<number | null>(null);
 
   useEffect(() => {
     if (!hostRef.current) return;
 
+    const startedAt = performance.now();
     const graph = new Graph();
-    const count = 60;
+    const count = nodeCount;
 
     for (let index = 0; index < count; index += 1) {
       const angle = (Math.PI * 2 * index) / count;
@@ -129,21 +175,109 @@ function GraphProbe() {
       renderEdgeLabels: false,
       allowInvalidContainer: false,
     });
+    const host = hostRef.current;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
+        renderer.resize();
+        renderer.refresh();
+      }
+    });
+    observer.observe(host);
+    let paintFrame = 0;
+    const frame = requestAnimationFrame(() => {
+      renderer.refresh();
+      paintFrame = requestAnimationFrame(() => setRenderTime(performance.now() - startedAt));
+    });
 
-    return () => renderer.kill();
+    return () => {
+      cancelAnimationFrame(frame);
+      cancelAnimationFrame(paintFrame);
+      observer.disconnect();
+      renderer.kill();
+    };
+  }, [nodeCount]);
+
+  return (
+    <>
+      <div className="probe-controls" role="group" aria-label="Graph capacity">
+        {[1_000, 5_000].map((count) => (
+          <button
+            className={nodeCount === count ? "active" : ""}
+            key={count}
+            onClick={() => setNodeCount(count)}
+            type="button"
+          >
+            {count.toLocaleString()} nodes
+          </button>
+        ))}
+        <span>first paint: {formatMilliseconds(renderTime)}</span>
+      </div>
+      <div className="graph-host" ref={hostRef} aria-label="Knowledge graph probe" />
+    </>
+  );
+}
+
+function GoogleAuthProbe() {
+  const [status, setStatus] = useState<GoogleAuthStatus | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    invoke<GoogleAuthStatus>("google_auth_status")
+      .then(setStatus)
+      .catch((reason: unknown) => setError(String(reason)));
   }, []);
 
-  return <div className="graph-host" ref={hostRef} aria-label="Knowledge graph probe" />;
+  const run = (command: "google_auth_connect" | "google_auth_disconnect") => {
+    setBusy(true);
+    setError(null);
+    invoke<GoogleAuthStatus>(command)
+      .then(setStatus)
+      .catch((reason: unknown) => setError(String(reason)))
+      .finally(() => setBusy(false));
+  };
+
+  return (
+    <section className="auth-probe" aria-label="Google authorization probe">
+      <div>
+        <strong>Google Drive authorization</strong>
+        <span>
+          {status?.supported
+            ? status.connected
+              ? `Connected · ${status.grantedScopeCount} scope`
+              : "Ready for Android consent"
+            : "Android native flow only"}
+        </span>
+      </div>
+      {status?.supported && (
+        <button
+          disabled={busy}
+          onClick={() => run(status.connected ? "google_auth_disconnect" : "google_auth_connect")}
+          type="button"
+        >
+          {busy ? "Waiting…" : status.connected ? "Disconnect" : "Connect Google Drive"}
+        </button>
+      )}
+      {error && <span className="probe-error">{error}</span>}
+    </section>
+  );
 }
 
 function App() {
   const [platform, setPlatform] = useState<PlatformInfo | null>(null);
   const [bridgeError, setBridgeError] = useState<string | null>(null);
+  const [visibilityEvents, setVisibilityEvents] = useState(0);
 
   useEffect(() => {
     invoke<PlatformInfo>("get_platform_info")
       .then(setPlatform)
       .catch((error: unknown) => setBridgeError(String(error)));
+  }, []);
+
+  useEffect(() => {
+    const recordVisibility = () => setVisibilityEvents((count) => count + 1);
+    document.addEventListener("visibilitychange", recordVisibility);
+    return () => document.removeEventListener("visibilitychange", recordVisibility);
   }, []);
 
   return (
@@ -202,11 +336,19 @@ function App() {
               <p className="card-kicker">WEBGL</p>
               <h2>Knowledge graph</h2>
             </div>
-            <span className="badge">60 nodes</span>
+            <span className="badge">capacity probe</span>
           </div>
           <GraphProbe />
         </article>
       </section>
+
+      <section className="runtime-evidence" aria-label="Runtime evidence">
+        <strong>Runtime evidence</strong>
+        <span>{navigator.userAgent}</span>
+        <span>Visibility transitions: {visibilityEvents}</span>
+      </section>
+
+      <GoogleAuthProbe />
 
       <footer className="spike-footer">
         <span>Next gates</span>

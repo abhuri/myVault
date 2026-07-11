@@ -8,7 +8,9 @@ coverage/
 # Rust and Tauri build output
 target/
 src-tauri/target/
+crates/*/Cargo.lock
 **/.gradle/
+**/.tauri/
 **/.cxx/
 **/local.properties
 **/build/

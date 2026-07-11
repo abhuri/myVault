@@ -8,7 +8,7 @@
     "typecheck": "pnpm --dir apps/tauri typecheck",
     "test": "pnpm --dir apps/tauri test",
     "check:rust": "cargo check --manifest-path apps/tauri/src-tauri/Cargo.toml",
-    "test:rust": "cargo test --manifest-path apps/tauri/src-tauri/Cargo.toml",
+    "test:rust": "cargo test --manifest-path apps/tauri/src-tauri/Cargo.toml && cargo test --manifest-path crates/myvault-core/Cargo.toml && cargo test --manifest-path crates/desktop-auth/Cargo.toml && cargo test --manifest-path crates/drive-sync-spike/Cargo.toml",
     "tauri:info": "pnpm --dir apps/tauri tauri info"
   }
 }

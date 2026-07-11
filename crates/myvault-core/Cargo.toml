@@ -1,0 +1,19 @@
+[package]
+name = "myvault-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Filesystem and derived-index safety primitives for myVault"
+
+[dependencies]
+cap-fs-ext = "4.0.2"
+cap-std = "4.0.2"
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"
