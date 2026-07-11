@@ -17,12 +17,35 @@ use windows_sys::Win32::Foundation::{
     STATUS_OBJECT_NAME_EXISTS,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FileAttributeTagInfo, GetFileInformationByHandleEx, DELETE, FILE_ATTRIBUTE_DEVICE,
+    FileAttributeTagInfo, FileIdInfo, GetFileInformationByHandleEx, DELETE, FILE_ATTRIBUTE_DEVICE,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    INVALID_FILE_ATTRIBUTES,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, INVALID_FILE_ATTRIBUTES,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+use super::DirectoryIdentity;
+
+pub(super) fn directory_identity(directory: &Dir) -> io::Result<DirectoryIdentity> {
+    let mut information = FILE_ID_INFO::default();
+    // SAFETY: `information` is a live, correctly sized output object. The
+    // directory handle remains owned by `directory` for this synchronous call.
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            directory.as_raw_handle() as HANDLE,
+            FileIdInfo,
+            (&raw mut information).cast::<c_void>(),
+            u32::try_from(size_of::<FILE_ID_INFO>()).expect("Win32 struct fits u32"),
+        )
+    };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(DirectoryIdentity::new(
+        information.VolumeSerialNumber,
+        information.FileId.Identifier,
+    ))
+}
 
 pub(super) fn rename_noreplace(
     source_parent: &Dir,

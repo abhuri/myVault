@@ -1693,15 +1693,11 @@ impl TrashStore<'_> {
                         {
                             Ok(directory) => directory,
                             Err(cause) => {
-                                let confirmation_report = MoveSyncReport {
-                                destination: confirmation_destination,
-                                source: Some(Err(std::io::Error::other(
-                                    "authoritative items directory could not be opened for sync",
-                                ))),
-                            };
-                                return Err(confirmation_report.into_verified_unknown(
+                                return Err(Vault::verified_move_unknown(
                                     &source,
                                     destination,
+                                    directory_sync_status(confirmation_destination),
+                                    DirectorySyncStatus::NotAttempted,
                                     cause,
                                 ));
                             }
@@ -2014,11 +2010,9 @@ impl TrashStore<'_> {
     }
 
     fn require_same_directory_identity(expected: &Dir, actual: &Dir) -> Result<()> {
-        let expected_metadata = expected.dir_metadata()?;
-        let actual_metadata = actual.dir_metadata()?;
-        if expected_metadata.dev() != actual_metadata.dev()
-            || expected_metadata.ino() != actual_metadata.ino()
-        {
+        let expected_identity = myvault_platform_fs::directory_identity(expected)?;
+        let actual_identity = myvault_platform_fs::directory_identity(actual)?;
+        if expected_identity != actual_identity {
             return Err(CoreError::InvalidTrashTopology(
                 "items directory identity changed",
             ));
@@ -3402,6 +3396,65 @@ mod tests {
                 source_sync: DirectorySyncStatus::Synced,
                 ..
             }
+        ));
+        assert!(base.join("note.md").is_file());
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn restore_confirmation_reports_source_not_attempted_when_reopen_fails() {
+        let (base, vault, id, manifest, digest) =
+            staged_publish_fault_fixture("restore-confirm-item-missing");
+        vault
+            .trash_store()
+            .publish_staging_item(id, &digest)
+            .expect("publish");
+        let destination = VaultPath::from_portable(&manifest.original_path).expect("destination");
+        let item = base.join(format!(".trash/v1/items/{id}"));
+        let mut destination_syncs = 0_u8;
+        let mut source_syncs = 0_u8;
+        let error = vault
+            .trash_store()
+            .restore_item_with_hooks(
+                id,
+                &destination,
+                &digest,
+                |parent, _| match parent {
+                    MoveSyncParent::Destination => {
+                        destination_syncs = destination_syncs.saturating_add(1);
+                        if destination_syncs == 3 {
+                            Ok(MoveDurability::DirectorySyncUnsupported)
+                        } else {
+                            Ok(MoveDurability::FullySynced)
+                        }
+                    }
+                    MoveSyncParent::Source => {
+                        source_syncs = source_syncs.saturating_add(1);
+                        if source_syncs == 2 {
+                            Err(injected_sync_failure(parent))
+                        } else {
+                            Ok(MoveDurability::FullySynced)
+                        }
+                    }
+                },
+                || {
+                    fs::remove_file(item.join("manifest.json")).expect("remove manifest");
+                    fs::remove_dir(&item).expect("remove item directory");
+                },
+            )
+            .expect_err("authoritative source reopen failure");
+
+        assert_eq!(destination_syncs, 3);
+        assert_eq!(source_syncs, 2);
+        assert!(matches!(
+            error,
+            CoreError::VerifiedMoveOutcomeUnknown {
+                destination_sync: DirectorySyncStatus::Unsupported,
+                source_sync: DirectorySyncStatus::NotAttempted,
+                verification,
+                ..
+            } if matches!(*verification, CoreError::Io(ref error)
+                if error.kind() == std::io::ErrorKind::NotFound)
         ));
         assert!(base.join("note.md").is_file());
         fs::remove_dir_all(base).expect("cleanup");
