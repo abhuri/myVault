@@ -140,7 +140,11 @@ impl VaultPath {
     /// important Windows/default-macOS case collisions before a mutation.
     #[must_use]
     pub fn collision_key(&self) -> String {
-        self.0.nfkc().case_fold().nfkc().collect()
+        self.0
+            .split('/')
+            .map(component_collision_key)
+            .collect::<Vec<_>>()
+            .join("/")
     }
 
     #[must_use]
@@ -150,13 +154,22 @@ impl VaultPath {
 
     #[must_use]
     pub(crate) fn classify(&self) -> VaultPathClass {
-        match self.0.split('/').next() {
-            Some(component) if component.eq_ignore_ascii_case(".obsidian") => {
-                VaultPathClass::ObsidianMetadata
-            }
-            Some(component) if component.eq_ignore_ascii_case(".trash") => VaultPathClass::Trash,
-            _ => VaultPathClass::Content,
-        }
+        self.0
+            .split('/')
+            .next()
+            .map_or(VaultPathClass::Content, classify_component)
+    }
+}
+
+pub(crate) fn component_collision_key(component: &str) -> String {
+    component.nfkc().case_fold().nfkc().collect()
+}
+
+pub(crate) fn classify_component(component: &str) -> VaultPathClass {
+    match component_collision_key(component).as_str() {
+        ".obsidian" => VaultPathClass::ObsidianMetadata,
+        ".trash" => VaultPathClass::Trash,
+        _ => VaultPathClass::Content,
     }
 }
 
@@ -224,6 +237,19 @@ mod tests {
         let path = VaultPath::from_portable("บันทึก ประจำวัน//你好 world.md").expect("valid path");
         assert_eq!(path.as_str(), "บันทึก ประจำวัน/你好 world.md");
         assert_eq!(path.as_path(), Path::new("บันทึก ประจำวัน/你好 world.md"));
+    }
+
+    #[test]
+    fn compatibility_internal_names_are_classified_centrally() {
+        assert!(VaultPath::new(".ｏｂｓｉｄｉａｎ/theme.css")
+            .expect("fullwidth obsidian")
+            .is_obsidian_metadata());
+        assert_eq!(
+            VaultPath::new(".ｔｒａｓｈ/old.md")
+                .expect("fullwidth trash")
+                .classify(),
+            VaultPathClass::Trash
+        );
     }
 
     #[test]
