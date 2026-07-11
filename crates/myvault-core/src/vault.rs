@@ -12,6 +12,35 @@ use crate::capability::{open_absolute_dir_nofollow, open_child_dir_nofollow};
 use crate::{CoreError, Result, VaultPath};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+pub const DEFAULT_READ_LIMIT: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InventoryLimits {
+    pub max_depth: usize,
+    pub max_entries: usize,
+}
+
+impl Default for InventoryLimits {
+    fn default() -> Self {
+        Self {
+            max_depth: 64,
+            max_entries: 100_000,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InventoryKind {
+    Markdown,
+    File,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InventoryEntry {
+    pub path: VaultPath,
+    pub kind: InventoryKind,
+    pub size: u64,
+}
 
 /// Identifies whether a write was explicitly initiated by the user.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,14 +85,112 @@ impl Vault {
     /// Returns an error when a parent or destination is a symlink, is missing,
     /// or cannot be read.
     pub fn read(&self, relative: &VaultPath) -> Result<Vec<u8>> {
+        self.read_bounded(relative, DEFAULT_READ_LIMIT)
+    }
+
+    /// Reads at most `limit` bytes, rejecting a larger file rather than
+    /// allocating in proportion to untrusted filesystem content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsafe paths, filesystem failures, or when the
+    /// content exceeds `limit`.
+    pub fn read_bounded(&self, relative: &VaultPath, limit: usize) -> Result<Vec<u8>> {
         let (parent, name) = self.open_parent(relative)?;
         self.reject_final_symlink(&parent, &name, relative)?;
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
         let mut file = parent.open_with(&name, &options)?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        let metadata = file.metadata()?;
+        if metadata.len() > limit as u64 {
+            return Err(CoreError::ResourceLimitExceeded {
+                resource: "file size",
+                limit,
+            });
+        }
+        let capacity = usize::try_from(metadata.len()).unwrap_or(limit).min(limit);
+        let mut bytes = Vec::with_capacity(capacity);
+        Read::by_ref(&mut file)
+            .take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            return Err(CoreError::ResourceLimitExceeded {
+                resource: "file size",
+                limit,
+            });
+        }
         Ok(bytes)
+    }
+
+    /// Inventories regular vault files without following symbolic links.
+    /// Internal `.obsidian` and `.trash` trees are excluded entirely.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for symlinks, invalid portable names, filesystem
+    /// failures, or an exceeded traversal limit.
+    pub fn inventory(&self, limits: InventoryLimits) -> Result<Vec<InventoryEntry>> {
+        let mut output = Vec::new();
+        let mut visited = 0_usize;
+        self.inventory_dir(&self.root_dir, &[], 0, limits, &mut visited, &mut output)?;
+        output.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        Ok(output)
+    }
+
+    /// Creates every missing directory component without following links.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a symlink/non-directory component or filesystem
+    /// failure.
+    pub fn create_directories(&self, relative: &VaultPath) -> Result<()> {
+        let mut current = self.root_dir.try_clone()?;
+        let mut display = self.root_path.clone();
+        for component in relative.as_path().components() {
+            let name = component.as_os_str();
+            display.push(name);
+            match current.create_dir(name) {
+                Ok(()) => sync_directory(&current)?,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            current = open_child_dir_nofollow(&current, name, &display)?;
+        }
+        Ok(())
+    }
+
+    /// Crash-safely creates a file and fails if the destination already exists.
+    /// The final hard-link publication has create-new/no-replace semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the destination exists, a path is unsafe, hard
+    /// links are unsupported by the filesystem, or another I/O operation fails.
+    pub fn create_new(&self, relative: &VaultPath, contents: &[u8]) -> Result<()> {
+        let components: Vec<_> = relative.as_path().components().collect();
+        if components.len() > 1 {
+            let parent_path = components[..components.len() - 1]
+                .iter()
+                .map(|component| component.as_os_str())
+                .collect::<PathBuf>();
+            self.create_directories(&VaultPath::new(parent_path)?)?;
+        }
+        let (parent, destination_name) = self.open_parent(relative)?;
+        self.reject_final_symlink(&parent, &destination_name, relative)?;
+        let (temp_name, mut file) = Self::create_temp(&parent)?;
+        let result = (|| {
+            file.write_all(contents)?;
+            file.sync_all()?;
+            drop(file);
+            parent.hard_link(&temp_name, &parent, &destination_name)?;
+            sync_directory(&parent)?;
+            parent.remove_file(&temp_name)?;
+            sync_directory(&parent)
+        })();
+        if result.is_err() {
+            let _ = parent.remove_file(&temp_name);
+        }
+        result
     }
 
     /// Atomically replaces a file through an already-open parent capability.
@@ -133,6 +260,79 @@ impl Vault {
             current = open_child_dir_nofollow(&current, component.as_os_str(), &display)?;
         }
         Ok((current, name.as_os_str().to_owned()))
+    }
+
+    fn inventory_dir(
+        &self,
+        directory: &Dir,
+        prefix: &[String],
+        depth: usize,
+        limits: InventoryLimits,
+        visited: &mut usize,
+        output: &mut Vec<InventoryEntry>,
+    ) -> Result<()> {
+        let mut entries = directory
+            .read_dir(".")?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_unstable_by_key(cap_std::fs::DirEntry::file_name);
+        for entry in entries {
+            let name = entry.file_name();
+            let Some(name_utf8) = name.to_str() else {
+                return Err(CoreError::InvalidRelativePath(self.root_path.join(&name)));
+            };
+            if prefix.is_empty()
+                && (name_utf8.eq_ignore_ascii_case(".obsidian")
+                    || name_utf8.eq_ignore_ascii_case(".trash"))
+            {
+                continue;
+            }
+            *visited = visited.saturating_add(1);
+            if *visited > limits.max_entries {
+                return Err(CoreError::ResourceLimitExceeded {
+                    resource: "inventory entries",
+                    limit: limits.max_entries,
+                });
+            }
+            let mut components = prefix.to_owned();
+            components.push(name_utf8.to_owned());
+            let path = VaultPath::from_portable(components.join("/"))?;
+            let metadata = directory.symlink_metadata(&name)?;
+            if metadata.file_type().is_symlink() {
+                return Err(CoreError::SymlinkRejected(
+                    self.root_path.join(path.as_path()),
+                ));
+            }
+            if metadata.is_dir() {
+                let next_depth = depth.saturating_add(1);
+                if next_depth > limits.max_depth {
+                    return Err(CoreError::ResourceLimitExceeded {
+                        resource: "inventory depth",
+                        limit: limits.max_depth,
+                    });
+                }
+                let display = self.root_path.join(path.as_path());
+                let child = open_child_dir_nofollow(directory, &name, &display)?;
+                self.inventory_dir(&child, &components, next_depth, limits, visited, output)?;
+            } else if metadata.is_file() {
+                let markdown = Path::new(name_utf8)
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        extension.eq_ignore_ascii_case("md")
+                            || extension.eq_ignore_ascii_case("markdown")
+                    });
+                output.push(InventoryEntry {
+                    path,
+                    kind: if markdown {
+                        InventoryKind::Markdown
+                    } else {
+                        InventoryKind::File
+                    },
+                    size: metadata.len(),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn reject_final_symlink(

@@ -8,10 +8,20 @@ pub enum CoreError {
     PathEscapesVault(PathBuf),
     SymlinkRejected(PathBuf),
     AutomaticObsidianWriteDenied(PathBuf),
-    AppDataInsideVault { app_data: PathBuf, vault: PathBuf },
+    AppDataInsideVault {
+        app_data: PathBuf,
+        vault: PathBuf,
+    },
     UnsafeDatabasePath(PathBuf),
     InvalidRecord(&'static str),
-    PortablePathCollision { existing: String, incoming: String },
+    ResourceLimitExceeded {
+        resource: &'static str,
+        limit: usize,
+    },
+    PortablePathCollision {
+        existing: String,
+        incoming: String,
+    },
     Io(std::io::Error),
     Sqlite(rusqlite::Error),
 }
@@ -49,6 +59,9 @@ impl fmt::Display for CoreError {
                 path.display()
             ),
             Self::InvalidRecord(reason) => write!(formatter, "invalid index record: {reason}"),
+            Self::ResourceLimitExceeded { resource, limit } => {
+                write!(formatter, "{resource} exceeds configured limit of {limit}")
+            }
             Self::PortablePathCollision { existing, incoming } => write!(
                 formatter,
                 "portable vault paths collide across filesystems: {incoming} conflicts with {existing}"
