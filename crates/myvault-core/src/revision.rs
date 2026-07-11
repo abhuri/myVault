@@ -1,7 +1,9 @@
 use crate::{CoreError, Result};
+use serde::{Deserialize, Serialize};
 
 /// A canonical BLAKE3 digest and byte length for one regular file.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileRevision {
     pub hex: String,
     pub byte_len: u64,

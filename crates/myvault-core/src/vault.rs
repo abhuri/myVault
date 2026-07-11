@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,13 +7,17 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 #[cfg(unix)]
 use cap_fs_ext::OpenOptionsExt;
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+use cap_fs_ext::{FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
 
 use crate::atomic_move::rename_noreplace;
 use crate::capability::{open_absolute_dir_nofollow, open_child_dir_nofollow};
 use crate::path::{classify_component, component_collision_key, VaultPathClass};
-use crate::{CoreError, FileRevision, Result, TrashArea, TrashEntryKind, TrashPath, VaultPath};
+use crate::trash::{manifest_path, payload_path};
+use crate::{
+    CoreError, FileRevision, ManifestDigest, PrepareManifestOutcome, Result, TrashArea, TrashId,
+    TrashManifestV1, TrashStore, VaultPath, MAX_TRASH_MANIFEST_BYTES,
+};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 static MUTATION_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
@@ -137,6 +141,11 @@ impl Vault {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root_path
+    }
+
+    #[must_use]
+    pub fn trash_store(&self) -> TrashStore<'_> {
+        TrashStore::new(self)
     }
 
     /// Reads a file relative to the held vault capability without following links.
@@ -384,55 +393,14 @@ impl Vault {
         })
     }
 
-    /// Moves one verified content file into an exact staging payload path.
-    /// Generic APIs remain denied access to `.trash`.
-    ///
-    /// # Errors
-    /// Returns an error for stale revisions, non-files, wrong trash layout,
-    /// symlinks, collisions, unsupported atomic moves, or durability failures.
-    pub fn move_content_to_trash_payload(
+    fn move_verified_to_internal_locked(
         &self,
         source: &VaultPath,
-        staging_payload: &TrashPath,
-        expected: &FileRevision,
-    ) -> Result<MoveDurability> {
-        let _guard = self.lock_mutations()?;
-        Self::require_content_path(source)?;
-        Self::require_trash_payload(staging_payload, TrashArea::Staging)?;
-        self.verify_expected_inner(source, expected, MAX_TRASH_PAYLOAD_BYTES)?;
-        let destination = staging_payload.as_vault_path();
-        let report = self.atomic_move_locked_report(source, destination, |_, directory| {
-            sync_directory_for_move(directory)
-        })?;
-        if report.has_failure() {
-            self.confirm_move_durability(source, destination, expected, MAX_TRASH_PAYLOAD_BYTES)
-        } else {
-            self.finish_verified_move(
-                source,
-                destination,
-                expected,
-                MAX_TRASH_PAYLOAD_BYTES,
-                report,
-            )
-        }
-    }
-
-    /// Restores one verified committed trash payload to a content path.
-    ///
-    /// # Errors
-    /// Returns an error for stale revisions, non-files, wrong trash layout,
-    /// symlinks, collisions, unsupported atomic moves, or durability failures.
-    pub fn restore_trash_payload(
-        &self,
-        payload: &TrashPath,
         destination: &VaultPath,
         expected: &FileRevision,
     ) -> Result<MoveDurability> {
-        let _guard = self.lock_mutations()?;
-        Self::require_trash_payload(payload, TrashArea::Items)?;
-        Self::require_content_path(destination)?;
-        let source = payload.as_vault_path();
         self.verify_expected_inner(source, expected, MAX_TRASH_PAYLOAD_BYTES)?;
+        self.verify_single_link_regular_file(source)?;
         let report = self.atomic_move_locked_report(source, destination, |_, directory| {
             sync_directory_for_move(directory)
         })?;
@@ -693,6 +661,13 @@ impl Vault {
                 max_bytes,
             )
             .and_then(|()| {
+                self.verify_single_link_from_parent(
+                    &destination_parent,
+                    &destination_name,
+                    destination,
+                )
+            })
+            .and_then(|()| {
                 Self::verify_source_absent(&source_parent, &source_name, source, destination)
             });
         if let Err(verification) = verification {
@@ -737,6 +712,7 @@ impl Vault {
         max_bytes: usize,
     ) -> Result<()> {
         self.verify_expected_inner(destination, expected, max_bytes)?;
+        self.verify_single_link_regular_file(destination)?;
         let (source_parent, source_name) = self.open_parent_checked(source)?;
         Self::verify_source_absent(&source_parent, &source_name, source, destination)
     }
@@ -756,6 +732,32 @@ impl Vault {
                 reason: "cannot confirm move durability while the source still exists",
             }),
         }
+    }
+
+    fn verify_single_link_regular_file(&self, relative: &VaultPath) -> Result<()> {
+        let (parent, name) = self.open_parent_checked(relative)?;
+        self.verify_single_link_from_parent(&parent, &name, relative)
+    }
+
+    fn verify_single_link_from_parent(
+        &self,
+        parent: &Dir,
+        name: &OsString,
+        relative: &VaultPath,
+    ) -> Result<()> {
+        self.reject_final_symlink(parent, name, relative)?;
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let file = parent.open_with(name, &options)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(CoreError::InvalidMove {
+                source_path: relative.as_path().to_owned(),
+                destination_path: relative.as_path().to_owned(),
+                reason: "trash payload must be a regular file with exactly one hard link",
+            });
+        }
+        Ok(())
     }
 
     fn finish_verified_move(
@@ -1027,16 +1029,6 @@ impl Vault {
         }
     }
 
-    fn require_trash_payload(path: &TrashPath, area: TrashArea) -> Result<()> {
-        if path.area() == area && path.kind() == TrashEntryKind::Payload {
-            Ok(())
-        } else {
-            Err(CoreError::InvalidTrashPath(
-                path.as_vault_path().as_path().to_owned(),
-            ))
-        }
-    }
-
     fn commit_unknown(path: PathBuf, error: CoreError) -> CoreError {
         match error {
             CoreError::Io(source) => CoreError::CommitOutcomeUnknown { path, source },
@@ -1123,6 +1115,260 @@ impl Vault {
             "unable to allocate atomic-write temporary name",
         )
         .into())
+    }
+}
+
+impl TrashStore<'_> {
+    /// Creates one immutable canonical staging manifest, or confirms an exact
+    /// existing manifest. No production path removes abandoned temp files.
+    ///
+    /// # Errors
+    /// Returns an error for semantic/canonical mismatch, collisions, symlinks,
+    /// nonregular files, unsafe hard links, or durability failures.
+    pub fn prepare_staging_manifest(
+        &self,
+        id: TrashId,
+        manifest: &TrashManifestV1,
+    ) -> Result<PrepareManifestOutcome> {
+        manifest.validate(Some(id))?;
+        let bytes = manifest.canonical_bytes()?;
+        let _guard = self.vault.lock_mutations()?;
+        let directory = self.ensure_staging_item_directory(id)?;
+        let manifest_relative = manifest_path(TrashArea::Staging, id)?;
+
+        match directory.symlink_metadata("manifest.json") {
+            Ok(_) => {
+                let (_, existing) =
+                    Self::read_manifest_from_directory(TrashArea::Staging, id, &directory, true)?;
+                return if existing == bytes {
+                    Ok(PrepareManifestOutcome::AlreadyPrepared)
+                } else {
+                    Err(CoreError::TrashManifestCollision(
+                        manifest_relative.as_path().to_owned(),
+                    ))
+                };
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        let (temporary_name, mut temporary) = Self::create_manifest_temp(&directory)?;
+        temporary.write_all(&bytes)?;
+        temporary.sync_all()?;
+        Self::require_single_link_regular(&temporary, "manifest temp must be single-link file")?;
+        drop(temporary);
+
+        match rename_noreplace(
+            &directory,
+            &temporary_name,
+            &directory,
+            OsStr::new("manifest.json"),
+        ) {
+            Ok(()) => {
+                let (_, published) =
+                    Self::read_manifest_from_directory(TrashArea::Staging, id, &directory, true)
+                        .map_err(|cause| CoreError::TrashManifestOutcomeUnknown {
+                            path: manifest_relative.as_path().to_owned(),
+                            cause: Box::new(cause),
+                        })?;
+                if published == bytes {
+                    Ok(PrepareManifestOutcome::Prepared)
+                } else {
+                    Err(CoreError::TrashManifestOutcomeUnknown {
+                        path: manifest_relative.as_path().to_owned(),
+                        cause: Box::new(CoreError::TrashManifestCollision(
+                            manifest_relative.as_path().to_owned(),
+                        )),
+                    })
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let (_, existing) =
+                    Self::read_manifest_from_directory(TrashArea::Staging, id, &directory, true)?;
+                if existing == bytes {
+                    Ok(PrepareManifestOutcome::AlreadyPrepared)
+                } else {
+                    Err(CoreError::TrashManifestCollision(
+                        manifest_relative.as_path().to_owned(),
+                    ))
+                }
+            }
+            Err(error) => Err(Vault::map_atomic_move_error(
+                &VaultPath::from_portable(format!(
+                    ".trash/v1/staging/{id}/{temporary_name}",
+                    temporary_name = temporary_name.to_string_lossy()
+                ))?,
+                &manifest_relative,
+                error,
+            )),
+        }
+    }
+
+    /// Reads one bounded, byte-for-byte canonical manifest.
+    ///
+    /// # Errors
+    /// Returns an error for missing, oversized, noncanonical, semantically
+    /// invalid, symlinked, nonregular, or multiply-linked files.
+    pub fn read_manifest(&self, area: TrashArea, id: TrashId) -> Result<TrashManifestV1> {
+        let relative = manifest_path(area, id)?;
+        let (directory, name) = self.vault.open_parent_checked(&relative)?;
+        if name != OsStr::new("manifest.json") {
+            return Err(CoreError::InvalidTrashPath(relative.as_path().to_owned()));
+        }
+        Self::read_manifest_from_directory(area, id, &directory, false)
+            .map(|(manifest, _)| manifest)
+    }
+
+    /// Stages a payload using only the source/revision bound by the canonical
+    /// manifest identified by `manifest_digest`.
+    ///
+    /// # Errors
+    /// Returns an error for digest/source mismatch, stale or oversized source,
+    /// hard links, collisions, symlinks, or move durability uncertainty.
+    pub fn stage_payload_if_revision(
+        &self,
+        id: TrashId,
+        source: &VaultPath,
+        manifest_digest: &ManifestDigest,
+    ) -> Result<MoveDurability> {
+        let _guard = self.vault.lock_mutations()?;
+        let relative = manifest_path(TrashArea::Staging, id)?;
+        let (directory, _) = self.vault.open_parent_checked(&relative)?;
+        let (manifest, bytes) =
+            Self::read_manifest_from_directory(TrashArea::Staging, id, &directory, false)?;
+        if ManifestDigest::from_bytes(&bytes) != *manifest_digest {
+            return Err(CoreError::TrashManifestDigestMismatch);
+        }
+        Vault::require_content_path(source)?;
+        if source.as_str() != manifest.original_path {
+            return Err(CoreError::InvalidTrashManifest(
+                "payload source does not match original path",
+            ));
+        }
+        let expected = manifest.expected_revision()?;
+        let destination = payload_path(TrashArea::Staging, id)?;
+        self.vault
+            .move_verified_to_internal_locked(source, &destination, &expected)
+    }
+
+    fn ensure_staging_item_directory(&self, id: TrashId) -> Result<Dir> {
+        let root = self.vault.root_dir.try_clone()?;
+        let trash = self.ensure_directory(&root, ".trash", ".trash")?;
+        let version = self.ensure_directory(&trash, "v1", ".trash/v1")?;
+        let staging = self.ensure_directory(&version, "staging", ".trash/v1/staging")?;
+        let _items = self.ensure_directory(&version, "items", ".trash/v1/items")?;
+        self.ensure_directory(
+            &staging,
+            &id.to_string(),
+            &format!(".trash/v1/staging/{id}"),
+        )
+    }
+
+    fn ensure_directory(&self, parent: &Dir, name: &str, portable: &str) -> Result<Dir> {
+        let path = VaultPath::from_portable(portable)?;
+        self.vault.reject_sibling_collision(parent, name, &path)?;
+        let created = match parent.create_dir(name) {
+            Ok(()) => {
+                sync_directory(parent)?;
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(error) => return Err(error.into()),
+        };
+        let display = self.vault.root_path.join(path.as_path());
+        let directory = open_child_dir_nofollow(parent, OsStr::new(name), &display)?;
+        self.vault.reject_sibling_collision(parent, name, &path)?;
+        if !created {
+            sync_directory(parent)?;
+        }
+        Ok(directory)
+    }
+
+    fn create_manifest_temp(directory: &Dir) -> Result<(OsString, cap_std::fs::File)> {
+        for _ in 0..16 {
+            let name = OsString::from(format!(".manifest-{}.tmp", uuid::Uuid::new_v4()));
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            options.follow(FollowSymlinks::No);
+            match directory.open_with(&name, &options) {
+                Ok(file) => {
+                    Self::require_single_link_regular(
+                        &file,
+                        "manifest temp must be single-link file",
+                    )?;
+                    return Ok((name, file));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "unable to allocate manifest temporary name",
+        )
+        .into())
+    }
+
+    fn read_manifest_from_directory(
+        _area: TrashArea,
+        id: TrashId,
+        directory: &Dir,
+        sync_existing: bool,
+    ) -> Result<(TrashManifestV1, Vec<u8>)> {
+        let metadata = directory.symlink_metadata("manifest.json")?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(CoreError::InvalidTrashManifest(
+                "manifest must be a regular file",
+            ));
+        }
+        if metadata.len() > MAX_TRASH_MANIFEST_BYTES as u64 {
+            return Err(CoreError::ResourceLimitExceeded {
+                resource: "trash manifest bytes",
+                limit: MAX_TRASH_MANIFEST_BYTES,
+            });
+        }
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(sync_existing)
+            .follow(FollowSymlinks::No);
+        let mut file = directory.open_with("manifest.json", &options)?;
+        Self::require_single_link_regular(&file, "manifest must be single-link file")?;
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(metadata.len())
+                .unwrap_or(MAX_TRASH_MANIFEST_BYTES)
+                .min(MAX_TRASH_MANIFEST_BYTES),
+        );
+        Read::by_ref(&mut file)
+            .take((MAX_TRASH_MANIFEST_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_TRASH_MANIFEST_BYTES {
+            return Err(CoreError::ResourceLimitExceeded {
+                resource: "trash manifest bytes",
+                limit: MAX_TRASH_MANIFEST_BYTES,
+            });
+        }
+        let manifest: TrashManifestV1 = serde_json::from_slice(&bytes)
+            .map_err(|_| CoreError::InvalidTrashManifest("manifest JSON is invalid"))?;
+        manifest.validate(Some(id))?;
+        if manifest.canonical_bytes()? != bytes {
+            return Err(CoreError::NonCanonicalTrashManifest);
+        }
+        if sync_existing {
+            file.sync_all()?;
+            sync_directory(directory)?;
+        }
+        Ok((manifest, bytes))
+    }
+
+    fn require_single_link_regular(file: &cap_std::fs::File, reason: &'static str) -> Result<()> {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(CoreError::InvalidTrashManifest(reason));
+        }
+        Ok(())
     }
 }
 

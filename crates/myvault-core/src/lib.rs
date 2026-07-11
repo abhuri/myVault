@@ -17,7 +17,10 @@ pub use error::{CoreError, Result};
 pub use index::{DerivedIndex, NoteRecord, SCHEMA_VERSION, SQLITE_OPEN_RESIDUAL_RISK};
 pub use path::VaultPath;
 pub use revision::FileRevision;
-pub use trash::{TrashArea, TrashEntryKind, TrashId, TrashPath};
+pub use trash::{
+    ManifestDigest, PayloadKind, PrepareManifestOutcome, TrashArea, TrashId, TrashManifestV1,
+    TrashStore, MAX_TRASH_MANIFEST_BYTES,
+};
 pub use vault::{
     DirectorySyncStatus, InventoryEntry, InventoryKind, InventoryLimits, MoveDurability, Vault,
     WriteIntent, DEFAULT_READ_LIMIT, MAX_TRASH_PAYLOAD_BYTES,
