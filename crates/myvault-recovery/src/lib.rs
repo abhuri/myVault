@@ -383,13 +383,26 @@ impl RecoveryJournal {
     /// # Errors
     /// Fails closed on collisions, unexpected topology, insecure files, or I/O errors.
     pub fn publish(&self, intent: &RenameMoveIntent) -> Result<PublishOutcome, Error> {
+        self.publish_with_sync(intent, &mut sync_held_directory)
+    }
+
+    fn publish_with_sync<F>(
+        &self,
+        intent: &RenameMoveIntent,
+        sync: &mut F,
+    ) -> Result<PublishOutcome, Error>
+    where
+        F: FnMut(&Dir) -> Result<(), Error>,
+    {
         intent.validate()?;
         let bytes = canonical_bytes(intent)?;
         let final_name = entry_name(intent.operation_id);
         if let Some(actual) = Self::read_raw_if_exists(&self.directory, &final_name)? {
-            return compare_published(&actual, &bytes);
+            let outcome = compare_published(&actual, &bytes)?;
+            sync(&self.directory).map_err(published_sync_error)?;
+            return Ok(outcome);
         }
-        if Self::publish_bytes(&self.directory, &final_name, &bytes)? {
+        if Self::publish_bytes(&self.directory, &final_name, &bytes, sync)? {
             Ok(PublishOutcome::Published)
         } else {
             Ok(PublishOutcome::AlreadyPublished)
@@ -406,6 +419,18 @@ impl RecoveryJournal {
         operation_id: Uuid,
         expected_intent: &RenameMoveIntent,
     ) -> Result<CompleteOutcome, Error> {
+        self.complete_with_sync(operation_id, expected_intent, &mut sync_held_directory)
+    }
+
+    fn complete_with_sync<F>(
+        &self,
+        operation_id: Uuid,
+        expected_intent: &RenameMoveIntent,
+        sync: &mut F,
+    ) -> Result<CompleteOutcome, Error>
+    where
+        F: FnMut(&Dir) -> Result<(), Error>,
+    {
         expected_intent.validate()?;
         if expected_intent.operation_id != operation_id {
             return Err(Error::IntentMismatch);
@@ -426,9 +451,10 @@ impl RecoveryJournal {
             if serde_json::to_vec(&observed)? != actual {
                 return Err(Error::IntentMismatch);
             }
+            sync(&self.completed).map_err(published_sync_error)?;
             return Ok(CompleteOutcome::AlreadyCompleted);
         }
-        if Self::publish_bytes(&self.completed, &tombstone_name, &tombstone_bytes)? {
+        if Self::publish_bytes(&self.completed, &tombstone_name, &tombstone_bytes, sync)? {
             Ok(CompleteOutcome::Completed)
         } else {
             Ok(CompleteOutcome::AlreadyCompleted)
@@ -546,7 +572,15 @@ impl RecoveryJournal {
         Ok(bytes)
     }
 
-    fn publish_bytes(directory: &Dir, final_name: &str, bytes: &[u8]) -> Result<bool, Error> {
+    fn publish_bytes<F>(
+        directory: &Dir,
+        final_name: &str,
+        bytes: &[u8],
+        sync: &mut F,
+    ) -> Result<bool, Error>
+    where
+        F: FnMut(&Dir) -> Result<(), Error>,
+    {
         let temporary_name = format!(".publish-{}.tmp", Uuid::new_v4());
         let mut options = OpenOptions::new();
         options
@@ -561,12 +595,13 @@ impl RecoveryJournal {
         drop(file);
         match atomic_rename_noreplace(directory, &temporary_name, final_name) {
             Ok(()) => {
-                sync_held_directory(directory).map_err(published_sync_error)?;
+                sync(directory).map_err(published_sync_error)?;
                 Ok(true)
             }
             Err(Error::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let actual = Self::read_raw(directory, final_name)?;
                 if actual == bytes {
+                    sync(directory).map_err(published_sync_error)?;
                     Ok(false)
                 } else {
                     Err(Error::JournalCollision)
@@ -857,4 +892,94 @@ fn atomic_rename_noreplace(
     _destination: &str,
 ) -> Result<(), Error> {
     Err(Error::PrivacyValidationRequired)
+}
+
+#[cfg(all(test, unix))]
+mod durability_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn fixture() -> (tempfile::TempDir, RecoveryJournal) {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let base = temporary
+            .path()
+            .canonicalize()
+            .expect("canonical temp root");
+        let app = base.join("app");
+        let vault = base.join("vault");
+        fs::create_dir(&app).expect("app directory");
+        fs::create_dir(&vault).expect("vault directory");
+        fs::set_permissions(&app, fs::Permissions::from_mode(0o700)).expect("private app root");
+        let journal = RecoveryJournal::open(&app, &vault).expect("open journal");
+        (temporary, journal)
+    }
+
+    fn intent() -> RenameMoveIntent {
+        RenameMoveIntent::new(
+            "source.md",
+            "destination.md",
+            FileRevision::from_bytes(b"note"),
+            None,
+        )
+        .expect("intent")
+    }
+
+    #[test]
+    fn identical_publish_retry_repeats_directory_sync_after_unknown_durability() {
+        let (_temporary, journal) = fixture();
+        let expected = intent();
+        let mut sync_attempts = 0_usize;
+        let mut fail_first_sync = |directory: &Dir| {
+            sync_attempts += 1;
+            if sync_attempts == 1 {
+                Err(Error::Io(io::Error::other(
+                    "injected directory sync failure",
+                )))
+            } else {
+                sync_held_directory(directory)
+            }
+        };
+
+        assert!(matches!(
+            journal.publish_with_sync(&expected, &mut fail_first_sync),
+            Err(Error::PublishedButNotSynced(_))
+        ));
+        assert_eq!(
+            journal
+                .publish_with_sync(&expected, &mut fail_first_sync)
+                .expect("retry sync"),
+            PublishOutcome::AlreadyPublished
+        );
+        assert_eq!(sync_attempts, 2);
+    }
+
+    #[test]
+    fn identical_tombstone_retry_repeats_completed_directory_sync() {
+        let (_temporary, journal) = fixture();
+        let expected = intent();
+        journal.publish(&expected).expect("publish intent");
+        let mut sync_attempts = 0_usize;
+        let mut fail_first_sync = |directory: &Dir| {
+            sync_attempts += 1;
+            if sync_attempts == 1 {
+                Err(Error::Io(io::Error::other(
+                    "injected tombstone sync failure",
+                )))
+            } else {
+                sync_held_directory(directory)
+            }
+        };
+
+        assert!(matches!(
+            journal.complete_with_sync(expected.operation_id, &expected, &mut fail_first_sync,),
+            Err(Error::PublishedButNotSynced(_))
+        ));
+        assert_eq!(
+            journal
+                .complete_with_sync(expected.operation_id, &expected, &mut fail_first_sync,)
+                .expect("retry tombstone sync"),
+            CompleteOutcome::AlreadyCompleted
+        );
+        assert_eq!(sync_attempts, 2);
+    }
 }
