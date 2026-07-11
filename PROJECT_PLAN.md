@@ -26,6 +26,8 @@
 - ไฟล์ Markdown และ attachment ยังคงเป็นไฟล์ปกติและไม่ผูกขาดกับแอปค่ะ
 - Obsidian บน desktop สามารถเปิด local Vault เดียวกันกับ myVault ได้ค่ะ
 - SQLite เป็นเพียง index และ operational state ที่สร้างใหม่ได้ ไม่ใช่ source of truth ค่ะ
+- การลบไฟล์ใช้ Vault-local `.trash/` เพื่อให้ย้ายและกู้คืนได้สม่ำเสมอข้าม platform ค่ะ
+- `.trash/` ต้องถูกซ่อนจาก file explorer ปกติ และไม่ถูกรวมใน index, search, backlinks หรือ graph ค่ะ
 - ห้ามใช้ silent last-write-wins เมื่อเกิด Sync conflict ค่ะ
 - เลื่อน Canvas, plugin system, collaboration, public sharing และ E2EE ออกจากรุ่นแรกค่ะ
 
@@ -326,6 +328,19 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - local recovery snapshots ค่ะ
 - `.obsidian` preservation policy ค่ะ
 
+ลำดับ implementation ที่อนุมัติแล้วมีดังนี้ค่ะ
+
+1. ล็อก portable Vault path contract, safety policy และ error contract ข้าม Windows, macOS, Ubuntu และ Android ค่ะ
+2. เพิ่ม Vault inventory, bounded scan, create และ list operations ค่ะ
+3. เพิ่ม rename, move, Vault-local `.trash/` และ restore โดยห้าม overwrite ปลายทางโดยเงียบค่ะ
+4. เพิ่ม private recovery snapshots, stale-revision protection และ crash recovery ค่ะ
+5. อัปเกรด SQLite derived-index schema และทดสอบ rebuild จาก Vault ค่ะ
+6. เพิ่ม desktop native watcher และการ normalize/suppress event ค่ะ
+7. เชื่อม custom least-privilege Tauri commands, desktop folder picker และ Android app-managed Vault ค่ะ
+8. สร้าง file explorer ขั้นต่ำและรัน cross-platform acceptance suite ค่ะ
+
+ค่าเริ่มต้นของ Phase 1 คือ portable UTF-8 paths, no silent overwrite, recovery snapshots เก็บ 30 วันหรือสูงสุด 100 revisions ต่อ note และรวมไม่เกิน 1 GiB ต่อ Vault ค่ะ `.obsidian/` และ `.trash/` เป็น protected/internal directories ที่ไม่รวมใน index ปกติค่ะ
+
 ### Phase 2 — Editor and Reader
 
 ระยะเวลาเป้าหมาย 2–3 สัปดาห์ค่ะ
@@ -454,7 +469,7 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 
 ## 14. Current Status
 
-- สถานะโครงการคือ Phase 0 Automated Spike Complete — External Validation Pending ค่ะ
+- สถานะโครงการคือ Phase 0 Automated Spike Complete — Phase 1 Started และ External Validation บนอุปกรณ์จริงถูกเลื่อนไว้ค่ะ
 - Git repository เชื่อมกับ `https://github.com/abhuri/myVault.git` แล้วค่ะ
 - initial repository safeguards ถูก push ไปที่ `main` ใน commit `6597e18` แล้วค่ะ
 - งาน Phase 0 อยู่บน branch `agent/phase-0-bootstrap` ค่ะ
@@ -464,7 +479,7 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - Phase 0 acceptance, OAuth/Drive และ environment contracts อยู่ใน `docs/phase-0` ค่ะ
 - frontend typecheck, 8 Vitest tests, production build, Rust fmt, clippy และ Rust suites รวม 49 tests ผ่านบน macOS host ค่ะ
 - Tauri debug binary build และ native launch ผ่านบน macOS host ค่ะ
-- GitHub quality check ของ Draft PR #1 ผ่านแล้วค่ะ
+- GitHub quality, Android compile + 16 KB alignment, Windows NSIS และ Ubuntu AppImage checks ของ Draft PR #1 ผ่านที่ commit `0aecda5` แล้วค่ะ
 - Android Studio, JBR 21, API 36, Platform Tools, Build Tools, Command-line Tools และ NDK ถูกติดตั้งแล้วค่ะ
 - Rust Android targets ทั้งสี่ architecture ถูกติดตั้งแล้วค่ะ
 - `tauri android init` และ ARM64 debug APK build ผ่านแล้วค่ะ
@@ -477,22 +492,24 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - project tree, Android SDK, Emulator/AVD และ Gradle cache อยู่บน `AWB-Apps` โดยคง compatibility path เดิมผ่าน symlink ค่ะ
 - backup ภายในถูกลบหลัง migration verification และพื้นที่ภายในเหลือประมาณ 42 GiB ค่ะ
 - full Xcode ยังไม่จำเป็นต่อ target Windows/macOS/Ubuntu/Android ใน Phase 0 จึงชะลอไว้ค่ะ
-- OAuth/Drive code และ env-gated live fixture harness พร้อมแล้ว แต่ consent และ live round trip ยัง blocked จนกว่า Google Cloud OAuth clients และมือถือจริงพร้อมค่ะ
+- Google Cloud project `myVault Personal` (`myvault-personal-0aecda5`) ถูกสร้างและ Google Drive API ถูกเปิดใช้งานแล้วค่ะ
+- Google Auth Platform กรอก app information, External testing audience และ contact email แล้ว แต่หยุดก่อนยอมรับ Google API Services User Data Policy เพื่อรอคุณโอยืนยันข้อตกลงค่ะ
+- OAuth/Drive code และ env-gated live fixture harness พร้อมแล้ว แต่ Android consent บนอุปกรณ์จริงถูกเลื่อนไว้จนกว่าจะมีมือถือค่ะ Desktop OAuth และ live Drive fixture ดำเนินต่อได้หลังสร้าง OAuth client ค่ะ
+- คุณโอเลือก Vault-local `.trash/` โดยซ่อนและตัดออกจาก index, search, backlinks และ graph ปกติค่ะ
 
 ## 15. Next Actions
 
-1. push ชุด Phase 0 spike และรอ quality, Android compile, Windows NSIS และ Ubuntu AppImage workflows ค่ะ
-2. ตั้ง Google Cloud project, เปิด Drive API และสร้าง Android/Desktop OAuth clients ตาม `docs/phase-0/DEVICE_TEST.md` ค่ะ
-3. เชื่อมต่อมือถือ Android จริงด้วย USB หรือ wireless debugging ค่ะ
-4. ทดสอบ consent/cancel/reconnect/revoke, Thai IME p95, lifecycle, Mermaid และ Sigma บนมือถือจริงค่ะ
-5. รัน live Drive acceptance fixture round trip แล้ว Trash เฉพาะ folder ID/marker ที่ยืนยันแล้วค่ะ
-6. บันทึกผลใน `docs/phase-0/RESULTS.md` และตัดสิน Phase 0 Go/No-Go ค่ะ
+1. เริ่ม Phase 1 ตามลำดับ portable path contract → operations → `.trash/`/restore → snapshots → SQLite → watcher → Tauri bridge → explorer ค่ะ
+2. หลังคุณโอยืนยัน Google API Services User Data Policy ให้ Sunday สร้าง Desktop/Android OAuth clients และเพิ่มบัญชีส่วนตัวเป็น test user ค่ะ
+3. รัน Desktop OAuth และ live Drive acceptance fixture แล้ว Trash เฉพาะ folder ID/marker ที่ยืนยันแล้วค่ะ
+4. เลื่อนการเชื่อมต่อมือถือ Android และ physical-device matrix ไว้จนกว่าคุณโอจะมีอุปกรณ์ค่ะ
+5. เมื่อมีมือถือ ให้ทดสอบ consent/cancel/reconnect/revoke, Thai IME p95, lifecycle, Mermaid และ Sigma แล้วอัปเดต Phase 0 external evidence ค่ะ
 
 ## 16. Session Handoff
 
 ### Current Handoff
 
-- วันที่อัปเดตคือ 2026-07-11 เวลา 22:50 เขตเวลา Asia/Bangkok ค่ะ
+- วันที่อัปเดตคือ 2026-07-12 เขตเวลา Asia/Bangkok ค่ะ
 - ผู้ใช้เรียกว่า คุณโอ หรือบอส ค่ะ
 - Sunday เป็นหัวหน้าทีมและเจ้าของ architecture, logic, mechanics และ final integration ค่ะ
 - Sunday สามารถ spawn sub-agents สำหรับ bounded parallel tasks ตาม Operating Model ในเอกสารนี้ค่ะ
@@ -509,16 +526,18 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - active branch คือ `agent/phase-0-bootstrap` ค่ะ
 - Phase 0 diagnostic shell และ contracts ถูกสร้างแล้วค่ะ
 - local checks ที่ผ่านคือ TypeScript, Vitest 8 tests, Vite build, Rust fmt/clippy, Rust 49 tests, macOS Keychain live probe และ Tauri debug build ค่ะ
-- GitHub quality check ของ Draft PR #1 ผ่านแล้วค่ะ
+- GitHub quality, Android compile + 16 KB alignment, Windows NSIS และ Ubuntu AppImage checks ของ Draft PR #1 ผ่านที่ commit `0aecda5` แล้วค่ะ
 - Android toolchain พร้อมและ ARM64 debug APK build ผ่านจาก external SSD แล้วค่ะ
 - Android Emulator API 36, WebView 133, Mermaid และ Sigma 1,000 nodes ผ่าน; 5,000 nodes ทำให้ headless surface ดำและถูกบันทึกเป็น non-gating capacity result ค่ะ
 - frontend, Rust, macOS native debug build และ Android build ผ่านหลังรวม core/auth/Drive dependencies ค่ะ
 - พื้นที่ internal เหลือประมาณ 42 GiB และ migration backup ถูกลบแล้วค่ะ
-- Android device test ยัง blocked เพราะไม่มีอุปกรณ์เชื่อมต่อค่ะ
+- Android physical-device test ถูกเลื่อนตามการตัดสินใจของคุณโอ เพราะยังไม่มีอุปกรณ์ค่ะ งานที่ไม่พึ่งมือถือดำเนินต่อได้ค่ะ
 - full Xcode ถูกชะลอโดยตั้งใจเพราะยังไม่มี iOS target และ Command Line Tools เพียงพอสำหรับ macOS Phase 0 ค่ะ
 - Android Google OAuth ใช้ GIS `AuthorizationClient` ผ่าน Kotlin Tauri plugin โดย access token อยู่ใน memory/native layer เท่านั้นค่ะ
 - Drive live harness ไม่มี permanent-delete API, จำกัด Google origin และตรวจ random marker ก่อน Trash ค่ะ
-- งานถัดไปคือ push/CI, Google Cloud configuration และ physical-device/live-Drive validation ค่ะ
+- คุณโอเลือก Vault-local `.trash/` ซึ่งต้องไม่ปรากฏใน index, search, backlinks หรือ graph ปกติค่ะ
+- Google Cloud project `myVault Personal` (`myvault-personal-0aecda5`) และ Drive API พร้อมแล้วค่ะ Google Auth Platform รอยืนยัน User Data Policy ก่อนสร้าง OAuth clients ค่ะ
+- งานถัดไปคือ Phase 1 portable path/core operations ควบคู่กับ OAuth client configuration และ Desktop live-Drive validation ค่ะ
 
 ### Handoff Update Template
 
@@ -554,6 +573,14 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 ```
 
 ## 17. Change Log
+
+### 2026-07-12
+
+- ปิด Phase 0 automated CI ที่ commit `0aecda5` โดย quality, Android compile + 16 KB alignment, Windows NSIS และ Ubuntu AppImage ผ่านทั้งหมดค่ะ
+- เลื่อน physical Android validation จนกว่าคุณโอจะมีอุปกรณ์ โดยไม่บล็อก Phase 1 ค่ะ
+- ล็อกการลบและกู้คืนด้วย Vault-local `.trash/` ซึ่งถูกตัดออกจากมุมมองและดัชนีปกติค่ะ
+- คุณโออนุมัติให้ Sunday ดำเนินการ Google Cloud project, Drive API และ OAuth clients ผ่าน logged-in browser session ค่ะ
+- เพิ่มลำดับ implementation และ safety defaults สำหรับ Phase 1 ค่ะ
 
 ### 2026-07-11
 
