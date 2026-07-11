@@ -28,8 +28,18 @@ fn roots() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
     let vault = base.join("vault");
     fs::create_dir(&app).unwrap();
     fs::create_dir(&vault).unwrap();
+    make_private(&app);
     (temporary, app, vault)
 }
+
+#[cfg(unix)]
+fn make_private(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[cfg(not(unix))]
+fn make_private(_path: &std::path::Path) {}
 
 #[test]
 fn classifies_every_recovery_topology() {
@@ -44,6 +54,14 @@ fn classifies_every_recovery_topology() {
                 temp: None,
             },
             RecoveryDecision::NotStarted,
+        ),
+        (
+            RecoveryTopology {
+                from: None,
+                to: None,
+                temp: Some(expected.clone()),
+            },
+            RecoveryDecision::InProgressAtTemp,
         ),
         (
             RecoveryTopology {
@@ -130,6 +148,31 @@ fn crash_temporary_file_is_ignored() {
     assert!(journal.list().unwrap().is_empty());
 }
 
+#[test]
+fn uuid_collision_preserves_existing_committed_entry() {
+    let (_temporary, app, vault) = roots();
+    let journal = RecoveryJournal::open(&app, &vault).unwrap();
+    let original = intent();
+    journal.publish(&original).unwrap();
+    let original_bytes = fs::read(
+        app.join("operation-journal")
+            .join(format!("{}.json", original.operation_id)),
+    )
+    .unwrap();
+    let result = journal.publish(&original);
+    assert!(
+        matches!(result, Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists)
+    );
+    assert_eq!(
+        fs::read(
+            app.join("operation-journal")
+                .join(format!("{}.json", original.operation_id))
+        )
+        .unwrap(),
+        original_bytes
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn rejects_symlink_components_and_sets_private_permissions() {
@@ -141,6 +184,15 @@ fn rejects_symlink_components_and_sets_private_permissions() {
     symlink(&actual, &linked).unwrap();
     assert!(matches!(
         RecoveryJournal::open(&linked, &vault),
+        Err(Error::InvalidRoot(_))
+    ));
+
+    let poisoned_app = temporary.path().canonicalize().unwrap().join("poisoned");
+    fs::create_dir(&poisoned_app).unwrap();
+    make_private(&poisoned_app);
+    symlink(&actual, poisoned_app.join("operation-journal")).unwrap();
+    assert!(matches!(
+        RecoveryJournal::open(&poisoned_app, &vault),
         Err(Error::InvalidRoot(_))
     ));
 
@@ -162,6 +214,34 @@ fn rejects_symlink_components_and_sets_private_permissions() {
         & 0o777;
     assert_eq!(directory_mode, 0o700);
     assert_eq!(file_mode, 0o600);
+
+    let malicious_id = Uuid::new_v4();
+    let target = app.join("target.json");
+    fs::write(&target, b"{}").unwrap();
+    symlink(
+        &target,
+        app.join("operation-journal")
+            .join(format!("{malicious_id}.json")),
+    )
+    .unwrap();
+    assert!(journal.read(malicious_id).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_broad_app_root_without_changing_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_temporary, app, vault) = roots();
+    fs::set_permissions(&app, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(matches!(
+        RecoveryJournal::open(&app, &vault),
+        Err(Error::InvalidRoot(_))
+    ));
+    assert!(!app.join("operation-journal").exists());
+    assert_eq!(
+        fs::metadata(&app).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
 }
 
 #[test]
@@ -172,6 +252,7 @@ fn rejects_overlapping_roots() {
     let vault = app.join("vault");
     fs::create_dir(&app).unwrap();
     fs::create_dir(&vault).unwrap();
+    make_private(&app);
     assert!(matches!(
         RecoveryJournal::open(&app, &vault),
         Err(Error::InvalidRoot(_))

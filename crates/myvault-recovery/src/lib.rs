@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
 use cap_std::ambient_authority;
-use cap_std::fs::Dir;
+use cap_std::fs::{Dir, OpenOptions};
+use myvault_core::VaultPath;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
@@ -24,6 +26,8 @@ pub enum Error {
     EntryTooLarge,
     TooManyEntries,
     UnsupportedVersion(u32),
+    PublishedButNotSynced(io::Error),
+    PublishedCleanupFailed(io::Error),
 }
 
 impl fmt::Display for Error {
@@ -39,6 +43,18 @@ impl fmt::Display for Error {
             Self::TooManyEntries => formatter.write_str("journal contains too many entries"),
             Self::UnsupportedVersion(version) => {
                 write!(formatter, "unsupported journal version {version}")
+            }
+            Self::PublishedButNotSynced(error) => {
+                write!(
+                    formatter,
+                    "journal published but directory sync failed: {error}"
+                )
+            }
+            Self::PublishedCleanupFailed(error) => {
+                write!(
+                    formatter,
+                    "journal published but temp cleanup failed: {error}"
+                )
             }
         }
     }
@@ -149,6 +165,7 @@ impl RenameMoveIntent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoveryDecision {
     NotStarted,
+    InProgressAtTemp,
     Committed,
     DestinationCollision,
     DuplicateManual,
@@ -169,6 +186,7 @@ pub fn decide_recovery(intent: &RenameMoveIntent, topology: &RecoveryTopology) -
     let expected = &intent.expected;
     match (&topology.from, &topology.to, &topology.temp) {
         (Some(from), None, None) if from == expected => RecoveryDecision::NotStarted,
+        (None, None, Some(temp)) if temp == expected => RecoveryDecision::InProgressAtTemp,
         (None, Some(to), None) if to == expected => RecoveryDecision::Committed,
         (Some(from), Some(to), _) if from == expected && to == expected => {
             RecoveryDecision::DuplicateManual
@@ -182,7 +200,6 @@ pub fn decide_recovery(intent: &RenameMoveIntent, topology: &RecoveryTopology) -
 }
 
 pub struct RecoveryJournal {
-    root: PathBuf,
     directory: Dir,
 }
 
@@ -193,19 +210,18 @@ impl RecoveryJournal {
     ///
     /// Returns an error for missing, symlinked, overlapping, or inaccessible roots.
     pub fn open(app_data_root: &Path, vault_root: &Path) -> Result<Self, Error> {
-        validate_existing_private_root(app_data_root)?;
         validate_disjoint(app_data_root, vault_root)?;
-        set_directory_permissions(app_data_root)?;
-        let root = app_data_root.join(JOURNAL_DIRECTORY);
-        match fs::create_dir(&root) {
-            Ok(()) => set_directory_permissions(&root)?,
+        let app_directory = open_absolute_dir_nofollow(app_data_root)?;
+        require_private_directory(&app_directory)?;
+        match app_directory.create_dir(JOURNAL_DIRECTORY) {
+            Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
-        validate_existing_private_root(&root)?;
-        set_directory_permissions(&root)?;
-        let directory = Dir::open_ambient_dir(&root, ambient_authority())?;
-        Ok(Self { root, directory })
+        let directory = open_child_dir_nofollow(&app_directory, JOURNAL_DIRECTORY)?;
+        set_held_directory_permissions(&directory)?;
+        sync_held_directory(&app_directory)?;
+        Ok(Self { directory })
     }
 
     /// Durably publishes an intent using temp-write, file sync, rename, and directory sync.
@@ -222,15 +238,22 @@ impl RecoveryJournal {
             return Err(Error::EntryTooLarge);
         }
 
-        let mut options = cap_std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
         let mut file = self.directory.open_with(&temporary_name, &options)?;
-        set_file_permissions(&self.root.join(&temporary_name))?;
+        set_held_file_permissions(&file)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         self.directory
-            .rename(&temporary_name, &self.directory, &final_name)?;
-        sync_directory(&self.root)?;
+            .hard_link(&temporary_name, &self.directory, &final_name)?;
+        sync_held_directory(&self.directory).map_err(published_sync_error)?;
+        self.directory
+            .remove_file(&temporary_name)
+            .map_err(Error::PublishedCleanupFailed)?;
+        sync_held_directory(&self.directory).map_err(published_sync_error)?;
         Ok(())
     }
 
@@ -248,7 +271,13 @@ impl RecoveryJournal {
         if metadata.len() > MAX_ENTRY_BYTES {
             return Err(Error::EntryTooLarge);
         }
-        let file = self.directory.open(&name)?;
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let file = self.directory.open_with(&name, &options)?;
+        if !file.metadata()?.is_file() {
+            return Err(Error::InvalidEntryName);
+        }
+        set_held_file_permissions(&file)?;
         let capacity = usize::try_from(metadata.len()).map_err(|_| Error::EntryTooLarge)?;
         let mut bytes = Vec::with_capacity(capacity);
         file.take(MAX_ENTRY_BYTES + 1).read_to_end(&mut bytes)?;
@@ -290,36 +319,9 @@ impl RecoveryJournal {
 }
 
 fn validate_portable_path(path: &str) -> Result<(), Error> {
-    if path.is_empty() || path.starts_with('/') || path.contains('\\') || path.contains('\0') {
-        return Err(Error::InvalidPortablePath);
-    }
-    for segment in path.split('/') {
-        if segment.is_empty()
-            || matches!(segment, "." | "..")
-            || segment.ends_with(['.', ' '])
-            || segment.contains([':', '*', '?', '"', '<', '>', '|'])
-            || segment.chars().any(char::is_control)
-            || is_windows_reserved(segment)
-        {
-            return Err(Error::InvalidPortablePath);
-        }
-    }
-    Ok(())
-}
-
-fn is_windows_reserved(segment: &str) -> bool {
-    let stem = segment
-        .split('.')
-        .next()
-        .unwrap_or(segment)
-        .to_ascii_uppercase();
-    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || stem.strip_prefix("COM").is_some_and(|suffix| {
-            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
-        })
-        || stem.strip_prefix("LPT").is_some_and(|suffix| {
-            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
-        })
+    VaultPath::from_portable(path)
+        .map(|_| ())
+        .map_err(|_| Error::InvalidPortablePath)
 }
 
 fn entry_name(operation_id: Uuid) -> String {
@@ -342,58 +344,109 @@ fn validate_disjoint(app_data_root: &Path, vault_root: &Path) -> Result<(), Erro
     Ok(())
 }
 
-fn validate_existing_private_root(path: &Path) -> Result<(), Error> {
+fn open_absolute_dir_nofollow(path: &Path) -> Result<Dir, Error> {
     if !path.is_absolute() {
         return Err(Error::InvalidRoot("root must be absolute"));
     }
-    let mut current = PathBuf::new();
+    let mut anchor = PathBuf::new();
+    let mut names = Vec::new();
     for component in path.components() {
         match component {
-            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
-            Component::RootDir => current.push(component.as_os_str()),
-            Component::Normal(name) => {
-                current.push(name);
-                let metadata = fs::symlink_metadata(&current)?;
-                if metadata.file_type().is_symlink() {
-                    return Err(Error::InvalidRoot("root contains a symlink component"));
-                }
-            }
+            Component::Prefix(prefix) => anchor.push(prefix.as_os_str()),
+            Component::RootDir => anchor.push(std::path::MAIN_SEPARATOR_STR),
+            Component::Normal(name) => names.push(name.to_owned()),
             Component::CurDir | Component::ParentDir => {
                 return Err(Error::InvalidRoot("root is not normalized"));
             }
         }
     }
-    if !fs::metadata(path)?.is_dir() {
+    let mut directory = Dir::open_ambient_dir(anchor, ambient_authority())?;
+    for name in names {
+        directory = open_child_dir_nofollow(&directory, &name)?;
+    }
+    Ok(directory)
+}
+
+fn open_child_dir_nofollow(parent: &Dir, name: impl AsRef<Path>) -> Result<Dir, Error> {
+    let name = name.as_ref();
+    if parent
+        .symlink_metadata(name)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(Error::InvalidRoot("root contains a symlink component"));
+    }
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
+    let file = parent.open_with(name, &options).map_err(|error| {
+        if parent
+            .symlink_metadata(name)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            Error::InvalidRoot("root contains a symlink component")
+        } else {
+            Error::Io(error)
+        }
+    })?;
+    if !file.metadata()?.is_dir() {
         return Err(Error::InvalidRoot("root is not a directory"));
+    }
+    Ok(Dir::from_std_file(file.into_std()))
+}
+
+fn published_sync_error(error: Error) -> Error {
+    match error {
+        Error::Io(error) => Error::PublishedButNotSynced(error),
+        other => other,
+    }
+}
+
+#[cfg(unix)]
+fn require_private_directory(directory: &Dir) -> Result<(), Error> {
+    use cap_std::fs::PermissionsExt;
+    if directory.dir_metadata()?.permissions().mode() & 0o077 != 0 {
+        return Err(Error::InvalidRoot(
+            "app data root grants group or world access",
+        ));
     }
     Ok(())
 }
 
-fn sync_directory(path: &Path) -> Result<(), Error> {
-    fs::File::open(path)?.sync_all()?;
+#[cfg(not(unix))]
+fn require_private_directory(_directory: &Dir) -> Result<(), Error> {
     Ok(())
 }
 
 #[cfg(unix)]
-fn set_directory_permissions(path: &Path) -> Result<(), Error> {
+fn set_held_directory_permissions(directory: &Dir) -> Result<(), Error> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    directory
+        .try_clone()?
+        .into_std_file()
+        .set_permissions(fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_directory_permissions(_path: &Path) -> Result<(), Error> {
+fn set_held_directory_permissions(_directory: &Dir) -> Result<(), Error> {
     Ok(())
 }
 
 #[cfg(unix)]
-fn set_file_permissions(path: &Path) -> Result<(), Error> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+fn set_held_file_permissions(file: &cap_std::fs::File) -> Result<(), Error> {
+    use cap_std::fs::{Permissions, PermissionsExt};
+    file.set_permissions(Permissions::from_mode(0o600))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_file_permissions(_path: &Path) -> Result<(), Error> {
+fn set_held_file_permissions(_file: &cap_std::fs::File) -> Result<(), Error> {
+    Ok(())
+}
+
+fn sync_held_directory(directory: &Dir) -> Result<(), Error> {
+    directory.try_clone()?.into_std_file().sync_all()?;
     Ok(())
 }
