@@ -2276,6 +2276,7 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "rusqlite",
+ "rustix",
  "unicode-casefold",
  "unicode-normalization",
 ]

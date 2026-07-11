@@ -10,6 +10,7 @@ use cap_fs_ext::OpenOptionsExt;
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
 
+use crate::atomic_move::rename_noreplace;
 use crate::capability::{open_absolute_dir_nofollow, open_child_dir_nofollow};
 use crate::path::{classify_component, component_collision_key, VaultPathClass};
 use crate::{CoreError, Result, VaultPath};
@@ -55,6 +56,15 @@ pub struct InventoryEntry {
 pub enum WriteIntent {
     Automatic,
     UserInitiated,
+}
+
+/// Durability reached after an atomic move has been published.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MoveDurability {
+    FullySynced,
+    /// Windows accepted the move but its filesystem does not permit flushing
+    /// one or both directory handles.
+    DirectorySyncUnsupported,
 }
 
 /// A vault whose filesystem authority is held by an open directory handle.
@@ -285,6 +295,74 @@ impl Vault {
         self.atomic_write_inner(relative, contents, intent, || {})
     }
 
+    /// Atomically moves a file or directory and never replaces a destination.
+    ///
+    /// Both parents are opened before publication and the rename is resolved
+    /// relative to those held capabilities. Destination and then source parent
+    /// directories are flushed; a shared parent is flushed once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::AlreadyExists`] when the destination exists,
+    /// [`CoreError::AtomicNoReplaceUnsupported`] when the host filesystem lacks
+    /// the required atomic primitive, or another safety/filesystem error.
+    pub fn atomic_move(
+        &self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        intent: WriteIntent,
+    ) -> Result<MoveDurability> {
+        let _guard = self.lock_mutations()?;
+        Self::validate_mutation_policy(source, intent)?;
+        Self::validate_mutation_policy(destination, intent)?;
+        if source == destination {
+            return Err(CoreError::AlreadyExists(destination.as_path().to_owned()));
+        }
+
+        let (source_parent, source_name) = self.open_parent_checked(source)?;
+        self.reject_final_symlink(&source_parent, &source_name, source)?;
+        let source_metadata = source_parent.symlink_metadata(&source_name)?;
+        if source_metadata.file_type().is_symlink() {
+            return Err(CoreError::SymlinkRejected(
+                self.root_path.join(source.as_path()),
+            ));
+        }
+
+        let (destination_parent, destination_name) = self.open_parent_checked(destination)?;
+        let destination_utf8 = destination_name
+            .to_str()
+            .ok_or_else(|| CoreError::InvalidRelativePath(destination.as_path().to_owned()))?;
+        self.reject_sibling_collision(&destination_parent, destination_utf8, destination)?;
+
+        let source_parent_path = source
+            .as_str()
+            .rsplit_once('/')
+            .map_or("", |(parent, _)| parent);
+        let destination_parent_path = destination
+            .as_str()
+            .rsplit_once('/')
+            .map_or("", |(parent, _)| parent);
+
+        if let Err(error) = rename_noreplace(
+            &source_parent,
+            &source_name,
+            &destination_parent,
+            &destination_name,
+        ) {
+            return Err(Self::map_atomic_move_error(source, destination, error));
+        }
+
+        let mut durability = sync_directory_for_move(&destination_parent)
+            .map_err(|error| Self::commit_unknown(destination.as_path().to_owned(), error))?;
+        if source_parent_path != destination_parent_path {
+            durability = durability.combine(
+                sync_directory_for_move(&source_parent)
+                    .map_err(|error| Self::commit_unknown(source.as_path().to_owned(), error))?,
+            );
+        }
+        Ok(durability)
+    }
+
     fn atomic_write_inner<F>(
         &self,
         relative: &VaultPath,
@@ -509,6 +587,24 @@ impl Vault {
         }
     }
 
+    fn map_atomic_move_error(
+        source: &VaultPath,
+        destination: &VaultPath,
+        error: std::io::Error,
+    ) -> CoreError {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            return CoreError::AlreadyExists(destination.as_path().to_owned());
+        }
+        if atomic_no_replace_is_unsupported(&error) {
+            return CoreError::AtomicNoReplaceUnsupported {
+                source_path: source.as_path().to_owned(),
+                destination_path: destination.as_path().to_owned(),
+                source: error,
+            };
+        }
+        CoreError::Io(error)
+    }
+
     fn cleanup_pending(path: PathBuf, temp_name: &OsString, source: std::io::Error) -> CoreError {
         CoreError::PublishedCleanupPending {
             path,
@@ -592,6 +688,51 @@ fn sync_directory(directory: &Dir) -> Result<()> {
     }
 }
 
+impl MoveDurability {
+    fn combine(self, other: Self) -> Self {
+        if self == Self::DirectorySyncUnsupported || other == Self::DirectorySyncUnsupported {
+            Self::DirectorySyncUnsupported
+        } else {
+            Self::FullySynced
+        }
+    }
+}
+
+fn sync_directory_for_move(directory: &Dir) -> Result<MoveDurability> {
+    let file = directory.try_clone()?.into_std_file();
+    match file.sync_all() {
+        Ok(()) => Ok(MoveDurability::FullySynced),
+        #[cfg(windows)]
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::InvalidInput
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(MoveDurability::DirectorySyncUnsupported)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn atomic_no_replace_is_unsupported(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::Unsupported {
+        return true;
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
+    {
+        // ENOSYS: primitive absent; EOPNOTSUPP/ENOTSUP: filesystem lacks it;
+        // EINVAL: known rename-with-flags response for unsupported flags.
+        matches!(error.raw_os_error(), Some(22 | 38 | 45 | 95 | 102))
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "linux", target_os = "macos")))]
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -659,6 +800,26 @@ mod tests {
                     .then_some(path)
             })
             .collect()
+    }
+
+    #[test]
+    fn atomic_move_maps_an_unsupported_primitive_without_fallback() {
+        let source = VaultPath::new("source.md").expect("source path");
+        let destination = VaultPath::new("destination.md").expect("destination path");
+        let error = Vault::map_atomic_move_error(
+            &source,
+            &destination,
+            std::io::Error::new(std::io::ErrorKind::Unsupported, "injected no-replace fault"),
+        );
+
+        assert!(matches!(
+            error,
+            CoreError::AtomicNoReplaceUnsupported {
+                source_path,
+                destination_path,
+                ..
+            } if source_path == source.as_path() && destination_path == destination.as_path()
+        ));
     }
 
     #[test]
