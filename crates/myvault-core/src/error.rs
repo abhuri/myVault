@@ -9,6 +9,15 @@ pub enum CoreError {
     SymlinkRejected(PathBuf),
     AutomaticObsidianWriteDenied(PathBuf),
     TrashWriteDenied(PathBuf),
+    TrashAccessDenied(PathBuf),
+    InvalidTrashPath(PathBuf),
+    InvalidRevision,
+    RevisionTargetNotFile(PathBuf),
+    StaleRevision {
+        path: PathBuf,
+        expected: crate::FileRevision,
+        actual: crate::FileRevision,
+    },
     AppDataInsideVault {
         app_data: PathBuf,
         vault: PathBuf,
@@ -55,19 +64,12 @@ pub enum CoreError {
 
 impl fmt::Display for CoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(result) = self.fmt_special(formatter) {
+            return result;
+        }
         match self {
-            Self::InvalidRelativePath(path) => {
-                write!(formatter, "invalid vault-relative path: {}", path.display())
-            }
-            Self::PathEscapesVault(path) => {
-                write!(formatter, "path escapes vault root: {}", path.display())
-            }
-            Self::SymlinkRejected(path) => {
-                write!(
-                    formatter,
-                    "symlink components are not allowed: {}",
-                    path.display()
-                )
+            Self::InvalidRelativePath(_) | Self::PathEscapesVault(_) | Self::SymlinkRejected(_) => {
+                unreachable!("handled before main error formatting")
             }
             Self::AutomaticObsidianWriteDenied(path) => write!(
                 formatter,
@@ -79,6 +81,11 @@ impl fmt::Display for CoreError {
                 "generic vault writes under .trash are denied: {}",
                 path.display()
             ),
+            Self::TrashAccessDenied(_)
+            | Self::InvalidTrashPath(_)
+            | Self::InvalidRevision
+            | Self::RevisionTargetNotFile(_)
+            | Self::StaleRevision { .. } => unreachable!("handled before main error formatting"),
             Self::AppDataInsideVault { app_data, vault } => write!(
                 formatter,
                 "app-data directory {} must be outside synced vault {}",
@@ -148,6 +155,58 @@ impl fmt::Display for CoreError {
             ),
             Self::Io(error) => write!(formatter, "filesystem error: {error}"),
             Self::Sqlite(error) => write!(formatter, "SQLite error: {error}"),
+        }
+    }
+}
+
+impl CoreError {
+    fn fmt_special(&self, formatter: &mut fmt::Formatter<'_>) -> Option<fmt::Result> {
+        match self {
+            Self::InvalidRelativePath(path) => Some(write!(
+                formatter,
+                "invalid vault-relative path: {}",
+                path.display()
+            )),
+            Self::PathEscapesVault(path) => Some(write!(
+                formatter,
+                "path escapes vault root: {}",
+                path.display()
+            )),
+            Self::SymlinkRejected(path) => Some(write!(
+                formatter,
+                "symlink components are not allowed: {}",
+                path.display()
+            )),
+            Self::TrashAccessDenied(path) => Some(write!(
+                formatter,
+                "generic vault access under .trash is denied: {}",
+                path.display()
+            )),
+            Self::InvalidTrashPath(path) => Some(write!(
+                formatter,
+                "invalid privileged trash path: {}",
+                path.display()
+            )),
+            Self::InvalidRevision => Some(formatter.write_str("invalid BLAKE3 file revision")),
+            Self::RevisionTargetNotFile(path) => Some(write!(
+                formatter,
+                "revision target is not a regular file: {}",
+                path.display()
+            )),
+            Self::StaleRevision {
+                path,
+                expected,
+                actual,
+            } => Some(write!(
+                formatter,
+                "stale revision for {}: expected {} bytes at {}, found {} bytes at {}",
+                path.display(),
+                expected.byte_len,
+                expected.hex,
+                actual.byte_len,
+                actual.hex
+            )),
+            _ => None,
         }
     }
 }

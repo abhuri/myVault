@@ -13,15 +13,20 @@ use cap_std::fs::{Dir, OpenOptions};
 use crate::atomic_move::rename_noreplace;
 use crate::capability::{open_absolute_dir_nofollow, open_child_dir_nofollow};
 use crate::path::{classify_component, component_collision_key, VaultPathClass};
-use crate::{CoreError, Result, VaultPath};
+use crate::{CoreError, FileRevision, Result, TrashArea, TrashEntryKind, TrashPath, VaultPath};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 static MUTATION_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
 pub const DEFAULT_READ_LIMIT: usize = 16 * 1024 * 1024;
+pub const MAX_TRASH_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 /// In-process vault instances share a mutation lock, but another process can
 /// still alter the filesystem between descriptor-relative validation and commit.
 pub const MUTATION_EXTERNAL_PROCESS_RESIDUAL_RISK: &str =
     "external processes are not serialized with myVault's per-root mutation lock";
+/// Revision checks and moves share the in-process root lock, but another process
+/// can still change an opened file between verification and the atomic rename.
+pub const TRASH_REVISION_EXTERNAL_PROCESS_RESIDUAL_RISK: &str =
+    "an external process can mutate a payload between descriptor-relative revision verification and rename";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InventoryLimits {
@@ -148,6 +153,7 @@ impl Vault {
     /// Returns an error for unsafe paths, filesystem failures, or when the
     /// content exceeds `limit`.
     pub fn read_bounded(&self, relative: &VaultPath, limit: usize) -> Result<Vec<u8>> {
+        Self::validate_generic_access(relative)?;
         let (parent, name) = self.open_parent(relative)?;
         self.reject_final_symlink(&parent, &name, relative)?;
         let mut options = OpenOptions::new();
@@ -172,6 +178,32 @@ impl Vault {
             });
         }
         Ok(bytes)
+    }
+
+    /// Computes a descriptor-relative, no-follow BLAKE3 revision while reading
+    /// no more than `max_bytes + 1` bytes.
+    ///
+    /// # Errors
+    /// Returns an error for internal trash paths, non-files, symlinks, unsafe
+    /// components, I/O failures, or content larger than `max_bytes`.
+    pub fn revision(&self, relative: &VaultPath, max_bytes: usize) -> Result<FileRevision> {
+        Self::validate_generic_access(relative)?;
+        self.revision_inner(relative, max_bytes)
+    }
+
+    /// Verifies a file against a caller-held expected revision.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::StaleRevision`] on a digest or byte-length mismatch,
+    /// or another bounded/no-follow revision error.
+    pub fn verify_expected(
+        &self,
+        relative: &VaultPath,
+        expected: &FileRevision,
+        max_bytes: usize,
+    ) -> Result<()> {
+        Self::validate_generic_access(relative)?;
+        self.verify_expected_inner(relative, expected, max_bytes)
     }
 
     /// Inventories regular vault files without following symbolic links.
@@ -348,12 +380,77 @@ impl Vault {
         })
     }
 
+    /// Moves one verified content file into an exact staging payload path.
+    /// Generic APIs remain denied access to `.trash`.
+    ///
+    /// # Errors
+    /// Returns an error for stale revisions, non-files, wrong trash layout,
+    /// symlinks, collisions, unsupported atomic moves, or durability failures.
+    pub fn move_content_to_trash_payload(
+        &self,
+        source: &VaultPath,
+        staging_payload: &TrashPath,
+        expected: &FileRevision,
+    ) -> Result<MoveDurability> {
+        let _guard = self.lock_mutations()?;
+        Self::require_content_path(source)?;
+        Self::require_trash_payload(staging_payload, TrashArea::Staging)?;
+        self.verify_expected_inner(source, expected, MAX_TRASH_PAYLOAD_BYTES)?;
+        let destination = staging_payload.as_vault_path();
+        let durability = match self.atomic_move_locked(source, destination, |_, directory| {
+            sync_directory_for_move(directory)
+        }) {
+            Ok(durability) => durability,
+            Err(CoreError::AtomicMoveOutcomeUnknown { .. }) => self.confirm_move_durability(
+                source,
+                destination,
+                expected,
+                MAX_TRASH_PAYLOAD_BYTES,
+            )?,
+            Err(error) => return Err(error),
+        };
+        self.verify_expected_inner(destination, expected, MAX_TRASH_PAYLOAD_BYTES)?;
+        Ok(durability)
+    }
+
+    /// Restores one verified committed trash payload to a content path.
+    ///
+    /// # Errors
+    /// Returns an error for stale revisions, non-files, wrong trash layout,
+    /// symlinks, collisions, unsupported atomic moves, or durability failures.
+    pub fn restore_trash_payload(
+        &self,
+        payload: &TrashPath,
+        destination: &VaultPath,
+        expected: &FileRevision,
+    ) -> Result<MoveDurability> {
+        let _guard = self.lock_mutations()?;
+        Self::require_trash_payload(payload, TrashArea::Items)?;
+        Self::require_content_path(destination)?;
+        let source = payload.as_vault_path();
+        self.verify_expected_inner(source, expected, MAX_TRASH_PAYLOAD_BYTES)?;
+        let durability = match self.atomic_move_locked(source, destination, |_, directory| {
+            sync_directory_for_move(directory)
+        }) {
+            Ok(durability) => durability,
+            Err(CoreError::AtomicMoveOutcomeUnknown { .. }) => self.confirm_move_durability(
+                source,
+                destination,
+                expected,
+                MAX_TRASH_PAYLOAD_BYTES,
+            )?,
+            Err(error) => return Err(error),
+        };
+        self.verify_expected_inner(destination, expected, MAX_TRASH_PAYLOAD_BYTES)?;
+        Ok(durability)
+    }
+
     fn atomic_move_inner<F>(
         &self,
         source: &VaultPath,
         destination: &VaultPath,
         intent: WriteIntent,
-        mut sync: F,
+        sync: F,
     ) -> Result<MoveDurability>
     where
         F: FnMut(MoveSyncParent, &Dir) -> std::io::Result<MoveDurability>,
@@ -361,6 +458,18 @@ impl Vault {
         let _guard = self.lock_mutations()?;
         Self::validate_mutation_policy(source, intent)?;
         Self::validate_mutation_policy(destination, intent)?;
+        self.atomic_move_locked(source, destination, sync)
+    }
+
+    fn atomic_move_locked<F>(
+        &self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        mut sync: F,
+    ) -> Result<MoveDurability>
+    where
+        F: FnMut(MoveSyncParent, &Dir) -> std::io::Result<MoveDurability>,
+    {
         if source == destination {
             return Err(CoreError::AlreadyExists(destination.as_path().to_owned()));
         }
@@ -423,6 +532,107 @@ impl Vault {
         } else {
             Some(sync(MoveSyncParent::Source, &source_parent))
         };
+        Self::finish_atomic_move_sync(source, destination, destination_sync, source_sync)
+    }
+
+    fn revision_inner(&self, relative: &VaultPath, max_bytes: usize) -> Result<FileRevision> {
+        let (parent, name) = self.open_parent_checked(relative)?;
+        self.reject_final_symlink(&parent, &name, relative)?;
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let mut file = parent.open_with(&name, &options)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(CoreError::RevisionTargetNotFile(
+                relative.as_path().to_owned(),
+            ));
+        }
+        let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+        if metadata.len() > max_bytes_u64 {
+            return Err(CoreError::ResourceLimitExceeded {
+                resource: "revision bytes",
+                limit: max_bytes,
+            });
+        }
+
+        let mut hasher = blake3::Hasher::new();
+        let mut total = 0_usize;
+        let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+        loop {
+            let remaining_with_probe = max_bytes.saturating_sub(total).saturating_add(1);
+            let read_limit = buffer.len().min(remaining_with_probe);
+            let count = file.read(&mut buffer[..read_limit])?;
+            if count == 0 {
+                break;
+            }
+            total = total.saturating_add(count);
+            if total > max_bytes {
+                return Err(CoreError::ResourceLimitExceeded {
+                    resource: "revision bytes",
+                    limit: max_bytes,
+                });
+            }
+            hasher.update(&buffer[..count]);
+        }
+        Ok(FileRevision {
+            hex: hasher.finalize().to_hex().to_string(),
+            byte_len: u64::try_from(total).unwrap_or(u64::MAX),
+        })
+    }
+
+    fn verify_expected_inner(
+        &self,
+        relative: &VaultPath,
+        expected: &FileRevision,
+        max_bytes: usize,
+    ) -> Result<()> {
+        expected.validate()?;
+        let actual = self.revision_inner(relative, max_bytes)?;
+        if &actual == expected {
+            Ok(())
+        } else {
+            Err(CoreError::StaleRevision {
+                path: relative.as_path().to_owned(),
+                expected: expected.clone(),
+                actual,
+            })
+        }
+    }
+
+    /// Confirms and re-syncs an outcome-unknown verified move. The caller must
+    /// hold the shared root mutation lock and must have already validated the
+    /// privileged endpoint roles.
+    fn confirm_move_durability(
+        &self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        expected: &FileRevision,
+        max_bytes: usize,
+    ) -> Result<MoveDurability> {
+        self.verify_expected_inner(destination, expected, max_bytes)?;
+        let (source_parent, source_name) = self.open_parent_checked(source)?;
+        match source_parent.symlink_metadata(&source_name) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => {
+                return Err(CoreError::InvalidMove {
+                    source_path: source.as_path().to_owned(),
+                    destination_path: destination.as_path().to_owned(),
+                    reason: "cannot confirm move durability while the source still exists",
+                });
+            }
+        }
+        let (destination_parent, _) = self.open_parent_checked(destination)?;
+        let destination_sync = sync_directory_for_move(&destination_parent);
+        let same_parent = source
+            .as_str()
+            .rsplit_once('/')
+            .map_or("", |(parent, _)| parent)
+            == destination
+                .as_str()
+                .rsplit_once('/')
+                .map_or("", |(parent, _)| parent);
+        let source_sync = (!same_parent).then(|| sync_directory_for_move(&source_parent));
         Self::finish_atomic_move_sync(source, destination, destination_sync, source_sync)
     }
 
@@ -640,6 +850,36 @@ impl Vault {
                 Err(CoreError::TrashWriteDenied(relative.as_path().to_owned()))
             }
             VaultPathClass::Content | VaultPathClass::ObsidianMetadata => Ok(()),
+        }
+    }
+
+    fn validate_generic_access(relative: &VaultPath) -> Result<()> {
+        if relative.classify() == VaultPathClass::Trash {
+            Err(CoreError::TrashAccessDenied(relative.as_path().to_owned()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn require_content_path(relative: &VaultPath) -> Result<()> {
+        if relative.classify() == VaultPathClass::Content {
+            Ok(())
+        } else {
+            Err(CoreError::InvalidMove {
+                source_path: relative.as_path().to_owned(),
+                destination_path: relative.as_path().to_owned(),
+                reason: "privileged trash moves require a content path",
+            })
+        }
+    }
+
+    fn require_trash_payload(path: &TrashPath, area: TrashArea) -> Result<()> {
+        if path.area() == area && path.kind() == TrashEntryKind::Payload {
+            Ok(())
+        } else {
+            Err(CoreError::InvalidTrashPath(
+                path.as_vault_path().as_path().to_owned(),
+            ))
         }
     }
 
@@ -1054,6 +1294,35 @@ mod tests {
                 ..
             }
         ));
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn confirm_move_durability_requires_expected_destination_and_absent_source() {
+        let temp_root = fs::canonicalize(std::env::temp_dir()).expect("canonical temp root");
+        let base = temp_root.join(format!(
+            "myvault-confirm-move-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(base.join("from")).expect("source parent");
+        fs::create_dir(base.join("to")).expect("destination parent");
+        fs::write(base.join("to/note.md"), b"note").expect("destination");
+        let vault = Vault::open(&base).expect("open vault");
+        let source = VaultPath::new("from/note.md").expect("source");
+        let destination = VaultPath::new("to/note.md").expect("destination");
+        let expected = FileRevision::from_bytes(b"note");
+        let guard = vault.lock_mutations().expect("lock");
+
+        vault
+            .confirm_move_durability(&source, &destination, &expected, 4)
+            .expect("confirmed durability");
+        fs::write(base.join("from/note.md"), b"duplicate").expect("duplicate source");
+        assert!(matches!(
+            vault.confirm_move_durability(&source, &destination, &expected, 4),
+            Err(CoreError::InvalidMove { .. })
+        ));
+        drop(guard);
         fs::remove_dir_all(base).expect("cleanup");
     }
 
