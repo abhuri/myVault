@@ -7,14 +7,14 @@ license = "MIT"
 description = "Filesystem and derived-index safety primitives for myVault"
 
 [dependencies]
-blake3 = "1.8.2"
+blake3 = "=1.8.2"
 cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
 myvault-platform-fs = { path = "../myvault-platform-fs" }
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 unicode-casefold = "0.2.0"
 unicode-normalization = "0.1.24"
-uuid = { version = "1.20.0", features = ["v4"] }
+uuid = { version = "=1.20.0", features = ["v4"] }
 
 [target.'cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))'.dependencies]
 rustix = { version = "1.1.4", features = ["fs"] }

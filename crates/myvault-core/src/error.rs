@@ -49,6 +49,13 @@ pub enum CoreError {
         destination_sync: crate::DirectorySyncStatus,
         source_sync: crate::DirectorySyncStatus,
     },
+    VerifiedMoveOutcomeUnknown {
+        source_path: PathBuf,
+        destination_path: PathBuf,
+        destination_sync: crate::DirectorySyncStatus,
+        source_sync: crate::DirectorySyncStatus,
+        verification: Box<CoreError>,
+    },
     CommitOutcomeUnknown {
         path: PathBuf,
         source: std::io::Error,
@@ -68,9 +75,6 @@ impl fmt::Display for CoreError {
             return result;
         }
         match self {
-            Self::InvalidRelativePath(_) | Self::PathEscapesVault(_) | Self::SymlinkRejected(_) => {
-                unreachable!("handled before main error formatting")
-            }
             Self::AutomaticObsidianWriteDenied(path) => write!(
                 formatter,
                 "automatic writes under .obsidian are denied: {}",
@@ -81,11 +85,17 @@ impl fmt::Display for CoreError {
                 "generic vault writes under .trash are denied: {}",
                 path.display()
             ),
-            Self::TrashAccessDenied(_)
+            Self::InvalidRelativePath(_)
+            | Self::PathEscapesVault(_)
+            | Self::SymlinkRejected(_)
+            | Self::TrashAccessDenied(_)
             | Self::InvalidTrashPath(_)
             | Self::InvalidRevision
             | Self::RevisionTargetNotFile(_)
-            | Self::StaleRevision { .. } => unreachable!("handled before main error formatting"),
+            | Self::StaleRevision { .. }
+            | Self::VerifiedMoveOutcomeUnknown { .. } => {
+                unreachable!("handled before main error formatting")
+            }
             Self::AppDataInsideVault { app_data, vault } => write!(
                 formatter,
                 "app-data directory {} must be outside synced vault {}",
@@ -206,6 +216,18 @@ impl CoreError {
                 actual.byte_len,
                 actual.hex
             )),
+            Self::VerifiedMoveOutcomeUnknown {
+                source_path,
+                destination_path,
+                destination_sync,
+                source_sync,
+                verification,
+            } => Some(write!(
+                formatter,
+                "verified move from {} to {} may be published (destination sync: {destination_sync}; source sync: {source_sync}); topology verification failed: {verification}",
+                source_path.display(),
+                destination_path.display()
+            )),
             _ => None,
         }
     }
@@ -222,6 +244,7 @@ impl std::error::Error for CoreError {
                 source_sync,
                 ..
             } => destination_sync.error().or_else(|| source_sync.error()),
+            Self::VerifiedMoveOutcomeUnknown { verification, .. } => Some(verification.as_ref()),
             Self::Sqlite(error) => Some(error),
             _ => None,
         }
