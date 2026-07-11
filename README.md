@@ -20,5 +20,23 @@ See [PROJECT_PLAN.md](PROJECT_PLAN.md) for architecture decisions, delivery phas
 
 ## Development
 
-Exact bootstrap and verification commands will be added during the Phase 0 scaffoldค่ะ
+Install dependencies and run the Phase 0 native shellค่ะ
 
+```bash
+pnpm install --frozen-lockfile
+pnpm dev
+```
+
+Run the baseline verification contractค่ะ
+
+```bash
+pnpm typecheck
+pnpm test
+pnpm build
+cargo fmt --manifest-path apps/tauri/src-tauri/Cargo.toml --all -- --check
+cargo clippy --manifest-path apps/tauri/src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+cargo test --manifest-path apps/tauri/src-tauri/Cargo.toml
+pnpm tauri:info
+```
+
+Phase 0 platform gates and environment gaps are documented in [docs/phase-0](docs/phase-0)ค่ะ

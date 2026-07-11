@@ -454,28 +454,35 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 
 ## 14. Current Status
 
-- สถานะโครงการคือ Planning Approved ค่ะ
-- project folder ยังไม่มี source code ค่ะ
-- `PROJECT_PLAN.md` ถูกสร้างเป็นเอกสารหลักแล้วค่ะ
-- ยังไม่ได้ `git init` ค่ะ
-- ยังไม่ได้สร้าง GitHub repository ค่ะ
-- ยังไม่ได้เลือก package manager หรือกำหนด exact dependency versions ค่ะ
-- Phase ถัดไปคือ Repository Bootstrap และ Phase 0 Technical Spike ค่ะ
+- สถานะโครงการคือ Phase 0 In Progress ค่ะ
+- Git repository เชื่อมกับ `https://github.com/abhuri/myVault.git` แล้วค่ะ
+- initial repository safeguards ถูก push ไปที่ `main` ใน commit `6597e18` แล้วค่ะ
+- งาน Phase 0 อยู่บน branch `agent/phase-0-bootstrap` ค่ะ
+- package manager ที่เลือกคือ `pnpm` ค่ะ
+- Tauri 2, React, TypeScript และ Rust scaffold ถูกสร้างที่ `apps/tauri` ค่ะ
+- diagnostic shell มี Rust platform bridge, CodeMirror, Mermaid strict mode และ Sigma graph แล้วค่ะ
+- Phase 0 acceptance, OAuth/Drive และ environment contracts อยู่ใน `docs/phase-0` ค่ะ
+- frontend typecheck, unit tests, production build, Rust fmt, clippy และ tests ผ่านบน macOS host ค่ะ
+- Tauri debug binary build และ native launch ผ่านบน macOS host ค่ะ
+- เครื่องยังไม่มี full Xcode, Java และ Android SDK/NDK จึงยังทดสอบ Android ไม่ได้ค่ะ
+- OAuth และ Drive API implementation ยังไม่เริ่มจนกว่า platform boundary และ Google Cloud configuration จะพร้อมค่ะ
 
 ## 15. Next Actions
 
-1. ขออนุมัติให้ `git init` และสร้าง repository bootstrap files ค่ะ
-2. ให้คุณโอสร้าง private GitHub repository หรืออนุญาตให้ Sunday สร้างเมื่อมี GitHub access ที่เหมาะสมค่ะ
-3. เลือก package manager โดยค่าแนะนำคือ `pnpm` ค่ะ
-4. กำหนด supported OS baseline ของ Windows, macOS, Ubuntu และ Android ค่ะ
-5. สร้าง Phase 0 acceptance checklist แบบ executable ค่ะ
-6. scaffold Tauri workspace หลังได้รับอนุมัติค่ะ
+1. push branch `agent/phase-0-bootstrap` และเปิด draft PR ค่ะ
+2. ให้คุณโอตรวจและอนุมัติการติดตั้ง full Xcode และ Android Studio/JDK/SDK/NDK ค่ะ
+3. รัน `tauri android init` หลัง Android toolchain พร้อมค่ะ
+4. สร้าง Kotlin Tauri plugin spike สำหรับ Google Identity Services `AuthorizationClient` ค่ะ
+5. สร้าง desktop OAuth loopback + PKCE spike ที่ไม่ส่ง token เข้า JavaScript ค่ะ
+6. เพิ่ม filesystem atomic-write/watcher และ SQLite recovery spike ค่ะ
+7. สร้าง Google Drive fixture folder หลัง Google Cloud OAuth configuration พร้อมค่ะ
+8. รัน platform gates บน Windows และ Ubuntu ผ่าน native machines หรือ manual CI workflow ค่ะ
 
 ## 16. Session Handoff
 
 ### Current Handoff
 
-- วันที่อัปเดตคือ 2026-07-11 เขตเวลา Asia/Bangkok ค่ะ
+- วันที่อัปเดตคือ 2026-07-11 เวลา 21:15 เขตเวลา Asia/Bangkok ค่ะ
 - ผู้ใช้เรียกว่า คุณโอ หรือบอส ค่ะ
 - Sunday เป็นหัวหน้าทีมและเจ้าของ architecture, logic, mechanics และ final integration ค่ะ
 - Sunday สามารถ spawn sub-agents สำหรับ bounded parallel tasks ตาม Operating Model ในเอกสารนี้ค่ะ
@@ -484,8 +491,15 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - architecture ที่ล็อกคือ Tauri 2, React, TypeScript, Rust, native SQLite และ direct Google Drive API ค่ะ
 - ไม่มี backend, hosting, VPN หรือ Store distribution ในรุ่นแรกค่ะ
 - project directory คือ `/Users/awb/My Apps/myVault` ค่ะ
-- ขณะสร้างเอกสารนี้ project directory ว่างและยังไม่เป็น Git repository ค่ะ
-- งานถัดไปที่เสนอคือ Git bootstrap และ Phase 0 Technical Spike ค่ะ
+- remote repository คือ `https://github.com/abhuri/myVault.git` ค่ะ
+- `main` มี initial commit `6597e18` ค่ะ
+- active branch คือ `agent/phase-0-bootstrap` ค่ะ
+- Phase 0 diagnostic shell และ contracts ถูกสร้างแล้วค่ะ
+- local checks ที่ผ่านคือ TypeScript, Vitest 6 tests, Vite build, Rust fmt, clippy, Rust test และ Tauri debug build/launch ค่ะ
+- Android ยัง blocked เพราะไม่มี Java, Android SDK/NDK และ Android Studio ค่ะ
+- full macOS packaging ยัง blocked เพราะไม่มี full Xcode ค่ะ
+- ข้อค้นพบสำคัญคือ Android Google OAuth ต้องใช้ GIS `AuthorizationClient` ผ่าน Kotlin Tauri plugin ค่ะ
+- งานถัดไปคือ push draft PR แล้วขออนุมัติติดตั้ง platform toolchains ค่ะ
 
 ### Handoff Update Template
 
@@ -529,3 +543,9 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - เพิ่ม Team Operating Model โดย Sunday เป็นหัวหน้าทีมค่ะ
 - กำหนดแนวทาง parallel sub-agent delegation, review และ incident handling ค่ะ
 - กำหนดจังหวะสร้าง Git และ private GitHub repository ก่อนเริ่ม source code ค่ะ
+- เริ่ม Phase 0 และสร้าง repository baseline ค่ะ
+- push initial commit `6597e18` ไปที่ `main` ค่ะ
+- สร้าง Tauri 2 React/TypeScript diagnostic shell ค่ะ
+- เพิ่ม Phase 0 acceptance, OAuth/Drive และ environment contracts ค่ะ
+- ยืนยันว่า desktop OAuth ใช้ loopback + PKCE และ Android ใช้ GIS `AuthorizationClient` ค่ะ
+- เพิ่ม pinned-action Linux quality workflow ค่ะ
