@@ -3,7 +3,9 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cap_fs_ext::{FollowSymlinks, OpenOptionsExt, OpenOptionsFollowExt};
+#[cfg(unix)]
+use cap_fs_ext::OpenOptionsExt;
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
 
 use crate::capability::{open_absolute_dir_nofollow, open_child_dir_nofollow};
@@ -156,11 +158,10 @@ impl Vault {
             let candidate =
                 OsString::from(format!(".myvault-write-{}-{id}.tmp", std::process::id()));
             let mut options = OpenOptions::new();
-            options
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .follow(FollowSymlinks::No);
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            options.follow(FollowSymlinks::No);
             match parent.open_with(&candidate, &options) {
                 Ok(file) => return Ok((candidate, file)),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}

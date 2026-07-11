@@ -116,6 +116,9 @@ jobs:
           distribution: temurin
           java-version: 21
 
+      - name: Set up Android command-line tools
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699
+
       - name: Install Rust Android target
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:

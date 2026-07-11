@@ -1,7 +1,11 @@
 use std::path::{Path, PathBuf};
 
-use cap_fs_ext::{FollowSymlinks, OpenOptionsExt, OpenOptionsFollowExt};
-use cap_std::fs::{OpenOptions, Permissions};
+#[cfg(unix)]
+use cap_fs_ext::OpenOptionsExt;
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::OpenOptions;
+#[cfg(unix)]
+use cap_std::fs::Permissions;
 use rusqlite::{params, Connection, Transaction};
 
 use crate::capability::open_absolute_dir_nofollow;
@@ -58,12 +62,10 @@ impl DerivedIndex {
         }
 
         let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .follow(FollowSymlinks::No);
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        options.follow(FollowSymlinks::No);
         let database_file = app_dir.open_with(DATABASE_NAME, &options)?;
         if !database_file.metadata()?.is_file() {
             return Err(CoreError::UnsafeDatabasePath(database_path));
