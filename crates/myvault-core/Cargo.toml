@@ -10,6 +10,8 @@ description = "Filesystem and derived-index safety primitives for myVault"
 cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+unicode-casefold = "0.2.0"
+unicode-normalization = "0.1.24"
 
 [lints.rust]
 unsafe_code = "forbid"

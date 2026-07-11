@@ -9,6 +9,7 @@ use cap_std::fs::Permissions;
 use rusqlite::{params, Connection, Transaction};
 
 use crate::capability::open_absolute_dir_nofollow;
+use crate::path::VaultPathClass;
 use crate::{CoreError, Result, Vault, VaultPath};
 
 pub const SCHEMA_VERSION: i64 = 1;
@@ -109,10 +110,7 @@ impl DerivedIndex {
     /// Returns an error when the database operation cannot be completed.
     pub fn remove(&mut self, path: &VaultPath) -> Result<()> {
         let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "DELETE FROM notes WHERE path = ?1",
-            [path.as_path().to_string_lossy().as_ref()],
-        )?;
+        transaction.execute("DELETE FROM notes WHERE path = ?1", [path.as_str()])?;
         transaction.commit()?;
         Ok(())
     }
@@ -145,7 +143,7 @@ impl DerivedIndex {
             "SELECT path, title, content_hash, modified_ms, byte_len
              FROM notes WHERE path = ?1",
         )?;
-        let mut rows = statement.query([path.as_path().to_string_lossy().as_ref()])?;
+        let mut rows = statement.query([path.as_str()])?;
         let Some(row) = rows.next()? else {
             return Ok(None);
         };
@@ -285,6 +283,11 @@ fn migrate(connection: &mut Connection) -> Result<()> {
 }
 
 fn insert_record(transaction: &Transaction<'_>, record: &NoteRecord) -> Result<()> {
+    if record.path.classify() != VaultPathClass::Content {
+        return Err(CoreError::InvalidRecord(
+            "internal .obsidian and .trash paths must not be indexed",
+        ));
+    }
     if record.content_hash.is_empty() {
         return Err(CoreError::InvalidRecord("content hash must not be empty"));
     }
@@ -299,7 +302,7 @@ fn insert_record(transaction: &Transaction<'_>, record: &NoteRecord) -> Result<(
             modified_ms = excluded.modified_ms,
             byte_len = excluded.byte_len",
         params![
-            record.path.as_path().to_string_lossy().as_ref(),
+            record.path.as_str(),
             record.title,
             record.content_hash,
             record.modified_ms,

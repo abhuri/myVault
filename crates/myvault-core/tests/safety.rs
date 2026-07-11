@@ -198,6 +198,35 @@ fn failed_rebuild_rolls_back_and_successful_rebuild_replaces_derived_rows() {
 }
 
 #[test]
+fn index_excludes_obsidian_metadata_and_trash_from_upsert_and_rebuild() {
+    let vault_root = TestDir::new("internal-index-vault");
+    let app_data = TestDir::new("internal-index-app-data");
+    let vault = Vault::open(&vault_root).expect("open vault");
+    let mut index = DerivedIndex::open(&app_data, &vault).expect("open index");
+    let content = note("เก็บ.md", "เก็บ", "content");
+    index.upsert(&content).expect("seed content");
+
+    for internal in [
+        note(".obsidian/app.json", "metadata", "obsidian"),
+        note(".trash/ลบแล้ว.md", "deleted", "trash"),
+    ] {
+        assert!(matches!(
+            index.upsert(&internal),
+            Err(CoreError::InvalidRecord(_))
+        ));
+        assert!(matches!(
+            index.rebuild([&internal]),
+            Err(CoreError::InvalidRecord(_))
+        ));
+        assert_eq!(index.count().expect("rollback count"), 1);
+        assert_eq!(
+            index.get(&content.path).expect("content after rollback"),
+            Some(content.clone())
+        );
+    }
+}
+
+#[test]
 fn index_rejects_app_data_inside_the_synced_vault() {
     let vault_root = TestDir::new("placement-vault");
     fs::create_dir(vault_root.as_ref().join(".myvault-data")).expect("app-data fixture");
