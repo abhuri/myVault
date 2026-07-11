@@ -501,7 +501,47 @@ fn publish_enforces_reserved_temp_extras_policy() {
 
     let (root, vault) = fixture();
     let (_manifest, digest) = prepare_staged_file(&root, &vault);
+    for index in 0..32_u128 {
+        let uuid = Uuid::from_u128(0x4000_8000_0000_0000_0000_0000_0000_0000_u128 + index);
+        fs::write(
+            staging_directory(&root).join(format!(".manifest-{uuid}.tmp")),
+            b"x",
+        )
+        .unwrap();
+    }
+    assert!(matches!(
+        vault.trash_store().publish_staging_item(id(), &digest),
+        Ok(PublishItemOutcome::Published(_))
+    ));
+
+    let (root, vault) = fixture();
+    let (_manifest, digest) = prepare_staged_file(&root, &vault);
     fs::write(staging_directory(&root).join("unexpected"), b"x").unwrap();
+    assert!(matches!(
+        vault.trash_store().publish_staging_item(id(), &digest),
+        Err(CoreError::InvalidTrashTopology(_))
+    ));
+
+    let (root, vault) = fixture();
+    let (_manifest, digest) = prepare_staged_file(&root, &vault);
+    fs::write(root.path().join("hardlink-source"), b"x").unwrap();
+    fs::hard_link(
+        root.path().join("hardlink-source"),
+        staging_directory(&root).join(".manifest-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.tmp"),
+    )
+    .unwrap();
+    assert!(matches!(
+        vault.trash_store().publish_staging_item(id(), &digest),
+        Err(CoreError::InvalidTrashTopology(_))
+    ));
+
+    let (root, vault) = fixture();
+    let (_manifest, digest) = prepare_staged_file(&root, &vault);
+    fs::write(
+        staging_directory(&root).join(".manifest-AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA.tmp"),
+        b"x",
+    )
+    .unwrap();
     assert!(matches!(
         vault.trash_store().publish_staging_item(id(), &digest),
         Err(CoreError::InvalidTrashTopology(_))
@@ -557,6 +597,26 @@ fn publish_rejects_reserved_temp_symlink() {
     symlink(
         root.path().join("note.md"),
         staging_directory(&root).join(".manifest-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.tmp"),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        vault.trash_store().publish_staging_item(id(), &digest),
+        Err(CoreError::InvalidTrashTopology(_))
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn publish_rejects_non_utf8_extra_name() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let (root, vault) = fixture();
+    let (_manifest, digest) = prepare_staged_file(&root, &vault);
+    fs::write(
+        staging_directory(&root).join(OsString::from_vec(vec![b'.', 0xff])),
+        b"x",
     )
     .unwrap();
 
