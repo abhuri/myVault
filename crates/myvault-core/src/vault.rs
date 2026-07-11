@@ -10,6 +10,7 @@ use cap_fs_ext::OpenOptionsExt;
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
 
+use crate::atomic_move::rename_noreplace;
 use crate::capability::{open_absolute_dir_nofollow, open_child_dir_nofollow};
 use crate::path::{classify_component, component_collision_key, VaultPathClass};
 use crate::{CoreError, Result, VaultPath};
@@ -55,6 +56,46 @@ pub struct InventoryEntry {
 pub enum WriteIntent {
     Automatic,
     UserInitiated,
+}
+
+/// Durability reached after an atomic move has been published.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MoveDurability {
+    FullySynced,
+    /// Windows accepted the move but its filesystem does not permit flushing
+    /// one or both directory handles.
+    DirectorySyncUnsupported,
+}
+
+/// Result of flushing one parent directory after a published move.
+#[derive(Debug)]
+pub enum DirectorySyncStatus {
+    Synced,
+    Unsupported,
+    Failed(std::io::Error),
+    SharedWithDestination,
+}
+
+impl DirectorySyncStatus {
+    pub(crate) fn error(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Failed(error) => Some(error),
+            Self::Synced | Self::Unsupported | Self::SharedWithDestination => None,
+        }
+    }
+}
+
+impl std::fmt::Display for DirectorySyncStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Synced => formatter.write_str("synced"),
+            Self::Unsupported => formatter.write_str("unsupported"),
+            Self::Failed(error) => write!(formatter, "failed: {error}"),
+            Self::SharedWithDestination => {
+                formatter.write_str("same parent; destination result applies")
+            }
+        }
+    }
 }
 
 /// A vault whose filesystem authority is held by an open directory handle.
@@ -285,6 +326,106 @@ impl Vault {
         self.atomic_write_inner(relative, contents, intent, || {})
     }
 
+    /// Atomically moves a file or directory and never replaces a destination.
+    ///
+    /// Both parents are opened before publication and the rename is resolved
+    /// relative to those held capabilities. Destination and then source parent
+    /// directories are flushed; a shared parent is flushed once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::AlreadyExists`] when the destination exists,
+    /// [`CoreError::AtomicNoReplaceUnsupported`] when the host filesystem lacks
+    /// the required atomic primitive, or another safety/filesystem error.
+    pub fn atomic_move(
+        &self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        intent: WriteIntent,
+    ) -> Result<MoveDurability> {
+        self.atomic_move_inner(source, destination, intent, |_, directory| {
+            sync_directory_for_move(directory)
+        })
+    }
+
+    fn atomic_move_inner<F>(
+        &self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        intent: WriteIntent,
+        mut sync: F,
+    ) -> Result<MoveDurability>
+    where
+        F: FnMut(MoveSyncParent, &Dir) -> std::io::Result<MoveDurability>,
+    {
+        let _guard = self.lock_mutations()?;
+        Self::validate_mutation_policy(source, intent)?;
+        Self::validate_mutation_policy(destination, intent)?;
+        if source == destination {
+            return Err(CoreError::AlreadyExists(destination.as_path().to_owned()));
+        }
+
+        let (source_parent, source_name) = self.open_parent_checked(source)?;
+        self.reject_final_symlink(&source_parent, &source_name, source)?;
+        let source_metadata = source_parent.symlink_metadata(&source_name)?;
+        if source_metadata.file_type().is_symlink() {
+            return Err(CoreError::SymlinkRejected(
+                self.root_path.join(source.as_path()),
+            ));
+        }
+        if !source_metadata.is_file() && !source_metadata.is_dir() {
+            return Err(CoreError::InvalidMove {
+                source_path: source.as_path().to_owned(),
+                destination_path: destination.as_path().to_owned(),
+                reason: "source must be a regular file or directory",
+            });
+        }
+        if source_metadata.is_dir()
+            && destination
+                .as_str()
+                .strip_prefix(source.as_str())
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            return Err(CoreError::InvalidMove {
+                source_path: source.as_path().to_owned(),
+                destination_path: destination.as_path().to_owned(),
+                reason: "a directory cannot be moved into its own descendant",
+            });
+        }
+
+        let (destination_parent, destination_name) = self.open_parent_checked(destination)?;
+        let destination_utf8 = destination_name
+            .to_str()
+            .ok_or_else(|| CoreError::InvalidRelativePath(destination.as_path().to_owned()))?;
+        self.reject_sibling_collision(&destination_parent, destination_utf8, destination)?;
+
+        let source_parent_path = source
+            .as_str()
+            .rsplit_once('/')
+            .map_or("", |(parent, _)| parent);
+        let destination_parent_path = destination
+            .as_str()
+            .rsplit_once('/')
+            .map_or("", |(parent, _)| parent);
+
+        if let Err(error) = rename_noreplace(
+            &source_parent,
+            &source_name,
+            &destination_parent,
+            &destination_name,
+        ) {
+            return Err(Self::map_atomic_move_error(source, destination, error));
+        }
+
+        let destination_sync = sync(MoveSyncParent::Destination, &destination_parent);
+        let source_sync = if source_parent_path == destination_parent_path {
+            None
+        } else {
+            Some(sync(MoveSyncParent::Source, &source_parent))
+        };
+        Self::finish_atomic_move_sync(source, destination, destination_sync, source_sync)
+    }
+
     fn atomic_write_inner<F>(
         &self,
         relative: &VaultPath,
@@ -509,6 +650,45 @@ impl Vault {
         }
     }
 
+    fn map_atomic_move_error(
+        source: &VaultPath,
+        destination: &VaultPath,
+        error: std::io::Error,
+    ) -> CoreError {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            return CoreError::AlreadyExists(destination.as_path().to_owned());
+        }
+        if atomic_no_replace_is_unsupported(&error) {
+            return CoreError::AtomicNoReplaceUnsupported {
+                source_path: source.as_path().to_owned(),
+                destination_path: destination.as_path().to_owned(),
+                source: error,
+            };
+        }
+        CoreError::Io(error)
+    }
+
+    fn finish_atomic_move_sync(
+        source: &VaultPath,
+        destination: &VaultPath,
+        destination_sync: std::io::Result<MoveDurability>,
+        source_sync: Option<std::io::Result<MoveDurability>>,
+    ) -> Result<MoveDurability> {
+        match (destination_sync, source_sync) {
+            (Ok(destination), None) => Ok(destination),
+            (Ok(destination), Some(Ok(source))) => Ok(destination.combine(source)),
+            (destination_result, source_result) => Err(CoreError::AtomicMoveOutcomeUnknown {
+                source_path: source.as_path().to_owned(),
+                destination_path: destination.as_path().to_owned(),
+                destination_sync: directory_sync_status(destination_result),
+                source_sync: source_result.map_or(
+                    DirectorySyncStatus::SharedWithDestination,
+                    directory_sync_status,
+                ),
+            }),
+        }
+    }
+
     fn cleanup_pending(path: PathBuf, temp_name: &OsString, source: std::io::Error) -> CoreError {
         CoreError::PublishedCleanupPending {
             path,
@@ -573,6 +753,12 @@ enum CreateStage {
     TempRemoved,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MoveSyncParent {
+    Destination,
+    Source,
+}
+
 fn sync_directory(directory: &Dir) -> Result<()> {
     let file = directory.try_clone()?.into_std_file();
     match file.sync_all() {
@@ -590,6 +776,64 @@ fn sync_directory(directory: &Dir) -> Result<()> {
         }
         Err(error) => Err(error.into()),
     }
+}
+
+impl MoveDurability {
+    fn combine(self, other: Self) -> Self {
+        if self == Self::DirectorySyncUnsupported || other == Self::DirectorySyncUnsupported {
+            Self::DirectorySyncUnsupported
+        } else {
+            Self::FullySynced
+        }
+    }
+}
+
+fn sync_directory_for_move(directory: &Dir) -> std::io::Result<MoveDurability> {
+    let file = directory.try_clone()?.into_std_file();
+    match file.sync_all() {
+        Ok(()) => Ok(MoveDurability::FullySynced),
+        #[cfg(windows)]
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::InvalidInput
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(MoveDurability::DirectorySyncUnsupported)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn directory_sync_status(result: std::io::Result<MoveDurability>) -> DirectorySyncStatus {
+    match result {
+        Ok(MoveDurability::FullySynced) => DirectorySyncStatus::Synced,
+        Ok(MoveDurability::DirectorySyncUnsupported) => DirectorySyncStatus::Unsupported,
+        Err(error) => DirectorySyncStatus::Failed(error),
+    }
+}
+
+fn atomic_no_replace_is_unsupported(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::Unsupported {
+        return true;
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
+    {
+        let code = error.raw_os_error();
+        [
+            rustix::io::Errno::NOSYS,
+            rustix::io::Errno::NOTSUP,
+            rustix::io::Errno::OPNOTSUPP,
+        ]
+        .into_iter()
+        .any(|errno| code == Some(errno.raw_os_error()))
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "linux", target_os = "macos")))]
+    false
 }
 
 #[cfg(test)]
@@ -659,6 +903,158 @@ mod tests {
                     .then_some(path)
             })
             .collect()
+    }
+
+    #[test]
+    fn atomic_move_maps_an_unsupported_primitive_without_fallback() {
+        let source = VaultPath::new("source.md").expect("source path");
+        let destination = VaultPath::new("destination.md").expect("destination path");
+        let error = Vault::map_atomic_move_error(
+            &source,
+            &destination,
+            std::io::Error::new(std::io::ErrorKind::Unsupported, "injected no-replace fault"),
+        );
+
+        assert!(matches!(
+            error,
+            CoreError::AtomicNoReplaceUnsupported {
+                source_path,
+                destination_path,
+                ..
+            } if source_path == source.as_path() && destination_path == destination.as_path()
+        ));
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn atomic_move_does_not_misclassify_generic_einval_as_unsupported() {
+        let source = VaultPath::new("source.md").expect("source path");
+        let destination = VaultPath::new("destination.md").expect("destination path");
+        let error = Vault::map_atomic_move_error(
+            &source,
+            &destination,
+            std::io::Error::from_raw_os_error(rustix::io::Errno::INVAL.raw_os_error()),
+        );
+
+        assert!(matches!(error, CoreError::Io(_)));
+    }
+
+    fn atomic_move_sync_fixture(label: &str) -> (PathBuf, Vault, VaultPath, VaultPath) {
+        let temp_root = fs::canonicalize(std::env::temp_dir()).expect("canonical temp root");
+        let base = temp_root.join(format!(
+            "myvault-move-sync-{label}-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(base.join("source-parent")).expect("source parent");
+        fs::create_dir(base.join("destination-parent")).expect("destination parent");
+        fs::write(base.join("source-parent/note.md"), b"note").expect("source");
+        let vault = Vault::open(&base).expect("open vault");
+        (
+            base,
+            vault,
+            VaultPath::new("source-parent/note.md").expect("source path"),
+            VaultPath::new("destination-parent/note.md").expect("destination path"),
+        )
+    }
+
+    fn injected_sync_failure(parent: MoveSyncParent) -> std::io::Error {
+        std::io::Error::other(format!("injected {parent:?} sync failure"))
+    }
+
+    #[test]
+    fn atomic_move_attempts_source_sync_after_destination_sync_fails() {
+        let (base, vault, source, destination) = atomic_move_sync_fixture("destination-fails");
+        let mut attempts = Vec::new();
+        let error = vault
+            .atomic_move_inner(
+                &source,
+                &destination,
+                WriteIntent::UserInitiated,
+                |parent, _| {
+                    attempts.push(parent);
+                    if parent == MoveSyncParent::Destination {
+                        Err(injected_sync_failure(parent))
+                    } else {
+                        Ok(MoveDurability::FullySynced)
+                    }
+                },
+            )
+            .expect_err("destination sync failure");
+
+        assert_eq!(
+            attempts,
+            [MoveSyncParent::Destination, MoveSyncParent::Source]
+        );
+        assert!(matches!(
+            error,
+            CoreError::AtomicMoveOutcomeUnknown {
+                destination_sync: DirectorySyncStatus::Failed(_),
+                source_sync: DirectorySyncStatus::Synced,
+                ..
+            }
+        ));
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn atomic_move_reports_source_sync_failure_after_destination_passes() {
+        let (base, vault, source, destination) = atomic_move_sync_fixture("source-fails");
+        let error = vault
+            .atomic_move_inner(
+                &source,
+                &destination,
+                WriteIntent::UserInitiated,
+                |parent, _| {
+                    if parent == MoveSyncParent::Source {
+                        Err(injected_sync_failure(parent))
+                    } else {
+                        Ok(MoveDurability::FullySynced)
+                    }
+                },
+            )
+            .expect_err("source sync failure");
+
+        assert!(matches!(
+            error,
+            CoreError::AtomicMoveOutcomeUnknown {
+                destination_sync: DirectorySyncStatus::Synced,
+                source_sync: DirectorySyncStatus::Failed(_),
+                ..
+            }
+        ));
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn atomic_move_reports_both_parent_sync_failures() {
+        let (base, vault, source, destination) = atomic_move_sync_fixture("both-fail");
+        let mut attempts = Vec::new();
+        let error = vault
+            .atomic_move_inner(
+                &source,
+                &destination,
+                WriteIntent::UserInitiated,
+                |parent, _| {
+                    attempts.push(parent);
+                    Err(injected_sync_failure(parent))
+                },
+            )
+            .expect_err("both sync failures");
+
+        assert_eq!(
+            attempts,
+            [MoveSyncParent::Destination, MoveSyncParent::Source]
+        );
+        assert!(matches!(
+            error,
+            CoreError::AtomicMoveOutcomeUnknown {
+                destination_sync: DirectorySyncStatus::Failed(_),
+                source_sync: DirectorySyncStatus::Failed(_),
+                ..
+            }
+        ));
+        fs::remove_dir_all(base).expect("cleanup");
     }
 
     #[test]

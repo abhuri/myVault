@@ -30,6 +30,7 @@ jobs:
             build-essential \
             curl \
             file \
+            libacl1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libssl-dev \
@@ -71,6 +72,9 @@ jobs:
         run: |
           cargo fmt --manifest-path apps/tauri/src-tauri/Cargo.toml --all -- --check
           cargo fmt --manifest-path crates/myvault-core/Cargo.toml --all -- --check
+          cargo fmt --manifest-path crates/myvault-platform-acl/Cargo.toml --all -- --check
+          cargo fmt --manifest-path crates/myvault-platform-fs/Cargo.toml --all -- --check
+          cargo fmt --manifest-path crates/myvault-recovery/Cargo.toml --all -- --check
           cargo fmt --manifest-path crates/desktop-auth/Cargo.toml --all -- --check
           cargo fmt --manifest-path crates/drive-sync-spike/Cargo.toml --all -- --check
           cargo fmt --manifest-path crates/tauri-plugin-google-auth/Cargo.toml --all -- --check
@@ -79,6 +83,9 @@ jobs:
         run: |
           cargo clippy --manifest-path apps/tauri/src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
           cargo clippy --manifest-path crates/myvault-core/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path crates/myvault-platform-acl/Cargo.toml --all-targets --all-features -- -D warnings
+          cargo clippy --manifest-path crates/myvault-platform-fs/Cargo.toml --all-targets --all-features -- -D warnings
+          cargo clippy --manifest-path crates/myvault-recovery/Cargo.toml --all-targets --all-features -- -D warnings
           cargo clippy --manifest-path crates/desktop-auth/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path crates/drive-sync-spike/Cargo.toml --all-targets -- -D warnings
 
@@ -86,6 +93,9 @@ jobs:
         run: |
           cargo test --manifest-path apps/tauri/src-tauri/Cargo.toml
           cargo test --manifest-path crates/myvault-core/Cargo.toml
+          cargo test --manifest-path crates/myvault-platform-acl/Cargo.toml
+          cargo test --manifest-path crates/myvault-platform-fs/Cargo.toml
+          cargo test --manifest-path crates/myvault-recovery/Cargo.toml
           cargo test --manifest-path crates/desktop-auth/Cargo.toml
           cargo test --manifest-path crates/drive-sync-spike/Cargo.toml
 

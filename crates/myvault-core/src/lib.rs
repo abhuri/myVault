@@ -3,6 +3,7 @@
 //! This crate deliberately contains no UI or platform integration. Callers must
 //! keep authentication tokens and other secrets outside the derived index.
 
+mod atomic_move;
 mod capability;
 mod error;
 mod index;
@@ -14,8 +15,8 @@ pub use error::{CoreError, Result};
 pub use index::{DerivedIndex, NoteRecord, SCHEMA_VERSION, SQLITE_OPEN_RESIDUAL_RISK};
 pub use path::VaultPath;
 pub use vault::{
-    InventoryEntry, InventoryKind, InventoryLimits, Vault, WriteIntent, DEFAULT_READ_LIMIT,
-    MUTATION_EXTERNAL_PROCESS_RESIDUAL_RISK,
+    DirectorySyncStatus, InventoryEntry, InventoryKind, InventoryLimits, MoveDurability, Vault,
+    WriteIntent, DEFAULT_READ_LIMIT, MUTATION_EXTERNAL_PROCESS_RESIDUAL_RISK,
 };
 pub use watcher::{
     BurstNormalizer, NormalizedEvent, RawEvent, SelfWriteSuppressor, WriteFingerprint,
