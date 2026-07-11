@@ -1,6 +1,6 @@
 use myvault_recovery::{
-    decide_recovery, Error, FileRevision, RecoveryDecision, RecoveryJournal, RecoveryOperationKind,
-    RecoveryTopology, RenameMoveIntent,
+    decide_recovery, Error, FileRevision, JournalEvidence, RecoveryDecision, RecoveryJournal,
+    RecoveryOperationKind, RecoveryTopology, RenameMoveIntent,
 };
 #[cfg(unix)]
 use myvault_recovery::{CompleteOutcome, PublishOutcome, MAX_PAGE_SIZE};
@@ -52,6 +52,22 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
+}
+
+#[cfg(unix)]
+fn write_unsupported(app: &std::path::Path, operation_id: Uuid, version: u32) -> Vec<u8> {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "version": version,
+        "operation_id": operation_id,
+        "opaque": { "must_not_be_interpreted": true }
+    }))
+    .unwrap();
+    write_private(
+        &app.join("operation-journal")
+            .join(format!("{operation_id}.json")),
+        &bytes,
+    );
+    bytes
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -914,6 +930,170 @@ fn legacy_and_noncanonical_journal_bytes_are_never_reinterpreted() {
     assert!(matches!(
         journal.read(expected.operation_id),
         Err(Error::InvalidEntryName)
+    ));
+}
+
+#[test]
+#[cfg(unix)]
+fn mixed_evidence_pages_are_uuid_ordered_and_keep_unsupported_bytes() {
+    let (_temporary, app, vault) = roots();
+    let journal = RecoveryJournal::open(&app, &vault).unwrap();
+    let ids = (1_u128..=5).map(Uuid::from_u128).collect::<Vec<_>>();
+    let unsupported_v2 = write_unsupported(&app, ids[0], 2);
+    let completed = RenameMoveIntent::new(
+        ids[1],
+        "completed-source.md",
+        "completed-destination.md",
+        revision("completed"),
+    )
+    .unwrap();
+    journal.publish(&completed).unwrap();
+    journal.complete(ids[1], &completed).unwrap();
+    let supported_3 =
+        RenameMoveIntent::new(ids[2], "source-3.md", "destination-3.md", revision("three"))
+            .unwrap();
+    journal.publish(&supported_3).unwrap();
+    let unsupported_future = write_unsupported(&app, ids[3], 99);
+    let supported_5 =
+        RenameMoveIntent::new(ids[4], "source-5.md", "destination-5.md", revision("five")).unwrap();
+    journal.publish(&supported_5).unwrap();
+
+    let first = journal.list_evidence_page(None, 2).unwrap();
+    assert_eq!(
+        first.entries,
+        vec![
+            JournalEvidence::Unsupported {
+                operation_id: ids[0],
+                version: 2,
+            },
+            JournalEvidence::Supported(supported_3.clone()),
+        ]
+    );
+    assert_eq!(first.next_after, Some(ids[2]));
+    let second = journal.list_evidence_page(first.next_after, 2).unwrap();
+    assert_eq!(
+        second.entries,
+        vec![
+            JournalEvidence::Unsupported {
+                operation_id: ids[3],
+                version: 99,
+            },
+            JournalEvidence::Supported(supported_5),
+        ]
+    );
+    assert!(second.next_after.is_none());
+    assert_eq!(
+        journal.read_evidence(ids[2]).unwrap(),
+        JournalEvidence::Supported(supported_3)
+    );
+    assert_eq!(
+        fs::read(
+            app.join("operation-journal")
+                .join(format!("{}.json", ids[0]))
+        )
+        .unwrap(),
+        unsupported_v2
+    );
+    assert_eq!(
+        fs::read(
+            app.join("operation-journal")
+                .join(format!("{}.json", ids[3]))
+        )
+        .unwrap(),
+        unsupported_future
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn only_unsupported_evidence_is_reported_without_tombstone_suppression() {
+    let (_temporary, app, vault) = roots();
+    let journal = RecoveryJournal::open(&app, &vault).unwrap();
+    let first = Uuid::from_u128(10);
+    let second = Uuid::from_u128(20);
+    let first_bytes = write_unsupported(&app, first, 1);
+    let second_bytes = write_unsupported(&app, second, 2);
+
+    // An unauthenticated same-name tombstone must not hide opaque evidence.
+    write_private(
+        &app.join("operation-journal/completed")
+            .join(format!("{first}.json")),
+        b"{}",
+    );
+    let page = journal.list_evidence_page(None, MAX_PAGE_SIZE).unwrap();
+    assert_eq!(
+        page.entries,
+        vec![
+            JournalEvidence::Unsupported {
+                operation_id: first,
+                version: 1,
+            },
+            JournalEvidence::Unsupported {
+                operation_id: second,
+                version: 2,
+            },
+        ]
+    );
+    assert_eq!(
+        fs::read(app.join("operation-journal").join(format!("{first}.json"))).unwrap(),
+        first_bytes
+    );
+    assert_eq!(
+        fs::read(app.join("operation-journal").join(format!("{second}.json"))).unwrap(),
+        second_bytes
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn malformed_or_noncanonical_current_evidence_is_an_explicit_error() {
+    let (_temporary, app, vault) = roots();
+    let journal = RecoveryJournal::open(&app, &vault).unwrap();
+    let malformed_id = Uuid::from_u128(30);
+    write_private(
+        &app.join("operation-journal")
+            .join(format!("{malformed_id}.json")),
+        b"{\"version\":",
+    );
+    assert!(matches!(
+        journal.list_evidence_page(None, MAX_PAGE_SIZE),
+        Err(Error::Json(_))
+    ));
+
+    let (_temporary, app, vault) = roots();
+    let journal = RecoveryJournal::open(&app, &vault).unwrap();
+    let expected = intent();
+    let bytes = serde_json::to_string_pretty(&expected).unwrap();
+    write_private(
+        &app.join("operation-journal")
+            .join(format!("{}.json", expected.operation_id)),
+        bytes.as_bytes(),
+    );
+    assert!(matches!(
+        journal.list_evidence_page(None, MAX_PAGE_SIZE),
+        Err(Error::InvalidEntryName)
+    ));
+}
+
+#[test]
+#[cfg(unix)]
+fn evidence_pagination_and_active_entry_count_are_bounded() {
+    let (_temporary, app, vault) = roots();
+    let journal = RecoveryJournal::open(&app, &vault).unwrap();
+    assert!(matches!(
+        journal.list_evidence_page(None, 0),
+        Err(Error::InvalidPageSize)
+    ));
+    assert!(matches!(
+        journal.list_evidence_page(None, MAX_PAGE_SIZE + 1),
+        Err(Error::InvalidPageSize)
+    ));
+    for value in 1_u128..=4_097 {
+        write_unsupported(&app, Uuid::from_u128(value), 2);
+    }
+    assert!(matches!(
+        journal.list_evidence_page(None, 1),
+        Err(Error::TooManyEntries)
     ));
 }
 

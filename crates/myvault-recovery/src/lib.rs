@@ -395,6 +395,22 @@ pub struct JournalPage {
     pub next_after: Option<Uuid>,
 }
 
+/// One immutable journal record classified without interpreting unsupported
+/// schema bytes as the current intent type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JournalEvidence {
+    Supported(RenameMoveIntent),
+    Unsupported { operation_id: Uuid, version: u32 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JournalEvidencePage {
+    /// Entries ordered by canonical operation UUID. Unsupported entries consume
+    /// one logical page slot and are never hidden by completion tombstones.
+    pub entries: Vec<JournalEvidence>,
+    pub next_after: Option<Uuid>,
+}
+
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CompletionTombstone {
@@ -588,6 +604,18 @@ impl RecoveryJournal {
         Ok(intent)
     }
 
+    /// Reads one bounded journal entry while preserving unsupported schemas as
+    /// opaque evidence. Unsupported bytes are not rewritten, deleted, or
+    /// deserialized as the current intent type.
+    ///
+    /// # Errors
+    /// Returns an error for malformed JSON, invalid current-schema evidence,
+    /// insecure files, or an operation-id/filename mismatch.
+    pub fn read_evidence(&self, operation_id: Uuid) -> Result<JournalEvidence, Error> {
+        let bytes = Self::read_raw(&self.directory, &entry_name(operation_id))?;
+        classify_evidence(operation_id, &bytes)
+    }
+
     /// Lists a deterministic page of logically active entries. Only an exact,
     /// valid completion tombstone suppresses an entry. Journal records and stale
     /// temps are physically retained; bounded garbage collection is deferred.
@@ -621,6 +649,65 @@ impl RecoveryJournal {
         })
     }
 
+    /// Lists a bounded deterministic UUID-ordered page containing both current
+    /// v3 intents and opaque unsupported-version evidence. A cursor is the last
+    /// returned UUID and the next page starts strictly after it.
+    ///
+    /// Valid completion tombstones suppress only their exact supported v3
+    /// intent. Unsupported records remain visible because their tombstones
+    /// cannot be authenticated without interpreting the unsupported schema.
+    ///
+    /// # Errors
+    /// Returns an error for invalid limits, excessive active evidence, or any
+    /// malformed/noncanonical current-schema record. Invalid evidence is never skipped.
+    pub fn list_evidence_page(
+        &self,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<JournalEvidencePage, Error> {
+        if !(1..=MAX_PAGE_SIZE).contains(&limit) {
+            return Err(Error::InvalidPageSize);
+        }
+        let mut entries = Vec::new();
+        for entry in self.directory.entries()? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(operation_id) = parse_entry_name(name) else {
+                continue;
+            };
+            let evidence = self.read_evidence(operation_id)?;
+            let active = match &evidence {
+                JournalEvidence::Supported(intent) => !self.has_valid_completion_for(intent),
+                JournalEvidence::Unsupported { .. } => true,
+            };
+            if active {
+                entries.push((operation_id, evidence));
+                if entries.len() > MAX_ENTRY_COUNT {
+                    return Err(Error::TooManyEntries);
+                }
+            }
+        }
+        entries.sort_unstable_by_key(|(operation_id, _)| *operation_id);
+        entries.dedup_by_key(|(operation_id, _)| *operation_id);
+        let mut selected = entries
+            .into_iter()
+            .filter(|(operation_id, _)| after.is_none_or(|cursor| *operation_id > cursor))
+            .take(limit + 1)
+            .collect::<Vec<_>>();
+        let has_more = selected.len() > limit;
+        selected.truncate(limit);
+        let next_after = if has_more {
+            selected.last().map(|(operation_id, _)| *operation_id)
+        } else {
+            None
+        };
+        Ok(JournalEvidencePage {
+            entries: selected.into_iter().map(|(_, evidence)| evidence).collect(),
+            next_after,
+        })
+    }
+
     fn active_ids(&self) -> Result<Vec<Uuid>, Error> {
         let mut ids = Vec::new();
         for entry in self.directory.entries()? {
@@ -645,15 +732,20 @@ impl RecoveryJournal {
 
     fn has_valid_completion(&self, operation_id: Uuid) -> Result<bool, Error> {
         let intent = self.read(operation_id)?;
+        Ok(self.has_valid_completion_for(&intent))
+    }
+
+    fn has_valid_completion_for(&self, intent: &RenameMoveIntent) -> bool {
+        let operation_id = intent.operation_id;
         let name = entry_name(operation_id);
         let Ok(Some(bytes)) = Self::read_raw_if_exists(&self.completed, &name) else {
-            return Ok(false);
+            return false;
         };
         let Ok(tombstone) = serde_json::from_slice::<CompletionTombstone>(&bytes) else {
-            return Ok(false);
+            return false;
         };
-        Ok(tombstone.validate_for(&intent).is_ok()
-            && serde_json::to_vec(&tombstone).is_ok_and(|canonical| canonical == bytes))
+        tombstone.validate_for(intent).is_ok()
+            && serde_json::to_vec(&tombstone).is_ok_and(|canonical| canonical == bytes)
     }
 
     fn read_raw_if_exists(directory: &Dir, name: &str) -> Result<Option<Vec<u8>>, Error> {
@@ -723,6 +815,22 @@ impl RecoveryJournal {
             Err(error) => Err(error),
         }
     }
+}
+
+fn classify_evidence(operation_id: Uuid, bytes: &[u8]) -> Result<JournalEvidence, Error> {
+    let envelope: VersionEnvelope = serde_json::from_slice(bytes)?;
+    if envelope.version != RenameMoveIntent::VERSION {
+        return Ok(JournalEvidence::Unsupported {
+            operation_id,
+            version: envelope.version,
+        });
+    }
+    let intent: RenameMoveIntent = serde_json::from_slice(bytes)?;
+    intent.validate()?;
+    if intent.operation_id != operation_id || canonical_bytes(&intent)? != bytes {
+        return Err(Error::InvalidEntryName);
+    }
+    Ok(JournalEvidence::Supported(intent))
 }
 
 fn canonical_portable(path: &str) -> Result<String, Error> {
