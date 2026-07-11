@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::{Arc, Barrier};
 
 use myvault_core::{
     FileRevision, TrashArea, TrashId, Vault, VaultPath, WriteIntent, MAX_TRASH_PAYLOAD_BYTES,
@@ -271,6 +272,41 @@ fn non_not_found_manifest_error_wins_over_missing_other_area() {
         Err(MutationError::Core(_))
     ));
     assert!(vault_path.join(source.as_path()).exists());
+}
+
+#[test]
+fn concurrent_journal_only_resumes_converge_without_split_manifest_decisions() {
+    let (_temporary, app, vault_path) = roots();
+    let vault = Vault::open(&vault_path).unwrap();
+    let journal = RecoveryJournal::open(&app, &vault_path).unwrap();
+    let source = VaultPath::from_portable("notes/concurrent-resume.md").unwrap();
+    setup_note(&vault, &source, b"concurrent");
+    let operation = MutationService::plan_trash(&vault, &source, 70).unwrap();
+    let (_, intent) = manifest_and_intent(&operation, &vault);
+    journal.publish(&intent).unwrap();
+
+    let vault = Arc::new(vault);
+    let journal = Arc::new(journal);
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let vault = Arc::clone(&vault);
+        let journal = Arc::clone(&journal);
+        let barrier = Arc::clone(&barrier);
+        let operation_id = operation.operation_id();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            MutationService::new(&vault, &journal).resume_trash(operation_id)
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+
+    assert!(!vault_path.join(source.as_path()).exists());
+    assert!(vault_path
+        .join(format!(".trash/v1/items/{}/payload", operation.trash_id()))
+        .exists());
 }
 
 #[test]

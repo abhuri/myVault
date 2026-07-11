@@ -3,8 +3,8 @@ use std::io;
 use crate::revision::{to_core, to_recovery};
 use crate::{MutationError, OperationId, TrashOperation};
 use myvault_core::{
-    CoreError, ManifestDigest, PrepareManifestOutcome, PublishItemOutcome, StagePayloadOutcome,
-    TrashArea, TrashId, TrashManifestV1, Vault, VaultPath, MAX_TRASH_PAYLOAD_BYTES,
+    ManifestDigest, PrepareManifestOutcome, PublishItemOutcome, StagePayloadOutcome, TrashId,
+    Vault, VaultPath, MAX_TRASH_PAYLOAD_BYTES,
 };
 use myvault_recovery::{
     CompleteOutcome, JournalEvidence, RecoveryJournal, RecoveryOperationKind, RenameMoveIntent,
@@ -13,7 +13,7 @@ use myvault_recovery::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TrashExecutionOutcome {
     pub operation_id: OperationId,
-    pub prepared: Option<PrepareManifestOutcome>,
+    pub prepared: PrepareManifestOutcome,
     pub staged: StagePayloadOutcome,
     pub published: PublishItemOutcome,
     pub completion: CompleteOutcome,
@@ -131,7 +131,7 @@ impl<'service> MutationService<'service> {
         operation: &TrashOperation,
         digest: &ManifestDigest,
         intent: &RenameMoveIntent,
-        prepared: Option<PrepareManifestOutcome>,
+        prepared: PrepareManifestOutcome,
     ) -> Result<TrashExecutionOutcome, MutationError> {
         let source = operation.source_path()?;
         let staged = self.vault.trash_store().stage_payload_if_revision(
@@ -159,50 +159,15 @@ impl<'service> MutationService<'service> {
         &self,
         operation: &TrashOperation,
         digest: &ManifestDigest,
-    ) -> Result<Option<PrepareManifestOutcome>, MutationError> {
+    ) -> Result<PrepareManifestOutcome, MutationError> {
         let expected = operation.rebuild_manifest()?;
         if expected.digest()? != *digest {
             return Err(MutationError::IntentMismatch);
         }
-        match self.read_unique_manifest(operation.trash_id())? {
-            Some(observed) => {
-                if observed != expected || observed.digest()? != *digest {
-                    return Err(MutationError::IntentMismatch);
-                }
-                Ok(None)
-            }
-            None => Ok(Some(
-                self.vault
-                    .trash_store()
-                    .prepare_staging_manifest(operation.trash_id(), &expected)?,
-            )),
-        }
-    }
-
-    fn read_unique_manifest(
-        &self,
-        trash_id: TrashId,
-    ) -> Result<Option<TrashManifestV1>, MutationError> {
-        let store = self.vault.trash_store();
-        let items = store.read_manifest(TrashArea::Items, trash_id);
-        let staging = store.read_manifest(TrashArea::Staging, trash_id);
-        match (items, staging) {
-            (Ok(_), Ok(_)) => Err(MutationError::InvalidOperation(
-                "staging and items manifests both exist",
-            )),
-            (Ok(manifest), Err(error)) if is_not_found(&error) => Ok(Some(manifest)),
-            (Err(error), Ok(manifest)) if is_not_found(&error) => Ok(Some(manifest)),
-            (Ok(_), Err(error)) | (Err(error), Ok(_)) => Err(error.into()),
-            (Err(items_error), Err(staging_error)) => {
-                if !is_not_found(&items_error) {
-                    Err(items_error.into())
-                } else if !is_not_found(&staging_error) {
-                    Err(staging_error.into())
-                } else {
-                    Ok(None)
-                }
-            }
-        }
+        Ok(self
+            .vault
+            .trash_store()
+            .prepare_staging_manifest(operation.trash_id(), &expected)?)
     }
 }
 
@@ -278,8 +243,4 @@ fn operation_from_intent(
         *trashed_at_unix_ms,
     )?;
     Ok((operation, digest))
-}
-
-fn is_not_found(error: &CoreError) -> bool {
-    matches!(error, CoreError::Io(source) if source.kind() == io::ErrorKind::NotFound)
 }

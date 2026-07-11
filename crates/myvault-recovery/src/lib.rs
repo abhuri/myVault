@@ -669,10 +669,10 @@ impl RecoveryJournal {
     }
 
     /// Lists a bounded deterministic UUID-ordered page containing both current
-    /// v3 intents and opaque unsupported-version evidence. A cursor is the last
+    /// v4 intents and opaque unsupported-version evidence. A cursor is the last
     /// returned UUID and the next page starts strictly after it.
     ///
-    /// Valid completion tombstones suppress only their exact supported v3
+    /// Valid completion tombstones suppress only their exact supported v4
     /// intent. Unsupported records remain visible because their tombstones
     /// cannot be authenticated without interpreting the unsupported schema.
     ///
