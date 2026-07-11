@@ -2,7 +2,13 @@
 
 This runbook is the remaining manual evidence path for Phase 0ค่ะ
 
+Current status as of 2026-07-12: automated Phase 0 CI is complete at commit `0aecda5`ค่ะ คุณโออนุมัติให้ Sunday perform the Google Cloud configuration through the logged-in browser sessionค่ะ Physical Android steps are deferred until a device becomes available and do not block Phase 1ค่ะ
+
 ## Google Cloud Configuration
+
+Owner: Sundayค่ะ Creating/selecting the project and OAuth clients is an approved external actionค่ะ Do not change billing, publish the OAuth app, or add users other than the personal test account without new approvalค่ะ
+
+Progress: project `myVault Personal` (`myvault-personal-0aecda5`) exists and Drive API is enabledค่ะ Google Auth Platform is paused at the Google API Services User Data Policy acceptance step pending the user's explicit confirmationค่ะ
 
 1. Create or select a Google Cloud project owned by the personal account that will use myVaultค่ะ
 2. Enable Google Drive APIค่ะ
@@ -15,6 +21,8 @@ This runbook is the remaining manual evidence path for Phase 0ค่ะ
 The full Drive scope is restricted and may display an unverified-app warning for a personal test applicationค่ะ Do not publish the OAuth app or add other users during Phase 0ค่ะ
 
 ## Connect the Physical Device
+
+Status: deferred by user because no physical Android device is currently availableค่ะ Resume this section when a device with Google Play Services can be connectedค่ะ
 
 1. Enable Developer options and USB debugging on the Android deviceค่ะ
 2. Connect USB and approve the computer fingerprint on the deviceค่ะ

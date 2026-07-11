@@ -13,7 +13,10 @@ mod watcher;
 pub use error::{CoreError, Result};
 pub use index::{DerivedIndex, NoteRecord, SCHEMA_VERSION, SQLITE_OPEN_RESIDUAL_RISK};
 pub use path::VaultPath;
-pub use vault::{Vault, WriteIntent};
+pub use vault::{
+    InventoryEntry, InventoryKind, InventoryLimits, Vault, WriteIntent, DEFAULT_READ_LIMIT,
+    MUTATION_EXTERNAL_PROCESS_RESIDUAL_RISK,
+};
 pub use watcher::{
     BurstNormalizer, NormalizedEvent, RawEvent, SelfWriteSuppressor, WriteFingerprint,
 };

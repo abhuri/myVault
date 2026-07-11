@@ -8,9 +8,30 @@ pub enum CoreError {
     PathEscapesVault(PathBuf),
     SymlinkRejected(PathBuf),
     AutomaticObsidianWriteDenied(PathBuf),
-    AppDataInsideVault { app_data: PathBuf, vault: PathBuf },
+    TrashWriteDenied(PathBuf),
+    AppDataInsideVault {
+        app_data: PathBuf,
+        vault: PathBuf,
+    },
     UnsafeDatabasePath(PathBuf),
     InvalidRecord(&'static str),
+    ResourceLimitExceeded {
+        resource: &'static str,
+        limit: usize,
+    },
+    PortablePathCollision {
+        existing: String,
+        incoming: String,
+    },
+    CommitOutcomeUnknown {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    PublishedCleanupPending {
+        path: PathBuf,
+        temp_name: String,
+        source: std::io::Error,
+    },
     Io(std::io::Error),
     Sqlite(rusqlite::Error),
 }
@@ -36,6 +57,11 @@ impl fmt::Display for CoreError {
                 "automatic writes under .obsidian are denied: {}",
                 path.display()
             ),
+            Self::TrashWriteDenied(path) => write!(
+                formatter,
+                "generic vault writes under .trash are denied: {}",
+                path.display()
+            ),
             Self::AppDataInsideVault { app_data, vault } => write!(
                 formatter,
                 "app-data directory {} must be outside synced vault {}",
@@ -48,6 +74,27 @@ impl fmt::Display for CoreError {
                 path.display()
             ),
             Self::InvalidRecord(reason) => write!(formatter, "invalid index record: {reason}"),
+            Self::ResourceLimitExceeded { resource, limit } => {
+                write!(formatter, "{resource} exceeds configured limit of {limit}")
+            }
+            Self::PortablePathCollision { existing, incoming } => write!(
+                formatter,
+                "portable vault paths collide across filesystems: {incoming} conflicts with {existing}"
+            ),
+            Self::CommitOutcomeUnknown { path, source } => write!(
+                formatter,
+                "publication outcome for {} is unknown: {source}",
+                path.display()
+            ),
+            Self::PublishedCleanupPending {
+                path,
+                temp_name,
+                source,
+            } => write!(
+                formatter,
+                "{} was published but cleanup of {temp_name} may be pending: {source}",
+                path.display()
+            ),
             Self::Io(error) => write!(formatter, "filesystem error: {error}"),
             Self::Sqlite(error) => write!(formatter, "SQLite error: {error}"),
         }
@@ -58,6 +105,8 @@ impl std::error::Error for CoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            Self::CommitOutcomeUnknown { source, .. }
+            | Self::PublishedCleanupPending { source, .. } => Some(source),
             Self::Sqlite(error) => Some(error),
             _ => None,
         }
