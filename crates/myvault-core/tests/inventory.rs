@@ -170,19 +170,55 @@ fn mutations_reject_case_and_nfd_sibling_collisions() {
 #[test]
 fn create_policy_runs_before_parent_or_temp_artifacts() {
     let (temp, vault) = fixture();
-    let obsidian = VaultPath::new(".ｏｂｓｉｄｉａｎ/new/plugin.json").expect("path");
-    assert!(matches!(
-        vault.create_new(&obsidian, b"x", WriteIntent::Automatic),
-        Err(CoreError::AutomaticObsidianWriteDenied(_))
-    ));
-    assert!(!temp.path().join(".ｏｂｓｉｄｉａｎ").exists());
+    for root in [".obsidian", ".ｏｂｓｉｄｉａｎ"] {
+        let path = VaultPath::new(format!("{root}/new/plugin.json")).expect("path");
+        assert!(matches!(
+            vault.create_new(&path, b"x", WriteIntent::Automatic),
+            Err(CoreError::AutomaticObsidianWriteDenied(_))
+        ));
+        assert!(matches!(
+            vault.create_directories(&path, WriteIntent::Automatic),
+            Err(CoreError::AutomaticObsidianWriteDenied(_))
+        ));
+        assert!(matches!(
+            vault.atomic_write(&path, b"x", WriteIntent::Automatic),
+            Err(CoreError::AutomaticObsidianWriteDenied(_))
+        ));
+        assert!(!temp.path().join(root).exists());
+    }
 
-    let trash = VaultPath::new(".ｔｒａｓｈ/new/note.md").expect("path");
+    for root in [".trash", ".ｔｒａｓｈ"] {
+        let path = VaultPath::new(format!("{root}/new/note.md")).expect("path");
+        assert!(matches!(
+            vault.create_new(&path, b"x", WriteIntent::UserInitiated),
+            Err(CoreError::TrashWriteDenied(_))
+        ));
+        assert!(matches!(
+            vault.atomic_write(&path, b"x", WriteIntent::UserInitiated),
+            Err(CoreError::TrashWriteDenied(_))
+        ));
+        assert!(matches!(
+            vault.create_directories(&path, WriteIntent::UserInitiated),
+            Err(CoreError::TrashWriteDenied(_))
+        ));
+        assert!(!temp.path().join(root).exists());
+    }
+}
+
+#[test]
+fn atomic_write_checks_collisions_for_every_parent_component() {
+    let (temp, vault) = fixture();
+    fs::create_dir(temp.path().join("Notes")).expect("external directory");
+    let path = VaultPath::new("notes/child.md").expect("path");
     assert!(matches!(
-        vault.create_new(&trash, b"x", WriteIntent::UserInitiated),
-        Err(CoreError::TrashWriteDenied(_))
+        vault.atomic_write(&path, b"new", WriteIntent::UserInitiated),
+        Err(CoreError::PortablePathCollision { .. })
     ));
-    assert!(!temp.path().join(".ｔｒａｓｈ").exists());
+    assert!(!temp.path().join("Notes/child.md").exists());
+    assert!(fs::read_dir(temp.path().join("Notes"))
+        .expect("directory")
+        .next()
+        .is_none());
 }
 
 #[test]
@@ -197,6 +233,48 @@ fn concurrent_portable_collisions_have_only_one_winner() {
         .into_iter()
         .map(|name| {
             let vault = Arc::clone(&vault);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                vault.create_new(
+                    &VaultPath::new(name).expect("path"),
+                    name.as_bytes(),
+                    WriteIntent::UserInitiated,
+                )
+            })
+        })
+        .collect();
+    barrier.wait();
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("thread"))
+        .collect();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(CoreError::PortablePathCollision { .. })))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn separately_opened_vaults_share_the_same_root_mutation_lock() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let temp = TempDir::new().expect("temp dir");
+    let canonical = fs::canonicalize(temp.path()).expect("canonical path");
+    let vaults = [
+        Arc::new(Vault::open(&canonical).expect("first vault")),
+        Arc::new(Vault::open(&canonical).expect("second vault")),
+    ];
+    let barrier = Arc::new(Barrier::new(3));
+    let handles: Vec<_> = vaults
+        .into_iter()
+        .zip(["Shared.md", "ｓｈａｒｅｄ.md"])
+        .map(|(vault, name)| {
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
                 barrier.wait();

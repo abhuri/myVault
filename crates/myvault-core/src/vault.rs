@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 #[cfg(unix)]
 use cap_fs_ext::OpenOptionsExt;
@@ -14,7 +15,12 @@ use crate::path::{classify_component, component_collision_key, VaultPathClass};
 use crate::{CoreError, Result, VaultPath};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+static MUTATION_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
 pub const DEFAULT_READ_LIMIT: usize = 16 * 1024 * 1024;
+/// In-process vault instances share a mutation lock, but another process can
+/// still alter the filesystem between descriptor-relative validation and commit.
+pub const MUTATION_EXTERNAL_PROCESS_RESIDUAL_RISK: &str =
+    "external processes are not serialized with myVault's per-root mutation lock";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InventoryLimits {
@@ -56,7 +62,7 @@ pub enum WriteIntent {
 pub struct Vault {
     root_path: PathBuf,
     root_dir: Dir,
-    mutation_lock: Mutex<()>,
+    mutation_lock: Arc<Mutex<()>>,
 }
 
 impl Vault {
@@ -70,10 +76,11 @@ impl Vault {
         let supplied = root.as_ref();
         let root_dir = open_absolute_dir_nofollow(supplied)?;
         let root_path = std::fs::canonicalize(supplied)?;
+        let mutation_lock = shared_mutation_lock(&root_path)?;
         Ok(Self {
             root_path,
             root_dir,
-            mutation_lock: Mutex::new(()),
+            mutation_lock,
         })
     }
 
@@ -155,10 +162,11 @@ impl Vault {
     ///
     /// # Errors
     ///
-    /// Returns an error for a symlink/non-directory component or filesystem
-    /// failure.
-    pub fn create_directories(&self, relative: &VaultPath) -> Result<()> {
+    /// Returns an error for a denied internal path, symlink/non-directory
+    /// component, portable-name collision, or filesystem failure.
+    pub fn create_directories(&self, relative: &VaultPath, intent: WriteIntent) -> Result<()> {
         let _guard = self.lock_mutations()?;
+        Self::validate_mutation_policy(relative, intent)?;
         self.create_directories_inner(relative)
     }
 
@@ -209,7 +217,7 @@ impl Vault {
     where
         F: FnMut(CreateStage) -> std::io::Result<()>,
     {
-        Self::validate_create_policy(relative, intent)?;
+        Self::validate_mutation_policy(relative, intent)?;
         let components: Vec<_> = relative.as_path().components().collect();
         if components.len() > 1 {
             let parent_path = components[..components.len() - 1]
@@ -265,8 +273,8 @@ impl Vault {
     ///
     /// # Errors
     ///
-    /// Returns an error for filesystem failures, symlink components, or
-    /// automatic writes beneath `.obsidian`.
+    /// Returns an error for filesystem failures, symlink components, portable
+    /// collisions, generic `.trash` writes, or automatic `.obsidian` writes.
     pub fn atomic_write(
         &self,
         relative: &VaultPath,
@@ -287,13 +295,9 @@ impl Vault {
     where
         F: FnOnce(),
     {
-        if intent == WriteIntent::Automatic && relative.is_obsidian_metadata() {
-            return Err(CoreError::AutomaticObsidianWriteDenied(
-                relative.as_path().to_path_buf(),
-            ));
-        }
+        Self::validate_mutation_policy(relative, intent)?;
 
-        let (parent, destination_name) = self.open_parent(relative)?;
+        let (parent, destination_name) = self.open_parent_checked(relative)?;
         let destination_utf8 = destination_name
             .to_str()
             .ok_or_else(|| CoreError::InvalidRelativePath(relative.as_path().to_owned()))?;
@@ -327,6 +331,25 @@ impl Vault {
         for component in parents {
             display.push(component.as_os_str());
             current = open_child_dir_nofollow(&current, component.as_os_str(), &display)?;
+        }
+        Ok((current, name.as_os_str().to_owned()))
+    }
+
+    fn open_parent_checked(&self, relative: &VaultPath) -> Result<(Dir, OsString)> {
+        let components: Vec<_> = relative.as_path().components().collect();
+        let (name, parents) = components
+            .split_last()
+            .ok_or_else(|| CoreError::InvalidRelativePath(relative.as_path().to_path_buf()))?;
+        let mut current = self.root_dir.try_clone()?;
+        let mut display = self.root_path.clone();
+        for component in parents {
+            let component_name = component.as_os_str();
+            let component_utf8 = component_name
+                .to_str()
+                .ok_or_else(|| CoreError::InvalidRelativePath(relative.as_path().to_path_buf()))?;
+            self.reject_sibling_collision(&current, component_utf8, relative)?;
+            display.push(component_name);
+            current = open_child_dir_nofollow(&current, component_name, &display)?;
         }
         Ok((current, name.as_os_str().to_owned()))
     }
@@ -467,7 +490,7 @@ impl Vault {
         Ok(())
     }
 
-    fn validate_create_policy(relative: &VaultPath, intent: WriteIntent) -> Result<()> {
+    fn validate_mutation_policy(relative: &VaultPath, intent: WriteIntent) -> Result<()> {
         match relative.classify() {
             VaultPathClass::ObsidianMetadata if intent == WriteIntent::Automatic => Err(
                 CoreError::AutomaticObsidianWriteDenied(relative.as_path().to_owned()),
@@ -527,6 +550,20 @@ impl Vault {
         )
         .into())
     }
+}
+
+fn shared_mutation_lock(root: &Path) -> Result<Arc<Mutex<()>>> {
+    let registry = MUTATION_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = registry
+        .lock()
+        .map_err(|_| std::io::Error::other("vault mutation-lock registry was poisoned"))?;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(root).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(root.to_owned(), Arc::downgrade(&lock));
+    Ok(lock)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
