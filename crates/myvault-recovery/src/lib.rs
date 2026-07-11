@@ -40,6 +40,7 @@ pub enum Error {
     InvalidOperationId,
     InvalidTrashId,
     InvalidManifestDigest,
+    InvalidOperationTopology,
     InvalidPortablePath,
     IdenticalPaths,
     CaseRenameContractRequired,
@@ -70,6 +71,9 @@ impl fmt::Display for Error {
             Self::InvalidTrashId => formatter.write_str("invalid trash id"),
             Self::InvalidManifestDigest => {
                 formatter.write_str("invalid canonical manifest BLAKE3 digest")
+            }
+            Self::InvalidOperationTopology => {
+                formatter.write_str("operation kind does not match its endpoint topology")
             }
             Self::InvalidPortablePath => formatter.write_str("invalid portable vault path"),
             Self::IdenticalPaths => formatter.write_str("rename source and destination are equal"),
@@ -204,18 +208,14 @@ impl RenameMoveIntent {
         from: impl AsRef<str>,
         to: impl AsRef<str>,
         expected: FileRevision,
-        temp: Option<String>,
     ) -> Result<Self, Error> {
-        let from = canonical_portable(from.as_ref())?;
-        let to = canonical_portable(to.as_ref())?;
-        let temp = temp.map(|path| canonical_portable(&path)).transpose()?;
         Self::new_for_kind(
             operation_id,
             RecoveryOperationKind::NormalMove,
             from,
             to,
             expected,
-            temp,
+            None,
         )
     }
 
@@ -250,10 +250,10 @@ impl RenameMoveIntent {
         trash_id: Uuid,
         manifest_blake3: impl Into<String>,
         from: impl AsRef<str>,
-        to: impl AsRef<str>,
         expected: FileRevision,
-        temp: Option<String>,
     ) -> Result<Self, Error> {
+        let to = trash_payload_path("items", trash_id);
+        let temp = trash_payload_path("staging", trash_id);
         Self::new_for_kind(
             operation_id,
             RecoveryOperationKind::Trash {
@@ -263,7 +263,7 @@ impl RenameMoveIntent {
             from,
             to,
             expected,
-            temp,
+            Some(temp),
         )
     }
 
@@ -275,11 +275,10 @@ impl RenameMoveIntent {
         operation_id: Uuid,
         trash_id: Uuid,
         manifest_blake3: impl Into<String>,
-        from: impl AsRef<str>,
         to: impl AsRef<str>,
         expected: FileRevision,
-        temp: Option<String>,
     ) -> Result<Self, Error> {
+        let from = trash_payload_path("items", trash_id);
         Self::new_for_kind(
             operation_id,
             RecoveryOperationKind::Restore {
@@ -289,7 +288,7 @@ impl RenameMoveIntent {
             from,
             to,
             expected,
-            temp,
+            None,
         )
     }
 
@@ -308,12 +307,7 @@ impl RenameMoveIntent {
         let from = canonical_portable(from.as_ref())?;
         let to = canonical_portable(to.as_ref())?;
         let temp = temp.map(|path| canonical_portable(&path)).transpose()?;
-        validate_path_relationship(
-            &from,
-            &to,
-            matches!(kind, RecoveryOperationKind::CaseRename),
-            temp.as_deref(),
-        )?;
+        validate_operation_topology(&kind, &from, &to, temp.as_deref())?;
         expected.validate()?;
         Ok(Self {
             version: Self::VERSION,
@@ -341,12 +335,7 @@ impl RenameMoveIntent {
         if from != self.from || to != self.to || temp.as_deref() != self.temp.as_deref() {
             return Err(Error::InvalidPortablePath);
         }
-        validate_path_relationship(
-            &from,
-            &to,
-            matches!(self.kind, RecoveryOperationKind::CaseRename),
-            temp.as_deref(),
-        )
+        validate_operation_topology(&self.kind, &from, &to, temp.as_deref())
     }
 }
 
@@ -763,6 +752,76 @@ fn decode_intent(bytes: &[u8]) -> Result<RenameMoveIntent, Error> {
     Ok(serde_json::from_slice(bytes)?)
 }
 
+fn trash_payload_path(area: &str, trash_id: Uuid) -> String {
+    format!(".trash/v1/{area}/{trash_id}/payload")
+}
+
+fn is_content_path(path: &str) -> Result<bool, Error> {
+    let path = VaultPath::from_portable(path).map_err(|_| Error::InvalidPortablePath)?;
+    let first_key = path
+        .collision_key()
+        .split('/')
+        .next()
+        .ok_or(Error::InvalidPortablePath)?
+        .to_owned();
+    Ok(first_key != ".trash" && first_key != ".obsidian")
+}
+
+fn require_content_path(path: &str) -> Result<(), Error> {
+    if is_content_path(path)? {
+        Ok(())
+    } else {
+        Err(Error::InvalidOperationTopology)
+    }
+}
+
+fn validate_operation_topology(
+    kind: &RecoveryOperationKind,
+    from: &str,
+    to: &str,
+    temp: Option<&str>,
+) -> Result<(), Error> {
+    match kind {
+        RecoveryOperationKind::NormalMove => {
+            require_content_path(from)?;
+            require_content_path(to)?;
+            if temp.is_some() {
+                return Err(Error::InvalidOperationTopology);
+            }
+            validate_path_relationship(from, to, false, None)
+        }
+        RecoveryOperationKind::CaseRename => {
+            require_content_path(from)?;
+            require_content_path(to)?;
+            let Some(temp) = temp else {
+                return Err(Error::InvalidOperationTopology);
+            };
+            // Exact reservation and ownership of this content path belong to
+            // the mutation service. The journal is an untrusted hint and only
+            // proves that the path is canonical, non-protected, and distinct.
+            require_content_path(temp)?;
+            validate_path_relationship(from, to, true, Some(temp))
+        }
+        RecoveryOperationKind::Trash { trash_id, .. } => {
+            require_content_path(from)?;
+            let expected_to = trash_payload_path("items", *trash_id);
+            let expected_temp = trash_payload_path("staging", *trash_id);
+            if to != expected_to || temp != Some(expected_temp.as_str()) {
+                return Err(Error::InvalidOperationTopology);
+            }
+            Ok(())
+        }
+        RecoveryOperationKind::Restore { trash_id, .. } => {
+            require_content_path(to)?;
+            let expected_from = trash_payload_path("items", *trash_id);
+            if from != expected_from || temp.is_some() {
+                return Err(Error::InvalidOperationTopology);
+            }
+            Ok(())
+        }
+    }
+}
+
 fn validate_path_relationship(
     from: &str,
     to: &str,
@@ -1065,7 +1124,6 @@ mod durability_tests {
             "source.md",
             "destination.md",
             FileRevision::from_bytes(b"note"),
-            None,
         )
         .expect("intent")
     }
