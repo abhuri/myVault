@@ -37,6 +37,9 @@ pub enum Error {
     PrivacyValidationRequired,
     ExtendedAcl,
     InvalidRevision,
+    InvalidOperationId,
+    InvalidTrashId,
+    InvalidManifestDigest,
     InvalidPortablePath,
     IdenticalPaths,
     CaseRenameContractRequired,
@@ -63,6 +66,11 @@ impl fmt::Display for Error {
             ),
             Self::ExtendedAcl => formatter.write_str("recovery journal object has an extended ACL"),
             Self::InvalidRevision => formatter.write_str("invalid BLAKE3 revision"),
+            Self::InvalidOperationId => formatter.write_str("invalid operation id"),
+            Self::InvalidTrashId => formatter.write_str("invalid trash id"),
+            Self::InvalidManifestDigest => {
+                formatter.write_str("invalid canonical manifest BLAKE3 digest")
+            }
             Self::InvalidPortablePath => formatter.write_str("invalid portable vault path"),
             Self::IdenticalPaths => formatter.write_str("rename source and destination are equal"),
             Self::CaseRenameContractRequired => {
@@ -90,6 +98,42 @@ impl fmt::Display for Error {
                     formatter,
                     "journal published but directory sync failed: {error}"
                 )
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RecoveryOperationKind {
+    NormalMove,
+    CaseRename,
+    Trash {
+        trash_id: Uuid,
+        manifest_blake3: String,
+    },
+    Restore {
+        trash_id: Uuid,
+        manifest_blake3: String,
+    },
+}
+
+impl RecoveryOperationKind {
+    fn validate(&self) -> Result<(), Error> {
+        match self {
+            Self::NormalMove | Self::CaseRename => Ok(()),
+            Self::Trash {
+                trash_id,
+                manifest_blake3,
+            }
+            | Self::Restore {
+                trash_id,
+                manifest_blake3,
+            } => {
+                if trash_id.is_nil() {
+                    return Err(Error::InvalidTrashId);
+                }
+                validate_blake3_hex(manifest_blake3).map_err(|()| Error::InvalidManifestDigest)
             }
         }
     }
@@ -128,16 +172,7 @@ impl FileRevision {
     /// # Errors
     /// Returns [`Error::InvalidRevision`] unless the digest is canonical lowercase BLAKE3 hex.
     pub fn validate(&self) -> Result<(), Error> {
-        let valid = self.blake3_hex.len() == 64
-            && self
-                .blake3_hex
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-        if valid {
-            Ok(())
-        } else {
-            Err(Error::InvalidRevision)
-        }
+        validate_blake3_hex(&self.blake3_hex).map_err(|()| Error::InvalidRevision)
     }
 }
 
@@ -150,12 +185,14 @@ pub struct RenameMoveIntent {
     pub to: String,
     pub expected: FileRevision,
     pub temp: Option<String>,
-    #[serde(default)]
-    pub case_rename: bool,
+    pub kind: RecoveryOperationKind,
 }
 
 impl RenameMoveIntent {
-    pub const VERSION: u32 = 2;
+    /// Version 3 replaces the ambiguous v2 `case_rename` flag with an explicit
+    /// operation kind. Older records are rejected as unsupported rather than
+    /// being silently reinterpreted.
+    pub const VERSION: u32 = 3;
 
     /// Creates a normal rename/move intent. Case-only renames must use
     /// [`Self::new_case_rename`]. Input paths are stored canonically.
@@ -163,6 +200,7 @@ impl RenameMoveIntent {
     /// # Errors
     /// Returns an error for invalid paths, equal paths, collision-key aliases, or revisions.
     pub fn new(
+        operation_id: Uuid,
         from: impl AsRef<str>,
         to: impl AsRef<str>,
         expected: FileRevision,
@@ -171,17 +209,14 @@ impl RenameMoveIntent {
         let from = canonical_portable(from.as_ref())?;
         let to = canonical_portable(to.as_ref())?;
         let temp = temp.map(|path| canonical_portable(&path)).transpose()?;
-        validate_path_relationship(&from, &to, false, temp.as_deref())?;
-        expected.validate()?;
-        Ok(Self {
-            version: Self::VERSION,
-            operation_id: Uuid::new_v4(),
+        Self::new_for_kind(
+            operation_id,
+            RecoveryOperationKind::NormalMove,
             from,
             to,
             expected,
             temp,
-            case_rename: false,
-        })
+        )
     }
 
     /// Creates an explicit two-step case-only rename intent.
@@ -190,24 +225,104 @@ impl RenameMoveIntent {
     /// Returns an error unless source/destination differ exactly, share a collision key,
     /// and the temporary path has a distinct collision key from both.
     pub fn new_case_rename(
+        operation_id: Uuid,
         from: impl AsRef<str>,
         to: impl AsRef<str>,
         expected: FileRevision,
         temp: impl AsRef<str>,
     ) -> Result<Self, Error> {
-        let from = canonical_portable(from.as_ref())?;
-        let to = canonical_portable(to.as_ref())?;
-        let temp = canonical_portable(temp.as_ref())?;
-        validate_path_relationship(&from, &to, true, Some(&temp))?;
-        expected.validate()?;
-        Ok(Self {
-            version: Self::VERSION,
-            operation_id: Uuid::new_v4(),
+        Self::new_for_kind(
+            operation_id,
+            RecoveryOperationKind::CaseRename,
             from,
             to,
             expected,
-            temp: Some(temp),
-            case_rename: true,
+            Some(temp.as_ref().to_owned()),
+        )
+    }
+
+    /// Creates a trash intent bound to an immutable trash manifest.
+    ///
+    /// # Errors
+    /// Returns an error for invalid identifiers, digest, paths, or revision.
+    pub fn new_trash(
+        operation_id: Uuid,
+        trash_id: Uuid,
+        manifest_blake3: impl Into<String>,
+        from: impl AsRef<str>,
+        to: impl AsRef<str>,
+        expected: FileRevision,
+        temp: Option<String>,
+    ) -> Result<Self, Error> {
+        Self::new_for_kind(
+            operation_id,
+            RecoveryOperationKind::Trash {
+                trash_id,
+                manifest_blake3: manifest_blake3.into(),
+            },
+            from,
+            to,
+            expected,
+            temp,
+        )
+    }
+
+    /// Creates a restore intent bound to the same immutable trash manifest.
+    ///
+    /// # Errors
+    /// Returns an error for invalid identifiers, digest, paths, or revision.
+    pub fn new_restore(
+        operation_id: Uuid,
+        trash_id: Uuid,
+        manifest_blake3: impl Into<String>,
+        from: impl AsRef<str>,
+        to: impl AsRef<str>,
+        expected: FileRevision,
+        temp: Option<String>,
+    ) -> Result<Self, Error> {
+        Self::new_for_kind(
+            operation_id,
+            RecoveryOperationKind::Restore {
+                trash_id,
+                manifest_blake3: manifest_blake3.into(),
+            },
+            from,
+            to,
+            expected,
+            temp,
+        )
+    }
+
+    fn new_for_kind(
+        operation_id: Uuid,
+        kind: RecoveryOperationKind,
+        from: impl AsRef<str>,
+        to: impl AsRef<str>,
+        expected: FileRevision,
+        temp: Option<String>,
+    ) -> Result<Self, Error> {
+        if operation_id.is_nil() {
+            return Err(Error::InvalidOperationId);
+        }
+        kind.validate()?;
+        let from = canonical_portable(from.as_ref())?;
+        let to = canonical_portable(to.as_ref())?;
+        let temp = temp.map(|path| canonical_portable(&path)).transpose()?;
+        validate_path_relationship(
+            &from,
+            &to,
+            matches!(kind, RecoveryOperationKind::CaseRename),
+            temp.as_deref(),
+        )?;
+        expected.validate()?;
+        Ok(Self {
+            version: Self::VERSION,
+            operation_id,
+            from,
+            to,
+            expected,
+            temp,
+            kind,
         })
     }
 
@@ -215,6 +330,10 @@ impl RenameMoveIntent {
         if self.version != Self::VERSION {
             return Err(Error::UnsupportedVersion(self.version));
         }
+        if self.operation_id.is_nil() {
+            return Err(Error::InvalidOperationId);
+        }
+        self.kind.validate()?;
         self.expected.validate()?;
         let from = canonical_portable(&self.from)?;
         let to = canonical_portable(&self.to)?;
@@ -222,7 +341,12 @@ impl RenameMoveIntent {
         if from != self.from || to != self.to || temp.as_deref() != self.temp.as_deref() {
             return Err(Error::InvalidPortablePath);
         }
-        validate_path_relationship(&from, &to, self.case_rename, temp.as_deref())
+        validate_path_relationship(
+            &from,
+            &to,
+            matches!(self.kind, RecoveryOperationKind::CaseRename),
+            temp.as_deref(),
+        )
     }
 }
 
@@ -467,7 +591,7 @@ impl RecoveryJournal {
     /// Returns an error for an absent, malformed, oversized, insecure, or mismatched entry.
     pub fn read(&self, operation_id: Uuid) -> Result<RenameMoveIntent, Error> {
         let bytes = Self::read_raw(&self.directory, &entry_name(operation_id))?;
-        let intent: RenameMoveIntent = serde_json::from_slice(&bytes)?;
+        let intent = decode_intent(&bytes)?;
         intent.validate()?;
         if intent.operation_id != operation_id || canonical_bytes(&intent)? != bytes {
             return Err(Error::InvalidEntryName);
@@ -616,6 +740,27 @@ fn canonical_portable(path: &str) -> Result<String, Error> {
     VaultPath::from_portable(path)
         .map(|path| path.as_str().to_owned())
         .map_err(|_| Error::InvalidPortablePath)
+}
+
+fn validate_blake3_hex(digest: &str) -> Result<(), ()> {
+    let valid = digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    valid.then_some(()).ok_or(())
+}
+
+#[derive(Deserialize)]
+struct VersionEnvelope {
+    version: u32,
+}
+
+fn decode_intent(bytes: &[u8]) -> Result<RenameMoveIntent, Error> {
+    let envelope: VersionEnvelope = serde_json::from_slice(bytes)?;
+    if envelope.version != RenameMoveIntent::VERSION {
+        return Err(Error::UnsupportedVersion(envelope.version));
+    }
+    Ok(serde_json::from_slice(bytes)?)
 }
 
 fn validate_path_relationship(
@@ -916,6 +1061,7 @@ mod durability_tests {
 
     fn intent() -> RenameMoveIntent {
         RenameMoveIntent::new(
+            Uuid::new_v4(),
             "source.md",
             "destination.md",
             FileRevision::from_bytes(b"note"),
