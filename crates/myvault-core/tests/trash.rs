@@ -1,47 +1,331 @@
 use std::fs;
+use std::io::Write;
 
 use myvault_core::{
-    CoreError, FileRevision, TrashArea, TrashEntryKind, TrashId, TrashPath, Vault, VaultPath,
-    WriteIntent,
+    CoreError, FileRevision, ManifestDigest, PrepareManifestOutcome, TrashArea, TrashId,
+    TrashManifestV1, Vault, VaultPath, MAX_TRASH_MANIFEST_BYTES, MAX_TRASH_PAYLOAD_BYTES,
 };
 use tempfile::TempDir;
+use uuid::Uuid;
+
+const TRASH_ID: &str = "11111111-1111-4111-8111-111111111111";
+const OPERATION_ID: &str = "22222222-2222-4222-8222-222222222222";
+const HELLO_BLAKE3: &str = "ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f";
 
 fn fixture() -> (TempDir, Vault) {
-    let directory = tempfile::tempdir().expect("temporary vault");
-    let canonical = fs::canonicalize(directory.path()).expect("canonical vault");
+    let root = tempfile::tempdir().expect("temporary vault");
+    let canonical = fs::canonicalize(root.path()).expect("canonical vault");
     let vault = Vault::open(canonical).expect("open vault");
-    (directory, vault)
+    (root, vault)
 }
 
-fn trash_path(area: TrashArea, kind: TrashEntryKind) -> TrashPath {
-    TrashPath::new(area, TrashId::new(), kind).expect("trash path")
+fn id() -> TrashId {
+    TrashId::parse(TRASH_ID).expect("trash id")
 }
 
-fn create_parent(root: &TempDir, path: &TrashPath) {
-    fs::create_dir_all(
-        root.path()
-            .join(path.as_vault_path().as_path())
-            .parent()
-            .expect("trash parent"),
+fn manifest(path: &str, bytes: &[u8]) -> TrashManifestV1 {
+    TrashManifestV1::new(
+        id(),
+        Uuid::parse_str(OPERATION_ID).expect("operation id"),
+        &VaultPath::from_portable(path).expect("content path"),
+        FileRevision::from_bytes(bytes),
+        1_234_567_890,
     )
-    .expect("create trash parent");
+    .expect("manifest")
+}
+
+fn staging_directory(root: &TempDir) -> std::path::PathBuf {
+    root.path().join(format!(".trash/v1/staging/{TRASH_ID}"))
+}
+
+fn write_manifest_raw(root: &TempDir, bytes: &[u8]) {
+    let directory = staging_directory(root);
+    fs::create_dir_all(&directory).expect("staging directory");
+    fs::write(directory.join("manifest.json"), bytes).expect("manifest bytes");
 }
 
 #[test]
-fn streams_revision_with_explicit_bound_and_verifies_expected() {
-    let (root, vault) = fixture();
-    let path = VaultPath::new("บันทึก/สวัสดี.md").expect("path");
-    fs::create_dir(root.path().join("บันทึก")).expect("parent");
-    let bytes = "เนื้อหาภาษาไทย 😀".repeat(8_000).into_bytes();
-    fs::write(root.path().join(path.as_path()), &bytes).expect("note");
+fn canonical_manifest_has_golden_bytes_and_digest() {
+    let manifest = manifest("โน้ต.md", b"hello");
+    let expected = format!(
+        "{{\"version\":1,\"trash_id\":\"{TRASH_ID}\",\"operation_id\":\"{OPERATION_ID}\",\"original_path\":\"โน้ต.md\",\"payload_kind\":\"file\",\"revision\":{{\"hex\":\"{HELLO_BLAKE3}\",\"byte_len\":5}},\"trashed_at_unix_ms\":1234567890}}"
+    );
+    assert_eq!(manifest.canonical_bytes().unwrap(), expected.as_bytes());
+    assert_eq!(
+        manifest.digest().unwrap().as_str(),
+        "86d6e404184b2a1bdd7de143d32fe4214c8008c7a6293a094af0d0633da64c8f"
+    );
+}
 
-    let revision = vault.revision(&path, bytes.len()).expect("revision");
-    assert_eq!(revision, FileRevision::from_bytes(&bytes));
-    vault
-        .verify_expected(&path, &revision, bytes.len())
-        .expect("matching revision");
+#[test]
+fn canonical_reader_rejects_format_aliases_duplicates_unknown_and_oversize() {
+    let (root, vault) = fixture();
+    let canonical = manifest("note.md", b"hello").canonical_bytes().unwrap();
+    let canonical_text = String::from_utf8(canonical.clone()).unwrap();
+    let reordered = canonical_text.replacen("{\"version\":1,\"trash_id\"", "{\"trash_id\"", 1);
+    let reordered = reordered.replacen(
+        &format!("\"{TRASH_ID}\",\"operation_id\""),
+        &format!("\"{TRASH_ID}\",\"version\":1,\"operation_id\""),
+        1,
+    );
+    let variants = [
+        format!(" {canonical_text}"),
+        reordered,
+        canonical_text.replacen("\"version\":1", "\"version\":1,\"version\":1", 1),
+        canonical_text.replacen("\"version\":1", "\"version\":1,\"unknown\":true", 1),
+        canonical_text.replacen(
+            &format!("\"hex\":\"{HELLO_BLAKE3}\",\"byte_len\":5"),
+            &format!("\"byte_len\":5,\"hex\":\"{HELLO_BLAKE3}\""),
+            1,
+        ),
+        canonical_text.replacen("\"byte_len\":5", "\"byte_len\":5,\"byte_len\":5", 1),
+        canonical_text.replacen("\"byte_len\":5", "\"byte_len\":5,\"nested_unknown\":0", 1),
+    ];
+    for bytes in variants {
+        write_manifest_raw(&root, bytes.as_bytes());
+        assert!(matches!(
+            vault.trash_store().read_manifest(TrashArea::Staging, id()),
+            Err(CoreError::NonCanonicalTrashManifest | CoreError::InvalidTrashManifest(_))
+        ));
+        fs::remove_file(staging_directory(&root).join("manifest.json")).unwrap();
+    }
+
+    write_manifest_raw(&root, &vec![b'x'; MAX_TRASH_MANIFEST_BYTES + 1]);
     assert!(matches!(
-        vault.revision(&path, bytes.len() - 1),
+        vault.trash_store().read_manifest(TrashArea::Staging, id()),
+        Err(CoreError::ResourceLimitExceeded {
+            resource: "trash manifest bytes",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn semantic_reader_rejects_version_kind_path_hash_and_uuid() {
+    let (root, vault) = fixture();
+    let canonical = String::from_utf8(manifest("note.md", b"hello").canonical_bytes().unwrap())
+        .expect("UTF-8 manifest");
+    let variants = [
+        canonical.replacen("\"version\":1", "\"version\":2", 1),
+        canonical.replacen(
+            "\"payload_kind\":\"file\"",
+            "\"payload_kind\":\"directory\"",
+            1,
+        ),
+        canonical.replacen(
+            "\"original_path\":\"note.md\"",
+            "\"original_path\":\".trash/x\"",
+            1,
+        ),
+        canonical.replacen(
+            "\"original_path\":\"note.md\"",
+            "\"original_path\":\".ｔｒａｓｈ/x\"",
+            1,
+        ),
+        canonical.replacen(
+            HELLO_BLAKE3,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            1,
+        ),
+        canonical.replacen(OPERATION_ID, "00000000-0000-0000-0000-000000000000", 1),
+        canonical.replacen(TRASH_ID, "33333333-3333-4333-8333-333333333333", 1),
+    ];
+    for bytes in variants {
+        write_manifest_raw(&root, bytes.as_bytes());
+        assert!(vault
+            .trash_store()
+            .read_manifest(TrashArea::Staging, id())
+            .is_err());
+        fs::remove_file(staging_directory(&root).join("manifest.json")).unwrap();
+    }
+
+    let mut oversized_revision = manifest("note.md", b"hello");
+    oversized_revision.revision.byte_len = u64::try_from(MAX_TRASH_PAYLOAD_BYTES + 1).unwrap();
+    assert!(matches!(
+        oversized_revision.canonical_bytes(),
+        Err(CoreError::ResourceLimitExceeded {
+            resource: "trash payload bytes",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn trash_id_rejects_aliases_and_nil() {
+    assert!(TrashId::parse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").is_ok());
+    assert!(TrashId::parse("AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA").is_err());
+    assert!(TrashId::parse("11111111111141118111111111111111").is_err());
+    assert!(TrashId::parse("00000000-0000-0000-0000-000000000000").is_err());
+    assert!(ManifestDigest::parse("A".repeat(64)).is_err());
+    assert!(ManifestDigest::parse("0".repeat(63)).is_err());
+}
+
+#[test]
+fn prepare_is_idempotent_preserves_stale_temps_and_detects_collision() {
+    let (root, vault) = fixture();
+    let store = vault.trash_store();
+    let first = manifest("note.md", b"hello");
+    assert_eq!(
+        store.prepare_staging_manifest(id(), &first).unwrap(),
+        PrepareManifestOutcome::Prepared
+    );
+    let stale = staging_directory(&root).join(".manifest-stale.tmp");
+    fs::write(&stale, b"stale").expect("stale temp");
+    assert_eq!(
+        store.prepare_staging_manifest(id(), &first).unwrap(),
+        PrepareManifestOutcome::AlreadyPrepared
+    );
+    assert_eq!(fs::read(&stale).unwrap(), b"stale");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            fs::metadata(staging_directory(&root).join("manifest.json"))
+                .unwrap()
+                .nlink(),
+            1
+        );
+    }
+
+    let different = manifest("different.md", b"different");
+    assert!(matches!(
+        store.prepare_staging_manifest(id(), &different),
+        Err(CoreError::TrashManifestCollision(_))
+    ));
+    assert_eq!(
+        store.read_manifest(TrashArea::Staging, id()).unwrap(),
+        first
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn prepare_rejects_symlinked_internal_parent_and_case_alias() {
+    use std::os::unix::fs::symlink;
+
+    let (root, vault) = fixture();
+    fs::create_dir(root.path().join("outside")).unwrap();
+    symlink(root.path().join("outside"), root.path().join(".trash")).unwrap();
+    assert!(vault
+        .trash_store()
+        .prepare_staging_manifest(id(), &manifest("note.md", b"hello"))
+        .is_err());
+    assert!(fs::read_dir(root.path().join("outside"))
+        .unwrap()
+        .next()
+        .is_none());
+
+    fs::remove_file(root.path().join(".trash")).unwrap();
+    fs::create_dir(root.path().join(".TRASH")).unwrap();
+    assert!(matches!(
+        vault
+            .trash_store()
+            .prepare_staging_manifest(id(), &manifest("note.md", b"hello")),
+        Err(CoreError::PortablePathCollision { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn prepare_and_read_reject_symlink_nonregular_and_hardlinked_manifest() {
+    use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixDatagram;
+
+    for kind in ["symlink", "directory", "socket", "hardlink"] {
+        let (root, vault) = fixture();
+        let directory = staging_directory(&root);
+        fs::create_dir_all(&directory).unwrap();
+        let final_path = directory.join("manifest.json");
+        match kind {
+            "symlink" => {
+                fs::write(root.path().join("outside"), b"outside").unwrap();
+                symlink(root.path().join("outside"), &final_path).unwrap();
+            }
+            "directory" => fs::create_dir(&final_path).unwrap(),
+            "socket" => {
+                let short = std::path::PathBuf::from(format!(
+                    "/tmp/myvault-trash-socket-{}",
+                    std::process::id()
+                ));
+                let _ = fs::remove_file(&short);
+                let socket = UnixDatagram::bind(&short).unwrap();
+                fs::rename(&short, &final_path).unwrap();
+                std::mem::forget(socket);
+            }
+            "hardlink" => {
+                let bytes = manifest("note.md", b"hello").canonical_bytes().unwrap();
+                fs::write(&final_path, bytes).unwrap();
+                fs::hard_link(&final_path, directory.join("alias.json")).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(vault
+            .trash_store()
+            .read_manifest(TrashArea::Staging, id())
+            .is_err());
+    }
+}
+
+#[test]
+fn stage_payload_is_bound_to_manifest_source_revision_and_digest() {
+    let (root, vault) = fixture();
+    let source = VaultPath::from_portable("บันทึก/ต้นฉบับ.md").unwrap();
+    fs::create_dir(root.path().join("บันทึก")).unwrap();
+    fs::write(root.path().join(source.as_path()), b"hello").unwrap();
+    let manifest = manifest(source.as_str(), b"hello");
+    let store = vault.trash_store();
+    store.prepare_staging_manifest(id(), &manifest).unwrap();
+
+    let wrong_digest = ManifestDigest::parse("0".repeat(64)).unwrap();
+    assert!(matches!(
+        store.stage_payload_if_revision(id(), &source, &wrong_digest),
+        Err(CoreError::TrashManifestDigestMismatch)
+    ));
+    let wrong_source = VaultPath::from_portable("other.md").unwrap();
+    assert!(matches!(
+        store.stage_payload_if_revision(id(), &wrong_source, &manifest.digest().unwrap()),
+        Err(CoreError::InvalidTrashManifest(_))
+    ));
+    fs::write(root.path().join(source.as_path()), b"changed").unwrap();
+    assert!(matches!(
+        store.stage_payload_if_revision(id(), &source, &manifest.digest().unwrap()),
+        Err(CoreError::StaleRevision { .. })
+    ));
+    fs::write(root.path().join(source.as_path()), b"hello").unwrap();
+    store
+        .stage_payload_if_revision(id(), &source, &manifest.digest().unwrap())
+        .expect("stage bound payload");
+    assert_eq!(
+        fs::read(staging_directory(&root).join("payload")).unwrap(),
+        b"hello"
+    );
+}
+
+#[test]
+fn stage_rejects_payload_collision_and_64mib_plus_one_source() {
+    let (root, vault) = fixture();
+    let source = VaultPath::from_portable("large.bin").unwrap();
+    let manifest = manifest(source.as_str(), b"hello");
+    let store = vault.trash_store();
+    store.prepare_staging_manifest(id(), &manifest).unwrap();
+    fs::write(staging_directory(&root).join("payload"), b"keep").unwrap();
+    fs::write(root.path().join(source.as_path()), b"hello").unwrap();
+    assert!(matches!(
+        store.stage_payload_if_revision(id(), &source, &manifest.digest().unwrap()),
+        Err(CoreError::AlreadyExists(_))
+    ));
+    assert_eq!(
+        fs::read(staging_directory(&root).join("payload")).unwrap(),
+        b"keep"
+    );
+
+    fs::remove_file(staging_directory(&root).join("payload")).unwrap();
+    let mut file = fs::File::create(root.path().join(source.as_path())).unwrap();
+    file.set_len(u64::try_from(MAX_TRASH_PAYLOAD_BYTES + 1).unwrap())
+        .unwrap();
+    file.flush().unwrap();
+    assert!(matches!(
+        store.stage_payload_if_revision(id(), &source, &manifest.digest().unwrap()),
         Err(CoreError::ResourceLimitExceeded {
             resource: "revision bytes",
             ..
@@ -50,230 +334,75 @@ fn streams_revision_with_explicit_bound_and_verifies_expected() {
 }
 
 #[test]
-fn moves_verified_thai_content_to_exact_staging_payload() {
+fn stage_rejects_directory_source() {
     let (root, vault) = fixture();
-    let source = VaultPath::new("โน้ต/ต้นฉบับ.md").expect("source");
-    let payload = trash_path(TrashArea::Staging, TrashEntryKind::Payload);
-    let bytes = "สวัสดีจากถังขยะ".as_bytes();
-    fs::create_dir(root.path().join("โน้ต")).expect("source parent");
-    fs::write(root.path().join(source.as_path()), bytes).expect("source");
-    create_parent(&root, &payload);
-    let expected = FileRevision::from_bytes(bytes);
-
-    vault
-        .move_content_to_trash_payload(&source, &payload, &expected)
-        .expect("trash move");
-
-    assert!(!root.path().join(source.as_path()).exists());
-    assert_eq!(
-        fs::read(root.path().join(payload.as_vault_path().as_path())).expect("payload"),
-        bytes
-    );
-}
-
-#[test]
-fn restores_verified_item_without_replacing_destination() {
-    let (root, vault) = fixture();
-    let payload = trash_path(TrashArea::Items, TrashEntryKind::Payload);
-    let destination = VaultPath::new("กู้คืน/โน้ต.md").expect("destination");
-    let bytes = "ข้อมูลที่กู้คืน".as_bytes();
-    create_parent(&root, &payload);
-    fs::create_dir(root.path().join("กู้คืน")).expect("destination parent");
-    fs::write(root.path().join(payload.as_vault_path().as_path()), bytes).expect("payload");
-    let expected = FileRevision::from_bytes(bytes);
-
-    vault
-        .restore_trash_payload(&payload, &destination, &expected)
-        .expect("restore");
-
-    assert!(!root.path().join(payload.as_vault_path().as_path()).exists());
-    assert_eq!(
-        fs::read(root.path().join(destination.as_path())).expect("restored"),
-        bytes
-    );
-}
-
-#[test]
-fn stale_revision_preserves_source_and_empty_destination() {
-    let (root, vault) = fixture();
-    let source = VaultPath::new("source.md").expect("source");
-    let payload = trash_path(TrashArea::Staging, TrashEntryKind::Payload);
-    fs::write(root.path().join(source.as_path()), b"new").expect("source");
-    create_parent(&root, &payload);
-
-    let error = vault
-        .move_content_to_trash_payload(&source, &payload, &FileRevision::from_bytes(b"old"))
-        .expect_err("stale revision");
-
-    assert!(matches!(error, CoreError::StaleRevision { .. }));
-    assert_eq!(
-        fs::read(root.path().join(source.as_path())).unwrap(),
-        b"new"
-    );
-    assert!(!root.path().join(payload.as_vault_path().as_path()).exists());
-}
-
-#[test]
-fn collisions_preserve_both_trash_and_content_files() {
-    let (root, vault) = fixture();
-    let source = VaultPath::new("source.md").expect("source");
-    let staging = trash_path(TrashArea::Staging, TrashEntryKind::Payload);
-    create_parent(&root, &staging);
-    fs::write(root.path().join(source.as_path()), b"source").expect("source");
-    fs::write(root.path().join(staging.as_vault_path().as_path()), b"keep").expect("collision");
-    let error = vault
-        .move_content_to_trash_payload(&source, &staging, &FileRevision::from_bytes(b"source"))
-        .expect_err("collision");
-    assert!(matches!(error, CoreError::AlreadyExists(_)));
-    assert_eq!(
-        fs::read(root.path().join(source.as_path())).unwrap(),
-        b"source"
-    );
-    assert_eq!(
-        fs::read(root.path().join(staging.as_vault_path().as_path())).unwrap(),
-        b"keep"
-    );
-
-    let item = trash_path(TrashArea::Items, TrashEntryKind::Payload);
-    let destination = VaultPath::new("destination.md").expect("destination");
-    create_parent(&root, &item);
-    fs::write(root.path().join(item.as_vault_path().as_path()), b"item").expect("item");
-    fs::write(root.path().join(destination.as_path()), b"keep destination").expect("destination");
-    let error = vault
-        .restore_trash_payload(&item, &destination, &FileRevision::from_bytes(b"item"))
-        .expect_err("restore collision");
-    assert!(matches!(error, CoreError::AlreadyExists(_)));
-    assert_eq!(
-        fs::read(root.path().join(item.as_vault_path().as_path())).unwrap(),
-        b"item"
-    );
-    assert_eq!(
-        fs::read(root.path().join(destination.as_path())).unwrap(),
-        b"keep destination"
-    );
-}
-
-#[test]
-fn strict_layout_and_operation_roles_are_enforced() {
-    let id = TrashId::new();
-    let canonical = format!(".trash/v1/staging/{id}/payload");
-    assert_eq!(
-        TrashPath::from_portable(&canonical)
-            .expect("canonical")
-            .as_vault_path()
-            .as_str(),
-        canonical
-    );
-    for invalid in [
-        format!(".trash//v1/staging/{id}/payload"),
-        format!(".trash/v2/staging/{id}/payload"),
-        format!(".trash/v1/other/{id}/payload"),
-        format!(".trash/v1/staging/{id}/other"),
-        format!(".trash/v1/staging/{id}/payload/extra"),
-        format!(
-            ".trash/v1/staging/{}/payload",
-            id.to_string().to_uppercase()
-        ),
-    ] {
-        assert!(matches!(
-            TrashPath::from_portable(&invalid),
-            Err(CoreError::InvalidTrashPath(_))
-        ));
-    }
-
-    let (root, vault) = fixture();
-    let source = VaultPath::new("source.md").expect("source");
-    fs::write(root.path().join(source.as_path()), b"source").expect("source");
-    let manifest =
-        TrashPath::new(TrashArea::Staging, id, TrashEntryKind::Manifest).expect("manifest path");
+    let source = VaultPath::from_portable("folder").unwrap();
+    fs::create_dir(root.path().join(source.as_path())).unwrap();
+    let manifest = manifest(source.as_str(), b"");
+    let store = vault.trash_store();
+    store.prepare_staging_manifest(id(), &manifest).unwrap();
     assert!(matches!(
-        vault.move_content_to_trash_payload(
-            &source,
-            &manifest,
-            &FileRevision::from_bytes(b"source")
-        ),
-        Err(CoreError::InvalidTrashPath(_))
+        store.stage_payload_if_revision(id(), &source, &manifest.digest().unwrap()),
+        Err(CoreError::RevisionTargetNotFile(_))
     ));
-}
-
-#[test]
-fn generic_apis_cannot_bypass_trash_boundary() {
-    let (root, vault) = fixture();
-    let internal = VaultPath::from_portable(".trash/v1/staging/arbitrary/payload")
-        .expect("portable internal path");
-    fs::create_dir_all(root.path().join(".trash/v1/staging/arbitrary")).expect("parent");
-    fs::write(root.path().join(internal.as_path()), b"internal").expect("internal");
-    assert!(matches!(
-        vault.read(&internal),
-        Err(CoreError::TrashAccessDenied(_))
-    ));
-    assert!(matches!(
-        vault.atomic_write(&internal, b"replace", WriteIntent::UserInitiated),
-        Err(CoreError::TrashWriteDenied(_))
-    ));
-    assert!(matches!(
-        vault.create_new(&internal, b"new", WriteIntent::UserInitiated),
-        Err(CoreError::TrashWriteDenied(_))
-    ));
-
-    let source = VaultPath::new("source.md").expect("source");
-    fs::write(root.path().join(source.as_path()), b"source").expect("source");
-    assert!(matches!(
-        vault.atomic_move(&source, &internal, WriteIntent::UserInitiated),
-        Err(CoreError::TrashWriteDenied(_))
-    ));
-    assert_eq!(
-        fs::read(root.path().join(source.as_path())).unwrap(),
-        b"source"
-    );
-}
-
-#[test]
-fn directory_payload_is_rejected_until_a_bounded_tree_revision_exists() {
-    let (root, vault) = fixture();
-    let source = VaultPath::new("โฟลเดอร์").expect("source");
-    let payload = trash_path(TrashArea::Staging, TrashEntryKind::Payload);
-    fs::create_dir(root.path().join(source.as_path())).expect("source directory");
-    create_parent(&root, &payload);
-    let error = vault
-        .move_content_to_trash_payload(&source, &payload, &FileRevision::from_bytes(b""))
-        .expect_err("directory revision unsupported");
-    assert!(matches!(error, CoreError::RevisionTargetNotFile(_)));
-    assert!(root.path().join(source.as_path()).is_dir());
 }
 
 #[cfg(unix)]
 #[test]
-fn symlink_source_and_symlinked_trash_parent_are_rejected() {
+fn stage_rejects_symlink_and_nonregular_source() {
     use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixDatagram;
 
     let (root, vault) = fixture();
-    fs::write(root.path().join("target.md"), b"target").expect("target");
-    symlink(root.path().join("target.md"), root.path().join("source.md")).expect("source link");
-    let source = VaultPath::new("source.md").expect("source");
-    let payload = trash_path(TrashArea::Staging, TrashEntryKind::Payload);
-    create_parent(&root, &payload);
-    assert!(matches!(
-        vault.move_content_to_trash_payload(
-            &source,
-            &payload,
-            &FileRevision::from_bytes(b"target")
-        ),
-        Err(CoreError::SymlinkRejected(_) | CoreError::Io(_))
-    ));
+    let source = VaultPath::from_portable("source.md").unwrap();
+    fs::write(root.path().join("target.md"), b"hello").unwrap();
+    symlink(
+        root.path().join("target.md"),
+        root.path().join(source.as_path()),
+    )
+    .unwrap();
+    let first = manifest(source.as_str(), b"hello");
+    vault
+        .trash_store()
+        .prepare_staging_manifest(id(), &first)
+        .unwrap();
+    assert!(vault
+        .trash_store()
+        .stage_payload_if_revision(id(), &source, &first.digest().unwrap())
+        .is_err());
 
-    fs::remove_file(root.path().join("source.md")).expect("remove source link");
-    fs::write(root.path().join("source.md"), b"source").expect("source");
-    fs::remove_dir_all(root.path().join(".trash")).expect("remove trash");
-    fs::create_dir(root.path().join("outside")).expect("outside");
-    symlink(root.path().join("outside"), root.path().join(".trash")).expect("trash link");
-    assert!(matches!(
-        vault.move_content_to_trash_payload(
-            &source,
-            &payload,
-            &FileRevision::from_bytes(b"source")
-        ),
-        Err(CoreError::SymlinkRejected(_) | CoreError::Io(_))
+    fs::remove_file(root.path().join(source.as_path())).unwrap();
+    let short = std::path::PathBuf::from(format!(
+        "/tmp/myvault-trash-source-socket-{}",
+        std::process::id()
     ));
-    assert!(!root.path().join("outside/v1").exists());
+    let _ = fs::remove_file(&short);
+    let socket = UnixDatagram::bind(&short).unwrap();
+    fs::rename(&short, root.path().join(source.as_path())).unwrap();
+    assert!(vault
+        .trash_store()
+        .stage_payload_if_revision(id(), &source, &first.digest().unwrap())
+        .is_err());
+    drop(socket);
+}
+
+#[cfg(unix)]
+#[test]
+fn stage_rejects_multiply_linked_source() {
+    let (root, vault) = fixture();
+    let source = VaultPath::from_portable("source.md").unwrap();
+    fs::write(root.path().join(source.as_path()), b"hello").unwrap();
+    fs::hard_link(
+        root.path().join(source.as_path()),
+        root.path().join("alias.md"),
+    )
+    .unwrap();
+    let manifest = manifest(source.as_str(), b"hello");
+    let store = vault.trash_store();
+    store.prepare_staging_manifest(id(), &manifest).unwrap();
+    assert!(matches!(
+        store.stage_payload_if_revision(id(), &source, &manifest.digest().unwrap()),
+        Err(CoreError::InvalidMove { .. })
+    ));
+    assert!(root.path().join(source.as_path()).exists());
 }

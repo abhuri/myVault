@@ -11,6 +11,20 @@ pub enum CoreError {
     TrashWriteDenied(PathBuf),
     TrashAccessDenied(PathBuf),
     InvalidTrashPath(PathBuf),
+    InvalidTrashManifest(&'static str),
+    NonCanonicalTrashManifest,
+    TrashManifestCollision(PathBuf),
+    TrashManifestDigestMismatch,
+    TrashManifestOutcomeUnknown {
+        path: PathBuf,
+        cause: Box<CoreError>,
+    },
+    TrashPayloadOutcomeUnknown {
+        source_path: PathBuf,
+        destination_path: PathBuf,
+        durability: crate::MoveDurability,
+        cause: Box<CoreError>,
+    },
     InvalidRevision,
     RevisionTargetNotFile(PathBuf),
     StaleRevision {
@@ -81,16 +95,18 @@ impl fmt::Display for CoreError {
                 "automatic writes under .obsidian are denied: {}",
                 path.display()
             ),
-            Self::TrashWriteDenied(path) => write!(
-                formatter,
-                "generic vault writes under .trash are denied: {}",
-                path.display()
-            ),
             Self::InvalidRelativePath(_)
             | Self::PathEscapesVault(_)
             | Self::SymlinkRejected(_)
+            | Self::TrashWriteDenied(_)
             | Self::TrashAccessDenied(_)
             | Self::InvalidTrashPath(_)
+            | Self::InvalidTrashManifest(_)
+            | Self::NonCanonicalTrashManifest
+            | Self::TrashManifestCollision(_)
+            | Self::TrashManifestDigestMismatch
+            | Self::TrashManifestOutcomeUnknown { .. }
+            | Self::TrashPayloadOutcomeUnknown { .. }
             | Self::InvalidRevision
             | Self::RevisionTargetNotFile(_)
             | Self::StaleRevision { .. }
@@ -194,10 +210,45 @@ impl CoreError {
                 "generic vault access under .trash is denied: {}",
                 path.display()
             )),
+            Self::TrashWriteDenied(path) => Some(write!(
+                formatter,
+                "generic vault writes under .trash are denied: {}",
+                path.display()
+            )),
             Self::InvalidTrashPath(path) => Some(write!(
                 formatter,
                 "invalid privileged trash path: {}",
                 path.display()
+            )),
+            Self::InvalidTrashManifest(reason) => {
+                Some(write!(formatter, "invalid trash manifest: {reason}"))
+            }
+            Self::NonCanonicalTrashManifest => {
+                Some(formatter.write_str("trash manifest JSON is not byte-for-byte canonical"))
+            }
+            Self::TrashManifestCollision(path) => Some(write!(
+                formatter,
+                "trash manifest differs from the existing entry: {}",
+                path.display()
+            )),
+            Self::TrashManifestDigestMismatch => {
+                Some(formatter.write_str("trash manifest digest does not match"))
+            }
+            Self::TrashManifestOutcomeUnknown { path, cause } => Some(write!(
+                formatter,
+                "trash manifest may be published at {}: {cause}",
+                path.display()
+            )),
+            Self::TrashPayloadOutcomeUnknown {
+                source_path,
+                destination_path,
+                durability,
+                cause,
+            } => Some(write!(
+                formatter,
+                "trash payload move from {} to {} is published with {durability:?}, but manifest revalidation failed: {cause}",
+                source_path.display(),
+                destination_path.display()
             )),
             Self::InvalidRevision => Some(formatter.write_str("invalid BLAKE3 file revision")),
             Self::RevisionTargetNotFile(path) => Some(write!(
@@ -250,6 +301,8 @@ impl std::error::Error for CoreError {
                 ..
             } => destination_sync.error().or_else(|| source_sync.error()),
             Self::VerifiedMoveOutcomeUnknown { verification, .. } => Some(verification.as_ref()),
+            Self::TrashManifestOutcomeUnknown { cause, .. }
+            | Self::TrashPayloadOutcomeUnknown { cause, .. } => Some(cause.as_ref()),
             Self::Sqlite(error) => Some(error),
             _ => None,
         }
