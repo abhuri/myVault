@@ -1,0 +1,90 @@
+name: platform-build
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "apps/tauri/**"
+      - "crates/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - ".github/workflows/platform-build.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-22.04-appimage
+            os: ubuntu-22.04
+            bundles: appimage
+            artifact: apps/tauri/src-tauri/target/release/bundle/appimage/*.AppImage
+          - name: windows-2022-nsis
+            os: windows-2022
+            bundles: nsis
+            artifact: apps/tauri/src-tauri/target/release/bundle/nsis/*-setup.exe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Install Ubuntu 22.04 native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            wget
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+        with:
+          version: 11.7.0
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.14.1
+          cache: pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.96.0
+
+      - name: Install JavaScript dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Record native environment
+        run: pnpm tauri:info
+
+      - name: Build native desktop artifact
+        run: pnpm --dir apps/tauri tauri build --bundles ${{ matrix.bundles }}
+
+      - name: Upload native artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: myvault-${{ matrix.name }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 7

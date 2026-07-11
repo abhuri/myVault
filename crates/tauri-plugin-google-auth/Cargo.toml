@@ -1,0 +1,17 @@
+[package]
+name = "tauri-plugin-google-auth"
+version = "0.1.0"
+description = "Android-only Google Identity Services authorization bridge for myVault"
+authors = ["A.Bhuri"]
+edition = "2021"
+rust-version = "1.77.2"
+links = "tauri-plugin-google-auth"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2.11.3" }
+thiserror = "2"
+zeroize = "1"
+
+[build-dependencies]
+tauri-plugin = { version = "2.6.3", features = ["build"] }

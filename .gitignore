@@ -8,7 +8,13 @@ coverage/
 # Rust and Tauri build output
 target/
 src-tauri/target/
-gen/
+crates/*/Cargo.lock
+**/.gradle/
+**/.tauri/
+**/.cxx/
+**/local.properties
+**/build/
+*.iml
 
 # Local configuration and secrets
 .env
@@ -20,6 +26,12 @@ gen/
 *.pfx
 *.keystore
 *.jks
+key.properties
+secrets.properties
+google-services.json
+client_secret*.json
+credentials*.json
+token*.json
 secrets/
 
 # Local application data and real vaults
@@ -31,6 +43,7 @@ test-vault-local/
 *.db
 *.db-shm
 *.db-wal
+*.sqlite-journal
 
 # IDE and operating-system files
 .DS_Store
@@ -44,4 +57,3 @@ Thumbs.db
 *.log
 tmp/
 temp/
-
