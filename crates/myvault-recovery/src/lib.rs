@@ -23,6 +23,10 @@ const JOURNAL_DIRECTORY: &str = "operation-journal";
 const COMPLETED_DIRECTORY: &str = "completed";
 const MAX_ENTRY_BYTES: u64 = 64 * 1024;
 const MAX_ENTRY_COUNT: usize = 4096;
+/// Maximum physical children inspected in the journal directory, including
+/// committed records, stale temps, junk, non-UTF-8 names, and `completed`.
+/// This is deliberately separate from the logical active-evidence bound.
+pub const MAX_DIRECTORY_ENTRY_COUNT: usize = 8192;
 pub const MAX_PAGE_SIZE: usize = 128;
 
 /// Recovery records are untrusted hints. They never authorize a vault mutation.
@@ -48,6 +52,7 @@ pub enum Error {
     InvalidEntryName,
     EntryTooLarge,
     TooManyEntries,
+    TooManyDirectoryEntries,
     InvalidPageSize,
     UnsupportedVersion(u32),
     JournalCollision,
@@ -86,6 +91,8 @@ impl fmt::Display for Error {
             Self::InvalidEntryName => formatter.write_str("invalid journal entry name"),
             Self::EntryTooLarge => formatter.write_str("journal entry exceeds size limit"),
             Self::TooManyEntries => formatter.write_str("journal contains too many entries"),
+            Self::TooManyDirectoryEntries => formatter
+                .write_str("journal directory contains too many physical entries (limit 8192)"),
             Self::InvalidPageSize => formatter.write_str("journal page size must be 1..=128"),
             Self::UnsupportedVersion(version) => {
                 write!(formatter, "unsupported journal version {version}")
@@ -395,6 +402,22 @@ pub struct JournalPage {
     pub next_after: Option<Uuid>,
 }
 
+/// One immutable journal record classified without interpreting unsupported
+/// schema bytes as the current intent type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JournalEvidence {
+    Supported(RenameMoveIntent),
+    Unsupported { operation_id: Uuid, version: u32 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JournalEvidencePage {
+    /// Entries ordered by canonical operation UUID. Unsupported entries consume
+    /// one logical page slot and are never hidden by completion tombstones.
+    pub entries: Vec<JournalEvidence>,
+    pub next_after: Option<Uuid>,
+}
+
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CompletionTombstone {
@@ -588,6 +611,18 @@ impl RecoveryJournal {
         Ok(intent)
     }
 
+    /// Reads one bounded journal entry while preserving unsupported schemas as
+    /// opaque evidence. Unsupported bytes are not rewritten, deleted, or
+    /// deserialized as the current intent type.
+    ///
+    /// # Errors
+    /// Returns an error for malformed JSON, invalid current-schema evidence,
+    /// insecure files, or an operation-id/filename mismatch.
+    pub fn read_evidence(&self, operation_id: Uuid) -> Result<JournalEvidence, Error> {
+        let bytes = Self::read_raw(&self.directory, &entry_name(operation_id))?;
+        classify_evidence(operation_id, &bytes)
+    }
+
     /// Lists a deterministic page of logically active entries. Only an exact,
     /// valid completion tombstone suppresses an entry. Journal records and stale
     /// temps are physically retained; bounded garbage collection is deferred.
@@ -621,10 +656,67 @@ impl RecoveryJournal {
         })
     }
 
+    /// Lists a bounded deterministic UUID-ordered page containing both current
+    /// v3 intents and opaque unsupported-version evidence. A cursor is the last
+    /// returned UUID and the next page starts strictly after it.
+    ///
+    /// Valid completion tombstones suppress only their exact supported v3
+    /// intent. Unsupported records remain visible because their tombstones
+    /// cannot be authenticated without interpreting the unsupported schema.
+    ///
+    /// # Errors
+    /// Returns an error for invalid limits, excessive active evidence, or any
+    /// malformed/noncanonical current-schema record. Invalid evidence is never skipped.
+    pub fn list_evidence_page(
+        &self,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<JournalEvidencePage, Error> {
+        if !(1..=MAX_PAGE_SIZE).contains(&limit) {
+            return Err(Error::InvalidPageSize);
+        }
+        let mut entries = Vec::new();
+        for entry in self.directory_entries_bounded()? {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(operation_id) = parse_entry_name(name) else {
+                continue;
+            };
+            let evidence = self.read_evidence(operation_id)?;
+            let active = match &evidence {
+                JournalEvidence::Supported(intent) => !self.has_valid_completion_for(intent),
+                JournalEvidence::Unsupported { .. } => true,
+            };
+            if active {
+                entries.push((operation_id, evidence));
+                if entries.len() > MAX_ENTRY_COUNT {
+                    return Err(Error::TooManyEntries);
+                }
+            }
+        }
+        entries.sort_unstable_by_key(|(operation_id, _)| *operation_id);
+        entries.dedup_by_key(|(operation_id, _)| *operation_id);
+        let mut selected = entries
+            .into_iter()
+            .filter(|(operation_id, _)| after.is_none_or(|cursor| *operation_id > cursor))
+            .take(limit + 1)
+            .collect::<Vec<_>>();
+        let has_more = selected.len() > limit;
+        selected.truncate(limit);
+        let next_after = if has_more {
+            selected.last().map(|(operation_id, _)| *operation_id)
+        } else {
+            None
+        };
+        Ok(JournalEvidencePage {
+            entries: selected.into_iter().map(|(_, evidence)| evidence).collect(),
+            next_after,
+        })
+    }
+
     fn active_ids(&self) -> Result<Vec<Uuid>, Error> {
         let mut ids = Vec::new();
-        for entry in self.directory.entries()? {
-            let entry = entry?;
+        for entry in self.directory_entries_bounded()? {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             let Some(id) = parse_entry_name(name) else {
@@ -643,17 +735,33 @@ impl RecoveryJournal {
         Ok(ids)
     }
 
+    fn directory_entries_bounded(&self) -> Result<Vec<cap_std::fs::DirEntry>, Error> {
+        let mut entries = Vec::new();
+        for entry in self.directory.entries()? {
+            if entries.len() == MAX_DIRECTORY_ENTRY_COUNT {
+                return Err(Error::TooManyDirectoryEntries);
+            }
+            entries.push(entry?);
+        }
+        Ok(entries)
+    }
+
     fn has_valid_completion(&self, operation_id: Uuid) -> Result<bool, Error> {
         let intent = self.read(operation_id)?;
+        Ok(self.has_valid_completion_for(&intent))
+    }
+
+    fn has_valid_completion_for(&self, intent: &RenameMoveIntent) -> bool {
+        let operation_id = intent.operation_id;
         let name = entry_name(operation_id);
         let Ok(Some(bytes)) = Self::read_raw_if_exists(&self.completed, &name) else {
-            return Ok(false);
+            return false;
         };
         let Ok(tombstone) = serde_json::from_slice::<CompletionTombstone>(&bytes) else {
-            return Ok(false);
+            return false;
         };
-        Ok(tombstone.validate_for(&intent).is_ok()
-            && serde_json::to_vec(&tombstone).is_ok_and(|canonical| canonical == bytes))
+        tombstone.validate_for(intent).is_ok()
+            && serde_json::to_vec(&tombstone).is_ok_and(|canonical| canonical == bytes)
     }
 
     fn read_raw_if_exists(directory: &Dir, name: &str) -> Result<Option<Vec<u8>>, Error> {
@@ -723,6 +831,46 @@ impl RecoveryJournal {
             Err(error) => Err(error),
         }
     }
+}
+
+fn classify_evidence(operation_id: Uuid, bytes: &[u8]) -> Result<JournalEvidence, Error> {
+    let envelope: RoutingEnvelope = serde_json::from_slice(bytes)?;
+    if envelope.operation_id != operation_id {
+        return Err(Error::InvalidEntryName);
+    }
+    if envelope.version != RenameMoveIntent::VERSION {
+        return Ok(JournalEvidence::Unsupported {
+            operation_id,
+            version: envelope.version,
+        });
+    }
+    let intent: RenameMoveIntent = serde_json::from_slice(bytes)?;
+    intent.validate()?;
+    if intent.operation_id != operation_id || canonical_bytes(&intent)? != bytes {
+        return Err(Error::InvalidEntryName);
+    }
+    Ok(JournalEvidence::Supported(intent))
+}
+
+#[derive(Deserialize)]
+struct RoutingEnvelope {
+    version: u32,
+    #[serde(deserialize_with = "deserialize_canonical_nonnil_uuid")]
+    operation_id: Uuid,
+}
+
+fn deserialize_canonical_nonnil_uuid<'de, D>(deserializer: D) -> Result<Uuid, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let text = String::deserialize(deserializer)?;
+    let operation_id = Uuid::parse_str(&text).map_err(serde::de::Error::custom)?;
+    if operation_id.is_nil() || operation_id.to_string() != text {
+        return Err(serde::de::Error::custom(
+            "operation_id must be a canonical lowercase nonnil UUID",
+        ));
+    }
+    Ok(operation_id)
 }
 
 fn canonical_portable(path: &str) -> Result<String, Error> {

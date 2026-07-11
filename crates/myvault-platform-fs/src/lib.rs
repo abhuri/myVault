@@ -5,6 +5,34 @@ use std::io;
 
 use cap_std::fs::Dir;
 
+/// Opaque, platform-complete identity of an opened directory handle.
+///
+/// Unix stores the device and inode. Windows stores the volume serial number
+/// and the complete 128-bit file identifier returned by `FileIdInfo`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryIdentity {
+    volume: u64,
+    file_id: [u8; 16],
+}
+
+impl DirectoryIdentity {
+    const fn new(volume: u64, file_id: [u8; 16]) -> Self {
+        Self { volume, file_id }
+    }
+}
+
+/// Reads the identity of an already-open directory without consulting an
+/// ambient path.
+///
+/// # Errors
+///
+/// Returns the operating-system error when a complete handle identity cannot
+/// be obtained. Callers must fail closed rather than fall back to a truncated
+/// identifier.
+pub fn directory_identity(directory: &Dir) -> io::Result<DirectoryIdentity> {
+    platform::directory_identity(directory)
+}
+
 /// Atomically renames an entry without replacing an existing destination.
 ///
 /// # Errors
@@ -35,6 +63,17 @@ mod platform {
 
     use cap_std::fs::Dir;
 
+    use cap_fs_ext::MetadataExt;
+
+    use super::DirectoryIdentity;
+
+    pub(super) fn directory_identity(directory: &Dir) -> io::Result<DirectoryIdentity> {
+        let metadata = directory.dir_metadata()?;
+        let mut file_id = [0_u8; 16];
+        file_id[..8].copy_from_slice(&metadata.ino().to_ne_bytes());
+        Ok(DirectoryIdentity::new(metadata.dev(), file_id))
+    }
+
     pub(super) fn rename_noreplace(
         _source_parent: &Dir,
         _source_name: &OsStr,
@@ -48,6 +87,27 @@ mod platform {
     }
 }
 
+#[cfg(test)]
+mod identity_tests {
+    use super::DirectoryIdentity;
+
+    #[test]
+    fn full_identifier_distinguishes_equal_low_64_bits() {
+        let low = 0x0123_4567_89ab_cdef_u64.to_ne_bytes();
+        let mut first = [0_u8; 16];
+        first[..8].copy_from_slice(&low);
+        first[8..].copy_from_slice(&1_u64.to_ne_bytes());
+        let mut second = [0_u8; 16];
+        second[..8].copy_from_slice(&low);
+        second[8..].copy_from_slice(&2_u64.to_ne_bytes());
+
+        assert_ne!(
+            DirectoryIdentity::new(7, first),
+            DirectoryIdentity::new(7, second)
+        );
+    }
+}
+
 #[cfg(all(test, windows))]
 mod windows_tests {
     use std::ffi::OsStr;
@@ -56,12 +116,53 @@ mod windows_tests {
     use cap_std::ambient_authority;
     use cap_std::fs::Dir;
 
-    use super::rename_noreplace;
+    use super::{directory_identity, rename_noreplace};
 
     fn fixture() -> (tempfile::TempDir, Dir) {
         let root = tempfile::tempdir().expect("temporary directory");
         let directory = Dir::open_ambient_dir(root.path(), ambient_authority()).expect("open root");
         (root, directory)
+    }
+
+    #[test]
+    fn directory_identity_is_stable_and_distinguishes_open_directories() {
+        let (root, directory) = fixture();
+        fs::create_dir(root.path().join("first")).expect("first directory");
+        fs::create_dir(root.path().join("second")).expect("second directory");
+        let first = directory.open_dir("first").expect("open first");
+        let first_again = directory.open_dir("first").expect("reopen first");
+        let second = directory.open_dir("second").expect("open second");
+
+        assert_eq!(
+            directory_identity(&first).expect("first identity"),
+            directory_identity(&first_again).expect("reopened first identity")
+        );
+        assert_ne!(
+            directory_identity(&first).expect("first identity"),
+            directory_identity(&second).expect("second identity")
+        );
+    }
+
+    #[test]
+    fn directory_identity_follows_rename_and_rejects_path_replacement() {
+        let (root, directory) = fixture();
+        fs::create_dir(root.path().join("item")).expect("item directory");
+        let held = directory.open_dir("item").expect("open item");
+        let held_identity = directory_identity(&held).expect("held identity");
+
+        fs::rename(root.path().join("item"), root.path().join("detached")).expect("detach item");
+        fs::create_dir(root.path().join("item")).expect("replacement item");
+        let detached = directory.open_dir("detached").expect("open detached");
+        let replacement = directory.open_dir("item").expect("open replacement");
+
+        assert_eq!(
+            held_identity,
+            directory_identity(&detached).expect("detached identity")
+        );
+        assert_ne!(
+            held_identity,
+            directory_identity(&replacement).expect("replacement identity")
+        );
     }
 
     #[test]

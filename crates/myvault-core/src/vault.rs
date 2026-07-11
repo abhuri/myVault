@@ -13,10 +13,11 @@ use cap_std::fs::{Dir, OpenOptions};
 use crate::atomic_move::rename_noreplace;
 use crate::capability::{open_absolute_dir_nofollow, open_child_dir_nofollow};
 use crate::path::{classify_component, component_collision_key, VaultPathClass};
-use crate::trash::{manifest_path, payload_path};
+use crate::trash::{item_directory_path, manifest_path, payload_path};
 use crate::{
-    CoreError, FileRevision, ManifestDigest, PrepareManifestOutcome, Result, TrashArea, TrashId,
-    TrashManifestV1, TrashStore, VaultPath, MAX_TRASH_MANIFEST_BYTES,
+    CoreError, FileRevision, ManifestDigest, PrepareManifestOutcome, PublishItemOutcome,
+    RestoreItemOutcome, Result, TrashArea, TrashId, TrashManifestV1, TrashStore, VaultPath,
+    MAX_TRASH_MANIFEST_BYTES,
 };
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -1391,6 +1392,777 @@ impl TrashStore<'_> {
         Ok(durability)
     }
 
+    /// Atomically publishes a complete staging UUID directory into `items`.
+    ///
+    /// # Errors
+    /// Returns a precondition error before rename, or an explicit verified
+    /// move outcome error for every failure after publication.
+    pub fn publish_staging_item(
+        &self,
+        id: TrashId,
+        digest: &ManifestDigest,
+    ) -> Result<PublishItemOutcome> {
+        self.publish_staging_item_with_hooks(
+            id,
+            digest,
+            |_, directory| sync_directory_for_move(directory),
+            || {},
+        )
+    }
+
+    fn publish_staging_item_with_hooks<F, G>(
+        &self,
+        id: TrashId,
+        digest: &ManifestDigest,
+        sync: F,
+        after_move: G,
+    ) -> Result<PublishItemOutcome>
+    where
+        F: FnMut(MoveSyncParent, &Dir) -> std::io::Result<MoveDurability>,
+        G: FnOnce(),
+    {
+        self.publish_staging_item_with_observation_hooks(id, digest, sync, || Ok(()), after_move)
+    }
+
+    fn publish_staging_item_with_observation_hooks<F, H, G>(
+        &self,
+        id: TrashId,
+        digest: &ManifestDigest,
+        mut sync: F,
+        before_initial_observation: H,
+        after_move: G,
+    ) -> Result<PublishItemOutcome>
+    where
+        F: FnMut(MoveSyncParent, &Dir) -> std::io::Result<MoveDurability>,
+        H: FnOnce() -> Result<()>,
+        G: FnOnce(),
+    {
+        let _guard = self.vault.lock_mutations()?;
+        let staging_path = item_directory_path(TrashArea::Staging, id)?;
+        let items_path = item_directory_path(TrashArea::Items, id)?;
+        let (staging_parent, staging_name) = self.vault.open_parent_checked(&staging_path)?;
+        let (items_parent, items_name) = self.vault.open_parent_checked(&items_path)?;
+        let initial_report = MoveSyncReport {
+            destination: sync(MoveSyncParent::Destination, &items_parent),
+            source: Some(sync(MoveSyncParent::Source, &staging_parent)),
+        };
+        let observed = before_initial_observation().and_then(|()| {
+            Ok((
+                Self::entry_exists(&staging_parent, &staging_name)?,
+                Self::entry_exists(&items_parent, &items_name)?,
+            ))
+        });
+        let (staging_exists, items_exists) = match observed {
+            Ok(topology) => topology,
+            Err(cause) => {
+                return Err(initial_report.into_verified_unknown(
+                    &staging_path,
+                    &items_path,
+                    cause,
+                ));
+            }
+        };
+
+        match (staging_exists, items_exists) {
+            (false, true) => self.confirm_published_item(
+                id,
+                digest,
+                &staging_path,
+                &items_path,
+                &staging_parent,
+                &staging_name,
+                &items_parent,
+                &items_name,
+                None,
+                initial_report,
+                true,
+            ),
+            (true, true) => Err(CoreError::InvalidTrashTopology(
+                "staging and items directories both exist",
+            )),
+            (false, false) => Err(CoreError::InvalidTrashTopology(
+                "staging and items directories are both absent",
+            )),
+            (true, false) => {
+                let staging_display = self.vault.root_path.join(staging_path.as_path());
+                let staged_directory =
+                    open_child_dir_nofollow(&staging_parent, &staging_name, &staging_display)?;
+                self.validate_item_contents(
+                    TrashArea::Staging,
+                    id,
+                    &staged_directory,
+                    digest,
+                    PayloadPresence::Required,
+                )?;
+                let report = self.vault.atomic_move_locked_report(
+                    &staging_path,
+                    &items_path,
+                    |parent, directory| sync(parent, directory),
+                )?;
+                after_move();
+                if report.has_failure() {
+                    let confirmation_report = MoveSyncReport {
+                        destination: sync(MoveSyncParent::Destination, &items_parent),
+                        source: Some(sync(MoveSyncParent::Source, &staging_parent)),
+                    };
+                    return self.confirm_published_item(
+                        id,
+                        digest,
+                        &staging_path,
+                        &items_path,
+                        &staging_parent,
+                        &staging_name,
+                        &items_parent,
+                        &items_name,
+                        Some(&staged_directory),
+                        confirmation_report,
+                        false,
+                    );
+                }
+                if let Err(cause) = self.validate_published_item_topology(
+                    id,
+                    digest,
+                    &staging_parent,
+                    &staging_name,
+                    &items_parent,
+                    &items_name,
+                    Some(&staged_directory),
+                ) {
+                    return Err(report.into_verified_unknown(&staging_path, &items_path, cause));
+                }
+                report
+                    .into_result(&staging_path, &items_path)
+                    .map(PublishItemOutcome::Published)
+            }
+        }
+    }
+
+    /// Restores an item payload only to the manifest's original content path.
+    /// The immutable manifest and UUID directory remain in `items`.
+    ///
+    /// # Errors
+    /// Returns a precondition error before rename, or an explicit verified
+    /// move outcome error for every failure after publication.
+    pub fn restore_item_if_revision(
+        &self,
+        id: TrashId,
+        destination: &VaultPath,
+        digest: &ManifestDigest,
+    ) -> Result<RestoreItemOutcome> {
+        self.restore_item_with_hooks(
+            id,
+            destination,
+            digest,
+            |_, directory| sync_directory_for_move(directory),
+            || {},
+        )
+    }
+
+    fn restore_item_with_hooks<F, G>(
+        &self,
+        id: TrashId,
+        destination: &VaultPath,
+        digest: &ManifestDigest,
+        sync: F,
+        after_move: G,
+    ) -> Result<RestoreItemOutcome>
+    where
+        F: FnMut(MoveSyncParent, &Dir) -> std::io::Result<MoveDurability>,
+        G: FnOnce(),
+    {
+        self.restore_item_with_observation_hooks(
+            id,
+            destination,
+            digest,
+            sync,
+            || Ok(()),
+            after_move,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn restore_item_with_observation_hooks<F, H, G>(
+        &self,
+        id: TrashId,
+        destination: &VaultPath,
+        digest: &ManifestDigest,
+        mut sync: F,
+        before_initial_observation: H,
+        after_move: G,
+    ) -> Result<RestoreItemOutcome>
+    where
+        F: FnMut(MoveSyncParent, &Dir) -> std::io::Result<MoveDurability>,
+        H: FnOnce() -> Result<()>,
+        G: FnOnce(),
+    {
+        let _guard = self.vault.lock_mutations()?;
+        Vault::require_content_path(destination)?;
+        let item_path = item_directory_path(TrashArea::Items, id)?;
+        let (items_parent, item_name) = self.vault.open_parent_checked(&item_path)?;
+        let source = payload_path(TrashArea::Items, id)?;
+        let (item_directory, payload_name) = self.vault.open_parent_checked(&source)?;
+        let (destination_parent, destination_name) = self.vault.open_parent_checked(destination)?;
+        let initial_report = MoveSyncReport {
+            destination: sync(MoveSyncParent::Destination, &destination_parent),
+            source: Some(sync(MoveSyncParent::Source, &item_directory)),
+        };
+        let observed = before_initial_observation().and_then(|()| {
+            let authoritative = self.reopen_authoritative_item_directory(
+                id,
+                &items_parent,
+                &item_name,
+                &item_directory,
+            )?;
+            Ok((
+                Self::entry_exists(&authoritative, &payload_name)?,
+                Self::entry_exists(&destination_parent, &destination_name)?,
+                authoritative,
+            ))
+        });
+        let (payload_exists, destination_exists, authoritative_item_directory) = match observed {
+            Ok(topology) => topology,
+            Err(cause) => {
+                return Err(initial_report.into_verified_unknown(&source, destination, cause));
+            }
+        };
+
+        match (payload_exists, destination_exists) {
+            (true, true) => Err(CoreError::AlreadyExists(destination.as_path().to_owned())),
+            (false, false) => Err(CoreError::InvalidTrashTopology(
+                "payload and restore destination are both absent",
+            )),
+            (false, true) => self.confirm_restored_item(
+                id,
+                destination,
+                digest,
+                None,
+                &source,
+                &items_parent,
+                &item_name,
+                &authoritative_item_directory,
+                &payload_name,
+                &destination_parent,
+                &destination_name,
+                initial_report,
+                true,
+            ),
+            (true, false) => {
+                let validated = self.validate_item_contents(
+                    TrashArea::Items,
+                    id,
+                    &authoritative_item_directory,
+                    digest,
+                    PayloadPresence::Required,
+                )?;
+                if destination.as_str() != validated.manifest.original_path {
+                    return Err(CoreError::InvalidTrashManifest(
+                        "restore destination must equal original path",
+                    ));
+                }
+                self.vault.reject_sibling_collision(
+                    &destination_parent,
+                    destination_name.to_str().ok_or_else(|| {
+                        CoreError::InvalidRelativePath(destination.as_path().to_owned())
+                    })?,
+                    destination,
+                )?;
+                let expected = validated.manifest.expected_revision()?;
+                self.vault.verify_expected_from_parent(
+                    &authoritative_item_directory,
+                    &payload_name,
+                    &source,
+                    &expected,
+                    MAX_TRASH_PAYLOAD_BYTES,
+                )?;
+                self.vault.verify_single_link_from_parent(
+                    &authoritative_item_directory,
+                    &payload_name,
+                    &source,
+                )?;
+                let report = self.vault.atomic_move_locked_report(
+                    &source,
+                    destination,
+                    |parent, directory| sync(parent, directory),
+                )?;
+                after_move();
+                if report.has_failure() {
+                    let confirmation_destination =
+                        sync(MoveSyncParent::Destination, &destination_parent);
+                    let confirmation_source =
+                        match self.open_authoritative_item_directory(id, &items_parent, &item_name)
+                        {
+                            Ok(directory) => directory,
+                            Err(cause) => {
+                                return Err(Vault::verified_move_unknown(
+                                    &source,
+                                    destination,
+                                    directory_sync_status(confirmation_destination),
+                                    DirectorySyncStatus::NotAttempted,
+                                    cause,
+                                ));
+                            }
+                        };
+                    let confirmation_report = MoveSyncReport {
+                        destination: confirmation_destination,
+                        source: Some(sync(MoveSyncParent::Source, &confirmation_source)),
+                    };
+                    if let Err(cause) = Self::require_same_directory_identity(
+                        &authoritative_item_directory,
+                        &confirmation_source,
+                    ) {
+                        return Err(confirmation_report.into_verified_unknown(
+                            &source,
+                            destination,
+                            cause,
+                        ));
+                    }
+                    return self.confirm_restored_item(
+                        id,
+                        destination,
+                        digest,
+                        Some(&validated),
+                        &source,
+                        &items_parent,
+                        &item_name,
+                        &authoritative_item_directory,
+                        &payload_name,
+                        &destination_parent,
+                        &destination_name,
+                        confirmation_report,
+                        false,
+                    );
+                }
+                if let Err(cause) = self.validate_restored_topology(
+                    id,
+                    destination,
+                    digest,
+                    &validated,
+                    &items_parent,
+                    &item_name,
+                    &authoritative_item_directory,
+                    &payload_name,
+                    &destination_parent,
+                    &destination_name,
+                ) {
+                    return Err(report.into_verified_unknown(&source, destination, cause));
+                }
+                report
+                    .into_result(&source, destination)
+                    .map(RestoreItemOutcome::Restored)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn confirm_published_item(
+        &self,
+        id: TrashId,
+        digest: &ManifestDigest,
+        staging_path: &VaultPath,
+        items_path: &VaultPath,
+        staging_parent: &Dir,
+        staging_name: &OsString,
+        items_parent: &Dir,
+        items_name: &OsString,
+        expected_items_directory: Option<&Dir>,
+        report: MoveSyncReport,
+        already_published: bool,
+    ) -> Result<PublishItemOutcome> {
+        if let Err(cause) = self.validate_published_item_topology(
+            id,
+            digest,
+            staging_parent,
+            staging_name,
+            items_parent,
+            items_name,
+            expected_items_directory,
+        ) {
+            return Err(report.into_verified_unknown(staging_path, items_path, cause));
+        }
+        if report.has_failure() {
+            return Err(report.into_verified_unknown(
+                staging_path,
+                items_path,
+                CoreError::MoveDurabilitySyncFailed,
+            ));
+        }
+        let durability = report.into_result(staging_path, items_path)?;
+        Ok(if already_published {
+            PublishItemOutcome::AlreadyPublished(durability)
+        } else {
+            PublishItemOutcome::Published(durability)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn confirm_restored_item(
+        &self,
+        id: TrashId,
+        destination: &VaultPath,
+        digest: &ManifestDigest,
+        validated: Option<&ValidatedTrashItem>,
+        source: &VaultPath,
+        items_parent: &Dir,
+        item_name: &OsString,
+        held_item_directory: &Dir,
+        payload_name: &OsString,
+        destination_parent: &Dir,
+        destination_name: &OsString,
+        report: MoveSyncReport,
+        already_restored: bool,
+    ) -> Result<RestoreItemOutcome> {
+        let verification = if let Some(validated) = validated {
+            self.validate_restored_topology(
+                id,
+                destination,
+                digest,
+                validated,
+                items_parent,
+                item_name,
+                held_item_directory,
+                payload_name,
+                destination_parent,
+                destination_name,
+            )
+        } else {
+            self.validate_completed_restore_topology(
+                id,
+                destination,
+                digest,
+                items_parent,
+                item_name,
+                held_item_directory,
+                destination_parent,
+                destination_name,
+            )
+        };
+        if let Err(cause) = verification {
+            return Err(report.into_verified_unknown(source, destination, cause));
+        }
+        if report.has_failure() {
+            return Err(report.into_verified_unknown(
+                source,
+                destination,
+                CoreError::MoveDurabilitySyncFailed,
+            ));
+        }
+        let durability = report.into_result(source, destination)?;
+        Ok(if already_restored {
+            RestoreItemOutcome::AlreadyRestored(durability)
+        } else {
+            RestoreItemOutcome::Restored(durability)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_published_item_topology(
+        &self,
+        id: TrashId,
+        digest: &ManifestDigest,
+        staging_parent: &Dir,
+        staging_name: &OsString,
+        items_parent: &Dir,
+        items_name: &OsString,
+        expected_items_directory: Option<&Dir>,
+    ) -> Result<()> {
+        if Self::entry_exists(staging_parent, staging_name)? {
+            return Err(CoreError::InvalidTrashTopology(
+                "staging directory was recreated after publish",
+            ));
+        }
+        if let Some(expected) = expected_items_directory {
+            let authoritative =
+                self.reopen_authoritative_item_directory(id, items_parent, items_name, expected)?;
+            self.validate_item_contents(
+                TrashArea::Items,
+                id,
+                &authoritative,
+                digest,
+                PayloadPresence::Required,
+            )?;
+        } else {
+            self.validate_item_directory(
+                TrashArea::Items,
+                id,
+                items_parent,
+                items_name,
+                digest,
+                PayloadPresence::Required,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_restored_topology(
+        &self,
+        id: TrashId,
+        destination: &VaultPath,
+        digest: &ManifestDigest,
+        validated: &ValidatedTrashItem,
+        items_parent: &Dir,
+        item_name: &OsString,
+        held_item_directory: &Dir,
+        payload_name: &OsString,
+        destination_parent: &Dir,
+        destination_name: &OsString,
+    ) -> Result<()> {
+        let item_directory = self.reopen_authoritative_item_directory(
+            id,
+            items_parent,
+            item_name,
+            held_item_directory,
+        )?;
+        let expected = validated.manifest.expected_revision()?;
+        self.vault.verify_expected_from_parent(
+            destination_parent,
+            destination_name,
+            destination,
+            &expected,
+            MAX_TRASH_PAYLOAD_BYTES,
+        )?;
+        self.vault.verify_single_link_from_parent(
+            destination_parent,
+            destination_name,
+            destination,
+        )?;
+        if Self::entry_exists(&item_directory, payload_name)? {
+            return Err(CoreError::InvalidTrashTopology(
+                "items payload still exists after restore",
+            ));
+        }
+        let reread = self.validate_item_contents(
+            TrashArea::Items,
+            id,
+            &item_directory,
+            digest,
+            PayloadPresence::Absent,
+        )?;
+        if reread.bytes != validated.bytes {
+            return Err(CoreError::TrashManifestDigestMismatch);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_completed_restore_topology(
+        &self,
+        id: TrashId,
+        destination: &VaultPath,
+        digest: &ManifestDigest,
+        items_parent: &Dir,
+        item_name: &OsString,
+        held_item_directory: &Dir,
+        destination_parent: &Dir,
+        destination_name: &OsString,
+    ) -> Result<()> {
+        let item_directory = self.reopen_authoritative_item_directory(
+            id,
+            items_parent,
+            item_name,
+            held_item_directory,
+        )?;
+        let validated = self.validate_item_contents(
+            TrashArea::Items,
+            id,
+            &item_directory,
+            digest,
+            PayloadPresence::Absent,
+        )?;
+        if destination.as_str() != validated.manifest.original_path {
+            return Err(CoreError::InvalidTrashManifest(
+                "restore destination must equal original path",
+            ));
+        }
+        let expected = validated.manifest.expected_revision()?;
+        self.vault.verify_expected_from_parent(
+            destination_parent,
+            destination_name,
+            destination,
+            &expected,
+            MAX_TRASH_PAYLOAD_BYTES,
+        )?;
+        self.vault
+            .verify_single_link_from_parent(destination_parent, destination_name, destination)
+    }
+
+    fn reopen_authoritative_item_directory(
+        &self,
+        id: TrashId,
+        items_parent: &Dir,
+        item_name: &OsString,
+        held_item_directory: &Dir,
+    ) -> Result<Dir> {
+        let authoritative = self.open_authoritative_item_directory(id, items_parent, item_name)?;
+        Self::require_same_directory_identity(held_item_directory, &authoritative)?;
+        Ok(authoritative)
+    }
+
+    fn open_authoritative_item_directory(
+        &self,
+        id: TrashId,
+        items_parent: &Dir,
+        item_name: &OsString,
+    ) -> Result<Dir> {
+        let item_path = item_directory_path(TrashArea::Items, id)?;
+        let display = self.vault.root_path.join(item_path.as_path());
+        open_child_dir_nofollow(items_parent, item_name, &display)
+    }
+
+    fn require_same_directory_identity(expected: &Dir, actual: &Dir) -> Result<()> {
+        let expected_identity = myvault_platform_fs::directory_identity(expected)?;
+        let actual_identity = myvault_platform_fs::directory_identity(actual)?;
+        if expected_identity != actual_identity {
+            return Err(CoreError::InvalidTrashTopology(
+                "items directory identity changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_item_directory(
+        &self,
+        area: TrashArea,
+        id: TrashId,
+        parent: &Dir,
+        name: &OsString,
+        digest: &ManifestDigest,
+        payload_presence: PayloadPresence,
+    ) -> Result<ValidatedTrashItem> {
+        let path = item_directory_path(area, id)?;
+        let display = self.vault.root_path.join(path.as_path());
+        let directory = open_child_dir_nofollow(parent, name, &display)?;
+        self.validate_item_contents(area, id, &directory, digest, payload_presence)
+    }
+
+    fn validate_item_contents(
+        &self,
+        area: TrashArea,
+        id: TrashId,
+        directory: &Dir,
+        digest: &ManifestDigest,
+        payload_presence: PayloadPresence,
+    ) -> Result<ValidatedTrashItem> {
+        let mut payload_seen = false;
+        let mut manifest_seen = false;
+        let mut temp_count = 0_usize;
+        let mut entry_count = 0_usize;
+        for entry in directory.entries()? {
+            let entry = entry?;
+            entry_count = entry_count.saturating_add(1);
+            if entry_count > MAX_TRASH_ITEM_ENTRIES {
+                return Err(CoreError::InvalidTrashTopology(
+                    "trash item contains too many entries",
+                ));
+            }
+            let name = entry.file_name();
+            let Some(name_utf8) = name.to_str() else {
+                return Err(CoreError::InvalidTrashTopology(
+                    "trash item entry name is not UTF-8",
+                ));
+            };
+            match name_utf8 {
+                "manifest.json" => manifest_seen = true,
+                "payload" => payload_seen = true,
+                _ if Self::is_reserved_manifest_temp(name_utf8) => {
+                    temp_count = temp_count.saturating_add(1);
+                    if temp_count > MAX_RESERVED_MANIFEST_TEMPS {
+                        return Err(CoreError::InvalidTrashTopology(
+                            "too many reserved manifest temp files",
+                        ));
+                    }
+                    Self::validate_reserved_temp(directory, &name)?;
+                }
+                _ => {
+                    return Err(CoreError::InvalidTrashTopology(
+                        "trash item contains an unrecognized entry",
+                    ));
+                }
+            }
+        }
+        if !manifest_seen {
+            return Err(CoreError::InvalidTrashTopology("manifest is absent"));
+        }
+        match payload_presence {
+            PayloadPresence::Required if !payload_seen => {
+                return Err(CoreError::InvalidTrashTopology("payload is absent"));
+            }
+            PayloadPresence::Absent if payload_seen => {
+                return Err(CoreError::InvalidTrashTopology("payload is present"));
+            }
+            PayloadPresence::Required | PayloadPresence::Absent => {}
+        }
+        let stored = Self::read_manifest_from_directory(id, directory, false)?;
+        if ManifestDigest::from_bytes(&stored.bytes) != *digest {
+            return Err(CoreError::TrashManifestDigestMismatch);
+        }
+        if payload_seen {
+            let expected = stored.manifest.expected_revision()?;
+            let payload_relative = payload_path(area, id)?;
+            let payload_name = OsString::from("payload");
+            self.vault.verify_expected_from_parent(
+                directory,
+                &payload_name,
+                &payload_relative,
+                &expected,
+                MAX_TRASH_PAYLOAD_BYTES,
+            )?;
+            self.vault.verify_single_link_from_parent(
+                directory,
+                &payload_name,
+                &payload_relative,
+            )?;
+        }
+        Ok(ValidatedTrashItem {
+            manifest: stored.manifest,
+            bytes: stored.bytes,
+        })
+    }
+
+    fn validate_reserved_temp(directory: &Dir, name: &OsString) -> Result<()> {
+        let metadata = directory.symlink_metadata(name)?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > u64::try_from(MAX_TRASH_MANIFEST_BYTES).unwrap_or(u64::MAX)
+        {
+            return Err(CoreError::InvalidTrashTopology(
+                "reserved manifest temp is not a bounded regular file",
+            ));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let file = directory.open_with(name, &options)?;
+        let opened_metadata = file.metadata()?;
+        if !opened_metadata.is_file()
+            || opened_metadata.nlink() != 1
+            || opened_metadata.len() > u64::try_from(MAX_TRASH_MANIFEST_BYTES).unwrap_or(u64::MAX)
+        {
+            return Err(CoreError::InvalidTrashTopology(
+                "reserved manifest temp must be a bounded single-link regular file",
+            ));
+        }
+        Ok(())
+    }
+
+    fn is_reserved_manifest_temp(name: &str) -> bool {
+        let Some(uuid) = name
+            .strip_prefix(".manifest-")
+            .and_then(|value| value.strip_suffix(".tmp"))
+        else {
+            return false;
+        };
+        uuid::Uuid::parse_str(uuid)
+            .is_ok_and(|parsed| !parsed.is_nil() && parsed.to_string() == uuid)
+    }
+
+    fn entry_exists(parent: &Dir, name: &OsString) -> Result<bool> {
+        match parent.symlink_metadata(name) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn ensure_staging_item_directory(&self, id: TrashId) -> Result<Dir> {
         let root = self.vault.root_dir.try_clone()?;
         let trash = self.ensure_directory(&root, ".trash", ".trash")?;
@@ -1553,6 +2325,20 @@ struct ManifestRead {
     bytes: Vec<u8>,
     file: cap_std::fs::File,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PayloadPresence {
+    Required,
+    Absent,
+}
+
+struct ValidatedTrashItem {
+    manifest: TrashManifestV1,
+    bytes: Vec<u8>,
+}
+
+const MAX_RESERVED_MANIFEST_TEMPS: usize = 32;
+const MAX_TRASH_ITEM_ENTRIES: usize = MAX_RESERVED_MANIFEST_TEMPS + 2;
 
 #[derive(Debug)]
 struct MoveSyncReport {
@@ -1779,6 +2565,27 @@ mod tests {
         (base, vault, id, manifest)
     }
 
+    fn staged_publish_fault_fixture(
+        label: &str,
+    ) -> (PathBuf, Vault, TrashId, TrashManifestV1, ManifestDigest) {
+        let (base, vault, id, manifest) = manifest_fault_fixture(label);
+        fs::write(base.join("note.md"), b"note").expect("source");
+        let digest = manifest.digest().expect("digest");
+        vault
+            .trash_store()
+            .prepare_staging_manifest(id, &manifest)
+            .expect("prepare");
+        vault
+            .trash_store()
+            .stage_payload_if_revision(
+                id,
+                &VaultPath::from_portable("note.md").expect("source path"),
+                &digest,
+            )
+            .expect("stage");
+        (base, vault, id, manifest, digest)
+    }
+
     #[test]
     fn published_manifest_sync_failure_is_outcome_unknown_before_verification() {
         let (base, vault, id, manifest) = manifest_fault_fixture("published-sync");
@@ -1910,6 +2717,859 @@ mod tests {
             assert!(!base.join("note.md").exists());
             fs::remove_dir_all(base).expect("cleanup");
         }
+    }
+
+    #[test]
+    fn publish_sync_failure_confirms_with_destination_then_source() {
+        let (base, vault, id, _manifest, digest) = staged_publish_fault_fixture("publish-confirm");
+        let mut attempts = Vec::new();
+        let mut first_destination = true;
+        let outcome = vault
+            .trash_store()
+            .publish_staging_item_with_hooks(
+                id,
+                &digest,
+                |parent, _| {
+                    attempts.push(parent);
+                    if parent == MoveSyncParent::Destination && first_destination {
+                        first_destination = false;
+                        Err(injected_sync_failure(parent))
+                    } else {
+                        Ok(MoveDurability::FullySynced)
+                    }
+                },
+                || {},
+            )
+            .expect("confirmed publish");
+
+        assert_eq!(
+            attempts,
+            [
+                MoveSyncParent::Destination,
+                MoveSyncParent::Source,
+                MoveSyncParent::Destination,
+                MoveSyncParent::Source,
+            ]
+        );
+        assert_eq!(
+            outcome,
+            PublishItemOutcome::Published(MoveDurability::FullySynced)
+        );
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn publish_idempotent_confirmation_syncs_before_rejecting_malformed_item() {
+        let (base, vault, id, _manifest, digest) =
+            staged_publish_fault_fixture("publish-idempotent-malformed");
+        vault
+            .trash_store()
+            .publish_staging_item(id, &digest)
+            .expect("publish");
+        fs::write(
+            base.join(format!(".trash/v1/items/{id}/manifest.json")),
+            b"{",
+        )
+        .expect("malform published manifest");
+        let mut attempts = Vec::new();
+
+        let error = vault
+            .trash_store()
+            .publish_staging_item_with_hooks(
+                id,
+                &digest,
+                |parent, _| {
+                    attempts.push(parent);
+                    match parent {
+                        MoveSyncParent::Destination => Ok(MoveDurability::DirectorySyncUnsupported),
+                        MoveSyncParent::Source => Ok(MoveDurability::FullySynced),
+                    }
+                },
+                || {},
+            )
+            .expect_err("malformed published item");
+
+        assert_eq!(
+            attempts,
+            [MoveSyncParent::Destination, MoveSyncParent::Source]
+        );
+        assert!(matches!(
+            error,
+            CoreError::VerifiedMoveOutcomeUnknown {
+                destination_sync: DirectorySyncStatus::Unsupported,
+                source_sync: DirectorySyncStatus::Synced,
+                verification,
+                ..
+            } if matches!(*verification, CoreError::InvalidTrashManifest(_))
+        ));
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn publish_observes_topology_only_after_both_initial_sync_attempts() {
+        let (base, vault, id, _manifest, digest) =
+            staged_publish_fault_fixture("publish-observation-order");
+        let staging = base.join(format!(".trash/v1/staging/{id}"));
+        let items = base.join(format!(".trash/v1/items/{id}"));
+        let mut attempts = Vec::new();
+
+        let outcome = vault
+            .trash_store()
+            .publish_staging_item_with_hooks(
+                id,
+                &digest,
+                |parent, _| {
+                    attempts.push(parent);
+                    if parent == MoveSyncParent::Source && staging.exists() {
+                        fs::rename(&staging, &items).expect("external publication during sync");
+                    }
+                    Ok(MoveDurability::FullySynced)
+                },
+                || {},
+            )
+            .expect("idempotent publish after sync-time move");
+
+        assert_eq!(
+            attempts,
+            [MoveSyncParent::Destination, MoveSyncParent::Source]
+        );
+        assert_eq!(
+            outcome,
+            PublishItemOutcome::AlreadyPublished(MoveDurability::FullySynced)
+        );
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn publish_preobservation_error_preserves_initial_sync_statuses() {
+        let (base, vault, id, _manifest, digest) =
+            staged_publish_fault_fixture("publish-observation-error");
+        let mut attempts = Vec::new();
+        let error = vault
+            .trash_store()
+            .publish_staging_item_with_observation_hooks(
+                id,
+                &digest,
+                |parent, _| {
+                    attempts.push(parent);
+                    match parent {
+                        MoveSyncParent::Destination => Ok(MoveDurability::DirectorySyncUnsupported),
+                        MoveSyncParent::Source => Ok(MoveDurability::FullySynced),
+                    }
+                },
+                || Err(std::io::Error::other("injected lstat failure").into()),
+                || {},
+            )
+            .expect_err("preobservation failure");
+
+        assert_eq!(
+            attempts,
+            [MoveSyncParent::Destination, MoveSyncParent::Source]
+        );
+        assert!(matches!(
+            error,
+            CoreError::VerifiedMoveOutcomeUnknown {
+                destination_sync: DirectorySyncStatus::Unsupported,
+                source_sync: DirectorySyncStatus::Synced,
+                verification,
+                ..
+            } if matches!(*verification, CoreError::Io(_))
+        ));
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn publish_both_and_neither_are_classified_after_initial_syncs() {
+        for (label, create_items, remove_staging) in
+            [("both", true, false), ("neither", false, true)]
+        {
+            let (base, vault, id, _manifest, digest) = staged_publish_fault_fixture(label);
+            let staging = base.join(format!(".trash/v1/staging/{id}"));
+            let items = base.join(format!(".trash/v1/items/{id}"));
+            if create_items {
+                fs::create_dir(&items).expect("items collision");
+            }
+            if remove_staging {
+                fs::remove_dir_all(&staging).expect("remove staging");
+            }
+            let mut attempts = Vec::new();
+
+            let error = vault
+                .trash_store()
+                .publish_staging_item_with_hooks(
+                    id,
+                    &digest,
+                    |parent, _| {
+                        attempts.push(parent);
+                        Ok(MoveDurability::FullySynced)
+                    },
+                    || {},
+                )
+                .expect_err("invalid topology");
+
+            assert_eq!(
+                attempts,
+                [MoveSyncParent::Destination, MoveSyncParent::Source]
+            );
+            assert!(matches!(error, CoreError::InvalidTrashTopology(_)));
+            fs::remove_dir_all(base).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn publish_postrename_source_recreation_preserves_mixed_sync_statuses() {
+        let (base, vault, id, _manifest, digest) =
+            staged_publish_fault_fixture("publish-source-recreated");
+        let staging = base.join(format!(".trash/v1/staging/{id}"));
+        let error = vault
+            .trash_store()
+            .publish_staging_item_with_hooks(
+                id,
+                &digest,
+                |parent, _| match parent {
+                    MoveSyncParent::Destination => Ok(MoveDurability::FullySynced),
+                    MoveSyncParent::Source => Ok(MoveDurability::DirectorySyncUnsupported),
+                },
+                || fs::create_dir(&staging).expect("recreate staging source"),
+            )
+            .expect_err("postrename source recreation");
+
+        assert!(matches!(
+            error,
+            CoreError::VerifiedMoveOutcomeUnknown {
+                destination_sync: DirectorySyncStatus::Synced,
+                source_sync: DirectorySyncStatus::Unsupported,
+                verification,
+                ..
+            } if matches!(*verification, CoreError::InvalidTrashTopology(_))
+        ));
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn publish_postrename_manifest_mutation_preserves_inverse_mixed_statuses() {
+        let (base, vault, id, _manifest, digest) =
+            staged_publish_fault_fixture("publish-manifest-mutated");
+        let final_manifest = base.join(format!(".trash/v1/items/{id}/manifest.json"));
+        let error = vault
+            .trash_store()
+            .publish_staging_item_with_hooks(
+                id,
+                &digest,
+                |parent, _| match parent {
+                    MoveSyncParent::Destination => Ok(MoveDurability::DirectorySyncUnsupported),
+                    MoveSyncParent::Source => Ok(MoveDurability::FullySynced),
+                },
+                || fs::write(&final_manifest, b"{").expect("mutate item manifest"),
+            )
+            .expect_err("postrename manifest mutation");
+
+        assert!(matches!(
+            error,
+            CoreError::VerifiedMoveOutcomeUnknown {
+                destination_sync: DirectorySyncStatus::Unsupported,
+                source_sync: DirectorySyncStatus::Synced,
+                ..
+            }
+        ));
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn publish_postrename_rejects_exact_looking_directory_swap() {
+        let (base, vault, id, _manifest, digest) =
+            staged_publish_fault_fixture("publish-exact-item-swap");
+        let staging_manifest = fs::read(base.join(format!(".trash/v1/staging/{id}/manifest.json")))
+            .expect("manifest bytes");
+        let staging_payload =
+            fs::read(base.join(format!(".trash/v1/staging/{id}/payload"))).expect("payload bytes");
+        let items = base.join(format!(".trash/v1/items/{id}"));
+        let detached = base.join(format!(".trash/v1/items/{id}.detached"));
+
+        let error = vault
+            .trash_store()
+            .publish_staging_item_with_hooks(
+                id,
+                &digest,
+                |_, _| Ok(MoveDurability::FullySynced),
+                || {
+                    fs::rename(&items, &detached).expect("detach published directory");
+                    fs::create_dir(&items).expect("replacement directory");
+                    fs::write(items.join("manifest.json"), &staging_manifest)
+                        .expect("replacement manifest");
+                    fs::write(items.join("payload"), &staging_payload)
+                        .expect("replacement payload");
+                },
+            )
+            .expect_err("published directory identity swap");
+
+        assert!(matches!(
+            error,
+            CoreError::VerifiedMoveOutcomeUnknown {
+                destination_sync: DirectorySyncStatus::Synced,
+                source_sync: DirectorySyncStatus::Synced,
+                verification,
+                ..
+            } if matches!(*verification, CoreError::InvalidTrashTopology(
+                "items directory identity changed"
+            ))
+        ));
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn restore_sync_failure_confirms_and_leaves_manifest() {
+        let (base, vault, id, manifest, digest) = staged_publish_fault_fixture("restore-confirm");
+        vault
+            .trash_store()
+            .publish_staging_item(id, &digest)
+            .expect("publish");
+        let destination = VaultPath::from_portable(&manifest.original_path).expect("destination");
+        let mut attempts = Vec::new();
+        let mut first_source = true;
+        let outcome = vault
+            .trash_store()
+            .restore_item_with_hooks(
+                id,
+                &destination,
+                &digest,
+                |parent, _| {
+                    attempts.push(parent);
+                    if parent == MoveSyncParent::Source && first_source {
+                        first_source = false;
+                        Err(injected_sync_failure(parent))
+                    } else {
+                        Ok(MoveDurability::FullySynced)
+                    }
+                },
+                || {},
+            )
+            .expect("confirmed restore");
+
+        assert_eq!(
+            attempts,
+            [
+                MoveSyncParent::Destination,
+                MoveSyncParent::Source,
+                MoveSyncParent::Destination,
+                MoveSyncParent::Source,
+            ]
+        );
+        assert_eq!(
+            outcome,
+            RestoreItemOutcome::Restored(MoveDurability::FullySynced)
+        );
+        assert!(base
+            .join(format!(".trash/v1/items/{id}/manifest.json"))
+            .is_file());
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn restore_idempotent_confirmation_syncs_before_rejecting_malformed_item() {
+        let (base, vault, id, manifest, digest) =
+            staged_publish_fault_fixture("restore-idempotent-malformed");
+        vault
+            .trash_store()
+            .publish_staging_item(id, &digest)
+            .expect("publish");
+        let destination = VaultPath::from_portable(&manifest.original_path).expect("destination");
+        vault
+            .trash_store()
+            .restore_item_if_revision(id, &destination, &digest)
+            .expect("restore");
+        fs::write(
+            base.join(format!(".trash/v1/items/{id}/manifest.json")),
+            b"{",
+        )
+        .expect("malform restored manifest");
+        let mut attempts = Vec::new();
+
+        let error = vault
+            .trash_store()
+            .restore_item_with_hooks(
+                id,
+                &destination,
+                &digest,
+                |parent, _| {
+                    attempts.push(parent);
+                    match parent {
+                        MoveSyncParent::Destination => Ok(MoveDurability::FullySynced),
+                        MoveSyncParent::Source => Ok(MoveDurability::DirectorySyncUnsupported),
+                    }
+                },
+                || {},
+            )
+            .expect_err("malformed completed item");
+
+        assert_eq!(
+            attempts,
+            [MoveSyncParent::Destination, MoveSyncParent::Source]
+        );
+        assert!(matches!(
+            error,
+            CoreError::VerifiedMoveOutcomeUnknown {
+                destination_sync: DirectorySyncStatus::Synced,
+                source_sync: DirectorySyncStatus::Unsupported,
+                verification,
+                ..
+            } if matches!(*verification, CoreError::InvalidTrashManifest(_))
+        ));
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn restore_observes_topology_only_after_both_initial_sync_attempts() {
+        let (base, vault, id, manifest, digest) =
+            staged_publish_fault_fixture("restore-observation-order");
+        vault
+            .trash_store()
+            .publish_staging_item(id, &digest)
+            .expect("publish");
+        let destination = VaultPath::from_portable(&manifest.original_path).expect("destination");
+        let payload = base.join(format!(".trash/v1/items/{id}/payload"));
+        let destination_path = base.join(destination.as_path());
+        let mut attempts = Vec::new();
+
+        let outcome = vault
+            .trash_store()
+            .restore_item_with_hooks(
+                id,
+                &destination,
+                &digest,
+                |parent, _| {
+                    attempts.push(parent);
+                    if parent == MoveSyncParent::Source && payload.exists() {
+                        fs::rename(&payload, &destination_path)
+                            .expect("external restore during sync");
+                    }
+                    Ok(MoveDurability::FullySynced)
+                },
+                || {},
+            )
+            .expect("idempotent restore after sync-time move");
+
+        assert_eq!(
+            attempts,
+            [MoveSyncParent::Destination, MoveSyncParent::Source]
+        );
+        assert_eq!(
+            outcome,
+            RestoreItemOutcome::AlreadyRestored(MoveDurability::FullySynced)
+        );
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn restore_preobservation_error_preserves_initial_sync_statuses() {
+        let (base, vault, id, manifest, digest) =
+            staged_publish_fault_fixture("restore-observation-error");
+        vault
+            .trash_store()
+            .publish_staging_item(id, &digest)
+            .expect("publish");
+        let destination = VaultPath::from_portable(&manifest.original_path).expect("destination");
+        let mut attempts = Vec::new();
+
+        let error = vault
+            .trash_store()
+            .restore_item_with_observation_hooks(
+                id,
+                &destination,
+                &digest,
+                |parent, _| {
+                    attempts.push(parent);
+                    match parent {
+                        MoveSyncParent::Destination => Ok(MoveDurability::FullySynced),
+                        MoveSyncParent::Source => Ok(MoveDurability::DirectorySyncUnsupported),
+                    }
+                },
+                || Err(std::io::Error::other("injected lstat failure").into()),
+                || {},
+            )
+            .expect_err("preobservation failure");
+
+        assert_eq!(
+            attempts,
+            [MoveSyncParent::Destination, MoveSyncParent::Source]
+        );
+        assert!(matches!(
+            error,
+            CoreError::VerifiedMoveOutcomeUnknown {
+                destination_sync: DirectorySyncStatus::Synced,
+                source_sync: DirectorySyncStatus::Unsupported,
+                verification,
+                ..
+            } if matches!(*verification, CoreError::Io(_))
+        ));
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn restore_both_and_neither_are_classified_after_initial_syncs() {
+        for (label, create_destination, remove_payload) in
+            [("both", true, false), ("neither", false, true)]
+        {
+            let (base, vault, id, manifest, digest) =
+                staged_publish_fault_fixture(&format!("restore-{label}"));
+            vault
+                .trash_store()
+                .publish_staging_item(id, &digest)
+                .expect("publish");
+            let destination =
+                VaultPath::from_portable(&manifest.original_path).expect("destination");
+            if create_destination {
+                fs::write(base.join(destination.as_path()), b"external")
+                    .expect("destination collision");
+            }
+            if remove_payload {
+                fs::remove_file(base.join(format!(".trash/v1/items/{id}/payload")))
+                    .expect("remove payload");
+            }
+            let mut attempts = Vec::new();
+
+            let error = vault
+                .trash_store()
+                .restore_item_with_hooks(
+                    id,
+                    &destination,
+                    &digest,
+                    |parent, _| {
+                        attempts.push(parent);
+                        Ok(MoveDurability::FullySynced)
+                    },
+                    || {},
+                )
+                .expect_err("invalid restore topology");
+
+            assert_eq!(
+                attempts,
+                [MoveSyncParent::Destination, MoveSyncParent::Source]
+            );
+            if create_destination {
+                assert!(matches!(error, CoreError::AlreadyExists(_)));
+            } else {
+                assert!(matches!(error, CoreError::InvalidTrashTopology(_)));
+            }
+            fs::remove_dir_all(base).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn restore_postmove_manifest_mutation_is_explicit_unknown() {
+        let (base, vault, id, manifest, digest) =
+            staged_publish_fault_fixture("restore-manifest-mutated");
+        vault
+            .trash_store()
+            .publish_staging_item(id, &digest)
+            .expect("publish");
+        let destination = VaultPath::from_portable(&manifest.original_path).expect("destination");
+        let final_manifest = base.join(format!(".trash/v1/items/{id}/manifest.json"));
+        let error = vault
+            .trash_store()
+            .restore_item_with_hooks(
+                id,
+                &destination,
+                &digest,
+                |parent, _| match parent {
+                    MoveSyncParent::Destination => Ok(MoveDurability::FullySynced),
+                    MoveSyncParent::Source => Ok(MoveDurability::DirectorySyncUnsupported),
+                },
+                || fs::write(&final_manifest, b"{").expect("mutate manifest"),
+            )
+            .expect_err("postmove manifest mutation");
+
+        assert!(matches!(
+            error,
+            CoreError::VerifiedMoveOutcomeUnknown {
+                destination_sync: DirectorySyncStatus::Synced,
+                source_sync: DirectorySyncStatus::Unsupported,
+                ..
+            }
+        ));
+        assert!(base.join("note.md").is_file());
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn restore_postmove_destination_mutation_is_explicit_unknown() {
+        let (base, vault, id, manifest, digest) =
+            staged_publish_fault_fixture("restore-destination-mutated");
+        vault
+            .trash_store()
+            .publish_staging_item(id, &digest)
+            .expect("publish");
+        let destination = VaultPath::from_portable(&manifest.original_path).expect("destination");
+        let destination_path = base.join(destination.as_path());
+        let error = vault
+            .trash_store()
+            .restore_item_with_hooks(
+                id,
+                &destination,
+                &digest,
+                |parent, _| match parent {
+                    MoveSyncParent::Destination => Ok(MoveDurability::DirectorySyncUnsupported),
+                    MoveSyncParent::Source => Ok(MoveDurability::FullySynced),
+                },
+                || fs::write(&destination_path, b"external").expect("mutate destination"),
+            )
+            .expect_err("postmove destination mutation");
+
+        assert!(matches!(
+            error,
+            CoreError::VerifiedMoveOutcomeUnknown {
+                destination_sync: DirectorySyncStatus::Unsupported,
+                source_sync: DirectorySyncStatus::Synced,
+                verification,
+                ..
+            } if matches!(*verification, CoreError::StaleRevision { .. })
+        ));
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn restore_postmove_payload_recreation_is_explicit_unknown() {
+        let (base, vault, id, manifest, digest) =
+            staged_publish_fault_fixture("restore-payload-recreated");
+        vault
+            .trash_store()
+            .publish_staging_item(id, &digest)
+            .expect("publish");
+        let destination = VaultPath::from_portable(&manifest.original_path).expect("destination");
+        let payload = base.join(format!(".trash/v1/items/{id}/payload"));
+        let error = vault
+            .trash_store()
+            .restore_item_with_hooks(
+                id,
+                &destination,
+                &digest,
+                |parent, _| match parent {
+                    MoveSyncParent::Destination => Ok(MoveDurability::FullySynced),
+                    MoveSyncParent::Source => Ok(MoveDurability::DirectorySyncUnsupported),
+                },
+                || fs::write(&payload, b"note").expect("recreate payload"),
+            )
+            .expect_err("postmove payload recreation");
+
+        assert!(matches!(
+            error,
+            CoreError::VerifiedMoveOutcomeUnknown {
+                destination_sync: DirectorySyncStatus::Synced,
+                source_sync: DirectorySyncStatus::Unsupported,
+                verification,
+                ..
+            } if matches!(*verification, CoreError::InvalidTrashTopology(_))
+        ));
+        assert!(base.join("note.md").is_file());
+        assert!(payload.is_file());
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn restore_postmove_missing_authoritative_item_directory_is_explicit_unknown() {
+        let (base, vault, id, manifest, digest) =
+            staged_publish_fault_fixture("restore-item-directory-missing");
+        vault
+            .trash_store()
+            .publish_staging_item(id, &digest)
+            .expect("publish");
+        let destination = VaultPath::from_portable(&manifest.original_path).expect("destination");
+        let item = base.join(format!(".trash/v1/items/{id}"));
+        let error = vault
+            .trash_store()
+            .restore_item_with_hooks(
+                id,
+                &destination,
+                &digest,
+                |_, _| Ok(MoveDurability::FullySynced),
+                || {
+                    fs::remove_file(item.join("manifest.json")).expect("remove manifest");
+                    fs::remove_dir(&item).expect("remove item directory");
+                },
+            )
+            .expect_err("missing authoritative item directory");
+
+        assert!(matches!(
+            error,
+            CoreError::VerifiedMoveOutcomeUnknown {
+                destination_sync: DirectorySyncStatus::Synced,
+                source_sync: DirectorySyncStatus::Synced,
+                ..
+            }
+        ));
+        assert!(base.join("note.md").is_file());
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn restore_confirmation_reports_source_not_attempted_when_reopen_fails() {
+        let (base, vault, id, manifest, digest) =
+            staged_publish_fault_fixture("restore-confirm-item-missing");
+        vault
+            .trash_store()
+            .publish_staging_item(id, &digest)
+            .expect("publish");
+        let destination = VaultPath::from_portable(&manifest.original_path).expect("destination");
+        let item = base.join(format!(".trash/v1/items/{id}"));
+        let mut destination_syncs = 0_u8;
+        let mut source_syncs = 0_u8;
+        let error = vault
+            .trash_store()
+            .restore_item_with_hooks(
+                id,
+                &destination,
+                &digest,
+                |parent, _| match parent {
+                    MoveSyncParent::Destination => {
+                        destination_syncs = destination_syncs.saturating_add(1);
+                        if destination_syncs == 3 {
+                            Ok(MoveDurability::DirectorySyncUnsupported)
+                        } else {
+                            Ok(MoveDurability::FullySynced)
+                        }
+                    }
+                    MoveSyncParent::Source => {
+                        source_syncs = source_syncs.saturating_add(1);
+                        if source_syncs == 2 {
+                            Err(injected_sync_failure(parent))
+                        } else {
+                            Ok(MoveDurability::FullySynced)
+                        }
+                    }
+                },
+                || {
+                    fs::remove_file(item.join("manifest.json")).expect("remove manifest");
+                    fs::remove_dir(&item).expect("remove item directory");
+                },
+            )
+            .expect_err("authoritative source reopen failure");
+
+        assert_eq!(destination_syncs, 3);
+        assert_eq!(source_syncs, 2);
+        assert!(matches!(
+            error,
+            CoreError::VerifiedMoveOutcomeUnknown {
+                destination_sync: DirectorySyncStatus::Unsupported,
+                source_sync: DirectorySyncStatus::NotAttempted,
+                verification,
+                ..
+            } if matches!(*verification, CoreError::Io(ref error)
+                if error.kind() == std::io::ErrorKind::NotFound)
+        ));
+        assert!(base.join("note.md").is_file());
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn restore_postmove_rejects_malformed_and_exact_looking_directory_swaps() {
+        for (label, exact_looking) in [("malformed", false), ("exact-looking", true)] {
+            let (base, vault, id, manifest, digest) =
+                staged_publish_fault_fixture(&format!("restore-item-swap-{label}"));
+            vault
+                .trash_store()
+                .publish_staging_item(id, &digest)
+                .expect("publish");
+            let destination =
+                VaultPath::from_portable(&manifest.original_path).expect("destination");
+            let item = base.join(format!(".trash/v1/items/{id}"));
+            let detached = base.join(format!(".trash/v1/items/{id}.detached"));
+            let manifest_bytes = fs::read(item.join("manifest.json")).expect("manifest bytes");
+            let error = vault
+                .trash_store()
+                .restore_item_with_hooks(
+                    id,
+                    &destination,
+                    &digest,
+                    |_, _| Ok(MoveDurability::FullySynced),
+                    || {
+                        fs::rename(&item, &detached).expect("detach item directory");
+                        fs::create_dir(&item).expect("replacement item directory");
+                        fs::write(
+                            item.join("manifest.json"),
+                            if exact_looking {
+                                manifest_bytes.as_slice()
+                            } else {
+                                b"{".as_slice()
+                            },
+                        )
+                        .expect("replacement manifest");
+                    },
+                )
+                .expect_err("item directory identity swap");
+
+            assert!(matches!(
+                error,
+                CoreError::VerifiedMoveOutcomeUnknown {
+                    destination_sync: DirectorySyncStatus::Synced,
+                    source_sync: DirectorySyncStatus::Synced,
+                    verification,
+                    ..
+                } if matches!(*verification, CoreError::InvalidTrashTopology(
+                    "items directory identity changed"
+                ))
+            ));
+            fs::remove_dir_all(base).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn restore_confirmation_reopens_authoritative_item_directory() {
+        let (base, vault, id, manifest, digest) =
+            staged_publish_fault_fixture("restore-confirm-item-swap");
+        vault
+            .trash_store()
+            .publish_staging_item(id, &digest)
+            .expect("publish");
+        let destination = VaultPath::from_portable(&manifest.original_path).expect("destination");
+        let item = base.join(format!(".trash/v1/items/{id}"));
+        let detached = base.join(format!(".trash/v1/items/{id}.detached"));
+        let manifest_bytes = fs::read(item.join("manifest.json")).expect("manifest bytes");
+        let mut source_syncs = 0_u8;
+        let mut confirmation_synced_replacement = false;
+        let error = vault
+            .trash_store()
+            .restore_item_with_hooks(
+                id,
+                &destination,
+                &digest,
+                |parent, directory| {
+                    if parent == MoveSyncParent::Source {
+                        source_syncs = source_syncs.saturating_add(1);
+                        if source_syncs == 2 {
+                            return Err(injected_sync_failure(parent));
+                        }
+                        if source_syncs == 3 {
+                            let synced = directory.dir_metadata().expect("synced directory");
+                            let path_bound = fs::metadata(&item).expect("path-bound directory");
+                            confirmation_synced_replacement = synced.dev() == path_bound.dev()
+                                && synced.ino() == path_bound.ino();
+                        }
+                    }
+                    Ok(MoveDurability::FullySynced)
+                },
+                || {
+                    fs::rename(&item, &detached).expect("detach item directory");
+                    fs::create_dir(&item).expect("replacement item directory");
+                    fs::write(item.join("manifest.json"), &manifest_bytes)
+                        .expect("replacement manifest");
+                },
+            )
+            .expect_err("confirmation must reject replacement inode");
+
+        assert_eq!(source_syncs, 3);
+        assert!(confirmation_synced_replacement);
+        assert!(matches!(
+            error,
+            CoreError::VerifiedMoveOutcomeUnknown {
+                destination_sync: DirectorySyncStatus::Synced,
+                source_sync: DirectorySyncStatus::Synced,
+                verification,
+                ..
+            } if matches!(*verification, CoreError::InvalidTrashTopology(
+                "items directory identity changed"
+            ))
+        ));
+        fs::remove_dir_all(base).expect("cleanup");
     }
 
     #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
