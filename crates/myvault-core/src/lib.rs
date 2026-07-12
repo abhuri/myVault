@@ -23,8 +23,8 @@ pub use trash::{
 };
 pub use vault::{
     CaseRenameOutcome, CaseRenamePhase, DirectorySyncStatus, InventoryEntry, InventoryKind,
-    InventoryLimits, MoveContentOutcome, MoveDurability, Vault, WriteIntent, DEFAULT_READ_LIMIT,
-    MAX_TRASH_PAYLOAD_BYTES, MUTATION_EXTERNAL_PROCESS_RESIDUAL_RISK,
+    InventoryLimits, MoveContentOutcome, MoveDurability, ReplaceContentOutcome, Vault, WriteIntent,
+    DEFAULT_READ_LIMIT, MAX_TRASH_PAYLOAD_BYTES, MUTATION_EXTERNAL_PROCESS_RESIDUAL_RISK,
     TRASH_REVISION_EXTERNAL_PROCESS_RESIDUAL_RISK,
 };
 pub use watcher::{
