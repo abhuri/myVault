@@ -47,6 +47,25 @@ pub(super) fn directory_identity(directory: &Dir) -> io::Result<DirectoryIdentit
     ))
 }
 
+pub(super) fn file_identity(file: &cap_std::fs::File) -> io::Result<super::FileIdentity> {
+    let mut information = FILE_ID_INFO::default();
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileIdInfo,
+            (&raw mut information).cast::<c_void>(),
+            u32::try_from(size_of::<FILE_ID_INFO>()).expect("Win32 struct fits u32"),
+        )
+    };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(super::FileIdentity {
+        volume: information.VolumeSerialNumber,
+        file_id: information.FileId.Identifier,
+    })
+}
+
 pub(super) fn rename_noreplace(
     source_parent: &Dir,
     source_name: &OsStr,

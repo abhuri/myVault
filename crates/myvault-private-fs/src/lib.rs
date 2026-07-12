@@ -80,6 +80,10 @@ pub struct PrivateDisjointRoots {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeldDirectoryIdentity(myvault_platform_fs::DirectoryIdentity);
 
+/// Opaque identity of a held private regular file.
+#[derive(Debug, Eq, PartialEq)]
+pub struct HeldPrivateFileIdentity(myvault_platform_fs::FileIdentity);
+
 /// Captures the platform-complete identity of a held directory capability.
 ///
 /// # Errors
@@ -88,6 +92,94 @@ pub fn held_directory_identity(directory: &Dir) -> Result<HeldDirectoryIdentity,
     myvault_platform_fs::directory_identity(directory)
         .map(HeldDirectoryIdentity)
         .map_err(Error::Io)
+}
+
+/// Captures the identity of a held private regular file with exactly one link.
+///
+/// # Errors
+/// Rejects insecure, non-regular, hardlinked, or unsupported held files.
+pub fn held_private_file_identity(file: &File) -> Result<HeldPrivateFileIdentity, Error> {
+    verify_private_file(file, 1)?;
+    myvault_platform_fs::file_identity(file)
+        .map(HeldPrivateFileIdentity)
+        .map_err(Error::Io)
+}
+
+/// Opens one existing private regular file relative to a held parent.
+///
+/// # Errors
+/// Fails for invalid names, symlinks/reparse points, wrong type/privacy, or links.
+pub fn open_private_file(
+    parent: &Dir,
+    name: impl AsRef<Path>,
+    max_links: u64,
+) -> Result<File, Error> {
+    let name = name.as_ref();
+    validate_child_name(name)?;
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let file = parent.open_with(name, &options)?;
+    verify_private_file(&file, max_links)?;
+    Ok(file)
+}
+
+/// Removes one private regular file only when its original held handle, token,
+/// and the current named handle all still identify the same private file.
+///
+/// Cooperating processes must serialize mutations with the operation lock. A
+/// malicious same-UID syscall race remains outside the threat model because
+/// Unix and macOS provide no portable unlink-by-handle primitive.
+///
+/// # Errors
+/// Preserves a distinct `NotFound` I/O error and rejects every identity/topology mismatch.
+pub fn remove_private_file_if_identity(
+    parent: &Dir,
+    name: impl AsRef<Path>,
+    held: &File,
+    expected: &HeldPrivateFileIdentity,
+) -> Result<(), Error> {
+    let name = name.as_ref();
+    let current = open_private_file(parent, name, 1)?;
+    if &held_private_file_identity(held)? != expected {
+        return Err(Error::ExternalMutation);
+    }
+    if &held_private_file_identity(&current)? != expected {
+        return Err(Error::ExternalMutation);
+    }
+    parent.remove_file(name)?;
+    Ok(())
+}
+
+/// Removes one empty private directory only when its original held handle,
+/// token, and the current named handle all still identify the same empty child.
+///
+/// Cooperating processes must serialize mutations with the operation lock. A
+/// malicious same-UID syscall race remains outside the threat model because
+/// Unix and macOS provide no portable unlink-by-handle primitive.
+///
+/// # Errors
+/// Rejects nonempty, replaced, symlinked/reparse, insecure, or invalid children.
+pub fn remove_empty_private_dir_if_identity(
+    parent: &Dir,
+    name: impl AsRef<Path>,
+    held: &Dir,
+    expected: &HeldDirectoryIdentity,
+) -> Result<(), Error> {
+    let name = name.as_ref();
+    validate_child_name(name)?;
+    if &held_directory_identity(held)? != expected || held.entries()?.next().transpose()?.is_some()
+    {
+        return Err(Error::ExternalMutation);
+    }
+    let current = open_private_dir(parent, name)?;
+    if &held_directory_identity(&current)? != expected {
+        return Err(Error::ExternalMutation);
+    }
+    if current.entries()?.next().transpose()?.is_some() {
+        return Err(Error::ExternalMutation);
+    }
+    parent.remove_dir(name)?;
+    Ok(())
 }
 
 impl PrivateDisjointRoots {
@@ -980,6 +1072,83 @@ mod tests {
         create_private_dir(&root, "work").expect("new private directory");
         let error = create_private_dir(&root, "work").expect_err("collision");
         assert!(matches!(error, Error::Io(error) if error.kind() == io::ErrorKind::AlreadyExists));
+    }
+
+    #[test]
+    fn identity_checked_one_component_removal_rejects_replacement_and_nonempty_directory() {
+        let (_temporary, app, other) = roots();
+        let root = open_private_disjoint_root(&app, &other).expect("private root");
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        let file = root.open_with("record", &options).expect("record");
+        set_private_file_permissions(&file).expect("private record");
+        let identity = held_private_file_identity(&file).expect("identity");
+        remove_private_file_if_identity(&root, "record", &file, &identity)
+            .expect("remove exact file");
+        assert!(matches!(
+            remove_private_file_if_identity(&root, "record", &file, &identity),
+            Err(Error::Io(error)) if error.kind() == io::ErrorKind::NotFound
+        ));
+
+        let child = create_private_dir(&root, "child").expect("child");
+        let child_identity = held_directory_identity(&child).expect("child identity");
+        child.create("nested").expect("nested");
+        assert!(matches!(
+            remove_empty_private_dir_if_identity(&root, "child", &child, &child_identity),
+            Err(Error::ExternalMutation)
+        ));
+    }
+
+    #[test]
+    fn identity_checked_removal_binds_token_to_original_live_handle() {
+        let (_temporary, app, other) = roots();
+        let root = open_private_disjoint_root(&app, &other).expect("private root");
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        let original = root.open_with("record", &options).expect("original");
+        set_private_file_permissions(&original).expect("private original");
+        let original_identity = held_private_file_identity(&original).expect("original identity");
+        root.rename("record", &root, "displaced")
+            .expect("displace original");
+        let replacement = root.open_with("record", &options).expect("replacement");
+        set_private_file_permissions(&replacement).expect("private replacement");
+
+        assert!(matches!(
+            remove_private_file_if_identity(&root, "record", &original, &original_identity),
+            Err(Error::ExternalMutation)
+        ));
+        assert!(root.open("record").is_ok());
+
+        let replacement_identity =
+            held_private_file_identity(&replacement).expect("replacement identity");
+        assert!(matches!(
+            remove_private_file_if_identity(&root, "record", &original, &replacement_identity),
+            Err(Error::ExternalMutation)
+        ));
+        assert!(root.open("record").is_ok());
+    }
+
+    #[test]
+    fn identity_checked_empty_directory_removal_rejects_named_substitution() {
+        let (_temporary, app, other) = roots();
+        let root = open_private_disjoint_root(&app, &other).expect("private root");
+        let original = create_private_dir(&root, "child").expect("original child");
+        let identity = held_directory_identity(&original).expect("original identity");
+        root.rename("child", &root, "displaced")
+            .expect("displace original");
+        create_private_dir(&root, "child").expect("replacement child");
+
+        assert!(matches!(
+            remove_empty_private_dir_if_identity(&root, "child", &original, &identity),
+            Err(Error::ExternalMutation)
+        ));
+        assert!(open_private_dir(&root, "child").is_ok());
     }
 }
 
