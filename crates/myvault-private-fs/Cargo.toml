@@ -19,6 +19,10 @@ xattr = { version = "=1.6.1", default-features = false }
 [target.'cfg(target_os = "macos")'.dependencies]
 myvault-platform-acl = { path = "../myvault-platform-acl" }
 
+[target.'cfg(windows)'.dependencies]
+myvault-platform-acl = { path = "../myvault-platform-acl" }
+myvault-platform-fs = { path = "../myvault-platform-fs" }
+
 [dev-dependencies]
 tempfile = "=3.23.0"
 

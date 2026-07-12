@@ -5,28 +5,23 @@
 //! Supported Unix hosts validate ownership, modes, links, and extended ACLs.
 //! Other targets fail closed until an equivalent privacy proof exists.
 
-#[cfg(not(windows))]
 use cap_fs_ext::OpenOptionsMaybeDirExt;
-#[cfg(not(windows))]
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
-#[cfg(not(windows))]
 use cap_std::ambient_authority;
-#[cfg(not(windows))]
 use cap_std::fs::OpenOptions;
 use cap_std::fs::{Dir, File};
 use std::fmt;
 #[cfg(unix)]
 use std::fs;
 use std::io;
-#[cfg(not(windows))]
 use std::path::Component;
 use std::path::Path;
-#[cfg(not(windows))]
 use std::path::PathBuf;
 
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
+    DirectorySyncUnsupported(io::Error),
     InvalidRoot(&'static str),
     PrivacyValidationRequired,
     ExtendedAcl,
@@ -37,6 +32,9 @@ impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
+            Self::DirectorySyncUnsupported(error) => {
+                write!(formatter, "directory sync is unsupported: {error}")
+            }
             Self::InvalidRoot(reason) => write!(formatter, "invalid private root: {reason}"),
             Self::PrivacyValidationRequired => {
                 formatter.write_str("robust platform privacy validation is required")
@@ -54,7 +52,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(error) => Some(error),
+            Self::Io(error) | Self::DirectorySyncUnsupported(error) => Some(error),
             Self::InvalidRoot(_)
             | Self::PrivacyValidationRequired
             | Self::ExtendedAcl
@@ -78,29 +76,20 @@ impl From<io::Error> for Error {
 /// Fails for I/O errors, invalid or overlapping roots, insecure permissions or
 /// ACLs, and platforms without complete privacy validation.
 pub fn open_private_disjoint_root(app_data_root: &Path, other_root: &Path) -> Result<Dir, Error> {
-    #[cfg(windows)]
-    {
-        let _ = (app_data_root, other_root);
-        Err(Error::PrivacyValidationRequired)
+    let app_before = app_data_root.canonicalize()?;
+    let other_before = other_root.canonicalize()?;
+    let app_directory = open_absolute_dir_nofollow(app_data_root)?;
+    let other_directory = open_absolute_dir_nofollow(other_root)?;
+    let app_after = app_data_root.canonicalize()?;
+    let other_after = other_root.canonicalize()?;
+    if app_before != app_after || other_before != other_after {
+        return Err(Error::InvalidRoot("root changed while it was opened"));
     }
-
-    #[cfg(not(windows))]
-    {
-        let app_before = app_data_root.canonicalize()?;
-        let other_before = other_root.canonicalize()?;
-        let app_directory = open_absolute_dir_nofollow(app_data_root)?;
-        let other_directory = open_absolute_dir_nofollow(other_root)?;
-        let app_after = app_data_root.canonicalize()?;
-        let other_after = other_root.canonicalize()?;
-        if app_before != app_after || other_before != other_after {
-            return Err(Error::InvalidRoot("root changed while it was opened"));
-        }
-        verify_root_identity(&app_directory, &app_after)?;
-        verify_root_identity(&other_directory, &other_after)?;
-        validate_disjoint_canonical(&app_after, &other_after)?;
-        require_private_directory(&app_directory)?;
-        Ok(app_directory)
-    }
+    verify_root_identity(&app_directory, &app_after)?;
+    verify_root_identity(&other_directory, &other_after)?;
+    validate_disjoint_canonical(&app_after, &other_after)?;
+    require_private_directory(&app_directory)?;
+    Ok(app_directory)
 }
 
 /// Creates a private child directory if absent, then opens and validates it
@@ -111,32 +100,22 @@ pub fn open_private_disjoint_root(app_data_root: &Path, other_root: &Path) -> Re
 /// Fails if `name` is not one normalized UTF-8 component, the child topology or
 /// privacy is invalid, durability fails, or validation is unsupported.
 pub fn create_or_open_private_dir(parent: &Dir, name: impl AsRef<Path>) -> Result<Dir, Error> {
-    #[cfg(windows)]
-    {
-        let _ = (parent, name);
-        Err(Error::PrivacyValidationRequired)
+    let name = name.as_ref();
+    validate_child_name(name)?;
+    let created = match parent.create_dir(name) {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+        Err(error) => return Err(error.into()),
+    };
+    let directory = open_child_dir_nofollow(parent, name)?;
+    if created {
+        set_private_directory_permissions(&directory)?;
     }
-
-    #[cfg(not(windows))]
-    {
-        let name = name.as_ref();
-        validate_child_name(name)?;
-        let created = match parent.create_dir(name) {
-            Ok(()) => true,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
-            Err(error) => return Err(error.into()),
-        };
-        let directory = open_child_dir_nofollow(parent, name)?;
-        if created {
-            set_private_directory_permissions(&directory)?;
-            sync_directory(parent)?;
-        }
-        require_private_directory(&directory)?;
-        Ok(directory)
-    }
+    require_private_directory(&directory)?;
+    sync_directory(parent)?;
+    Ok(directory)
 }
 
-#[cfg(not(windows))]
 fn validate_child_name(name: &Path) -> Result<(), Error> {
     let mut components = name.components();
     let Some(Component::Normal(component)) = components.next() else {
@@ -152,7 +131,8 @@ fn validate_child_name(name: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// Applies the private regular-file mode to an already-open file.
+/// Applies the private regular-file policy to an already-open, newly created
+/// dedicated file. This must not be used to repair an arbitrary existing file.
 ///
 /// # Errors
 ///
@@ -177,11 +157,23 @@ pub fn verify_private_file(file: &File, max_links: u64) -> Result<(), Error> {
 ///
 /// Returns the operating-system error when the held directory cannot be synced.
 pub fn sync_directory(directory: &Dir) -> Result<(), Error> {
-    directory.try_clone()?.into_std_file().sync_all()?;
-    Ok(())
+    match directory.try_clone()?.into_std_file().sync_all() {
+        Ok(()) => Ok(()),
+        #[cfg(windows)]
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput
+                    | io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::Unsupported
+            ) =>
+        {
+            Err(Error::DirectorySyncUnsupported(error))
+        }
+        Err(error) => Err(Error::Io(error)),
+    }
 }
 
-#[cfg(not(windows))]
 fn validate_disjoint_canonical(app: &Path, other: &Path) -> Result<(), Error> {
     if app == other || app.starts_with(other) || other.starts_with(app) {
         return Err(Error::InvalidRoot(
@@ -191,11 +183,12 @@ fn validate_disjoint_canonical(app: &Path, other: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(not(windows))]
 fn open_absolute_dir_nofollow(path: &Path) -> Result<Dir, Error> {
     if !path.is_absolute() {
         return Err(Error::InvalidRoot("root must be absolute"));
     }
+    #[cfg(windows)]
+    validate_root_namespace(path)?;
     let mut anchor = PathBuf::new();
     let mut names = Vec::new();
     for component in path.components() {
@@ -209,13 +202,33 @@ fn open_absolute_dir_nofollow(path: &Path) -> Result<Dir, Error> {
         }
     }
     let mut directory = Dir::open_ambient_dir(anchor, ambient_authority())?;
+    #[cfg(windows)]
+    require_non_reparse_directory(&directory)?;
     for name in names {
         directory = open_child_dir_nofollow(&directory, &name)?;
     }
     Ok(directory)
 }
 
-#[cfg(not(windows))]
+#[cfg(windows)]
+fn validate_root_namespace(path: &Path) -> Result<(), Error> {
+    use std::path::Prefix;
+    let mut components = path.components();
+    match components.next() {
+        Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) => {}
+        _ => {
+            return Err(Error::InvalidRoot(
+                "device, verbatim, and network roots are unsupported",
+            ));
+        }
+    }
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return Err(Error::InvalidRoot("root must be drive absolute"));
+    }
+    Ok(())
+}
+
 fn open_child_dir_nofollow(parent: &Dir, name: impl AsRef<Path>) -> Result<Dir, Error> {
     let name = name.as_ref();
     if parent
@@ -242,7 +255,30 @@ fn open_child_dir_nofollow(parent: &Dir, name: impl AsRef<Path>) -> Result<Dir, 
     if !file.metadata()?.is_dir() {
         return Err(Error::InvalidRoot("root is not a directory"));
     }
+    #[cfg(windows)]
+    if !myvault_platform_acl::is_non_reparse_handle(
+        &file.try_clone()?.into_std(),
+        myvault_platform_acl::ObjectKind::Directory,
+    )? {
+        return Err(Error::InvalidRoot(
+            "root contains a reparse point or device",
+        ));
+    }
     Ok(Dir::from_std_file(file.into_std()))
+}
+
+#[cfg(windows)]
+fn require_non_reparse_directory(directory: &Dir) -> Result<(), Error> {
+    let held = directory.try_clone()?.into_std_file();
+    if !myvault_platform_acl::is_non_reparse_handle(
+        &held,
+        myvault_platform_acl::ObjectKind::Directory,
+    )? {
+        return Err(Error::InvalidRoot(
+            "root contains a reparse point or device",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -251,6 +287,19 @@ fn verify_root_identity(directory: &Dir, canonical: &Path) -> Result<(), Error> 
     let held = directory.try_clone()?.into_std_file().metadata()?;
     let ambient = fs::metadata(canonical)?;
     if held.dev() != ambient.dev() || held.ino() != ambient.ino() {
+        return Err(Error::InvalidRoot(
+            "root identity changed while it was opened",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_root_identity(directory: &Dir, canonical: &Path) -> Result<(), Error> {
+    let held = myvault_platform_fs::directory_identity(directory)?;
+    let ambient = Dir::open_ambient_dir(canonical, ambient_authority())?;
+    require_non_reparse_directory(&ambient)?;
+    if held != myvault_platform_fs::directory_identity(&ambient)? {
         return Err(Error::InvalidRoot(
             "root identity changed while it was opened",
         ));
@@ -281,6 +330,21 @@ fn require_private_directory(directory: &Dir) -> Result<(), Error> {
     verify_no_extended_acl(&held)
 }
 
+#[cfg(windows)]
+fn require_private_directory(directory: &Dir) -> Result<(), Error> {
+    let held = directory.try_clone()?.into_std_file();
+    if !myvault_platform_acl::is_private_handle(
+        &held,
+        myvault_platform_acl::ObjectKind::Directory,
+        1,
+    )? {
+        return Err(Error::InvalidRoot(
+            "private directory owner, DACL, topology, or links are unsafe",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(all(not(unix), not(windows)))]
 fn require_private_directory(_directory: &Dir) -> Result<(), Error> {
     Err(Error::PrivacyValidationRequired)
@@ -296,6 +360,16 @@ fn set_private_directory_permissions(directory: &Dir) -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn set_private_directory_permissions(directory: &Dir) -> Result<(), Error> {
+    let held = directory.try_clone()?.into_std_file();
+    myvault_platform_acl::harden_private_handle(
+        &held,
+        myvault_platform_acl::ObjectKind::Directory,
+    )?;
+    Ok(())
+}
+
 #[cfg(all(not(unix), not(windows)))]
 fn set_private_directory_permissions(_directory: &Dir) -> Result<(), Error> {
     Err(Error::PrivacyValidationRequired)
@@ -308,7 +382,14 @@ fn platform_set_private_file_permissions(file: &File) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn platform_set_private_file_permissions(file: &File) -> Result<(), Error> {
+    let held = file.try_clone()?.into_std();
+    myvault_platform_acl::harden_private_handle(&held, myvault_platform_acl::ObjectKind::File)?;
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn platform_set_private_file_permissions(_file: &File) -> Result<(), Error> {
     Err(Error::PrivacyValidationRequired)
 }
@@ -328,7 +409,20 @@ fn platform_verify_private_file(file: &File, max_links: u64) -> Result<(), Error
     verify_no_extended_acl(&held)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn platform_verify_private_file(file: &File, max_links: u64) -> Result<(), Error> {
+    let held = file.try_clone()?.into_std();
+    if !myvault_platform_acl::is_private_handle(
+        &held,
+        myvault_platform_acl::ObjectKind::File,
+        max_links,
+    )? {
+        return Err(Error::ExternalMutation);
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn platform_verify_private_file(_file: &File, _max_links: u64) -> Result<(), Error> {
     Err(Error::PrivacyValidationRequired)
 }
@@ -515,8 +609,17 @@ mod tests {
 mod windows_tests {
     use super::*;
 
+    fn harden_directory(path: &Path) {
+        let directory = Dir::open_ambient_dir(path, ambient_authority()).expect("open directory");
+        myvault_platform_acl::harden_private_handle(
+            &directory.into_std_file(),
+            myvault_platform_acl::ObjectKind::Directory,
+        )
+        .expect("harden directory");
+    }
+
     #[test]
-    fn root_privacy_fails_closed() {
+    fn arbitrary_root_is_not_repaired_but_explicitly_provisioned_root_works() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let app = temporary.path().join("app");
         let other = temporary.path().join("vault");
@@ -524,7 +627,13 @@ mod windows_tests {
         std::fs::create_dir(&other).expect("vault");
         assert!(matches!(
             open_private_disjoint_root(&app, &other),
-            Err(Error::PrivacyValidationRequired)
+            Err(Error::InvalidRoot(_))
+        ));
+        harden_directory(&app);
+        let root = open_private_disjoint_root(&app, &other).expect("private root");
+        assert!(matches!(
+            create_or_open_private_dir(&root, "journal"),
+            Err(Error::DirectorySyncUnsupported(_))
         ));
     }
 }

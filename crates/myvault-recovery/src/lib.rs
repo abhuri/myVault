@@ -5,6 +5,8 @@ use cap_std::fs::{Dir, OpenOptions};
 use myvault_core::VaultPath;
 use myvault_private_fs as private_fs;
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use std::ffi::OsStr;
 use std::fmt;
 #[cfg(all(test, unix))]
 use std::fs;
@@ -29,6 +31,7 @@ pub const JOURNAL_IS_UNTRUSTED_HINT: bool = true;
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
+    DirectorySyncUnsupported(io::Error),
     Json(serde_json::Error),
     InvalidRoot(&'static str),
     PrivacyValidationRequired,
@@ -58,6 +61,9 @@ impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
+            Self::DirectorySyncUnsupported(error) => {
+                write!(formatter, "recovery directory sync is unsupported: {error}")
+            }
             Self::Json(error) => write!(formatter, "invalid journal JSON: {error}"),
             Self::InvalidRoot(reason) => write!(formatter, "invalid recovery root: {reason}"),
             Self::PrivacyValidationRequired => formatter.write_str(
@@ -153,7 +159,37 @@ impl RecoveryOperationKind {
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error)
+            | Self::DirectorySyncUnsupported(error)
+            | Self::PublishedButNotSynced(error) => Some(error),
+            Self::Json(error) => Some(error),
+            Self::InvalidRoot(_)
+            | Self::PrivacyValidationRequired
+            | Self::ExtendedAcl
+            | Self::InvalidRevision
+            | Self::InvalidOperationId
+            | Self::InvalidTrashId
+            | Self::InvalidManifestDigest
+            | Self::InvalidOperationTopology
+            | Self::InvalidPortablePath
+            | Self::IdenticalPaths
+            | Self::CaseRenameContractRequired
+            | Self::InvalidCaseRenameContract
+            | Self::InvalidEntryName
+            | Self::EntryTooLarge
+            | Self::TooManyEntries
+            | Self::TooManyDirectoryEntries
+            | Self::InvalidPageSize
+            | Self::UnsupportedVersion(_)
+            | Self::JournalCollision
+            | Self::IntentMismatch
+            | Self::ExternalMutation => None,
+        }
+    }
+}
 
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
@@ -171,6 +207,9 @@ impl From<private_fs::Error> for Error {
     fn from(value: private_fs::Error) -> Self {
         match value {
             private_fs::Error::Io(error) => Self::Io(error),
+            private_fs::Error::DirectorySyncUnsupported(error) => {
+                Self::DirectorySyncUnsupported(error)
+            }
             private_fs::Error::InvalidRoot(reason) => Self::InvalidRoot(reason),
             private_fs::Error::PrivacyValidationRequired => Self::PrivacyValidationRequired,
             private_fs::Error::ExtendedAcl => Self::ExtendedAcl,
@@ -1032,7 +1071,23 @@ fn atomic_rename_noreplace(directory: &Dir, source: &str, destination: &str) -> 
     .map_err(|error| Error::Io(io::Error::from(error)))
 }
 
-#[cfg(not(any(target_os = "android", target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn atomic_rename_noreplace(directory: &Dir, source: &str, destination: &str) -> Result<(), Error> {
+    myvault_platform_fs::rename_noreplace(
+        directory,
+        OsStr::new(source),
+        directory,
+        OsStr::new(destination),
+    )
+    .map_err(Error::Io)
+}
+
+#[cfg(not(any(
+    windows,
+    target_os = "android",
+    target_os = "linux",
+    target_os = "macos"
+)))]
 fn atomic_rename_noreplace(
     _directory: &Dir,
     _source: &str,

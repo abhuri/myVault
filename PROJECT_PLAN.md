@@ -482,7 +482,8 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - original-path Restore, journaled NormalMove และ retained-recovery ABA hardening ถูก merge เข้า `main` ผ่าน PR #8 ที่ merge commit `0a4767d` แล้วค่ะ
 - compound CaseRename core/service ถูก merge เข้า `main` ผ่าน PR #9 ที่ merge commit `7475de4` แล้วค่ะ
 - revision-checked atomic content overwrite ถูก merge เข้า `main` ผ่าน PR #10 ที่ merge commit `731aef3` แล้วค่ะ
-- งาน shared private-filesystem policy extraction อยู่บน branch `agent/phase-1-private-fs` และผ่าน local migration checks แล้วค่ะ
+- shared private-filesystem policy extraction ถูก merge เข้า `main` ผ่าน PR #11 ที่ merge commit `433d141` แล้วค่ะ
+- งาน Windows owner/DACL/reparse privacy proof อยู่บน branch `agent/phase-1-private-fs-platforms` และผ่าน local safety audit แล้วค่ะ
 - package manager ที่เลือกคือ `pnpm` ค่ะ
 - Tauri 2, React, TypeScript และ Rust scaffold ถูกสร้างที่ `apps/tauri` ค่ะ
 - diagnostic shell มี Rust platform bridge, CodeMirror, Mermaid strict mode, Sigma 1,000/5,000-node probes, runtime evidence และ Android Google authorization controls แล้วค่ะ
@@ -523,10 +524,11 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - CaseRename ใช้ exact directory enumeration และ deterministic same-parent temporary path ทำ `Source → Temporary → Destination` แบบ no-replace ภายใต้ root lock เดียว พร้อมแยก Fresh/Retained เพื่อป้องกัน source-only ABA ค่ะ
 - revision-checked content overwrite ตรวจ expected revision, parent identity, regular+nlink1 target และ temp integrity ซ้ำก่อน replacing rename พร้อม typed postpublication outcome-unknown และ durability evidence ค่ะ
 - `myvault-private-fs` รวม held-capability root disjointness, identity, owner/mode/ACL, symlink และ link-count policy เพื่อให้ recovery กับ snapshots ใช้ security boundary เดียวกันค่ะ
+- Windows privacy proof ตรวจ current-user owner, protected non-NULL DACL, trusted SID allowlist, bounded ACE/SID parsing และ reparse/device จาก held handle ค่ะ Directory flush ที่ Windows ไม่รองรับถูก report เป็น `DirectorySyncUnsupported` และ recovery ยัง fail closed โดยตั้งใจค่ะ
 
 ## 15. Next Actions
 
-1. เปิด PR และรัน cross-platform CI สำหรับ shared private-filesystem extraction จากนั้น merge เมื่อทุก check ผ่านค่ะ
+1. เปิด PR และรัน Windows runtime CI สำหรับ owner/DACL/reparse privacy proof และ typed directory-durability failure จากนั้น merge เมื่อทุก check ผ่านค่ะ
 2. หลังคุณโอยืนยัน Google API Services User Data Policy ให้ Sunday สร้าง Desktop/Android OAuth clients และเพิ่มบัญชีส่วนตัวเป็น test user ค่ะ
 3. รัน Desktop OAuth และ live Drive acceptance fixture แล้ว Trash เฉพาะ folder ID/marker ที่ยืนยันแล้วค่ะ
 4. เลื่อนการเชื่อมต่อมือถือ Android และ physical-device matrix ไว้จนกว่าคุณโอจะมีอุปกรณ์ค่ะ
@@ -550,7 +552,7 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - Gradle cache physical path คือ `/Volumes/AWB-Apps/Developer/Gradle` และ `~/.gradle` เป็น symlink ค่ะ
 - remote repository คือ `https://github.com/abhuri/myVault.git` ค่ะ
 - `main` มี initial commit `6597e18` ค่ะ
-- active branch คือ `agent/phase-1-private-fs` ค่ะ Phase 0 PR #1, portable-core PR #2, mutation/recovery PR #3, trash-boundary PR #4, TrashStore PR #5, publish/restore PR #6, Trash mutation-service PR #7, Restore/NormalMove PR #8, CaseRename PR #9 และ revision-checked overwrite PR #10 merge เข้า `main` แล้วค่ะ
+- active branch คือ `agent/phase-1-private-fs-platforms` ค่ะ Phase 0 PR #1, portable-core PR #2, mutation/recovery PR #3, trash-boundary PR #4, TrashStore PR #5, publish/restore PR #6, Trash mutation-service PR #7, Restore/NormalMove PR #8, CaseRename PR #9, revision-checked overwrite PR #10 และ shared private-fs PR #11 merge เข้า `main` แล้วค่ะ
 - Phase 0 diagnostic shell และ contracts ถูกสร้างแล้วค่ะ
 - local checks ที่ผ่านคือ TypeScript, Vitest 8 tests, Vite build, Rust fmt/clippy, Rust 49 tests, macOS Keychain live probe และ Tauri debug build ค่ะ
 - GitHub quality, Android compile + 16 KB alignment, Windows NSIS และ Ubuntu AppImage checks ของ Draft PR #1 ผ่านที่ commit `0aecda5` แล้วค่ะ
@@ -567,7 +569,7 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - Phase 1 portable paths, bounded inventory/read, no-overwrite create, revision-checked overwrite, derived index schema v2, atomic no-replace move และ file-only Trash/Restore/NormalMove/CaseRename state transitions พร้อมแล้วและผ่าน core 148 tests ค่ะ
 - append-only recovery journal schema v4 ผ่าน 38 tests ไม่มี production unlink/hardlink cleanup API, typed operation บังคับ endpoint topology และ unsupported evidence ถูก report แบบ bounded/fail-closed ค่ะ
 - Trash, original-path Restore, NormalMove และ CaseRename services แบบ journal-first ผ่าน 45 tests โดย retained NormalMove/CaseRename ปฏิเสธ source-only topology ที่กำกวมเพื่อป้องกัน ABA ค่ะ
-- งานถัดไปคือ merge shared private-filesystem PR → Windows/Android privacy proof → immutable private snapshot store ควบคู่กับ OAuth client configuration และ Desktop live-Drive validation ค่ะ
+- งานถัดไปคือ merge Windows privacy proof PR → Android trusted no-backup proof → immutable private snapshot store ควบคู่กับ OAuth client configuration และ Desktop live-Drive validation ค่ะ
 
 ### Handoff Update Template
 
@@ -606,6 +608,9 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 
 ### 2026-07-12
 
+- merge PR #11 ที่ commit `433d141` พร้อม shared `myvault-private-fs` หลัง cross-platform CI ผ่านทั้งหมดค่ะ
+- เพิ่ม Windows native owner/DACL/ACE/reparse privacy proof โดยจำกัด `unsafe` ไว้ใน platform ACL facade และตรวจ SID bounds ก่อนเรียก Win32 ค่ะ
+- Windows directory sync ที่ handle ปัจจุบันไม่รองรับถูกแยกเป็น typed `DirectorySyncUnsupported`; retry ไม่สามารถข้าม durability check และ RecoveryJournal ยัง fail closed ค่ะ
 - merge PR #10 ที่ commit `731aef3` พร้อม revision-checked content overwrite หลัง cross-platform CI ผ่านทั้งหมดค่ะ
 - แยก private root/permission/ACL/file-link policy จาก recovery เป็น crate `myvault-private-fs` โดยคง recovery schema และ evidence bytes เดิมค่ะ
 - shared privacy boundary ผ่าน private-fs 8 tests, recovery 38 tests, clippy และ compile checks บน Windows/Android โดยสอง platform ยังคง fail closed จน native privacy proof พร้อมค่ะ
