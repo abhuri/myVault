@@ -15,6 +15,12 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use uuid::Uuid;
 
+mod retention;
+pub use retention::{
+    RetentionCandidate, RetentionPlan, RetentionPolicy, RetentionReason, MAX_RETENTION_CANDIDATES,
+    MAX_SNAPSHOT_SCAN_ENTRIES, MAX_VERIFICATION_BYTES,
+};
+
 const ROOT_DIRECTORY: &str = "recovery-snapshots";
 const VERSION_DIRECTORY: &str = "v1";
 const VAULTS_DIRECTORY: &str = "vaults";
@@ -23,6 +29,8 @@ const STAGING_DIRECTORY: &str = "staging";
 const OBJECTS_DIRECTORY: &str = "objects";
 const MANIFEST_FILE: &str = "manifest.json";
 const PAYLOAD_FILE: &str = "payload";
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const OPERATION_LOCK_FILE: &str = "operation.lock";
 
 pub const MAX_MANIFEST_BYTES: u64 = 16 * 1024;
 pub const MAX_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
@@ -55,6 +63,12 @@ pub enum Error {
     SnapshotCollision,
     BindingCollision,
     AmbiguousEvidence,
+    TooManySnapshotEntries,
+    ArithmeticOverflow,
+    VerificationBudgetExceeded,
+    OperationLockLost,
+    PublishedButLockLost(PublishOutcome),
+    OperationFailedAndLockLost(Box<Error>),
     PublishedButNotSynced {
         boundary: DurabilityBoundary,
         source: private_fs::Error,
@@ -94,6 +108,24 @@ impl fmt::Display for Error {
             Self::AmbiguousEvidence => {
                 formatter.write_str("snapshot exists in both staging and objects")
             }
+            Self::TooManySnapshotEntries => {
+                formatter.write_str("snapshot inventory exceeds 8192 physical entries")
+            }
+            Self::ArithmeticOverflow => formatter.write_str("snapshot byte arithmetic overflow"),
+            Self::VerificationBudgetExceeded => {
+                formatter.write_str("snapshot verification budget exceeded")
+            }
+            Self::OperationLockLost => {
+                formatter.write_str("operation lock identity was lost before completion")
+            }
+            Self::PublishedButLockLost(outcome) => write!(
+                formatter,
+                "snapshot publication reached {outcome:?} but operation lock was lost"
+            ),
+            Self::OperationFailedAndLockLost(error) => write!(
+                formatter,
+                "operation failed and its lock was also lost: {error}"
+            ),
             Self::PublishedButNotSynced { boundary, source } => {
                 write!(
                     formatter,
@@ -290,6 +322,8 @@ pub struct SnapshotStore {
     vault_id: Uuid,
     staging: Dir,
     objects: Dir,
+    vault: Dir,
+    lock_identity: LockIdentity,
 }
 
 impl SnapshotStore {
@@ -316,6 +350,7 @@ impl SnapshotStore {
             unix_inode: identity.inode(),
         };
         publish_or_verify_binding(&vault, &binding)?;
+        let lock_identity = ensure_operation_lock(&vault)?;
         let staging = private_fs::create_or_open_private_dir(&vault, STAGING_DIRECTORY)?;
         let objects = private_fs::create_or_open_private_dir(&vault, OBJECTS_DIRECTORY)?;
         Ok(Self {
@@ -323,6 +358,8 @@ impl SnapshotStore {
             vault_id,
             staging,
             objects,
+            vault,
+            lock_identity,
         })
     }
 
@@ -335,39 +372,43 @@ impl SnapshotStore {
         manifest: &SnapshotManifest,
         payload: &[u8],
     ) -> Result<PublishOutcome, Error> {
-        manifest.validate()?;
-        if manifest.vault_id != self.vault_id {
-            return Err(Error::InvalidVaultId);
-        }
-        if payload.len() as u64 > MAX_PAYLOAD_BYTES {
-            return Err(Error::PayloadTooLarge);
-        }
-        if SnapshotRevision::from_bytes(payload) != manifest.revision {
-            return Err(Error::InvalidRevision);
-        }
-        let manifest_bytes = canonical_manifest_bytes(manifest)?;
-        if let Some(outcome) = self.resume_stable(manifest, &manifest_bytes)? {
-            return Ok(outcome);
-        }
-
-        let (work_name, work) = self.create_fresh_work(manifest.snapshot_id)?;
-        write_private_file(&work, PAYLOAD_FILE, payload)?;
-        write_private_file(&work, MANIFEST_FILE, &manifest_bytes)?;
-        verify_expected_object(&work, manifest, &manifest_bytes)?;
-        sync_published(&work, DurabilityBoundary::WorkDirectory)?;
-        drop(work);
-
-        let stable_name = manifest.snapshot_id.to_string();
-        match atomic_rename_noreplace(&self.staging, &work_name, &self.staging, &stable_name) {
-            Ok(()) => sync_published(&self.staging, DurabilityBoundary::StagingDirectory)?,
-            Err(Error::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
-                return self
-                    .resume_stable(manifest, &manifest_bytes)?
-                    .ok_or(Error::SnapshotCollision);
+        let operation = self.lock_operation()?;
+        let result = (|| {
+            manifest.validate()?;
+            if manifest.vault_id != self.vault_id {
+                return Err(Error::InvalidVaultId);
             }
-            Err(error) => return Err(error),
-        }
-        self.promote_staging(manifest, &manifest_bytes, PublishOutcome::Published)
+            if payload.len() as u64 > MAX_PAYLOAD_BYTES {
+                return Err(Error::PayloadTooLarge);
+            }
+            if SnapshotRevision::from_bytes(payload) != manifest.revision {
+                return Err(Error::InvalidRevision);
+            }
+            let manifest_bytes = canonical_manifest_bytes(manifest)?;
+            if let Some(outcome) = self.resume_stable(manifest, &manifest_bytes)? {
+                return Ok(outcome);
+            }
+
+            let (work_name, work) = self.create_fresh_work(manifest.snapshot_id)?;
+            write_private_file(&work, PAYLOAD_FILE, payload)?;
+            write_private_file(&work, MANIFEST_FILE, &manifest_bytes)?;
+            verify_expected_object(&work, manifest, &manifest_bytes)?;
+            sync_published(&work, DurabilityBoundary::WorkDirectory)?;
+            drop(work);
+
+            let stable_name = manifest.snapshot_id.to_string();
+            match atomic_rename_noreplace(&self.staging, &work_name, &self.staging, &stable_name) {
+                Ok(()) => sync_published(&self.staging, DurabilityBoundary::StagingDirectory)?,
+                Err(Error::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    return self
+                        .resume_stable(manifest, &manifest_bytes)?
+                        .ok_or(Error::SnapshotCollision);
+                }
+                Err(error) => return Err(error),
+            }
+            self.promote_staging(manifest, &manifest_bytes, PublishOutcome::Published)
+        })();
+        finish_publish_operation(operation, result)
     }
 
     /// Inspects one immutable stable object without interpreting future schemas.
@@ -388,13 +429,17 @@ impl SnapshotStore {
                 EvidenceLocation::Objects,
                 snapshot_id,
                 self.vault_id,
-            ),
+                None,
+            )
+            .and_then(|(evidence, _)| evidence),
             (None, Some(directory)) => inspect_object(
                 &directory,
                 EvidenceLocation::Staging,
                 snapshot_id,
                 self.vault_id,
-            ),
+                None,
+            )
+            .and_then(|(evidence, _)| evidence),
             (None, None) => Err(Error::SnapshotNotFound),
         }
     }
@@ -410,6 +455,10 @@ impl SnapshotStore {
             }
         }
         Err(Error::SnapshotCollision)
+    }
+
+    fn lock_operation(&self) -> Result<OperationGuard, Error> {
+        acquire_operation_lock(&self.vault, self.lock_identity)
     }
 
     fn resume_stable(
@@ -461,6 +510,145 @@ impl SnapshotStore {
         let object = private_fs::open_private_dir(&self.objects, &name)?;
         verify_expected_object(&object, manifest, manifest_bytes)?;
         Ok(outcome)
+    }
+}
+
+struct OperationGuard {
+    file: cap_std::fs::File,
+    vault: Dir,
+    expected_identity: LockIdentity,
+}
+
+impl OperationGuard {
+    fn finish(self) -> Result<(), Error> {
+        validate_locked_file(&self.file, &self.vault, self.expected_identity)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LockIdentity {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    device: u64,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    inode: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn ensure_operation_lock(vault: &Dir) -> Result<LockIdentity, Error> {
+    use cap_fs_ext::MetadataExt;
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No);
+    match vault.open_with(OPERATION_LOCK_FILE, &options) {
+        Ok(file) => {
+            private_fs::set_private_file_permissions(&file)?;
+            file.sync_all()?;
+            private_fs::verify_private_file(&file, 1)?;
+            sync_published(vault, DurabilityBoundary::BindingDirectory)?;
+            let metadata = file.metadata()?;
+            Ok(LockIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let mut existing = OpenOptions::new();
+            existing.read(true).write(true).follow(FollowSymlinks::No);
+            let file = vault.open_with(OPERATION_LOCK_FILE, &existing)?;
+            private_fs::verify_private_file(&file, 1)?;
+            let metadata = file.metadata()?;
+            Ok(LockIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn ensure_operation_lock(_vault: &Dir) -> Result<LockIdentity, Error> {
+    Err(Error::PrivacyValidationRequired)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn acquire_operation_lock(
+    vault: &Dir,
+    expected_identity: LockIdentity,
+) -> Result<OperationGuard, Error> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).follow(FollowSymlinks::No);
+    let file = vault.open_with(OPERATION_LOCK_FILE, &options)?;
+    private_fs::verify_private_file(&file, 1)?;
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).map_err(|error| {
+        let error = io::Error::from(error);
+        if error.kind() == io::ErrorKind::Unsupported {
+            Error::PrivacyValidationRequired
+        } else {
+            Error::Io(error)
+        }
+    })?;
+    validate_locked_file(&file, vault, expected_identity)?;
+    Ok(OperationGuard {
+        file,
+        vault: vault.try_clone()?,
+        expected_identity,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn acquire_operation_lock(
+    _vault: &Dir,
+    _expected_identity: LockIdentity,
+) -> Result<OperationGuard, Error> {
+    Err(Error::PrivacyValidationRequired)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_locked_file(
+    file: &cap_std::fs::File,
+    vault: &Dir,
+    expected_identity: LockIdentity,
+) -> Result<(), Error> {
+    use cap_fs_ext::MetadataExt;
+
+    private_fs::verify_private_file(file, 1)?;
+    let held = file.metadata()?;
+    let named = vault.symlink_metadata(OPERATION_LOCK_FILE)?;
+    if !named.file_type().is_file()
+        || held.dev() != named.dev()
+        || held.ino() != named.ino()
+        || held.dev() != expected_identity.device
+        || held.ino() != expected_identity.inode
+        || held.nlink() != 1
+    {
+        return Err(Error::ExternalMutation);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn validate_locked_file(
+    _file: &cap_std::fs::File,
+    _vault: &Dir,
+    _expected_identity: LockIdentity,
+) -> Result<(), Error> {
+    Err(Error::PrivacyValidationRequired)
+}
+
+fn finish_publish_operation(
+    operation: OperationGuard,
+    result: Result<PublishOutcome, Error>,
+) -> Result<PublishOutcome, Error> {
+    match (result, operation.finish()) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Ok(outcome), Err(_)) => Err(Error::PublishedButLockLost(outcome)),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(_)) => Err(Error::OperationFailedAndLockLost(Box::new(error))),
     }
 }
 
@@ -530,30 +718,49 @@ fn inspect_object(
     location: EvidenceLocation,
     expected_snapshot_id: Uuid,
     expected_vault_id: Uuid,
-) -> Result<SnapshotEvidence, Error> {
+    verification_budget: Option<&mut u64>,
+) -> Result<(Result<SnapshotEvidence, Error>, u64), Error> {
     verify_exact_object_entries(directory)?;
-    let bytes = read_private_file(directory, MANIFEST_FILE, MAX_MANIFEST_BYTES)?;
-    let envelope: RoutingEnvelope = serde_json::from_slice(&bytes)?;
-    if envelope.snapshot_id != expected_snapshot_id || envelope.vault_id != expected_vault_id {
-        return Err(Error::SnapshotCollision);
+    let (manifest_file, manifest_len) =
+        open_held_private_file(directory, MANIFEST_FILE, MAX_MANIFEST_BYTES)?;
+    let (payload_file, payload_len) =
+        open_held_private_file(directory, PAYLOAD_FILE, MAX_PAYLOAD_BYTES)?;
+    let logical_bytes = manifest_len
+        .checked_add(payload_len)
+        .ok_or(Error::ArithmeticOverflow)?;
+    if let Some(budget) = verification_budget {
+        if logical_bytes > *budget {
+            return Err(Error::VerificationBudgetExceeded);
+        }
+        *budget = budget
+            .checked_sub(logical_bytes)
+            .ok_or(Error::ArithmeticOverflow)?;
     }
-    if envelope.version != SnapshotManifest::VERSION {
-        return Ok(SnapshotEvidence::Unsupported {
-            location,
-            snapshot_id: envelope.snapshot_id,
-            vault_id: envelope.vault_id,
-            version: envelope.version,
-            payload_revision: read_payload_revision(directory)?,
-        });
-    }
-    let manifest: SnapshotManifest = serde_json::from_slice(&bytes)?;
-    manifest.validate()?;
-    if canonical_manifest_bytes(&manifest)? != bytes
-        || read_payload_revision(directory)? != manifest.revision
-    {
-        return Err(Error::SnapshotCollision);
-    }
-    Ok(SnapshotEvidence::Supported { location, manifest })
+    let bytes = read_held_private_file(manifest_file, manifest_len)?;
+    let payload = read_held_private_file(payload_file, payload_len)?;
+    let payload_revision = SnapshotRevision::from_bytes(&payload);
+    let evidence = (|| {
+        let envelope: RoutingEnvelope = serde_json::from_slice(&bytes)?;
+        if envelope.snapshot_id != expected_snapshot_id || envelope.vault_id != expected_vault_id {
+            return Err(Error::SnapshotCollision);
+        }
+        if envelope.version != SnapshotManifest::VERSION {
+            return Ok(SnapshotEvidence::Unsupported {
+                location,
+                snapshot_id: envelope.snapshot_id,
+                vault_id: envelope.vault_id,
+                version: envelope.version,
+                payload_revision,
+            });
+        }
+        let manifest: SnapshotManifest = serde_json::from_slice(&bytes)?;
+        manifest.validate()?;
+        if canonical_manifest_bytes(&manifest)? != bytes || payload_revision != manifest.revision {
+            return Err(Error::SnapshotCollision);
+        }
+        Ok(SnapshotEvidence::Supported { location, manifest })
+    })();
+    Ok((evidence, logical_bytes))
 }
 
 fn verify_exact_object_entries(directory: &Dir) -> Result<(), Error> {
@@ -597,8 +804,21 @@ fn read_optional_private_file(
 }
 
 fn read_private_file(directory: &Dir, name: &str, maximum: u64) -> Result<Vec<u8>, Error> {
-    let metadata = directory.symlink_metadata(name)?;
-    if !metadata.file_type().is_file() {
+    let (file, length) = open_held_private_file(directory, name, maximum)?;
+    read_held_private_file(file, length)
+}
+
+fn open_held_private_file(
+    directory: &Dir,
+    name: &str,
+    maximum: u64,
+) -> Result<(cap_std::fs::File, u64), Error> {
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let file = directory.open_with(name, &options)?;
+    private_fs::verify_private_file(&file, 1)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(Error::ExternalMutation);
     }
     if metadata.len() > maximum {
@@ -608,19 +828,24 @@ fn read_private_file(directory: &Dir, name: &str, maximum: u64) -> Result<Vec<u8
             Error::ManifestTooLarge
         });
     }
-    let mut options = OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
-    let file = directory.open_with(name, &options)?;
-    private_fs::verify_private_file(&file, 1)?;
-    let capacity = usize::try_from(metadata.len()).map_err(|_| Error::PayloadTooLarge)?;
+    Ok((file, metadata.len()))
+}
+
+fn read_held_private_file(
+    mut file: cap_std::fs::File,
+    expected_length: u64,
+) -> Result<Vec<u8>, Error> {
+    let capacity = usize::try_from(expected_length).map_err(|_| Error::PayloadTooLarge)?;
     let mut bytes = Vec::with_capacity(capacity);
-    file.take(maximum + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > maximum {
-        return Err(if name == PAYLOAD_FILE {
-            Error::PayloadTooLarge
-        } else {
-            Error::ManifestTooLarge
-        });
+    let read_bound = expected_length
+        .checked_add(1)
+        .ok_or(Error::ArithmeticOverflow)?;
+    Read::by_ref(&mut file)
+        .take(read_bound)
+        .read_to_end(&mut bytes)?;
+    private_fs::verify_private_file(&file, 1)?;
+    if bytes.len() as u64 != expected_length || file.metadata()?.len() != expected_length {
+        return Err(Error::ExternalMutation);
     }
     Ok(bytes)
 }
@@ -708,4 +933,44 @@ fn atomic_rename_noreplace(
     _destination: &str,
 ) -> Result<(), Error> {
     Err(Error::PrivacyValidationRequired)
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod lock_finish_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn end_revalidation_preserves_published_fact_when_named_lock_is_replaced() {
+        let temporary = tempfile::tempdir().expect("temporary");
+        let base = temporary.path().canonicalize().expect("canonical root");
+        let app = base.join("app");
+        let vault = base.join("vault");
+        fs::create_dir(&app).expect("app");
+        fs::create_dir(&vault).expect("vault");
+        fs::set_permissions(&app, fs::Permissions::from_mode(0o700)).expect("private app");
+        let vault_id = Uuid::new_v4();
+        let store = SnapshotStore::open(&app, &vault, vault_id).expect("store");
+        let operation = store.lock_operation().expect("operation lock");
+        let lock_root = app
+            .join("recovery-snapshots/v1/vaults")
+            .join(vault_id.to_string());
+        fs::rename(
+            lock_root.join(OPERATION_LOCK_FILE),
+            lock_root.join("detached-lock"),
+        )
+        .expect("detach lock");
+        fs::write(lock_root.join(OPERATION_LOCK_FILE), b"").expect("replacement");
+        fs::set_permissions(
+            lock_root.join(OPERATION_LOCK_FILE),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("private replacement");
+
+        assert!(matches!(
+            finish_publish_operation(operation, Ok(PublishOutcome::Published)),
+            Err(Error::PublishedButLockLost(PublishOutcome::Published))
+        ));
+    }
 }
