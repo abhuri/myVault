@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
@@ -12,7 +13,8 @@ pub const MAX_VERIFICATION_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_MAX_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const DEFAULT_MAX_LOGICAL_BYTES: u64 = 1024 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetentionPolicy {
     pub max_age_ms: u64,
     pub max_per_lineage: usize,
@@ -29,7 +31,8 @@ impl Default for RetentionPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RetentionReason {
     Age,
     LineageCount,
@@ -173,7 +176,7 @@ impl SnapshotStore {
         }
     }
 
-    fn plan_retention_locked(
+    pub(super) fn plan_retention_locked(
         &self,
         now_unix_ms: u64,
         policy: RetentionPolicy,

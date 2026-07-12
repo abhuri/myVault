@@ -75,6 +75,21 @@ pub struct PrivateDisjointRoots {
     other_identity: UnixRootIdentity,
 }
 
+/// Opaque identity of a held directory, suitable for detecting replacement
+/// across an atomic rename without exposing platform-specific identifiers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeldDirectoryIdentity(myvault_platform_fs::DirectoryIdentity);
+
+/// Captures the platform-complete identity of a held directory capability.
+///
+/// # Errors
+/// Fails closed when the platform cannot provide a complete held identity.
+pub fn held_directory_identity(directory: &Dir) -> Result<HeldDirectoryIdentity, Error> {
+    myvault_platform_fs::directory_identity(directory)
+        .map(HeldDirectoryIdentity)
+        .map_err(Error::Io)
+}
+
 impl PrivateDisjointRoots {
     #[must_use]
     pub const fn private_root(&self) -> &Dir {

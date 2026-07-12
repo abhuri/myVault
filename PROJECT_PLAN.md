@@ -486,7 +486,8 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - Windows owner/DACL/reparse privacy proof ถูก merge เข้า `main` ผ่าน PR #12 ที่ merge commit `fd1a3e8` แล้วค่ะ
 - Android native no-backup private-root capability ถูก merge เข้า `main` ผ่าน PR #13 ที่ merge commit `35ddfd1` แล้วค่ะ
 - immutable snapshot store พร้อม canonical timestamp, stable Vault binding, bounded payload, atomic no-replace publication และ mount-instance privacy proof ถูก merge เข้า `main` ผ่าน PR #14 ที่ merge commit `a8a64c4` แล้วค่ะ
-- cross-process snapshot operation lock, bounded inventory และ deterministic retention dry-run ผ่าน independent audit สถานะ SAFE บน branch `agent/phase-1-snapshot-retention` แล้วค่ะ
+- cross-process snapshot operation lock, bounded inventory และ deterministic retention dry-run ถูก merge เข้า `main` ผ่าน PR #15 ที่ merge commit `bc1981a` แล้วค่ะ
+- immutable GC plan, atomic quarantine detach, bounded marker staging และ crash recovery ผ่าน independent audit สถานะ SAFE บน branch `agent/phase-1-snapshot-quarantine` แล้ว โดยยังไม่มี production deletion path ค่ะ
 - package manager ที่เลือกคือ `pnpm` ค่ะ
 - Tauri 2, React, TypeScript และ Rust scaffold ถูกสร้างที่ `apps/tauri` ค่ะ
 - diagnostic shell มี Rust platform bridge, CodeMirror, Mermaid strict mode, Sigma 1,000/5,000-node probes, runtime evidence และ Android Google authorization controls แล้วค่ะ
@@ -531,8 +532,8 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 
 ## 15. Next Actions
 
-1. เปิด PR และรัน cross-platform CI สำหรับ snapshot operation lock, bounded inventory และ deterministic retention dry-run จากนั้น merge เมื่อทุก check ผ่านค่ะ
-2. เพิ่ม quarantine-before-delete GC และ crash recovery โดยใช้ retention plan ที่ผ่าน audit แล้วค่ะ
+1. เปิด PR และรัน cross-platform CI สำหรับ immutable GC plan, atomic quarantine detach และ crash recovery จากนั้น merge เมื่อทุก check ผ่านค่ะ
+2. เพิ่ม verified quarantined byte deletion และ completed-run cleanup โดยแตะเฉพาะ detached marker/item ที่ตรวจครบค่ะ
 3. สร้าง app-service, coherent read, bounded Trash listing, VaultSession, watcher และ least-privilege Tauri commands ค่ะ
 4. สร้าง macOS-first Local Desktop Demo ด้วย Synthetic Demo Vault, autosave 750 ms และ Obsidian-inspired dark UI ตาม canonical direction `Technical Utility` ค่ะ
 5. เชื่อม editor/reader, Mermaid, attachments, backlinks, outline, search, quick switcher และ prototype graph แล้วรัน Demo acceptance ค่ะ
@@ -557,7 +558,7 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - Gradle cache physical path คือ `/Volumes/AWB-Apps/Developer/Gradle` และ `~/.gradle` เป็น symlink ค่ะ
 - remote repository คือ `https://github.com/abhuri/myVault.git` ค่ะ
 - `main` มี initial commit `6597e18` ค่ะ
-- active branch คือ `agent/phase-1-snapshot-retention` ค่ะ PR #1 ถึง PR #14 merge เข้า `main` แล้ว และ retention dry-run ผ่าน deep safety audit ค่ะ
+- active branch คือ `agent/phase-1-snapshot-quarantine` ค่ะ PR #1 ถึง PR #15 merge เข้า `main` แล้ว และ quarantine detach/recovery ผ่าน deep safety audit โดยยังไม่ลบข้อมูลจริงค่ะ
 - Phase 0 diagnostic shell และ contracts ถูกสร้างแล้วค่ะ
 - local checks ที่ผ่านคือ TypeScript, Vitest 8 tests, Vite build, Rust fmt/clippy, Rust 49 tests, macOS Keychain live probe และ Tauri debug build ค่ะ
 - GitHub quality, Android compile + 16 KB alignment, Windows NSIS และ Ubuntu AppImage checks ของ Draft PR #1 ผ่านที่ commit `0aecda5` แล้วค่ะ
@@ -614,6 +615,9 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 
 ### 2026-07-12
 
+- merge PR #15 ที่ commit `bc1981a` พร้อม cross-process lock, bounded inventory และ deterministic retention dry-run หลัง cross-platform CI ผ่านทั้งหมดค่ะ
+- เพิ่ม atomic work-to-runs GC plan publication, bounded marker staging, quarantine detach และ destination-only crash recovery โดยไม่มี unlink/remove/delete ค่ะ
+- quarantine detach ผ่าน independent audit สถานะ SAFE หลังปิด request-order, run-cap, marker-staging, typed outcome, plan semantics และ Windows cfg findings ค่ะ
 - merge PR #14 ที่ commit `a8a64c4` พร้อม immutable private snapshot store และ native mount-instance privacy proof หลัง quality, Android, Windows และ Ubuntu CI ผ่านทั้งหมดค่ะ
 - เพิ่ม per-Vault cross-process lock, bounded snapshot inventory และ deterministic retention dry-run สำหรับ 30 วัน, 100 revisions ต่อ path lineage และ 1 GiB logical bytes โดยยังไม่มี production deletion path ค่ะ
 - retention dry-run ผ่าน independent audit สถานะ SAFE หลังปิด split-lock, held-read budget, exact cutoff, checked arithmetic, duplicate/mixed Vault และ Android cfg findings ค่ะ

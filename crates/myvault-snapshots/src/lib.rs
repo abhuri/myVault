@@ -15,7 +15,9 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use uuid::Uuid;
 
+mod quarantine;
 mod retention;
+pub use quarantine::{GcCandidate, GcPlan, QuarantineOutcome, QuarantineReport};
 pub use retention::{
     RetentionCandidate, RetentionPlan, RetentionPolicy, RetentionReason, MAX_RETENTION_CANDIDATES,
     MAX_SNAPSHOT_SCAN_ENTRIES, MAX_VERIFICATION_BYTES,
@@ -41,6 +43,13 @@ pub enum DurabilityBoundary {
     WorkDirectory,
     StagingDirectory,
     ObjectsDirectory,
+    QuarantineRun,
+    QuarantineRuns,
+    QuarantineWork,
+    QuarantineItems,
+    QuarantineState,
+    QuarantineMarkerStaging,
+    SourceObjects,
 }
 
 #[derive(Debug)]
@@ -69,6 +78,22 @@ pub enum Error {
     OperationLockLost,
     PublishedButLockLost(PublishOutcome),
     OperationFailedAndLockLost(Box<Error>),
+    GcPlanTooLarge,
+    TooManyGcRuns,
+    InvalidGcPlan,
+    QuarantineCollision,
+    QuarantinedButLockLost(QuarantineReport),
+    DetachedButNotSynced {
+        run_id: Uuid,
+        snapshot_id: Uuid,
+        boundary: DurabilityBoundary,
+        source: Box<Error>,
+    },
+    DetachedOutcomeUnknown {
+        run_id: Uuid,
+        snapshot_id: Uuid,
+        source: Box<Error>,
+    },
     PublishedButNotSynced {
         boundary: DurabilityBoundary,
         source: private_fs::Error,
@@ -125,6 +150,32 @@ impl fmt::Display for Error {
             Self::OperationFailedAndLockLost(error) => write!(
                 formatter,
                 "operation failed and its lock was also lost: {error}"
+            ),
+            Self::GcPlanTooLarge => formatter.write_str("GC plan exceeds 128 KiB"),
+            Self::TooManyGcRuns => formatter.write_str("quarantine contains more than 128 runs"),
+            Self::InvalidGcPlan => formatter.write_str("invalid or opaque GC plan evidence"),
+            Self::QuarantineCollision => formatter.write_str("quarantine topology mismatch"),
+            Self::QuarantinedButLockLost(report) => write!(
+                formatter,
+                "quarantine run {} detached {} items but operation lock was lost",
+                report.run_id, report.detached
+            ),
+            Self::DetachedButNotSynced {
+                run_id,
+                snapshot_id,
+                boundary,
+                source,
+            } => write!(
+                formatter,
+                "snapshot {snapshot_id} detached in run {run_id} but {boundary:?} sync failed: {source}"
+            ),
+            Self::DetachedOutcomeUnknown {
+                run_id,
+                snapshot_id,
+                source,
+            } => write!(
+                formatter,
+                "snapshot {snapshot_id} detach outcome in run {run_id} is unknown: {source}"
             ),
             Self::PublishedButNotSynced { boundary, source } => {
                 write!(
