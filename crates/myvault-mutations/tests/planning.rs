@@ -59,11 +59,14 @@ fn restore_planning_reads_immutable_item_without_moving_payload() {
     .unwrap();
     let digest = manifest.digest().unwrap();
     let store = vault.trash_store();
-    store.prepare_staging_manifest(trash_id, &manifest).unwrap();
-    store
-        .stage_payload_if_revision(trash_id, &source, &digest)
-        .unwrap();
-    store.publish_staging_item(trash_id, &digest).unwrap();
+    let item = root.join(format!(".trash/v1/items/{trash_id}"));
+    fs::create_dir_all(&item).unwrap();
+    fs::write(
+        item.join("manifest.json"),
+        manifest.canonical_bytes().unwrap(),
+    )
+    .unwrap();
+    fs::rename(root.join(source.as_path()), item.join("payload")).unwrap();
 
     let operation = MutationService::plan_restore(&vault, trash_id).unwrap();
 
