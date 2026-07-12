@@ -29,3 +29,4 @@ myvault-desktop-auth = { path = "../../../crates/desktop-auth" }
 
 [target.'cfg(target_os = "android")'.dependencies]
 tauri-plugin-google-auth = { path = "../../../crates/tauri-plugin-google-auth" }
+tauri-plugin-private-root = { path = "../../../crates/tauri-plugin-private-root" }

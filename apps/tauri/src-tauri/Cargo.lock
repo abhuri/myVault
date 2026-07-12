@@ -2298,6 +2298,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-google-auth",
+ "tauri-plugin-private-root",
 ]
 
 [[package]]
@@ -2331,12 +2332,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "myvault-platform-acl"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "myvault-platform-fs"
 version = "0.1.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "myvault-private-fs"
+version = "0.1.0"
+dependencies = [
+ "cap-fs-ext",
+ "cap-std",
+ "myvault-platform-acl",
+ "myvault-platform-fs",
+ "rustix",
+ "xattr",
 ]
 
 [[package]]
@@ -4099,6 +4119,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tauri-plugin-private-root"
+version = "0.1.0"
+dependencies = [
+ "cap-fs-ext",
+ "cap-std",
+ "myvault-private-fs",
+ "serde",
+ "tauri",
+ "tauri-plugin",
+]
+
+[[package]]
 name = "tauri-runtime"
 version = "2.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5469,6 +5501,16 @@ dependencies = [
  "libc",
  "once_cell",
  "pkg-config",
+]
+
+[[package]]
+name = "xattr"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
+dependencies = [
+ "libc",
+ "rustix",
 ]
 
 [[package]]
