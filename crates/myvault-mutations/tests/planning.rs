@@ -46,9 +46,8 @@ fn restore_planning_reads_immutable_item_without_moving_payload() {
     let (_temporary, root, vault) = vault();
     let source = VaultPath::from_portable("notes/restore-plan.md").unwrap();
     let bytes = b"restore plan";
-    vault
-        .create_new(&source, bytes, WriteIntent::UserInitiated)
-        .unwrap();
+    fs::create_dir_all(root.join("notes")).unwrap();
+    fs::write(root.join(source.as_path()), bytes).unwrap();
     let trash_id = TrashId::new();
     let manifest = TrashManifestV1::new(
         trash_id,
