@@ -576,6 +576,9 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - PR17 merge หลังผ่าน strict host checks, snapshot tests 62 รายการ, private-fs 13 รายการ, platform-fs 2 รายการ, Windows platform/private cross-check และ Android aarch64 cross-Clippy แล้วค่ะ
 - PR18 core/app-service ผ่าน independent deep audit สถานะ SAFE พร้อม core 73 unit tests + integration suites, note-read 4, Trash-listing 7 และ app-service 7 tests ค่ะ
 - PR18 Tauri bridge เปิดเฉพาะ `vault_status`, `vault_read_note` และ `vault_list_trash`, ใช้ canonical session ID + `spawn_blocking`, ไม่มี root/open/activation IPC และผ่าน Tauri tests 4 รายการค่ะ
+- PR18 merge เข้า `main` ผ่าน PR #18 ที่ merge commit `596a9d5` หลัง quality, Android, Windows และ Ubuntu ผ่านครบค่ะ
+- PR19 local-vault activation/explorer ผ่าน independent deep audit สถานะ SAFE โดยไม่เหลือ P0/P1/P2 ค่ะ Desktop ใช้ custom path-free native picker, Android ตอบ typed unsupported และ explorer ใช้ bounded deterministic pagination ค่ะ
+- PR19 harden `Vault::open` ด้วย canonical-before/after, held no-follow capability และ full directory identity verification พร้อม core 77 unit tests, app-service 8 tests, Tauri 5 tests และ Android aarch64 cross-Clippy ผ่านค่ะ
 - malicious same-UID syscall race บน Unix/macOS อยู่นอก threat model ที่ประกาศไว้ เพราะไม่มี portable unlink-by-handle primitive; cooperating myVault processes ถูก serialize ด้วย operation lock ค่ะ
 - Phase 0 diagnostic shell และ contracts ถูกสร้างแล้วค่ะ
 - local checks ที่ผ่านคือ TypeScript, Vitest 8 tests, Vite build, Rust fmt/clippy, Rust 49 tests, macOS Keychain live probe และ Tauri debug build ค่ะ
@@ -594,7 +597,7 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - append-only recovery journal schema v4 ผ่าน 38 tests ไม่มี production unlink/hardlink cleanup API, typed operation บังคับ endpoint topology และ unsupported evidence ถูก report แบบ bounded/fail-closed ค่ะ
 - Trash, original-path Restore, NormalMove และ CaseRename services แบบ journal-first ผ่าน 45 tests โดย retained NormalMove/CaseRename ปฏิเสธ source-only topology ที่กำกวมเพื่อป้องกัน ABA ค่ะ
 - งานถัดไปคือ merge Android trusted no-backup proof PR → immutable private snapshot store → retention/quarantine GC ค่ะ OAuth client configuration รอคุณโอยืนยัน User Data Policy และ physical Android validation ถูกเลื่อนไว้ค่ะ
-- งานถัดไปคือ merge snapshot store PR → retention/quarantine GC → app-service → Demo UI/editor/knowledge features → acceptance และ tag `v0.1.0-demo` ค่ะ OAuth/Drive และ physical Android validation ไม่บล็อก Local Demo ค่ะ
+- งานถัดไปคือ merge local picker/explorer PR → revision-checked save/autosave bridge → Demo UI/editor/reader/knowledge features → Synthetic Vault acceptance และ tag `v0.1.0-demo` ค่ะ OAuth/Drive และ physical Android validation ไม่บล็อก Local Demo ค่ะ
 
 ### Handoff Update Template
 
@@ -633,6 +636,10 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 
 ### 2026-07-12
 
+- merge PR #18 ที่ commit `596a9d5` พร้อม coherent note read, bounded Trash listing, opaque app session และ least-privilege Tauri read bridge หลัง cross-platform CI ผ่านทั้งหมดค่ะ
+- เพิ่ม desktop native folder picker แบบไม่มี path argument/response, Android typed unsupported response และ bounded explorer pagination สำหรับ Local Demo ค่ะ
+- harden การเปิด Vault ด้วย held no-follow root identity verification และ exact-looking replacement rejection ค่ะ
+- PR19 ผ่าน independent deep audit สถานะ SAFE โดยไม่เหลือ P0/P1/P2 พร้อม host strict suites และ Android aarch64 cross-Clippy ค่ะ
 - merge PR #17 ที่ commit `bd9ed58` พร้อม marker-authorized physical deletion, retained terminal ledger และ full crash fault matrix หลัง cross-platform CI ผ่านทั้งหมดค่ะ
 - เพิ่ม coherent single-stream note read ขนาดสูงสุด 16 MiB, deterministic bounded Trash pagination และ Tauri-free opaque Vault session service ค่ะ
 - PR18 core/app-service ผ่าน independent audit สถานะ SAFE หลังปิด I/O-vs-Opaque classification, item identity revalidation, canonical session input, camelCase DTO, capability-only activation และ stale-session race findings ค่ะ

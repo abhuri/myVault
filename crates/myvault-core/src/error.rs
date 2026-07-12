@@ -69,6 +69,7 @@ pub enum CoreError {
         directory_sync: crate::DirectorySyncStatus,
         verification: Box<CoreError>,
     },
+    VaultRootIdentityChanged,
     AppDataInsideVault {
         app_data: PathBuf,
         vault: PathBuf,
@@ -155,6 +156,7 @@ impl fmt::Display for CoreError {
             | Self::CaseRenamePrepublicationSyncFailed { .. }
             | Self::CaseRenameOutcomeUnknown { .. }
             | Self::ReplaceContentOutcomeUnknown { .. }
+            | Self::VaultRootIdentityChanged
             | Self::VerifiedMoveOutcomeUnknown { .. } => {
                 unreachable!("handled before main error formatting")
             }
@@ -395,6 +397,9 @@ impl CoreError {
                 "replacement of {} may be published (directory sync: {directory_sync}); verification failed: {verification}",
                 path.display()
             )),
+            Self::VaultRootIdentityChanged => {
+                Some(formatter.write_str("vault root identity changed while it was opened"))
+            }
             _ => None,
         }
     }

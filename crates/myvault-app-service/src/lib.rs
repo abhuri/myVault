@@ -5,6 +5,11 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
+pub const EXPLORER_MAX_DEPTH: usize = 64;
+pub const EXPLORER_MAX_SCAN: usize = 5_000;
+pub const EXPLORER_DEFAULT_PAGE_SIZE: usize = 100;
+pub const EXPLORER_MAX_PAGE_SIZE: usize = 200;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct VaultSessionId(Uuid);
@@ -93,6 +98,31 @@ pub struct TrashPageDto {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub enum ExplorerKindDto {
+    Markdown,
+    File,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExplorerEntryDto {
+    pub path: String,
+    pub kind: ExplorerKindDto,
+    pub byte_len: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExplorerPageDto {
+    pub session_id: VaultSessionId,
+    pub entries: Vec<ExplorerEntryDto>,
+    pub next_after: Option<String>,
+    pub has_more: bool,
+    pub scanned_entries: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum AppErrorCode {
     NoActiveSession,
     StaleSession,
@@ -104,6 +134,8 @@ pub enum AppErrorCode {
     NoteNotUtf8,
     VaultUnavailable,
     ResourceLimit,
+    VaultSelectionFailed,
+    UnsupportedPlatform,
     Internal,
 }
 
@@ -124,6 +156,22 @@ impl AppError {
         Self::new(
             AppErrorCode::Internal,
             "the application service is unavailable",
+        )
+    }
+
+    #[must_use]
+    pub const fn vault_selection_failed() -> Self {
+        Self::new(
+            AppErrorCode::VaultSelectionFailed,
+            "the selected vault could not be activated",
+        )
+    }
+
+    #[must_use]
+    pub const fn unsupported_platform() -> Self {
+        Self::new(
+            AppErrorCode::UnsupportedPlatform,
+            "this operation is unsupported on the current platform",
         )
     }
 }
@@ -260,6 +308,72 @@ impl AppService {
                 next_after: page.next_after.map(|id| id.to_string()),
                 has_more: page.has_more,
                 scanned_entries: page.scanned_entries,
+            })
+        })
+    }
+
+    /// Lists a deterministic, bounded page of portable explorer entries.
+    ///
+    /// # Errors
+    /// Rejects noncanonical cursors/page sizes, unavailable evidence, and stale sessions.
+    pub fn list_explorer(
+        &self,
+        session_id: VaultSessionId,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<ExplorerPageDto, AppError> {
+        if !(1..=EXPLORER_MAX_PAGE_SIZE).contains(&limit) {
+            return Err(AppError::new(
+                AppErrorCode::InvalidLimit,
+                "the requested page size is invalid",
+            ));
+        }
+        let after = after
+            .map(|value| {
+                let path = VaultPath::from_portable(value).map_err(|_| {
+                    AppError::new(
+                        AppErrorCode::InvalidCursor,
+                        "the explorer cursor is invalid",
+                    )
+                })?;
+                if path.as_str() != value {
+                    return Err(AppError::new(
+                        AppErrorCode::InvalidCursor,
+                        "the explorer cursor is invalid",
+                    ));
+                }
+                Ok(path)
+            })
+            .transpose()?;
+        self.with_session(session_id, |session| {
+            let inventory = session
+                .vault
+                .inventory(myvault_core::InventoryLimits {
+                    max_depth: EXPLORER_MAX_DEPTH,
+                    max_entries: EXPLORER_MAX_SCAN,
+                })
+                .map_err(map_core_error)?;
+            let start = after.as_ref().map_or(0, |cursor| {
+                inventory.partition_point(|entry| entry.path.as_str() <= cursor.as_str())
+            });
+            let end = inventory.len().min(start.saturating_add(limit));
+            let entries = inventory[start..end]
+                .iter()
+                .map(|entry| ExplorerEntryDto {
+                    path: entry.path.as_str().to_owned(),
+                    kind: match entry.kind {
+                        myvault_core::InventoryKind::Markdown => ExplorerKindDto::Markdown,
+                        myvault_core::InventoryKind::File => ExplorerKindDto::File,
+                    },
+                    byte_len: entry.size,
+                })
+                .collect::<Vec<_>>();
+            Ok(ExplorerPageDto {
+                session_id,
+                next_after: entries.last().map(|entry| entry.path.clone()),
+                has_more: end < inventory.len(),
+                scanned_entries: inventory.len(),
+                entries,
             })
         })
     }

@@ -159,6 +159,9 @@ pub fn run() {
         .plugin(tauri_plugin_google_auth::init())
         .plugin(tauri_plugin_private_root::init());
 
+    #[cfg(not(target_os = "android"))]
+    let builder = builder.plugin(tauri_plugin_dialog::init());
+
     builder
         .invoke_handler(tauri::generate_handler![
             get_platform_info,
@@ -167,7 +170,9 @@ pub fn run() {
             google_auth_disconnect,
             app_commands::vault_status,
             app_commands::vault_read_note,
-            app_commands::vault_list_trash
+            app_commands::vault_list_trash,
+            app_commands::vault_list_explorer,
+            app_commands::vault_choose_folder
         ])
         .run(tauri::generate_context!())
         .expect("error while running myVault");
