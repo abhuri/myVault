@@ -43,6 +43,55 @@ pub struct InspectedAndroidPrivateRoot {
     acl: AndroidAclInspection,
 }
 
+/// Stable Unix identity facts read from a held root capability.
+///
+/// These facts are intentionally narrow: they are suitable for binding
+/// immutable app data to one vault root, but they do not expose an ambient
+/// path or authorize filesystem access.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnixRootIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl UnixRootIdentity {
+    #[must_use]
+    pub const fn device(self) -> u64 {
+        self.device
+    }
+
+    #[must_use]
+    pub const fn inode(self) -> u64 {
+        self.inode
+    }
+}
+
+/// Held roots and identity evidence from one race-checked disjoint-root open.
+/// Keeping both handles alive lets consumers bind later evidence to the exact
+/// roots that passed validation.
+pub struct PrivateDisjointRoots {
+    private_root: Dir,
+    other_root: Dir,
+    other_identity: UnixRootIdentity,
+}
+
+impl PrivateDisjointRoots {
+    #[must_use]
+    pub const fn private_root(&self) -> &Dir {
+        &self.private_root
+    }
+
+    #[must_use]
+    pub const fn other_root(&self) -> &Dir {
+        &self.other_root
+    }
+
+    #[must_use]
+    pub const fn other_identity(&self) -> UnixRootIdentity {
+        self.other_identity
+    }
+}
+
 #[cfg(target_os = "android")]
 impl InspectedAndroidPrivateRoot {
     /// Returns whether ACL xattrs were proven absent or unsupported.
@@ -230,6 +279,52 @@ impl From<io::Error> for Error {
 /// Fails for I/O errors, invalid or overlapping roots, insecure permissions or
 /// ACLs, and platforms without complete privacy validation.
 pub fn open_private_disjoint_root(app_data_root: &Path, other_root: &Path) -> Result<Dir, Error> {
+    let (private_root, _) = open_validated_disjoint_roots(app_data_root, other_root)?;
+    Ok(private_root)
+}
+
+/// Opens the same private/disjoint boundary as [`open_private_disjoint_root`]
+/// while retaining both held roots and stable Unix device/inode binding facts.
+///
+/// This deliberately fails closed outside macOS and Linux. A caller that
+/// persists Unix binding facts must not silently substitute a different
+/// platform identity model.
+///
+/// # Errors
+/// Fails for the same reasons as [`open_private_disjoint_root`], or when the
+/// target cannot provide the exact Unix binding contract.
+pub fn open_private_disjoint_roots_with_unix_identity(
+    app_data_root: &Path,
+    other_root: &Path,
+) -> Result<PrivateDisjointRoots, Error> {
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (app_data_root, other_root);
+        Err(Error::PrivacyValidationRequired)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let (app_directory, other_directory) =
+            open_validated_disjoint_roots(app_data_root, other_root)?;
+        let metadata = other_directory.try_clone()?.into_std_file().metadata()?;
+        Ok(PrivateDisjointRoots {
+            private_root: app_directory,
+            other_root: other_directory,
+            other_identity: UnixRootIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+        })
+    }
+}
+
+fn open_validated_disjoint_roots(
+    app_data_root: &Path,
+    other_root: &Path,
+) -> Result<(Dir, Dir), Error> {
     let app_before = app_data_root.canonicalize()?;
     let other_before = other_root.canonicalize()?;
     let app_directory = open_absolute_dir_nofollow(app_data_root)?;
@@ -239,11 +334,34 @@ pub fn open_private_disjoint_root(app_data_root: &Path, other_root: &Path) -> Re
     if app_before != app_after || other_before != other_after {
         return Err(Error::InvalidRoot("root changed while it was opened"));
     }
+    validate_disjoint_canonical(&app_after, &other_after)?;
     verify_root_identity(&app_directory, &app_after)?;
     verify_root_identity(&other_directory, &other_after)?;
-    validate_disjoint_canonical(&app_after, &other_after)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let app_metadata = app_directory.try_clone()?.into_std_file().metadata()?;
+        let other_metadata = other_directory.try_clone()?.into_std_file().metadata()?;
+        if app_metadata.dev() == other_metadata.dev() && app_metadata.ino() == other_metadata.ino()
+        {
+            return Err(Error::InvalidRoot(
+                "private and other roots resolve to the same held directory identity",
+            ));
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if app_metadata.dev() == other_metadata.dev()
+            && myvault_platform_fs::mount_identity(&app_directory).map_err(mount_proof_error)?
+                != myvault_platform_fs::mount_identity(&other_directory)
+                    .map_err(mount_proof_error)?
+        {
+            return Err(Error::InvalidRoot(
+                "same-device roots belong to different mount instances",
+            ));
+        }
+    }
     require_private_directory(&app_directory)?;
-    Ok(app_directory)
+    Ok((app_directory, other_directory))
 }
 
 /// Creates a private child directory if absent, then opens and validates it
@@ -266,7 +384,40 @@ pub fn create_or_open_private_dir(parent: &Dir, name: impl AsRef<Path>) -> Resul
         set_private_directory_permissions(&directory)?;
     }
     require_private_directory(&directory)?;
+    sync_directory(&directory)?;
     sync_directory(parent)?;
+    Ok(directory)
+}
+
+/// Creates a new private child directory and never reuses or repairs an
+/// existing name. The parent is synced after the new directory is hardened.
+///
+/// # Errors
+/// Returns [`io::ErrorKind::AlreadyExists`] through [`Error::Io`] for a name
+/// collision, and otherwise fails closed on invalid topology or privacy.
+pub fn create_private_dir(parent: &Dir, name: impl AsRef<Path>) -> Result<Dir, Error> {
+    let name = name.as_ref();
+    validate_child_name(name)?;
+    parent.create_dir(name)?;
+    let directory = open_child_dir_nofollow(parent, name)?;
+    set_private_directory_permissions(&directory)?;
+    require_private_directory(&directory)?;
+    sync_directory(&directory)?;
+    sync_directory(parent)?;
+    Ok(directory)
+}
+
+/// Opens and validates an existing private child directory without following
+/// symlinks and without creating or repairing anything.
+///
+/// # Errors
+/// Fails if `name` is invalid, absent, symlinked, not a directory, or violates
+/// the platform private-directory policy.
+pub fn open_private_dir(parent: &Dir, name: impl AsRef<Path>) -> Result<Dir, Error> {
+    let name = name.as_ref();
+    validate_child_name(name)?;
+    let directory = open_child_dir_nofollow(parent, name)?;
+    require_private_directory(&directory)?;
     Ok(directory)
 }
 
@@ -435,7 +586,29 @@ fn require_non_reparse_directory(directory: &Dir) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn verify_root_identity(directory: &Dir, canonical: &Path) -> Result<(), Error> {
+    use std::os::unix::fs::MetadataExt;
+    let held = directory.try_clone()?.into_std_file().metadata()?;
+    let verification = open_absolute_dir_nofollow(canonical)?;
+    let ambient = verification.try_clone()?.into_std_file().metadata()?;
+    if held.dev() != ambient.dev() || held.ino() != ambient.ino() {
+        return Err(Error::InvalidRoot(
+            "root identity changed while it was opened",
+        ));
+    }
+    let held_mount = myvault_platform_fs::mount_identity(directory).map_err(mount_proof_error)?;
+    let ambient_mount =
+        myvault_platform_fs::mount_identity(&verification).map_err(mount_proof_error)?;
+    if held_mount != ambient_mount {
+        return Err(Error::InvalidRoot(
+            "root resolves through different mount instances",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn verify_root_identity(directory: &Dir, canonical: &Path) -> Result<(), Error> {
     use std::os::unix::fs::MetadataExt;
     let held = directory.try_clone()?.into_std_file().metadata()?;
@@ -446,6 +619,15 @@ fn verify_root_identity(directory: &Dir, canonical: &Path) -> Result<(), Error> 
         ));
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn mount_proof_error(error: io::Error) -> Error {
+    if error.kind() == io::ErrorKind::Unsupported {
+        Error::PrivacyValidationRequired
+    } else {
+        Error::Io(error)
+    }
 }
 
 #[cfg(windows)]
@@ -756,6 +938,33 @@ mod tests {
         }
         assert!(!app.join("escape").exists());
         assert!(!app.join("nested").exists());
+    }
+
+    #[test]
+    fn held_pair_reports_the_other_root_identity() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (_temporary, app, other) = roots();
+        let roots =
+            open_private_disjoint_roots_with_unix_identity(&app, &other).expect("held root pair");
+        let expected = roots
+            .other_root()
+            .try_clone()
+            .expect("clone other")
+            .into_std_file()
+            .metadata()
+            .expect("other metadata");
+        assert_eq!(roots.other_identity().device(), expected.dev());
+        assert_eq!(roots.other_identity().inode(), expected.ino());
+    }
+
+    #[test]
+    fn create_private_dir_never_reuses_a_collision() {
+        let (_temporary, app, other) = roots();
+        let root = open_private_disjoint_root(&app, &other).expect("private root");
+        create_private_dir(&root, "work").expect("new private directory");
+        let error = create_private_dir(&root, "work").expect_err("collision");
+        assert!(matches!(error, Error::Io(error) if error.kind() == io::ErrorKind::AlreadyExists));
     }
 }
 

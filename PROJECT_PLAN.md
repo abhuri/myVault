@@ -469,7 +469,7 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 
 ## 14. Current Status
 
-- สถานะโครงการคือ Phase 0 Automated Spike Complete — Phase 1 Started และ External Validation บนอุปกรณ์จริงถูกเลื่อนไว้ค่ะ
+- สถานะโครงการคือ Phase 0 Automated Spike Complete — Phase 1 Local Demo implementation กำลังดำเนินการ และ External Validation บนอุปกรณ์จริงถูกเลื่อนไว้ค่ะ
 - Git repository เชื่อมกับ `https://github.com/abhuri/myVault.git` แล้วค่ะ
 - initial repository safeguards ถูก push ไปที่ `main` ใน commit `6597e18` แล้วค่ะ
 - Phase 0 ถูก merge เข้า `main` ผ่าน PR #1 ที่ merge commit `dab395a` แล้วค่ะ
@@ -484,7 +484,8 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - revision-checked atomic content overwrite ถูก merge เข้า `main` ผ่าน PR #10 ที่ merge commit `731aef3` แล้วค่ะ
 - shared private-filesystem policy extraction ถูก merge เข้า `main` ผ่าน PR #11 ที่ merge commit `433d141` แล้วค่ะ
 - Windows owner/DACL/reparse privacy proof ถูก merge เข้า `main` ผ่าน PR #12 ที่ merge commit `fd1a3e8` แล้วค่ะ
-- Android native no-backup private-root capability อยู่บน branch `agent/phase-1-private-fs-android` และผ่าน Android compile/cross-clippy แล้วค่ะ
+- Android native no-backup private-root capability ถูก merge เข้า `main` ผ่าน PR #13 ที่ merge commit `35ddfd1` แล้วค่ะ
+- immutable snapshot store พร้อม canonical timestamp, stable Vault binding, bounded payload, atomic no-replace publication และ mount-instance privacy proof ผ่าน independent audit สถานะ SAFE บน branch `agent/phase-1-snapshot-store` แล้วค่ะ
 - package manager ที่เลือกคือ `pnpm` ค่ะ
 - Tauri 2, React, TypeScript และ Rust scaffold ถูกสร้างที่ `apps/tauri` ค่ะ
 - diagnostic shell มี Rust platform bridge, CodeMirror, Mermaid strict mode, Sigma 1,000/5,000-node probes, runtime evidence และ Android Google authorization controls แล้วค่ะ
@@ -529,11 +530,12 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 
 ## 15. Next Actions
 
-1. ปิด independent safety audit, เปิด PR และรัน cross-platform CI สำหรับ Android native no-backup private-root capability จากนั้น merge เมื่อทุก check ผ่านค่ะ
-2. สร้าง immutable private snapshot store บน shared private-filesystem boundary พร้อม bounded manifest/payload, stable Vault binding และ fail-closed retry ค่ะ
-3. เพิ่ม retention/quarantine GC หลัง snapshot store ผ่าน audit และ CI ค่ะ
-4. หลังคุณโอยืนยัน Google API Services User Data Policy ให้ Sunday สร้าง Desktop/Android OAuth clients, เพิ่มบัญชีส่วนตัวเป็น test user และรัน Desktop live-Drive fixture ค่ะ
-5. เลื่อนการเชื่อมต่อมือถือ Android และ physical-device matrix ไว้จนกว่าคุณโอจะมีอุปกรณ์ค่ะ
+1. เปิด PR และรัน cross-platform CI สำหรับ immutable snapshot store และ mount-instance privacy proof จากนั้น merge เมื่อทุก check ผ่านค่ะ
+2. เพิ่ม retention 30 วัน, 100 revisions ต่อ note, 1 GiB ต่อ Vault และ quarantine-before-delete GC ค่ะ
+3. สร้าง app-service, coherent read, bounded Trash listing, VaultSession, watcher และ least-privilege Tauri commands ค่ะ
+4. สร้าง macOS-first Local Desktop Demo ด้วย Synthetic Demo Vault, autosave 750 ms และ Obsidian-inspired dark UI ตาม canonical direction `Technical Utility` ค่ะ
+5. เชื่อม editor/reader, Mermaid, attachments, backlinks, outline, search, quick switcher และ prototype graph แล้วรัน Demo acceptance ค่ะ
+6. หลังคุณโอยืนยัน Google API Services User Data Policy จึงเริ่ม Drive Sync milestone ค่ะ Physical Android validation เลื่อนไว้จนกว่าจะมีอุปกรณ์ค่ะ
 
 ## 16. Session Handoff
 
@@ -545,6 +547,7 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - Sunday สามารถ spawn sub-agents สำหรับ bounded parallel tasks ตาม Operating Model ในเอกสารนี้ค่ะ
 - ทุก implementation plan ต้องขออนุมัติคุณโอก่อนลงมือค่ะ
 - รุ่นแรกเป็น personal-use native application แบบ zero-cash-cost ค่ะ
+- คุณโออนุมัติเป้าหมายต่อเนื่องถึง `v0.1.0-demo` โดยเลือก Local Desktop Demo, Synthetic Demo Vault, macOS acceptance target, autosave 750 ms + manual save และ Obsidian-inspired dark UI ค่ะ
 - architecture ที่ล็อกคือ Tauri 2, React, TypeScript, Rust, native SQLite และ direct Google Drive API ค่ะ
 - ไม่มี backend, hosting, VPN หรือ Store distribution ในรุ่นแรกค่ะ
 - compatibility project path คือ `/Users/awb/My Apps/myVault` และ physical path คือ `/Volumes/AWB-Apps/My Apps/myVault` ค่ะ
@@ -553,7 +556,7 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - Gradle cache physical path คือ `/Volumes/AWB-Apps/Developer/Gradle` และ `~/.gradle` เป็น symlink ค่ะ
 - remote repository คือ `https://github.com/abhuri/myVault.git` ค่ะ
 - `main` มี initial commit `6597e18` ค่ะ
-- active branch คือ `agent/phase-1-private-fs-android` ค่ะ Phase 0 PR #1, portable-core PR #2, mutation/recovery PR #3, trash-boundary PR #4, TrashStore PR #5, publish/restore PR #6, Trash mutation-service PR #7, Restore/NormalMove PR #8, CaseRename PR #9, revision-checked overwrite PR #10, shared private-fs PR #11 และ Windows privacy proof PR #12 merge เข้า `main` แล้วค่ะ
+- active branch คือ `agent/phase-1-snapshot-store` ค่ะ PR #1 ถึง PR #13 merge เข้า `main` แล้ว และ immutable snapshot store อยู่ระหว่าง deep safety audit ค่ะ
 - Phase 0 diagnostic shell และ contracts ถูกสร้างแล้วค่ะ
 - local checks ที่ผ่านคือ TypeScript, Vitest 8 tests, Vite build, Rust fmt/clippy, Rust 49 tests, macOS Keychain live probe และ Tauri debug build ค่ะ
 - GitHub quality, Android compile + 16 KB alignment, Windows NSIS และ Ubuntu AppImage checks ของ Draft PR #1 ผ่านที่ commit `0aecda5` แล้วค่ะ
@@ -571,6 +574,7 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - append-only recovery journal schema v4 ผ่าน 38 tests ไม่มี production unlink/hardlink cleanup API, typed operation บังคับ endpoint topology และ unsupported evidence ถูก report แบบ bounded/fail-closed ค่ะ
 - Trash, original-path Restore, NormalMove และ CaseRename services แบบ journal-first ผ่าน 45 tests โดย retained NormalMove/CaseRename ปฏิเสธ source-only topology ที่กำกวมเพื่อป้องกัน ABA ค่ะ
 - งานถัดไปคือ merge Android trusted no-backup proof PR → immutable private snapshot store → retention/quarantine GC ค่ะ OAuth client configuration รอคุณโอยืนยัน User Data Policy และ physical Android validation ถูกเลื่อนไว้ค่ะ
+- งานถัดไปคือ merge snapshot store PR → retention/quarantine GC → app-service → Demo UI/editor/knowledge features → acceptance และ tag `v0.1.0-demo` ค่ะ OAuth/Drive และ physical Android validation ไม่บล็อก Local Demo ค่ะ
 
 ### Handoff Update Template
 
@@ -609,6 +613,10 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 
 ### 2026-07-12
 
+- คุณโออนุมัติค่าเริ่มต้นทั้งหมดและให้ Sunday เดินงานต่อเนื่องถึง `v0.1.0-demo` ค่ะ
+- ล็อก Demo scope เป็น Local Desktop, Synthetic Demo Vault, macOS-first acceptance, autosave 750 ms + manual save และ Obsidian-inspired `Technical Utility` dark UI ค่ะ
+- immutable snapshot store และ mount-instance privacy proof ผ่าน independent audit สถานะ SAFE โดยไม่เหลือ P0/P1/P2 ค่ะ FUSE mirror ที่สร้าง identity ใหม่ถูกระบุไว้นอก native inode/mount threat model ค่ะ
+- merge PR #13 ที่ commit `35ddfd1` พร้อม Android native no-backup private-root capability หลัง quality, Android, Windows และ Ubuntu CI ผ่านทั้งหมดค่ะ
 - merge PR #12 ที่ commit `fd1a3e8` พร้อม Windows owner/DACL/reparse privacy proof หลัง Windows runtime และ cross-platform CI ผ่านทั้งหมดค่ะ
 - เพิ่ม Android native-only Tauri bridge สำหรับ `noBackupFilesDir`, opaque held capabilities, exact owner/mode/link/ACL checks และไม่เปิด path หรือ command ให้ frontend ค่ะ
 - ยืนยัน Android private-root patch ด้วย private-fs 8 tests, desktop repository compile gate, Android cross-clippy และ full Rust/Kotlin/Gradle APK build ค่ะ Physical-device evidence ถูกเลื่อนตามการตัดสินใจของคุณโอค่ะ

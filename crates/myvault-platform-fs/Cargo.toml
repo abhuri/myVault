@@ -10,6 +10,9 @@ description = "Isolated platform filesystem boundary for myVault"
 cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
 
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
   "Wdk_Storage_FileSystem",

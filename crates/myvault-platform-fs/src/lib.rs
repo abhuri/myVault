@@ -15,6 +15,26 @@ pub struct DirectoryIdentity {
     file_id: [u8; 16],
 }
 
+/// Opaque identity of the mount instance containing a held directory.
+///
+/// Linux distinguishes kernel-unique mount ids from the legacy id returned by
+/// older kernels. macOS retains the complete filesystem id and both mount
+/// endpoint names from `fstatfs`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MountIdentity(MountIdentityInner);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MountIdentityInner {
+    #[cfg(target_os = "linux")]
+    Linux { id: u64, unique: bool },
+    #[cfg(target_os = "macos")]
+    Macos {
+        fsid: [i32; 2],
+        mounted_on: Box<[i8]>,
+        mounted_from: Box<[i8]>,
+    },
+}
+
 impl DirectoryIdentity {
     const fn new(volume: u64, file_id: [u8; 16]) -> Self {
         Self { volume, file_id }
@@ -31,6 +51,91 @@ impl DirectoryIdentity {
 /// identifier.
 pub fn directory_identity(directory: &Dir) -> io::Result<DirectoryIdentity> {
     platform::directory_identity(directory)
+}
+
+/// Reads a mount-instance identity exclusively from a held directory.
+///
+/// Linux prefers `STATX_MNT_ID_UNIQUE` and falls back to `STATX_MNT_ID` only
+/// when the kernel does not report the unique field. macOS combines `fstat`
+/// type validation with the complete held `fstatfs` mount identity.
+///
+/// # Errors
+/// Returns [`io::ErrorKind::Unsupported`] rather than weakening the proof when
+/// the target or kernel cannot provide a mount-instance identity.
+pub fn mount_identity(directory: &Dir) -> io::Result<MountIdentity> {
+    platform_mount_identity(directory)
+}
+
+#[cfg(target_os = "linux")]
+fn platform_mount_identity(directory: &Dir) -> io::Result<MountIdentity> {
+    use rustix::fs::{AtFlags, StatxFlags};
+
+    // Linux 6.8 added STATX_MNT_ID_UNIQUE. rustix 1.1 exposes forward-compatible
+    // bitflags but does not yet name this bit, so retain the UAPI value here.
+    const STATX_MNT_ID_UNIQUE: u32 = 0x0000_4000;
+    let unique = StatxFlags::from_bits_retain(STATX_MNT_ID_UNIQUE);
+    match rustix::fs::statx(directory, "", AtFlags::EMPTY_PATH, unique) {
+        Ok(stat) if stat.stx_mask & STATX_MNT_ID_UNIQUE != 0 => {
+            return Ok(MountIdentity(MountIdentityInner::Linux {
+                id: stat.stx_mnt_id,
+                unique: true,
+            }));
+        }
+        Ok(_) | Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS) => {}
+        Err(error) => return Err(io::Error::from(error)),
+    }
+
+    let legacy = rustix::fs::statx(directory, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)
+        .map_err(io::Error::from)?;
+    if legacy.stx_mask & StatxFlags::MNT_ID.bits() == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "statx did not report a mount id",
+        ));
+    }
+    Ok(MountIdentity(MountIdentityInner::Linux {
+        id: legacy.stx_mnt_id,
+        unique: false,
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn platform_mount_identity(directory: &Dir) -> io::Result<MountIdentity> {
+    let held = directory.try_clone()?.into_std_file();
+    let stat = rustix::fs::fstat(&held)?;
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "mount identity requires a held directory",
+        ));
+    }
+    let statfs = rustix::fs::fstatfs(&held)?;
+    // SAFETY: Darwin fsid_t is exactly two i32 values. Both source and target
+    // are plain Copy values of identical size/alignment, and every bit pattern
+    // is valid for i32. This platform crate isolates the libc-private field.
+    let fsid = unsafe { std::mem::transmute::<rustix::fs::Fsid, [i32; 2]>(statfs.f_fsid) };
+    Ok(MountIdentity(MountIdentityInner::Macos {
+        fsid,
+        mounted_on: nul_terminated_mount_name(&statfs.f_mntonname),
+        mounted_from: nul_terminated_mount_name(&statfs.f_mntfromname),
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn nul_terminated_mount_name(name: &[i8]) -> Box<[i8]> {
+    let length = name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(name.len());
+    name[..length].into()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn platform_mount_identity(_directory: &Dir) -> io::Result<MountIdentity> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "held mount identity is unavailable on this target",
+    ))
 }
 
 /// Atomically renames an entry without replacing an existing destination.
@@ -104,6 +209,27 @@ mod identity_tests {
         assert_ne!(
             DirectoryIdentity::new(7, first),
             DirectoryIdentity::new(7, second)
+        );
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod mount_identity_tests {
+    use cap_std::ambient_authority;
+    use cap_std::fs::Dir;
+
+    use super::mount_identity;
+
+    #[test]
+    fn held_mount_identity_is_stable_across_independent_opens() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let canonical = temporary.path().canonicalize().expect("canonical path");
+        let first = Dir::open_ambient_dir(&canonical, ambient_authority()).expect("first open");
+        let second = Dir::open_ambient_dir(&canonical, ambient_authority()).expect("second open");
+
+        assert_eq!(
+            mount_identity(&first).expect("first mount identity"),
+            mount_identity(&second).expect("second mount identity")
         );
     }
 }
