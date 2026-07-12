@@ -1,25 +1,18 @@
 #![forbid(unsafe_code)]
 
-#[cfg(not(windows))]
-use cap_fs_ext::OpenOptionsMaybeDirExt;
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
-#[cfg(not(windows))]
-use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use myvault_core::VaultPath;
+use myvault_private_fs as private_fs;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
-#[cfg(not(windows))]
-use std::path::{Component, PathBuf};
 use uuid::Uuid;
 
-#[cfg(not(windows))]
 const JOURNAL_DIRECTORY: &str = "operation-journal";
-#[cfg(not(windows))]
 const COMPLETED_DIRECTORY: &str = "completed";
 const MAX_ENTRY_BYTES: u64 = 64 * 1024;
 const MAX_ENTRY_COUNT: usize = 4096;
@@ -171,6 +164,18 @@ impl From<io::Error> for Error {
 impl From<serde_json::Error> for Error {
     fn from(value: serde_json::Error) -> Self {
         Self::Json(value)
+    }
+}
+
+impl From<private_fs::Error> for Error {
+    fn from(value: private_fs::Error) -> Self {
+        match value {
+            private_fs::Error::Io(error) => Self::Io(error),
+            private_fs::Error::InvalidRoot(reason) => Self::InvalidRoot(reason),
+            private_fs::Error::PrivacyValidationRequired => Self::PrivacyValidationRequired,
+            private_fs::Error::ExtendedAcl => Self::ExtendedAcl,
+            private_fs::Error::ExternalMutation => Self::ExternalMutation,
+        }
     }
 }
 
@@ -474,55 +479,13 @@ impl RecoveryJournal {
     /// # Errors
     /// Returns an error for unstable, symlinked, overlapping, or non-private roots.
     pub fn open(app_data_root: &Path, vault_root: &Path) -> Result<Self, Error> {
-        #[cfg(windows)]
-        {
-            let _ = (app_data_root, vault_root);
-            return Err(Error::PrivacyValidationRequired);
-        }
-
-        #[cfg(not(windows))]
-        {
-            let app_before = app_data_root.canonicalize()?;
-            let vault_before = vault_root.canonicalize()?;
-            let app_directory = open_absolute_dir_nofollow(app_data_root)?;
-            let vault_directory = open_absolute_dir_nofollow(vault_root)?;
-            let app_after = app_data_root.canonicalize()?;
-            let vault_after = vault_root.canonicalize()?;
-            if app_before != app_after || vault_before != vault_after {
-                return Err(Error::InvalidRoot("root changed while it was opened"));
-            }
-            verify_root_identity(&app_directory, &app_after)?;
-            verify_root_identity(&vault_directory, &vault_after)?;
-            validate_disjoint_canonical(&app_after, &vault_after)?;
-            require_private_directory(&app_directory)?;
-
-            let created = match app_directory.create_dir(JOURNAL_DIRECTORY) {
-                Ok(()) => true,
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
-                Err(error) => return Err(error.into()),
-            };
-            let directory = open_child_dir_nofollow(&app_directory, JOURNAL_DIRECTORY)?;
-            if created {
-                set_held_directory_permissions(&directory)?;
-                sync_held_directory(&app_directory)?;
-            }
-            require_private_directory(&directory)?;
-            let completed_created = match directory.create_dir(COMPLETED_DIRECTORY) {
-                Ok(()) => true,
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
-                Err(error) => return Err(error.into()),
-            };
-            let completed = open_child_dir_nofollow(&directory, COMPLETED_DIRECTORY)?;
-            if completed_created {
-                set_held_directory_permissions(&completed)?;
-                sync_held_directory(&directory)?;
-            }
-            require_private_directory(&completed)?;
-            Ok(Self {
-                directory,
-                completed,
-            })
-        }
+        let app_directory = private_fs::open_private_disjoint_root(app_data_root, vault_root)?;
+        let directory = private_fs::create_or_open_private_dir(&app_directory, JOURNAL_DIRECTORY)?;
+        let completed = private_fs::create_or_open_private_dir(&directory, COMPLETED_DIRECTORY)?;
+        Ok(Self {
+            directory,
+            completed,
+        })
     }
 
     /// Durably publishes an intent using a fresh temp and atomic no-replace rename.
@@ -795,7 +758,7 @@ impl RecoveryJournal {
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
         let file = directory.open_with(name, &options)?;
-        verify_private_file(&file, 1)?;
+        private_fs::verify_private_file(&file, 1)?;
         let capacity = usize::try_from(metadata.len()).map_err(|_| Error::EntryTooLarge)?;
         let mut bytes = Vec::with_capacity(capacity);
         file.take(MAX_ENTRY_BYTES + 1).read_to_end(&mut bytes)?;
@@ -821,10 +784,10 @@ impl RecoveryJournal {
             .create_new(true)
             .follow(FollowSymlinks::No);
         let mut file = directory.open_with(&temporary_name, &options)?;
-        set_held_file_permissions(&file)?;
+        private_fs::set_private_file_permissions(&file)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        verify_private_file(&file, 1)?;
+        private_fs::verify_private_file(&file, 1)?;
         drop(file);
         match atomic_rename_noreplace(directory, &temporary_name, final_name) {
             Ok(()) => {
@@ -1045,70 +1008,6 @@ fn parse_entry_name(name: &str) -> Option<Uuid> {
     (id.to_string() == id_text).then_some(id)
 }
 
-#[cfg(not(windows))]
-fn validate_disjoint_canonical(app: &Path, vault: &Path) -> Result<(), Error> {
-    if app == vault || app.starts_with(vault) || vault.starts_with(app) {
-        return Err(Error::InvalidRoot(
-            "app data and vault roots must be disjoint",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn open_absolute_dir_nofollow(path: &Path) -> Result<Dir, Error> {
-    if !path.is_absolute() {
-        return Err(Error::InvalidRoot("root must be absolute"));
-    }
-    let mut anchor = PathBuf::new();
-    let mut names = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => anchor.push(prefix.as_os_str()),
-            Component::RootDir => anchor.push(std::path::MAIN_SEPARATOR_STR),
-            Component::Normal(name) => names.push(name.to_owned()),
-            Component::CurDir | Component::ParentDir => {
-                return Err(Error::InvalidRoot("root is not normalized"));
-            }
-        }
-    }
-    let mut directory = Dir::open_ambient_dir(anchor, ambient_authority())?;
-    for name in names {
-        directory = open_child_dir_nofollow(&directory, &name)?;
-    }
-    Ok(directory)
-}
-
-#[cfg(not(windows))]
-fn open_child_dir_nofollow(parent: &Dir, name: impl AsRef<Path>) -> Result<Dir, Error> {
-    let name = name.as_ref();
-    if parent
-        .symlink_metadata(name)
-        .is_ok_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err(Error::InvalidRoot("root contains a symlink component"));
-    }
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .follow(FollowSymlinks::No)
-        .maybe_dir(true);
-    let file = parent.open_with(name, &options).map_err(|error| {
-        if parent
-            .symlink_metadata(name)
-            .is_ok_and(|metadata| metadata.file_type().is_symlink())
-        {
-            Error::InvalidRoot("root contains a symlink component")
-        } else {
-            Error::Io(error)
-        }
-    })?;
-    if !file.metadata()?.is_dir() {
-        return Err(Error::InvalidRoot("root is not a directory"));
-    }
-    Ok(Dir::from_std_file(file.into_std()))
-}
-
 fn published_sync_error(error: Error) -> Error {
     match error {
         Error::Io(error) => Error::PublishedButNotSynced(error),
@@ -1116,124 +1015,8 @@ fn published_sync_error(error: Error) -> Error {
     }
 }
 
-#[cfg(unix)]
-fn verify_root_identity(directory: &Dir, canonical: &Path) -> Result<(), Error> {
-    use std::os::unix::fs::MetadataExt;
-    let held = directory.try_clone()?.into_std_file().metadata()?;
-    let ambient = fs::metadata(canonical)?;
-    if held.dev() != ambient.dev() || held.ino() != ambient.ino() {
-        return Err(Error::InvalidRoot(
-            "root identity changed while it was opened",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(all(not(unix), not(windows)))]
-fn verify_root_identity(_directory: &Dir, _canonical: &Path) -> Result<(), Error> {
-    Err(Error::PrivacyValidationRequired)
-}
-
-#[cfg(unix)]
-fn require_private_directory(directory: &Dir) -> Result<(), Error> {
-    use std::os::unix::fs::MetadataExt;
-    let held = directory.try_clone()?.into_std_file();
-    let metadata = held.metadata()?;
-    if metadata.uid() != rustix::process::geteuid().as_raw() {
-        return Err(Error::InvalidRoot(
-            "private directory is not owned by current user",
-        ));
-    }
-    if metadata.mode() & 0o077 != 0 {
-        return Err(Error::InvalidRoot(
-            "private directory grants group or world access",
-        ));
-    }
-    verify_no_extended_acl(&held)?;
-    Ok(())
-}
-
-#[cfg(all(not(unix), not(windows)))]
-fn require_private_directory(_directory: &Dir) -> Result<(), Error> {
-    Err(Error::PrivacyValidationRequired)
-}
-
-#[cfg(unix)]
-fn set_held_directory_permissions(directory: &Dir) -> Result<(), Error> {
-    use std::os::unix::fs::PermissionsExt;
-    directory
-        .try_clone()?
-        .into_std_file()
-        .set_permissions(fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
-#[cfg(all(not(unix), not(windows)))]
-fn set_held_directory_permissions(_directory: &Dir) -> Result<(), Error> {
-    Err(Error::PrivacyValidationRequired)
-}
-
-#[cfg(unix)]
-fn set_held_file_permissions(file: &cap_std::fs::File) -> Result<(), Error> {
-    use cap_std::fs::{Permissions, PermissionsExt};
-    file.set_permissions(Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_held_file_permissions(_file: &cap_std::fs::File) -> Result<(), Error> {
-    Err(Error::PrivacyValidationRequired)
-}
-
-#[cfg(unix)]
-fn verify_private_file(file: &cap_std::fs::File, max_links: u64) -> Result<(), Error> {
-    use std::os::unix::fs::MetadataExt;
-    let held = file.try_clone()?.into_std();
-    let metadata = held.metadata()?;
-    if !metadata.is_file()
-        || metadata.uid() != rustix::process::geteuid().as_raw()
-        || metadata.mode() & 0o777 != 0o600
-        || !(1..=max_links).contains(&metadata.nlink())
-    {
-        return Err(Error::ExternalMutation);
-    }
-    verify_no_extended_acl(&held)?;
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn verify_no_extended_acl(file: &std::fs::File) -> Result<(), Error> {
-    if myvault_platform_acl::has_extended_acl(file)? {
-        return Err(Error::ExtendedAcl);
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn verify_no_extended_acl(file: &std::fs::File) -> Result<(), Error> {
-    use xattr::FileExt;
-
-    if file.get_xattr("system.posix_acl_access")?.is_some()
-        || file.get_xattr("system.posix_acl_default")?.is_some()
-    {
-        return Err(Error::ExtendedAcl);
-    }
-    Ok(())
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn verify_no_extended_acl(_file: &std::fs::File) -> Result<(), Error> {
-    Err(Error::PrivacyValidationRequired)
-}
-
-#[cfg(not(unix))]
-fn verify_private_file(_file: &cap_std::fs::File, _max_links: u64) -> Result<(), Error> {
-    Err(Error::PrivacyValidationRequired)
-}
-
 fn sync_held_directory(directory: &Dir) -> Result<(), Error> {
-    directory.try_clone()?.into_std_file().sync_all()?;
-    Ok(())
+    private_fs::sync_directory(directory).map_err(Error::from)
 }
 
 #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
