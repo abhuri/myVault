@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "myVault — Phase 0",
+        "title": "myVault — Local Demo",
         "width": 1180,
         "height": 820,
         "minWidth": 760,
