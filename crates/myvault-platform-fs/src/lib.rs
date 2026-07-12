@@ -81,7 +81,7 @@ fn platform_mount_identity(directory: &Dir) -> io::Result<MountIdentity> {
                 unique: true,
             }));
         }
-        Ok(_) | Err(rustix::io::Errno::INVAL) | Err(rustix::io::Errno::NOSYS) => {}
+        Ok(_) | Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS) => {}
         Err(error) => return Err(io::Error::from(error)),
     }
 
