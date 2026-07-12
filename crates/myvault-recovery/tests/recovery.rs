@@ -43,7 +43,18 @@ fn make_private(path: &std::path::Path) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn make_private(path: &std::path::Path) {
+    use cap_std::{ambient_authority, fs::Dir};
+    let directory = Dir::open_ambient_dir(path, ambient_authority()).unwrap();
+    myvault_platform_acl::harden_private_handle(
+        &directory.into_std_file(),
+        myvault_platform_acl::ObjectKind::Directory,
+    )
+    .unwrap();
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn make_private(_path: &std::path::Path) {}
 
 #[cfg(unix)]
@@ -1409,10 +1420,10 @@ fn rejects_overlapping_roots() {
 
 #[cfg(windows)]
 #[test]
-fn windows_fails_closed_until_acl_privacy_validation_exists() {
+fn windows_fails_closed_when_directory_sync_is_unsupported() {
     let (_temporary, app, vault) = roots();
     assert!(matches!(
         RecoveryJournal::open(&app, &vault),
-        Err(Error::PrivacyValidationRequired)
+        Err(Error::DirectorySyncUnsupported(_))
     ));
 }
