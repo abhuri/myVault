@@ -1,6 +1,6 @@
 use std::fmt;
 
-use myvault_core::{FileRevision, TrashId, TrashManifestV1, VaultPath};
+use myvault_core::{FileRevision, ManifestDigest, TrashId, TrashManifestV1, VaultPath};
 use uuid::Uuid;
 
 use crate::MutationError;
@@ -119,5 +119,76 @@ impl TrashOperation {
     #[must_use]
     pub fn trashed_at_unix_ms(&self) -> i64 {
         self.trashed_at_unix_ms
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestoreOperation {
+    operation_id: OperationId,
+    trash_id: TrashId,
+    destination: String,
+    revision: FileRevision,
+    manifest_digest: String,
+}
+
+impl RestoreOperation {
+    pub(crate) fn new(
+        operation_id: OperationId,
+        trash_id: TrashId,
+        destination: &VaultPath,
+        revision: FileRevision,
+        manifest_digest: impl Into<String>,
+    ) -> Result<Self, MutationError> {
+        let manifest_digest = manifest_digest.into();
+        ManifestDigest::parse(manifest_digest.clone())?;
+        myvault_recovery::RenameMoveIntent::new_restore(
+            operation_id.as_uuid(),
+            trash_id.as_uuid(),
+            manifest_digest.clone(),
+            destination.as_str(),
+            crate::revision::to_recovery(&revision),
+        )?;
+        Ok(Self {
+            operation_id,
+            trash_id,
+            destination: destination.as_str().to_owned(),
+            revision,
+            manifest_digest,
+        })
+    }
+
+    pub(crate) fn destination_path(&self) -> Result<VaultPath, MutationError> {
+        let path = VaultPath::from_portable(&self.destination)?;
+        if path.as_str() != self.destination {
+            return Err(MutationError::InvalidOperation(
+                "restore destination is not canonical",
+            ));
+        }
+        Ok(path)
+    }
+
+    #[must_use]
+    pub fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+
+    #[must_use]
+    pub fn trash_id(&self) -> TrashId {
+        self.trash_id
+    }
+
+    #[must_use]
+    pub fn destination(&self) -> &str {
+        &self.destination
+    }
+
+    #[must_use]
+    pub fn revision(&self) -> &FileRevision {
+        &self.revision
+    }
+
+    #[must_use]
+    pub fn manifest_digest(&self) -> &str {
+        &self.manifest_digest
     }
 }
