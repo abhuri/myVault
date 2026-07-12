@@ -6,6 +6,8 @@
 
 Local Desktop Demo ผ่าน automated gates และ live macOS smoke test ค่ะ Frontend กับ save bridge ผ่าน independent deep audit โดยไม่เหลือ P0/P1/P2 ค่ะ
 
+Release: [myVault v0.1.0-demo](https://github.com/abhuri/myVault/releases/tag/v0.1.0-demo) จาก merge commit `0c5fbf0` ค่ะ
+
 ## Live macOS Evidence
 
 - native debug `.app` build สำเร็จและเปิดด้วยชื่อ `myVault — Local Demo` ค่ะ
@@ -37,3 +39,11 @@ Local Desktop Demo ผ่าน automated gates และ live macOS smoke test 
 - Reader link navigation ถูกปิดทั้งหมดใน Demo เพื่อป้องกัน WebView top navigation ค่ะ
 - Mermaid/graph ทำให้ main JavaScript chunk ประมาณ 1.05 MB minified; code splitting เป็น P3 follow-up ค่ะ
 - frontmatter แสดงแบบ Markdown พื้นฐาน ยังไม่มี properties editor เต็มรูปแบบค่ะ
+
+## Release Checksums
+
+```text
+c07846b60ed70fd166bd7c2ec451245397da747aec3e29a11ebcfb4c90fefe49  myVault-v0.1.0-demo-macos-ad-hoc.zip
+c55fa98359bfa3e8c6ccd702091e57a364c35146d1b99a644b8fbe04be02c125  myVault-v0.1.0-demo-windows-x64-unsigned-setup.exe
+2e45d33fc0d81a7aaeeeadda137af85cbc6f60cc946996a14b932765ec45416e  myVault-v0.1.0-demo-linux-amd64.AppImage
+```
