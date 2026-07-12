@@ -491,6 +491,8 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - verified quarantined byte deletion และ completed-run cleanup บน branch `agent/phase-1-snapshot-delete` ผ่าน independent deep audit สถานะ SAFE โดยไม่เหลือ P0/P1/P2 แล้วค่ะ
 - deletion ใช้ nested two-pass preflight, held-handle-bound identity, payload → manifest → empty item ordering, canonical completion marker และ retained terminal ledger เพื่อให้ crash retry พิสูจน์สถานะได้ค่ะ
 - retained terminal ledgers ไม่ถูกนับใน active-run cap 128 รายการ แต่ physical evidence scan จำกัด 512 รายการและสงวน capacity ก่อน terminal publication ค่ะ Ledger compaction ถูกเลื่อนไปหลัง v0.1 ค่ะ
+- verified quarantined byte deletion ถูก merge เข้า `main` ผ่าน PR #17 ที่ merge commit `bd9ed58` หลัง independent audit สถานะ SAFE และ cross-platform CI ผ่านครบแล้วค่ะ
+- coherent note read, bounded Trash pagination, Tauri-free app-service และ least-privilege Tauri commands ผ่าน independent audit สถานะ SAFE บน branch `agent/phase-1-app-service-read` แล้วค่ะ
 - package manager ที่เลือกคือ `pnpm` ค่ะ
 - Tauri 2, React, TypeScript และ Rust scaffold ถูกสร้างที่ `apps/tauri` ค่ะ
 - diagnostic shell มี Rust platform bridge, CodeMirror, Mermaid strict mode, Sigma 1,000/5,000-node probes, runtime evidence และ Android Google authorization controls แล้วค่ะ
@@ -570,8 +572,10 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - Gradle cache physical path คือ `/Volumes/AWB-Apps/Developer/Gradle` และ `~/.gradle` เป็น symlink ค่ะ
 - remote repository คือ `https://github.com/abhuri/myVault.git` ค่ะ
 - `main` มี initial commit `6597e18` ค่ะ
-- active branch คือ `agent/phase-1-snapshot-delete` ค่ะ PR #1 ถึง PR #16 merge เข้า `main` แล้ว และกำลังเพิ่ม physical deletion เฉพาะ quarantine item ที่มี durable detached marker ค่ะ
-- PR17 implementation ผ่าน strict host checks, snapshot tests 62 รายการ, private-fs 13 รายการ, platform-fs 2 รายการ, Windows platform/private cross-check และ Android aarch64 cross-Clippy แล้วค่ะ
+- active branch คือ `agent/phase-1-app-service-read` ค่ะ PR #1 ถึง PR #17 merge เข้า `main` แล้ว และกำลังสร้าง coherent read + bounded Trash listing + opaque Vault session service ค่ะ
+- PR17 merge หลังผ่าน strict host checks, snapshot tests 62 รายการ, private-fs 13 รายการ, platform-fs 2 รายการ, Windows platform/private cross-check และ Android aarch64 cross-Clippy แล้วค่ะ
+- PR18 core/app-service ผ่าน independent deep audit สถานะ SAFE พร้อม core 73 unit tests + integration suites, note-read 4, Trash-listing 7 และ app-service 7 tests ค่ะ
+- PR18 Tauri bridge เปิดเฉพาะ `vault_status`, `vault_read_note` และ `vault_list_trash`, ใช้ canonical session ID + `spawn_blocking`, ไม่มี root/open/activation IPC และผ่าน Tauri tests 4 รายการค่ะ
 - malicious same-UID syscall race บน Unix/macOS อยู่นอก threat model ที่ประกาศไว้ เพราะไม่มี portable unlink-by-handle primitive; cooperating myVault processes ถูก serialize ด้วย operation lock ค่ะ
 - Phase 0 diagnostic shell และ contracts ถูกสร้างแล้วค่ะ
 - local checks ที่ผ่านคือ TypeScript, Vitest 8 tests, Vite build, Rust fmt/clippy, Rust 49 tests, macOS Keychain live probe และ Tauri debug build ค่ะ
@@ -629,6 +633,10 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 
 ### 2026-07-12
 
+- merge PR #17 ที่ commit `bd9ed58` พร้อม marker-authorized physical deletion, retained terminal ledger และ full crash fault matrix หลัง cross-platform CI ผ่านทั้งหมดค่ะ
+- เพิ่ม coherent single-stream note read ขนาดสูงสุด 16 MiB, deterministic bounded Trash pagination และ Tauri-free opaque Vault session service ค่ะ
+- PR18 core/app-service ผ่าน independent audit สถานะ SAFE หลังปิด I/O-vs-Opaque classification, item identity revalidation, canonical session input, camelCase DTO, capability-only activation และ stale-session race findings ค่ะ
+- เชื่อม app-service เข้า Tauri ด้วย `Arc<AppService>` และ safe typed commands พร้อม CI gates; bridge ผ่าน independent audit สถานะ SAFE โดยไม่เหลือ P0/P1/P2 ค่ะ
 - เพิ่ม marker-authorized physical quarantine deletion พร้อม nested two-pass preflight ซึ่งตรวจทุก candidate และ unknown evidence ก่อน mutation ใด ๆ ค่ะ
 - เพิ่ม canonical completed-run marker, retained terminal ledger, bounded attempt families, reserved physical capacity และ retry-convergent fault matrix ครบทุก destructive boundary ค่ะ
 - เพิ่ม Windows full file identity, held-handle-bound removal contract และ `DeletedButLockLost(DeletionReport)` เพื่อรักษาข้อเท็จจริงหลัง operation lock สูญหายค่ะ

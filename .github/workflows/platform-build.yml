@@ -88,6 +88,7 @@ jobs:
           cargo test --manifest-path crates/myvault-recovery/Cargo.toml
           cargo test --manifest-path crates/myvault-mutations/Cargo.toml
           cargo test --manifest-path crates/myvault-snapshots/Cargo.toml
+          cargo test --manifest-path crates/myvault-app-service/Cargo.toml
 
       - name: Build native desktop artifact
         run: pnpm --dir apps/tauri tauri build --bundles ${{ matrix.bundles }}

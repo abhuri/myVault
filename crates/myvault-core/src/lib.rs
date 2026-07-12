@@ -19,13 +19,14 @@ pub use path::VaultPath;
 pub use revision::FileRevision;
 pub use trash::{
     ManifestDigest, PayloadKind, PrepareManifestOutcome, PublishItemOutcome, RestoreItemOutcome,
-    StagePayloadOutcome, TrashArea, TrashId, TrashManifestV1, TrashStore, MAX_TRASH_MANIFEST_BYTES,
+    StagePayloadOutcome, TrashArea, TrashId, TrashListEvidence, TrashListPage, TrashManifestV1,
+    TrashStore, MAX_TRASH_LIST_SCAN, MAX_TRASH_MANIFEST_BYTES, MAX_TRASH_PAGE_SIZE,
 };
 pub use vault::{
     CaseRenameOutcome, CaseRenamePhase, DirectorySyncStatus, InventoryEntry, InventoryKind,
-    InventoryLimits, MoveContentOutcome, MoveDurability, ReplaceContentOutcome, Vault, WriteIntent,
-    DEFAULT_READ_LIMIT, MAX_TRASH_PAYLOAD_BYTES, MUTATION_EXTERNAL_PROCESS_RESIDUAL_RISK,
-    TRASH_REVISION_EXTERNAL_PROCESS_RESIDUAL_RISK,
+    InventoryLimits, MoveContentOutcome, MoveDurability, ReadNote, ReplaceContentOutcome, Vault,
+    WriteIntent, DEFAULT_READ_LIMIT, MAX_NOTE_BYTES, MAX_TRASH_PAYLOAD_BYTES,
+    MUTATION_EXTERNAL_PROCESS_RESIDUAL_RISK, TRASH_REVISION_EXTERNAL_PROCESS_RESIDUAL_RISK,
 };
 pub use watcher::{
     BurstNormalizer, NormalizedEvent, RawEvent, SelfWriteSuppressor, WriteFingerprint,

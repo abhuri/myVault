@@ -1,6 +1,9 @@
 use serde::Serialize;
+use std::sync::Arc;
 #[cfg(target_os = "android")]
 use std::sync::Mutex;
+
+mod app_commands;
 
 #[cfg(target_os = "android")]
 use tauri_plugin_google_auth::GoogleAuthExt;
@@ -66,13 +69,13 @@ fn google_auth_status(
             .authorization
             .lock()
             .map_err(|_| "Authorization state is unavailable".to_owned())?;
-        return Ok(GoogleAuthStatus {
+        Ok(GoogleAuthStatus {
             supported: true,
             connected: authorization.is_some(),
             granted_scope_count: authorization
                 .as_ref()
                 .map_or(0, |value| value.granted_scope_count),
-        });
+        })
     }
 
     #[cfg(not(target_os = "android"))]
@@ -98,11 +101,11 @@ fn google_auth_connect(
             .authorization
             .lock()
             .map_err(|_| "Authorization state is unavailable".to_owned())? = Some(authorization);
-        return Ok(GoogleAuthStatus {
+        Ok(GoogleAuthStatus {
             supported: true,
             connected: true,
             granted_scope_count: scope_count,
-        });
+        })
     }
 
     #[cfg(not(target_os = "android"))]
@@ -131,11 +134,11 @@ fn google_auth_disconnect(
         }
         authorization.take();
 
-        return Ok(GoogleAuthStatus {
+        Ok(GoogleAuthStatus {
             supported: true,
             connected: false,
             granted_scope_count: 0,
-        });
+        })
     }
 
     #[cfg(not(target_os = "android"))]
@@ -147,7 +150,9 @@ fn google_auth_disconnect(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default().manage(GoogleAuthSession::default());
+    let builder = tauri::Builder::default()
+        .manage(GoogleAuthSession::default())
+        .manage(Arc::new(myvault_app_service::AppService::new()));
 
     #[cfg(target_os = "android")]
     let builder = builder
@@ -159,7 +164,10 @@ pub fn run() {
             get_platform_info,
             google_auth_status,
             google_auth_connect,
-            google_auth_disconnect
+            google_auth_disconnect,
+            app_commands::vault_status,
+            app_commands::vault_read_note,
+            app_commands::vault_list_trash
         ])
         .run(tauri::generate_context!())
         .expect("error while running myVault");
