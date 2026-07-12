@@ -15,6 +15,13 @@ pub struct DirectoryIdentity {
     file_id: [u8; 16],
 }
 
+/// Platform-complete identity of an opened regular file handle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileIdentity {
+    volume: u64,
+    file_id: [u8; 16],
+}
+
 /// Opaque identity of the mount instance containing a held directory.
 ///
 /// Linux distinguishes kernel-unique mount ids from the legacy id returned by
@@ -51,6 +58,28 @@ impl DirectoryIdentity {
 /// identifier.
 pub fn directory_identity(directory: &Dir) -> io::Result<DirectoryIdentity> {
     platform::directory_identity(directory)
+}
+
+/// Reads a complete identity from an already-open file handle.
+///
+/// # Errors
+/// Returns the platform error when complete identity cannot be obtained.
+pub fn file_identity(file: &cap_std::fs::File) -> io::Result<FileIdentity> {
+    #[cfg(windows)]
+    {
+        platform::file_identity(file)
+    }
+    #[cfg(not(windows))]
+    {
+        use cap_fs_ext::MetadataExt;
+        let metadata = file.metadata()?;
+        let mut file_id = [0_u8; 16];
+        file_id[..8].copy_from_slice(&metadata.ino().to_ne_bytes());
+        Ok(FileIdentity {
+            volume: metadata.dev(),
+            file_id,
+        })
+    }
 }
 
 /// Reads a mount-instance identity exclusively from a held directory.

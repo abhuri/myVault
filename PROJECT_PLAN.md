@@ -487,7 +487,10 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - Android native no-backup private-root capability ถูก merge เข้า `main` ผ่าน PR #13 ที่ merge commit `35ddfd1` แล้วค่ะ
 - immutable snapshot store พร้อม canonical timestamp, stable Vault binding, bounded payload, atomic no-replace publication และ mount-instance privacy proof ถูก merge เข้า `main` ผ่าน PR #14 ที่ merge commit `a8a64c4` แล้วค่ะ
 - cross-process snapshot operation lock, bounded inventory และ deterministic retention dry-run ถูก merge เข้า `main` ผ่าน PR #15 ที่ merge commit `bc1981a` แล้วค่ะ
-- immutable GC plan, atomic quarantine detach, bounded marker staging และ crash recovery ผ่าน independent audit สถานะ SAFE บน branch `agent/phase-1-snapshot-quarantine` แล้ว โดยยังไม่มี production deletion path ค่ะ
+- immutable GC plan, atomic quarantine detach, bounded marker staging และ crash recovery ถูก merge เข้า `main` ผ่าน PR #16 ที่ merge commit `c779083` หลัง independent audit สถานะ SAFE และ cross-platform CI ผ่านครบแล้วค่ะ
+- verified quarantined byte deletion และ completed-run cleanup บน branch `agent/phase-1-snapshot-delete` ผ่าน independent deep audit สถานะ SAFE โดยไม่เหลือ P0/P1/P2 แล้วค่ะ
+- deletion ใช้ nested two-pass preflight, held-handle-bound identity, payload → manifest → empty item ordering, canonical completion marker และ retained terminal ledger เพื่อให้ crash retry พิสูจน์สถานะได้ค่ะ
+- retained terminal ledgers ไม่ถูกนับใน active-run cap 128 รายการ แต่ physical evidence scan จำกัด 512 รายการและสงวน capacity ก่อน terminal publication ค่ะ Ledger compaction ถูกเลื่อนไปหลัง v0.1 ค่ะ
 - package manager ที่เลือกคือ `pnpm` ค่ะ
 - Tauri 2, React, TypeScript และ Rust scaffold ถูกสร้างที่ `apps/tauri` ค่ะ
 - diagnostic shell มี Rust platform bridge, CodeMirror, Mermaid strict mode, Sigma 1,000/5,000-node probes, runtime evidence และ Android Google authorization controls แล้วค่ะ
@@ -532,14 +535,23 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 
 ## 15. Next Actions
 
-1. เปิด PR และรัน cross-platform CI สำหรับ immutable GC plan, atomic quarantine detach และ crash recovery จากนั้น merge เมื่อทุก check ผ่านค่ะ
-2. เพิ่ม verified quarantined byte deletion และ completed-run cleanup โดยแตะเฉพาะ detached marker/item ที่ตรวจครบค่ะ
-3. สร้าง app-service, coherent read, bounded Trash listing, VaultSession, watcher และ least-privilege Tauri commands ค่ะ
-4. สร้าง macOS-first Local Desktop Demo ด้วย Synthetic Demo Vault, autosave 750 ms และ Obsidian-inspired dark UI ตาม canonical direction `Technical Utility` ค่ะ
-5. เชื่อม editor/reader, Mermaid, attachments, backlinks, outline, search, quick switcher และ prototype graph แล้วรัน Demo acceptance ค่ะ
-6. หลังคุณโอยืนยัน Google API Services User Data Policy จึงเริ่ม Drive Sync milestone ค่ะ Physical Android validation เลื่อนไว้จนกว่าจะมีอุปกรณ์ค่ะ
+1. เพิ่ม verified quarantined byte deletion และ completed-run cleanup โดยแตะเฉพาะ detached marker/item ที่ตรวจครบ พร้อม independent safety audit และ cross-platform CI ค่ะ
+2. สร้าง app-service, coherent read, bounded Trash listing, VaultSession, watcher และ least-privilege Tauri commands ค่ะ
+3. สร้าง macOS-first Local Desktop Demo ด้วย Synthetic Demo Vault, autosave 750 ms และ Obsidian-inspired dark UI ตาม canonical direction `Technical Utility` ค่ะ
+4. เชื่อม editor/reader, Mermaid, attachments, backlinks, outline, search, quick switcher และ prototype graph แล้วรัน Demo acceptance ค่ะ
+5. หลังคุณโอยืนยัน Google API Services User Data Policy จึงเริ่ม Drive Sync milestone ค่ะ Physical Android validation เลื่อนไว้จนกว่าจะมีอุปกรณ์ค่ะ
 
 ## 16. Session Handoff
+
+### Approved PR18 Service Slice
+
+- หลัง physical snapshot deletion ผ่าน audit ให้เพิ่ม coherent `read_note_with_revision` ใน `myvault-core` โดยอ่าน held file stream เดียว จำกัด 16 MiB รองรับเฉพาะ `.md`/`.MD` และคำนวณ revision จาก byte ที่คืนจริงค่ะ
+- เพิ่ม deterministic bounded Trash item pagination จำกัด scan 8,192 entries และ page 1–100 entries โดย valid evidence แสดง metadata และ malformed/future evidence แสดงเป็น opaque โดยไม่เปิดสิทธิ์ restore ค่ะ
+- สร้าง crate `myvault-app-service` ที่ไม่ขึ้นกับ Tauri, UI, Drive, OAuth, mutations หรือ snapshots และถือ opaque `VaultSessionId` สำหรับป้องกัน response จาก Vault เก่าปะปนกับ Vault ใหม่ค่ะ
+- frontend-safe errors ต้องเป็น stable code และห้ามเผย absolute path, OS error, token หรือ backtrace ค่ะ
+- Tauri PR18 เปิดเฉพาะ `vault_status`, `vault_read_note` และ `vault_list_trash` โดยห้ามมี IPC command ที่รับ arbitrary Vault root path ค่ะ
+- native folder picker, Android managed-root activation, watcher, save/autosave, snapshot orchestration, explorer inventory และ UI integration แยกเป็น milestone ถัดไปค่ะ
+- PR18 acceptance คือ integration test เปิด Synthetic Vault จาก trusted native boundary, อ่าน Markdown ภาษาไทยพร้อม exact revision, list valid/opaque Trash อย่าง deterministic และ serialize safe DTO ได้โดยไม่มี ambient filesystem path จาก frontend ค่ะ
 
 ### Current Handoff
 
@@ -558,7 +570,9 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - Gradle cache physical path คือ `/Volumes/AWB-Apps/Developer/Gradle` และ `~/.gradle` เป็น symlink ค่ะ
 - remote repository คือ `https://github.com/abhuri/myVault.git` ค่ะ
 - `main` มี initial commit `6597e18` ค่ะ
-- active branch คือ `agent/phase-1-snapshot-quarantine` ค่ะ PR #1 ถึง PR #15 merge เข้า `main` แล้ว และ quarantine detach/recovery ผ่าน deep safety audit โดยยังไม่ลบข้อมูลจริงค่ะ
+- active branch คือ `agent/phase-1-snapshot-delete` ค่ะ PR #1 ถึง PR #16 merge เข้า `main` แล้ว และกำลังเพิ่ม physical deletion เฉพาะ quarantine item ที่มี durable detached marker ค่ะ
+- PR17 implementation ผ่าน strict host checks, snapshot tests 62 รายการ, private-fs 13 รายการ, platform-fs 2 รายการ, Windows platform/private cross-check และ Android aarch64 cross-Clippy แล้วค่ะ
+- malicious same-UID syscall race บน Unix/macOS อยู่นอก threat model ที่ประกาศไว้ เพราะไม่มี portable unlink-by-handle primitive; cooperating myVault processes ถูก serialize ด้วย operation lock ค่ะ
 - Phase 0 diagnostic shell และ contracts ถูกสร้างแล้วค่ะ
 - local checks ที่ผ่านคือ TypeScript, Vitest 8 tests, Vite build, Rust fmt/clippy, Rust 49 tests, macOS Keychain live probe และ Tauri debug build ค่ะ
 - GitHub quality, Android compile + 16 KB alignment, Windows NSIS และ Ubuntu AppImage checks ของ Draft PR #1 ผ่านที่ commit `0aecda5` แล้วค่ะ
@@ -615,6 +629,12 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 
 ### 2026-07-12
 
+- เพิ่ม marker-authorized physical quarantine deletion พร้อม nested two-pass preflight ซึ่งตรวจทุก candidate และ unknown evidence ก่อน mutation ใด ๆ ค่ะ
+- เพิ่ม canonical completed-run marker, retained terminal ledger, bounded attempt families, reserved physical capacity และ retry-convergent fault matrix ครบทุก destructive boundary ค่ะ
+- เพิ่ม Windows full file identity, held-handle-bound removal contract และ `DeletedButLockLost(DeletionReport)` เพื่อรักษาข้อเท็จจริงหลัง operation lock สูญหายค่ะ
+- PR17 ผ่าน independent deep audit สถานะ SAFE โดยไม่เหลือ P0/P1/P2 พร้อม snapshot 62, private-fs 13 และ platform-fs 2 tests ค่ะ
+- merge PR #16 ที่ commit `c779083` พร้อม immutable GC plan, atomic quarantine detach และ crash recovery หลัง quality, Android, Windows และ Ubuntu CI ผ่านทั้งหมดค่ะ
+- เริ่ม verified quarantined byte deletion โดยล็อก invariant ว่า หลัง detached marker ห้ามแตะ snapshot object ชื่อเดิม และหลัง completed-run marker ให้ทำ metadata cleanup เท่านั้นค่ะ
 - merge PR #15 ที่ commit `bc1981a` พร้อม cross-process lock, bounded inventory และ deterministic retention dry-run หลัง cross-platform CI ผ่านทั้งหมดค่ะ
 - เพิ่ม atomic work-to-runs GC plan publication, bounded marker staging, quarantine detach และ destination-only crash recovery โดยไม่มี unlink/remove/delete ค่ะ
 - quarantine detach ผ่าน independent audit สถานะ SAFE หลังปิด request-order, run-cap, marker-staging, typed outcome, plan semantics และ Windows cfg findings ค่ะ

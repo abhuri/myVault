@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 mod quarantine;
 mod retention;
+pub use quarantine::{DeletionOutcome, DeletionReport};
 pub use quarantine::{GcCandidate, GcPlan, QuarantineOutcome, QuarantineReport};
 pub use retention::{
     RetentionCandidate, RetentionPlan, RetentionPolicy, RetentionReason, MAX_RETENTION_CANDIDATES,
@@ -50,6 +51,10 @@ pub enum DurabilityBoundary {
     QuarantineState,
     QuarantineMarkerStaging,
     SourceObjects,
+    DeletionItem,
+    DeletionItems,
+    DeletionRun,
+    DeletionRuns,
 }
 
 #[derive(Debug)]
@@ -83,6 +88,7 @@ pub enum Error {
     InvalidGcPlan,
     QuarantineCollision,
     QuarantinedButLockLost(QuarantineReport),
+    DeletedButLockLost(DeletionReport),
     DetachedButNotSynced {
         run_id: Uuid,
         snapshot_id: Uuid,
@@ -94,6 +100,18 @@ pub enum Error {
         snapshot_id: Uuid,
         source: Box<Error>,
     },
+    RemovedButNotSynced {
+        run_id: Uuid,
+        snapshot_id: Option<Uuid>,
+        boundary: DurabilityBoundary,
+        source: Box<Error>,
+    },
+    RemovedAndSyncedButInterrupted {
+        run_id: Uuid,
+        snapshot_id: Option<Uuid>,
+        boundary: DurabilityBoundary,
+        source: Box<Error>,
+    },
     PublishedButNotSynced {
         boundary: DurabilityBoundary,
         source: private_fs::Error,
@@ -101,6 +119,7 @@ pub enum Error {
 }
 
 impl fmt::Display for Error {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
@@ -160,6 +179,11 @@ impl fmt::Display for Error {
                 "quarantine run {} detached {} items but operation lock was lost",
                 report.run_id, report.detached
             ),
+            Self::DeletedButLockLost(report) => write!(
+                formatter,
+                "quarantine run {} deletion completed but operation lock was lost",
+                report.run_id
+            ),
             Self::DetachedButNotSynced {
                 run_id,
                 snapshot_id,
@@ -176,6 +200,24 @@ impl fmt::Display for Error {
             } => write!(
                 formatter,
                 "snapshot {snapshot_id} detach outcome in run {run_id} is unknown: {source}"
+            ),
+            Self::RemovedButNotSynced {
+                run_id,
+                snapshot_id,
+                boundary,
+                source,
+            } => write!(
+                formatter,
+                "quarantine evidence {snapshot_id:?} removed in run {run_id} but {boundary:?} sync failed: {source}"
+            ),
+            Self::RemovedAndSyncedButInterrupted {
+                run_id,
+                snapshot_id,
+                boundary,
+                source,
+            } => write!(
+                formatter,
+                "quarantine evidence {snapshot_id:?} was removed and {boundary:?} synced in run {run_id}, then processing was interrupted: {source}"
             ),
             Self::PublishedButNotSynced { boundary, source } => {
                 write!(
