@@ -170,6 +170,7 @@ pub fn run() {
             google_auth_disconnect,
             app_commands::vault_status,
             app_commands::vault_read_note,
+            app_commands::vault_save_note,
             app_commands::vault_list_trash,
             app_commands::vault_list_explorer,
             app_commands::vault_choose_folder

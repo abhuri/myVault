@@ -1,6 +1,6 @@
 use myvault_app_service::{
-    AppError, AppService, ExplorerPageDto, NoteDto, TrashPageDto, VaultSessionId, VaultStatusDto,
-    EXPLORER_DEFAULT_PAGE_SIZE,
+    AppError, AppService, ExplorerPageDto, NoteDto, SaveNoteDto, TrashPageDto, VaultSessionId,
+    VaultStatusDto, EXPLORER_DEFAULT_PAGE_SIZE,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -24,6 +24,10 @@ fn resolved_trash_limit(limit: Option<usize>) -> usize {
 
 fn resolved_explorer_limit(limit: Option<usize>) -> usize {
     limit.unwrap_or(EXPLORER_DEFAULT_PAGE_SIZE)
+}
+
+fn map_save_join_failure() -> AppError {
+    AppError::write_outcome_unknown()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -79,6 +83,30 @@ pub async fn vault_read_note(
     tauri::async_runtime::spawn_blocking(move || service.read_note(session_id, &path))
         .await
         .map_err(|_| AppError::internal())?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn vault_save_note(
+    service: tauri::State<'_, Arc<AppService>>,
+    session_id: String,
+    path: String,
+    text: String,
+    expected_revision_hex: String,
+    expected_byte_len: u64,
+) -> Result<SaveNoteDto, AppError> {
+    let session_id = parse_session_id(&session_id)?;
+    let service = Arc::clone(service.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        service.save_note(
+            session_id,
+            &path,
+            &text,
+            &expected_revision_hex,
+            expected_byte_len,
+        )
+    })
+    .await
+    .map_err(|_| map_save_join_failure())?
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -177,6 +205,17 @@ mod tests {
         assert_eq!(
             json,
             "{\"code\":\"internal\",\"message\":\"the application service is unavailable\"}"
+        );
+        assert!(!json.contains("path"));
+        assert!(!json.contains("backtrace"));
+    }
+
+    #[test]
+    fn save_join_failure_is_exact_write_outcome_unknown_json() {
+        let json = serde_json::to_string(&map_save_join_failure()).expect("safe error JSON");
+        assert_eq!(
+            json,
+            "{\"code\":\"writeOutcomeUnknown\",\"message\":\"the note write outcome is unknown\"}"
         );
         assert!(!json.contains("path"));
         assert!(!json.contains("backtrace"));

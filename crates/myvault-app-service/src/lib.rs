@@ -123,6 +123,23 @@ pub struct ExplorerPageDto {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub enum SaveDurabilityDto {
+    FullySynced,
+    DirectorySyncUnsupported,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveNoteDto {
+    pub session_id: VaultSessionId,
+    pub path: String,
+    pub revision_hex: String,
+    pub byte_len: u64,
+    pub durability: SaveDurabilityDto,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum AppErrorCode {
     NoActiveSession,
     StaleSession,
@@ -130,6 +147,9 @@ pub enum AppErrorCode {
     InvalidPath,
     InvalidCursor,
     InvalidLimit,
+    InvalidRevision,
+    StaleRevision,
+    WriteOutcomeUnknown,
     NoteNotFound,
     NoteNotUtf8,
     VaultUnavailable,
@@ -172,6 +192,14 @@ impl AppError {
         Self::new(
             AppErrorCode::UnsupportedPlatform,
             "this operation is unsupported on the current platform",
+        )
+    }
+
+    #[must_use]
+    pub const fn write_outcome_unknown() -> Self {
+        Self::new(
+            AppErrorCode::WriteOutcomeUnknown,
+            "the note write outcome is unknown",
         )
     }
 }
@@ -378,6 +406,86 @@ impl AppService {
         })
     }
 
+    /// Replaces one Markdown note only when its exact current revision matches.
+    ///
+    /// # Errors
+    /// Rejects invalid paths/revisions, oversized text, stale revisions, unknown
+    /// publication outcomes, unavailable evidence, and stale sessions.
+    pub fn save_note(
+        &self,
+        session_id: VaultSessionId,
+        portable_path: &str,
+        text: &str,
+        expected_revision_hex: &str,
+        expected_byte_len: u64,
+    ) -> Result<SaveNoteDto, AppError> {
+        self.save_note_with_hook(
+            session_id,
+            portable_path,
+            text,
+            expected_revision_hex,
+            expected_byte_len,
+            || {},
+        )
+    }
+
+    fn save_note_with_hook(
+        &self,
+        session_id: VaultSessionId,
+        portable_path: &str,
+        text: &str,
+        expected_revision_hex: &str,
+        expected_byte_len: u64,
+        after_mutating_session_lock: impl FnOnce(),
+    ) -> Result<SaveNoteDto, AppError> {
+        let path = VaultPath::from_portable(portable_path).map_err(|_| invalid_path_error())?;
+        let supported_extension = path
+            .as_path()
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|extension| matches!(extension, "md" | "MD"));
+        if !supported_extension {
+            return Err(invalid_path_error());
+        }
+        let bytes = text.as_bytes();
+        if bytes.len() > myvault_core::MAX_NOTE_BYTES {
+            return Err(resource_limit_error());
+        }
+        let expected =
+            myvault_core::FileRevision::new(expected_revision_hex.to_owned(), expected_byte_len)
+                .map_err(map_save_error)?;
+        let replacement = myvault_core::FileRevision::from_bytes(bytes);
+        let canonical = path.as_str().to_owned();
+        // Mutations take the session read lock before the core vault mutation
+        // lock. Activation/close need the session write lock and never hold a
+        // core mutation lock, so there is no reverse lock order. Holding this
+        // guard linearizes publication before a later switch/close; the hook is
+        // private and exists only for deterministic lock-order tests.
+        let current = self.session.read().map_err(|_| internal_error())?;
+        let session = current.as_ref().ok_or_else(no_session_error)?;
+        if session.id != session_id {
+            return Err(stale_session_error());
+        }
+        after_mutating_session_lock();
+        let outcome = session
+            .vault
+            .replace_content_file_if_revision(&path, &expected, bytes, myvault_core::MAX_NOTE_BYTES)
+            .map_err(map_save_error)?;
+        let myvault_core::ReplaceContentOutcome::Replaced(durability) = outcome;
+        Ok(SaveNoteDto {
+            session_id,
+            path: canonical,
+            revision_hex: replacement.hex,
+            byte_len: replacement.byte_len,
+            durability: match durability {
+                myvault_core::MoveDurability::FullySynced => SaveDurabilityDto::FullySynced,
+                myvault_core::MoveDurability::DirectorySyncUnsupported => {
+                    SaveDurabilityDto::DirectorySyncUnsupported
+                }
+            },
+        })
+    }
+
     fn with_session<T>(
         &self,
         requested: VaultSessionId,
@@ -427,15 +535,38 @@ fn map_note_error(error: CoreError) -> AppError {
     match error {
         CoreError::InvalidRelativePath(_)
         | CoreError::PathEscapesVault(_)
+        | CoreError::AutomaticObsidianWriteDenied(_)
+        | CoreError::TrashWriteDenied(_)
         | CoreError::TrashAccessDenied(_)
+        | CoreError::InvalidMove { .. }
         | CoreError::RevisionTargetNotFile(_) => invalid_path_error(),
-        CoreError::ResourceLimitExceeded { .. } => AppError::new(
-            AppErrorCode::ResourceLimit,
-            "the requested resource exceeds its safe limit",
-        ),
+        CoreError::ResourceLimitExceeded { .. } => resource_limit_error(),
         CoreError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
             AppError::new(AppErrorCode::NoteNotFound, "the note was not found")
         }
+        _ => map_core_error(error),
+    }
+}
+
+fn map_save_error(error: CoreError) -> AppError {
+    match error {
+        CoreError::InvalidRevision => AppError::new(
+            AppErrorCode::InvalidRevision,
+            "the expected note revision is invalid",
+        ),
+        CoreError::StaleRevision { .. } => AppError::new(
+            AppErrorCode::StaleRevision,
+            "the note changed before it could be saved",
+        ),
+        CoreError::ReplaceContentOutcomeUnknown { .. } => AppError::write_outcome_unknown(),
+        CoreError::InvalidRelativePath(_)
+        | CoreError::PathEscapesVault(_)
+        | CoreError::AutomaticObsidianWriteDenied(_)
+        | CoreError::TrashWriteDenied(_)
+        | CoreError::TrashAccessDenied(_)
+        | CoreError::InvalidMove { .. }
+        | CoreError::RevisionTargetNotFile(_) => invalid_path_error(),
+        CoreError::ResourceLimitExceeded { .. } => resource_limit_error(),
         _ => map_core_error(error),
     }
 }
@@ -445,10 +576,7 @@ fn map_note_error(error: CoreError) -> AppError {
 #[allow(clippy::needless_pass_by_value)]
 fn map_core_error(error: CoreError) -> AppError {
     if matches!(error, CoreError::ResourceLimitExceeded { .. }) {
-        AppError::new(
-            AppErrorCode::ResourceLimit,
-            "the requested resource exceeds its safe limit",
-        )
+        resource_limit_error()
     } else {
         AppError::new(
             AppErrorCode::VaultUnavailable,
@@ -470,6 +598,13 @@ const fn stale_session_error() -> AppError {
 
 const fn invalid_path_error() -> AppError {
     AppError::new(AppErrorCode::InvalidPath, "the note path is invalid")
+}
+
+const fn resource_limit_error() -> AppError {
+    AppError::new(
+        AppErrorCode::ResourceLimit,
+        "the requested resource exceeds its safe limit",
+    )
 }
 
 const fn invalid_session_id_error() -> AppError {
@@ -539,6 +674,88 @@ mod tests {
                     .expect_err("old DTO suppressed");
                 assert_eq!(error.code, AppErrorCode::StaleSession);
             });
+        }
+    }
+
+    #[test]
+    fn save_linearizes_before_switch_or_close_and_returns_success_not_stale() {
+        for switch in [false, true] {
+            let temporary = tempfile::tempdir().expect("temporary");
+            let first = temporary.path().join("first");
+            let second = temporary.path().join("second");
+            fs::create_dir(&first).expect("first");
+            fs::create_dir(&second).expect("second");
+            fs::write(first.join("note.md"), b"old").expect("old note");
+            let first = first.canonicalize().expect("canonical first");
+            let second = second.canonicalize().expect("canonical second");
+            let service = AppService::new();
+            let first_id = service
+                .activate_trusted_vault(Vault::open(&first).expect("first vault"))
+                .expect("activate first")
+                .session_id
+                .expect("first id");
+            let expected = myvault_core::FileRevision::from_bytes(b"old");
+            let locked = Arc::new(Barrier::new(2));
+            let resume = Arc::new(Barrier::new(2));
+            std::thread::scope(|scope| {
+                let locked_worker = Arc::clone(&locked);
+                let resume_worker = Arc::clone(&resume);
+                let service_ref = &service;
+                let save = scope.spawn(move || {
+                    service_ref.save_note_with_hook(
+                        first_id,
+                        "note.md",
+                        "ใหม่",
+                        &expected.hex,
+                        expected.byte_len,
+                        || {
+                            locked_worker.wait();
+                            resume_worker.wait();
+                        },
+                    )
+                });
+                locked.wait();
+                assert!(matches!(
+                    service.session.try_write(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                let (started_tx, started_rx) = std::sync::mpsc::channel();
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let service_ref = &service;
+                let transition = scope.spawn(move || {
+                    started_tx.send(()).expect("started");
+                    let result = if switch {
+                        service_ref
+                            .activate_trusted_vault(Vault::open(&second).expect("second vault"))
+                            .map(|_| ())
+                    } else {
+                        service_ref.close(first_id).map(|_| ())
+                    };
+                    done_tx.send(()).expect("done");
+                    result
+                });
+                started_rx.recv().expect("transition started");
+                assert!(matches!(
+                    done_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ));
+                resume.wait();
+                let saved = save.join().expect("save worker").expect("save succeeds");
+                assert_eq!(saved.session_id, first_id);
+                assert_eq!(
+                    saved.revision_hex,
+                    myvault_core::FileRevision::from_bytes("ใหม่".as_bytes()).hex
+                );
+                transition
+                    .join()
+                    .expect("transition worker")
+                    .expect("transition succeeds after save");
+                done_rx.recv().expect("transition done");
+            });
+            assert_eq!(
+                fs::read(first.join("note.md")).expect("published note"),
+                "ใหม่".as_bytes()
+            );
         }
     }
 }
