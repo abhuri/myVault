@@ -537,11 +537,11 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 
 ## 15. Next Actions
 
-1. push/open Demo PR และรอ quality, Android, Windows และ Ubuntu CI ผ่านค่ะ
-2. merge Demo PR แล้ว tag `v0.1.0-demo` พร้อม GitHub Release notes ค่ะ
-3. ให้คุณโอทดลอง `.app` กับ copy ของ Synthetic Demo Vault และบันทึก usability feedback ค่ะ
-4. ทำ P3 code splitting และ frontmatter/properties presentation หลัง Demo โดยไม่บล็อก tag ค่ะ
-5. หลังคุณโอยืนยัน Google API Services User Data Policy จึงเริ่ม Drive Sync milestone ค่ะ Physical Android validation เลื่อนไว้จนกว่าจะมีอุปกรณ์ค่ะ
+1. ให้คุณโอทดลอง release กับ copy ของ Vault และบันทึก usability feedback ค่ะ
+2. ทำ P3 code splitting และ frontmatter/properties presentation โดยไม่กระทบ safety contract ของ Demo ค่ะ
+3. เพิ่ม persistent full-vault index สำหรับ content search, backlinks และ graph ใน milestone ถัดไปค่ะ
+4. หลังคุณโอยืนยัน Google API Services User Data Policy จึงเริ่ม Drive Sync milestone ค่ะ
+5. ทำ physical Android validation เมื่อมีอุปกรณ์ โดยผล compile/alignment ปัจจุบันไม่ใช้แทน device evidence ค่ะ
 
 ## 16. Session Handoff
 
@@ -572,7 +572,7 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - Gradle cache physical path คือ `/Volumes/AWB-Apps/Developer/Gradle` และ `~/.gradle` เป็น symlink ค่ะ
 - remote repository คือ `https://github.com/abhuri/myVault.git` ค่ะ
 - `main` มี initial commit `6597e18` ค่ะ
-- active branch คือ `agent/demo-save-bridge` ค่ะ PR #1 ถึง PR #19 merge เข้า `main` แล้ว และกำลังส่ง Local Demo PR ค่ะ
+- `v0.1.0-demo` release แล้วจาก merge commit `0c5fbf0` ค่ะ PR #1 ถึง PR #20 merge เข้า `main` แล้วค่ะ
 - PR17 merge หลังผ่าน strict host checks, snapshot tests 62 รายการ, private-fs 13 รายการ, platform-fs 2 รายการ, Windows platform/private cross-check และ Android aarch64 cross-Clippy แล้วค่ะ
 - PR18 core/app-service ผ่าน independent deep audit สถานะ SAFE พร้อม core 73 unit tests + integration suites, note-read 4, Trash-listing 7 และ app-service 7 tests ค่ะ
 - PR18 Tauri bridge เปิดเฉพาะ `vault_status`, `vault_read_note` และ `vault_list_trash`, ใช้ canonical session ID + `spawn_blocking`, ไม่มี root/open/activation IPC และผ่าน Tauri tests 4 รายการค่ะ
@@ -585,6 +585,7 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - frontend deep audit ปิด edit-during-save, cross-session response, unsafe switch, sanitizer/CSS spoof, wiki-code corruption, focus containment และ WebView top-navigation findings ครบ โดย verdict สุดท้าย SAFE ค่ะ
 - local gates ผ่าน TypeScript, Vitest 19, Vite build, app-service 10 tests, Tauri 6 tests, strict host Clippy, Android aarch64 cross-Clippy และ macOS debug `.app` bundle ค่ะ
 - live macOS test ผ่าน native picker, 5-note explorer, Thai read, Reader table/code, exact autosave และ external-edit conflict ที่ไม่ overwrite disk ค่ะ
+- GitHub Release คือ `https://github.com/abhuri/myVault/releases/tag/v0.1.0-demo` พร้อม macOS ARM64, Windows x64, Linux amd64 และ SHA-256 checksums ค่ะ
 - malicious same-UID syscall race บน Unix/macOS อยู่นอก threat model ที่ประกาศไว้ เพราะไม่มี portable unlink-by-handle primitive; cooperating myVault processes ถูก serialize ด้วย operation lock ค่ะ
 - Phase 0 diagnostic shell และ contracts ถูกสร้างแล้วค่ะ
 - local checks ที่ผ่านคือ TypeScript, Vitest 8 tests, Vite build, Rust fmt/clippy, Rust 49 tests, macOS Keychain live probe และ Tauri debug build ค่ะ
@@ -603,7 +604,7 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - append-only recovery journal schema v4 ผ่าน 38 tests ไม่มี production unlink/hardlink cleanup API, typed operation บังคับ endpoint topology และ unsupported evidence ถูก report แบบ bounded/fail-closed ค่ะ
 - Trash, original-path Restore, NormalMove และ CaseRename services แบบ journal-first ผ่าน 45 tests โดย retained NormalMove/CaseRename ปฏิเสธ source-only topology ที่กำกวมเพื่อป้องกัน ABA ค่ะ
 - งานถัดไปคือ merge Android trusted no-backup proof PR → immutable private snapshot store → retention/quarantine GC ค่ะ OAuth client configuration รอคุณโอยืนยัน User Data Policy และ physical Android validation ถูกเลื่อนไว้ค่ะ
-- งานถัดไปคือ push/open Demo PR → cross-platform CI → merge → tag `v0.1.0-demo` และสร้าง GitHub Release ค่ะ OAuth/Drive และ physical Android validation ไม่บล็อก Local Demo ค่ะ
+- งานถัดไปคือคุณโอทดลอง release กับ Vault สำเนา → รวบรวม feedback → วาง milestone persistent index และ P3 polish ค่ะ OAuth/Drive กับ physical Android validation ยังเป็นงานถัดไปและไม่ย้อนกลับไปบล็อก Demo ที่ release แล้วค่ะ
 
 ### Handoff Update Template
 
@@ -642,6 +643,9 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 
 ### 2026-07-12
 
+- merge PR #20 ที่ commit `0c5fbf0` หลัง quality, Android, Windows และ Ubuntu CI ผ่านครบ แล้วออก GitHub Release `v0.1.0-demo` พร้อม macOS/Windows/Linux assets และ checksums ค่ะ
+- live macOS acceptance ยืนยัน native picker, Thai read, 750 ms autosave และ stale-revision conflict ที่รักษา external bytes โดยไม่ overwrite ค่ะ
+- frontend และ save bridge ผ่าน final independent deep audit สถานะ SAFE โดยไม่เหลือ P0/P1/P2 ค่ะ
 - merge PR #18 ที่ commit `596a9d5` พร้อม coherent note read, bounded Trash listing, opaque app session และ least-privilege Tauri read bridge หลัง cross-platform CI ผ่านทั้งหมดค่ะ
 - เพิ่ม desktop native folder picker แบบไม่มี path argument/response, Android typed unsupported response และ bounded explorer pagination สำหรับ Local Demo ค่ะ
 - harden การเปิด Vault ด้วย held no-follow root identity verification และ exact-looking replacement rejection ค่ะ
