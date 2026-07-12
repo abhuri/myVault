@@ -34,6 +34,13 @@ pub enum CoreError {
         actual: crate::FileRevision,
     },
     MoveDurabilitySyncFailed,
+    StagePayloadPrepublicationSyncFailed {
+        source_path: PathBuf,
+        destination_path: PathBuf,
+        destination_sync: crate::DirectorySyncStatus,
+        source_sync: crate::DirectorySyncStatus,
+        cause: Box<CoreError>,
+    },
     AppDataInsideVault {
         app_data: PathBuf,
         vault: PathBuf,
@@ -113,6 +120,7 @@ impl fmt::Display for CoreError {
             | Self::RevisionTargetNotFile(_)
             | Self::StaleRevision { .. }
             | Self::MoveDurabilitySyncFailed
+            | Self::StagePayloadPrepublicationSyncFailed { .. }
             | Self::VerifiedMoveOutcomeUnknown { .. } => {
                 unreachable!("handled before main error formatting")
             }
@@ -190,6 +198,7 @@ impl fmt::Display for CoreError {
 }
 
 impl CoreError {
+    #[allow(clippy::too_many_lines)]
     fn fmt_special(&self, formatter: &mut fmt::Formatter<'_>) -> Option<fmt::Result> {
         match self {
             Self::InvalidRelativePath(path) => Some(write!(
@@ -275,7 +284,19 @@ impl CoreError {
                 actual.hex
             )),
             Self::MoveDurabilitySyncFailed => Some(formatter.write_str(
-                "one or more post-publication directory sync attempts failed",
+                "one or more directory sync attempts failed",
+            )),
+            Self::StagePayloadPrepublicationSyncFailed {
+                source_path,
+                destination_path,
+                destination_sync,
+                source_sync,
+                cause,
+            } => Some(write!(
+                formatter,
+                "trash payload was not published from {} to {} because prepublication sync failed (destination sync: {destination_sync}; source sync: {source_sync}): {cause}",
+                source_path.display(),
+                destination_path.display()
             )),
             Self::VerifiedMoveOutcomeUnknown {
                 source_path,
@@ -306,7 +327,8 @@ impl std::error::Error for CoreError {
                 ..
             } => destination_sync.error().or_else(|| source_sync.error()),
             Self::VerifiedMoveOutcomeUnknown { verification, .. } => Some(verification.as_ref()),
-            Self::TrashManifestOutcomeUnknown { cause, .. }
+            Self::StagePayloadPrepublicationSyncFailed { cause, .. }
+            | Self::TrashManifestOutcomeUnknown { cause, .. }
             | Self::TrashPayloadOutcomeUnknown { cause, .. } => Some(cause.as_ref()),
             Self::Sqlite(error) => Some(error),
             _ => None,

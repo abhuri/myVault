@@ -228,6 +228,14 @@ impl<'vault> TrashStore<'vault> {
 pub enum PrepareManifestOutcome {
     Prepared,
     AlreadyPrepared,
+    AlreadyPublished,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StagePayloadOutcome {
+    Staged(crate::MoveDurability),
+    AlreadyStaged(crate::MoveDurability),
+    AlreadyPublished(crate::MoveDurability),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

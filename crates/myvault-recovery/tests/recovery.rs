@@ -543,6 +543,7 @@ fn caller_supplied_operation_id_is_stable_and_identifiers_are_validated() {
             Uuid::new_v4(),
             Uuid::nil(),
             manifest.clone(),
+            1,
             "source.md",
             revision("note"),
         ),
@@ -553,10 +554,22 @@ fn caller_supplied_operation_id_is_stable_and_identifiers_are_validated() {
             Uuid::new_v4(),
             Uuid::new_v4(),
             manifest.to_uppercase(),
+            1,
             "source.md",
             revision("note"),
         ),
         Err(Error::InvalidManifestDigest)
+    ));
+    assert!(matches!(
+        RenameMoveIntent::new_trash(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            blake3::hash(b"manifest").to_hex().to_string(),
+            -1,
+            "source.md",
+            revision("note"),
+        ),
+        Err(Error::InvalidOperationTopology)
     ));
 }
 
@@ -587,6 +600,7 @@ fn every_operation_kind_round_trips_deterministically() {
             Uuid::new_v4(),
             trash_id,
             manifest.clone(),
+            1_700_000_000_000,
             "source.md",
             revision("note"),
         )
@@ -641,6 +655,7 @@ fn same_id_with_different_kind_or_payload_is_a_collision() {
         operation_id,
         Uuid::new_v4(),
         blake3::hash(b"manifest").to_hex().to_string(),
+        1,
         "source.md",
         revision("note"),
     )
@@ -779,6 +794,7 @@ fn decoded_public_structs_reject_cross_kind_endpoint_topologies() {
             Uuid::new_v4(),
             trash_id,
             manifest.clone(),
+            1,
             "source.md",
             revision("note"),
         )
@@ -857,6 +873,7 @@ fn decoded_endpoint_shape_cannot_be_relabeled_as_another_kind() {
                     operation_id,
                     trash_id,
                     manifest.clone(),
+                    1,
                     "source.md",
                     revision("note"),
                 )
@@ -877,6 +894,7 @@ fn decoded_endpoint_shape_cannot_be_relabeled_as_another_kind() {
                 2 => RecoveryOperationKind::Trash {
                     trash_id,
                     manifest_blake3: manifest.clone(),
+                    trashed_at_unix_ms: 1,
                 },
                 3 => RecoveryOperationKind::Restore {
                     trash_id,
@@ -914,6 +932,24 @@ fn legacy_and_noncanonical_journal_bytes_are_never_reinterpreted() {
         journal.read(legacy_id),
         Err(Error::UnsupportedVersion(2))
     ));
+
+    let version_3_id = Uuid::new_v4();
+    let version_3_bytes = write_unsupported(&app, version_3_id, 3);
+    assert_eq!(
+        journal.read_evidence(version_3_id).unwrap(),
+        JournalEvidence::Unsupported {
+            operation_id: version_3_id,
+            version: 3,
+        }
+    );
+    assert_eq!(
+        fs::read(
+            app.join("operation-journal")
+                .join(format!("{version_3_id}.json"))
+        )
+        .unwrap(),
+        version_3_bytes
+    );
 
     let expected = intent();
     let canonical = serde_json::to_string(&expected).unwrap();

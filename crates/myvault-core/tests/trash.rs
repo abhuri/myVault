@@ -3,7 +3,7 @@ use std::io::Write;
 
 use myvault_core::{
     CoreError, FileRevision, ManifestDigest, PrepareManifestOutcome, PublishItemOutcome,
-    RestoreItemOutcome, TrashArea, TrashId, TrashManifestV1, Vault, VaultPath,
+    RestoreItemOutcome, StagePayloadOutcome, TrashArea, TrashId, TrashManifestV1, Vault, VaultPath,
     MAX_TRASH_MANIFEST_BYTES, MAX_TRASH_PAYLOAD_BYTES,
 };
 use tempfile::TempDir;
@@ -183,7 +183,7 @@ fn prepare_is_idempotent_preserves_stale_temps_and_detects_collision() {
         store.prepare_staging_manifest(id(), &first).unwrap(),
         PrepareManifestOutcome::Prepared
     );
-    let stale = staging_directory(&root).join(".manifest-stale.tmp");
+    let stale = staging_directory(&root).join(".manifest-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.tmp");
     fs::write(&stale, b"stale").expect("stale temp");
     assert_eq!(
         store.prepare_staging_manifest(id(), &first).unwrap(),
@@ -210,6 +210,63 @@ fn prepare_is_idempotent_preserves_stale_temps_and_detects_collision() {
         store.read_manifest(TrashArea::Staging, id()).unwrap(),
         first
     );
+}
+
+#[test]
+fn prepare_after_publish_is_idempotent_and_never_recreates_staging() {
+    let (root, vault) = fixture();
+    let (manifest, digest) = prepare_staged_file(&root, &vault);
+    vault
+        .trash_store()
+        .publish_staging_item(id(), &digest)
+        .unwrap();
+
+    assert_eq!(
+        vault
+            .trash_store()
+            .prepare_staging_manifest(id(), &manifest)
+            .unwrap(),
+        PrepareManifestOutcome::AlreadyPublished
+    );
+    assert!(!staging_directory(&root).exists());
+}
+
+#[test]
+fn concurrent_prepare_and_publish_never_leave_both_uuid_directories() {
+    use std::sync::{Arc, Barrier};
+
+    let (root, vault) = fixture();
+    let (manifest, digest) = prepare_staged_file(&root, &vault);
+    let canonical = fs::canonicalize(root.path()).unwrap();
+    let prepare_vault = Vault::open(&canonical).unwrap();
+    let publish_vault = Vault::open(&canonical).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let prepare_barrier = Arc::clone(&barrier);
+    let publish_barrier = Arc::clone(&barrier);
+    let prepare = std::thread::spawn(move || {
+        prepare_barrier.wait();
+        prepare_vault
+            .trash_store()
+            .prepare_staging_manifest(id(), &manifest)
+    });
+    let publish = std::thread::spawn(move || {
+        publish_barrier.wait();
+        publish_vault
+            .trash_store()
+            .publish_staging_item(id(), &digest)
+    });
+
+    let prepare_outcome = prepare.join().unwrap().unwrap();
+    publish.join().unwrap().unwrap();
+    assert!(matches!(
+        prepare_outcome,
+        PrepareManifestOutcome::AlreadyPrepared | PrepareManifestOutcome::AlreadyPublished
+    ));
+    assert!(!staging_directory(&root).exists());
+    assert!(root
+        .path()
+        .join(format!(".trash/v1/items/{TRASH_ID}"))
+        .is_dir());
 }
 
 #[cfg(unix)]
@@ -306,13 +363,114 @@ fn stage_payload_is_bound_to_manifest_source_revision_and_digest() {
         Err(CoreError::StaleRevision { .. })
     ));
     fs::write(root.path().join(source.as_path()), b"hello").unwrap();
-    store
-        .stage_payload_if_revision(id(), &source, &manifest.digest().unwrap())
-        .expect("stage bound payload");
+    assert!(matches!(
+        store
+            .stage_payload_if_revision(id(), &source, &manifest.digest().unwrap())
+            .expect("stage bound payload"),
+        StagePayloadOutcome::Staged(_)
+    ));
     assert_eq!(
         fs::read(staging_directory(&root).join("payload")).unwrap(),
         b"hello"
     );
+}
+
+#[test]
+fn stage_retry_recognizes_staged_and_published_payloads() {
+    let (root, vault) = fixture();
+    let source = VaultPath::from_portable("note.md").unwrap();
+    fs::write(root.path().join(source.as_path()), b"hello").unwrap();
+    let manifest = manifest(source.as_str(), b"hello");
+    let digest = manifest.digest().unwrap();
+    let store = vault.trash_store();
+    store.prepare_staging_manifest(id(), &manifest).unwrap();
+
+    assert!(matches!(
+        store
+            .stage_payload_if_revision(id(), &source, &digest)
+            .unwrap(),
+        StagePayloadOutcome::Staged(_)
+    ));
+    assert!(matches!(
+        store
+            .stage_payload_if_revision(id(), &source, &digest)
+            .unwrap(),
+        StagePayloadOutcome::AlreadyStaged(_)
+    ));
+    store.publish_staging_item(id(), &digest).unwrap();
+    assert!(matches!(
+        store
+            .stage_payload_if_revision(id(), &source, &digest)
+            .unwrap(),
+        StagePayloadOutcome::AlreadyPublished(_)
+    ));
+}
+
+#[test]
+fn stage_retry_rejects_ambiguous_and_missing_topologies() {
+    let (root, vault) = fixture();
+    let source = VaultPath::from_portable("note.md").unwrap();
+    fs::write(root.path().join(source.as_path()), b"hello").unwrap();
+    let manifest = manifest(source.as_str(), b"hello");
+    let digest = manifest.digest().unwrap();
+    let store = vault.trash_store();
+    store.prepare_staging_manifest(id(), &manifest).unwrap();
+    fs::remove_file(root.path().join(source.as_path())).unwrap();
+    assert!(matches!(
+        store.stage_payload_if_revision(id(), &source, &digest),
+        Err(CoreError::InvalidTrashTopology(_))
+    ));
+
+    let (root, vault) = fixture();
+    let (_manifest, digest) = prepare_staged_file(&root, &vault);
+    fs::create_dir(root.path().join(format!(".trash/v1/items/{TRASH_ID}"))).unwrap();
+    assert!(matches!(
+        vault.trash_store().stage_payload_if_revision(
+            id(),
+            &VaultPath::from_portable("note.md").unwrap(),
+            &digest
+        ),
+        Err(CoreError::InvalidTrashTopology(_))
+    ));
+
+    let (root, vault) = fixture();
+    let (_manifest, digest) = prepare_staged_file(&root, &vault);
+    vault
+        .trash_store()
+        .publish_staging_item(id(), &digest)
+        .unwrap();
+    fs::write(root.path().join("note.md"), b"hello").unwrap();
+    assert!(matches!(
+        vault.trash_store().stage_payload_if_revision(
+            id(),
+            &VaultPath::from_portable("note.md").unwrap(),
+            &digest
+        ),
+        Err(CoreError::InvalidTrashTopology(_))
+    ));
+
+    let (root, vault) = fixture();
+    let (_manifest, digest) = prepare_staged_file(&root, &vault);
+    fs::remove_dir_all(staging_directory(&root)).unwrap();
+    assert!(matches!(
+        vault.trash_store().stage_payload_if_revision(
+            id(),
+            &VaultPath::from_portable("note.md").unwrap(),
+            &digest
+        ),
+        Err(CoreError::InvalidTrashTopology(_))
+    ));
+
+    let (root, vault) = fixture();
+    let (_manifest, digest) = prepare_staged_file(&root, &vault);
+    fs::write(staging_directory(&root).join("manifest.json"), b"{").unwrap();
+    assert!(matches!(
+        vault
+            .trash_store()
+            .stage_payload_if_revision(id(), &VaultPath::from_portable("note.md").unwrap(), &digest),
+        Err(CoreError::VerifiedMoveOutcomeUnknown { verification, .. })
+            if matches!(*verification, CoreError::InvalidTrashManifest(_))
+    ));
 }
 
 #[test]

@@ -1,0 +1,22 @@
+[package]
+name = "myvault-mutations"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Crash-safe mutation orchestration for myVault"
+
+[dependencies]
+myvault-core = { path = "../myvault-core" }
+myvault-recovery = { path = "../myvault-recovery" }
+uuid = { version = "=1.20.0", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "=3.23.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"
