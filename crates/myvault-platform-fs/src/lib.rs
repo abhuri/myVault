@@ -87,7 +87,7 @@ fn platform_mount_identity(directory: &Dir) -> io::Result<MountIdentity> {
 
     let legacy = rustix::fs::statx(directory, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)
         .map_err(io::Error::from)?;
-    if !legacy.stx_mask.contains(StatxFlags::MNT_ID) {
+    if legacy.stx_mask & StatxFlags::MNT_ID.bits() == 0 {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "statx did not report a mount id",
