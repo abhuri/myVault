@@ -16,13 +16,15 @@ use crate::path::{classify_component, component_collision_key, VaultPathClass};
 use crate::trash::{item_directory_path, manifest_path, payload_path};
 use crate::{
     CoreError, FileRevision, ManifestDigest, PrepareManifestOutcome, PublishItemOutcome,
-    RestoreItemOutcome, Result, StagePayloadOutcome, TrashArea, TrashId, TrashManifestV1,
-    TrashStore, VaultPath, MAX_TRASH_MANIFEST_BYTES,
+    RestoreItemOutcome, Result, StagePayloadOutcome, TrashArea, TrashId, TrashListEvidence,
+    TrashListPage, TrashManifestV1, TrashStore, VaultPath, MAX_TRASH_LIST_SCAN,
+    MAX_TRASH_MANIFEST_BYTES, MAX_TRASH_PAGE_SIZE,
 };
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 static MUTATION_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
 pub const DEFAULT_READ_LIMIT: usize = 16 * 1024 * 1024;
+pub const MAX_NOTE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_TRASH_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 /// In-process vault instances share a mutation lock, but another process can
 /// still alter the filesystem between descriptor-relative validation and commit.
@@ -59,6 +61,12 @@ pub struct InventoryEntry {
     pub path: VaultPath,
     pub kind: InventoryKind,
     pub size: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadNote {
+    pub bytes: Vec<u8>,
+    pub revision: FileRevision,
 }
 
 /// Identifies whether a write was explicitly initiated by the user.
@@ -229,6 +237,73 @@ impl Vault {
             });
         }
         Ok(bytes)
+    }
+
+    /// Reads one editable Markdown note and computes the revision from the
+    /// exact bytes returned by the same held-file stream.
+    ///
+    /// # Errors
+    /// Rejects internal/non-Markdown paths, symlinks, nonregular or multiply
+    /// linked files, and content larger than 16 MiB.
+    pub fn read_note_with_revision(&self, relative: &VaultPath) -> Result<ReadNote> {
+        Self::require_content_path(relative)?;
+        let supported_extension = relative
+            .as_path()
+            .extension()
+            .and_then(OsStr::to_str)
+            .is_some_and(|extension| matches!(extension, "md" | "MD"));
+        if !supported_extension {
+            return Err(CoreError::InvalidRelativePath(
+                relative.as_path().to_owned(),
+            ));
+        }
+
+        let _guard = self.lock_mutations()?;
+        let (parent, name) = self.open_parent_checked(relative)?;
+        self.reject_final_symlink(&parent, &name, relative)?;
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let mut file = parent.open_with(&name, &options)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(CoreError::RevisionTargetNotFile(
+                relative.as_path().to_owned(),
+            ));
+        }
+        if metadata.nlink() != 1 {
+            return Err(CoreError::InvalidRevision);
+        }
+        if metadata.len() > MAX_NOTE_BYTES as u64 {
+            return Err(CoreError::ResourceLimitExceeded {
+                resource: "note bytes",
+                limit: MAX_NOTE_BYTES,
+            });
+        }
+
+        let capacity = usize::try_from(metadata.len())
+            .unwrap_or(MAX_NOTE_BYTES)
+            .min(MAX_NOTE_BYTES);
+        let mut bytes = Vec::with_capacity(capacity);
+        Read::by_ref(&mut file)
+            .take(MAX_NOTE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_NOTE_BYTES {
+            return Err(CoreError::ResourceLimitExceeded {
+                resource: "note bytes",
+                limit: MAX_NOTE_BYTES,
+            });
+        }
+        let final_metadata = file.metadata()?;
+        if !final_metadata.is_file() {
+            return Err(CoreError::RevisionTargetNotFile(
+                relative.as_path().to_owned(),
+            ));
+        }
+        if final_metadata.nlink() != 1 {
+            return Err(CoreError::InvalidRevision);
+        }
+        let revision = FileRevision::from_bytes(&bytes);
+        Ok(ReadNote { bytes, revision })
     }
 
     /// Computes a descriptor-relative, no-follow BLAKE3 revision while reading
@@ -2075,6 +2150,244 @@ impl Vault {
 }
 
 impl TrashStore<'_> {
+    /// Lists a deterministic bounded page of published Trash evidence without
+    /// creating a missing Trash hierarchy or hashing payload contents.
+    ///
+    /// # Errors
+    /// Rejects invalid page sizes, unsafe hierarchy components, I/O failures,
+    /// or more than 8192 physical entries. Individual malformed/future items
+    /// are returned as opaque evidence.
+    pub fn list_items_page(&self, after: Option<TrashId>, limit: usize) -> Result<TrashListPage> {
+        self.list_items_page_with_hook(after, limit, |_| Ok(()))
+    }
+
+    fn list_items_page_with_hook<F>(
+        &self,
+        after: Option<TrashId>,
+        limit: usize,
+        mut before_authoritative_reopen: F,
+    ) -> Result<TrashListPage>
+    where
+        F: FnMut(TrashId) -> Result<()>,
+    {
+        if !(1..=MAX_TRASH_PAGE_SIZE).contains(&limit) {
+            return Err(CoreError::ResourceLimitExceeded {
+                resource: "trash page size",
+                limit: MAX_TRASH_PAGE_SIZE,
+            });
+        }
+        let _guard = self.vault.lock_mutations()?;
+        let Some(items) = self.open_optional_items_directory()? else {
+            return Ok(TrashListPage {
+                entries: Vec::new(),
+                invalid_name_count: 0,
+                next_after: None,
+                has_more: false,
+                scanned_entries: 0,
+            });
+        };
+
+        let mut scanned_entries = 0_usize;
+        let mut invalid_name_count = 0_usize;
+        let mut ids = Vec::new();
+        for entry in items.entries()? {
+            let entry = entry?;
+            scanned_entries =
+                scanned_entries
+                    .checked_add(1)
+                    .ok_or(CoreError::ResourceLimitExceeded {
+                        resource: "trash list entries",
+                        limit: MAX_TRASH_LIST_SCAN,
+                    })?;
+            if scanned_entries > MAX_TRASH_LIST_SCAN {
+                return Err(CoreError::ResourceLimitExceeded {
+                    resource: "trash list entries",
+                    limit: MAX_TRASH_LIST_SCAN,
+                });
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                invalid_name_count += 1;
+                continue;
+            };
+            match TrashId::parse(&name) {
+                Ok(id) => ids.push(id),
+                Err(_) => invalid_name_count += 1,
+            }
+        }
+        ids.sort_unstable();
+
+        let start = after.map_or(0, |cursor| ids.partition_point(|id| *id <= cursor));
+        let selected = &ids[start..ids.len().min(start.saturating_add(limit))];
+        let has_more = start.saturating_add(selected.len()) < ids.len();
+        let mut entries = Vec::with_capacity(selected.len());
+        for id in selected {
+            let evidence =
+                match self.inspect_list_item(&items, *id, &mut before_authoritative_reopen) {
+                    Ok(evidence) => evidence,
+                    Err(error) if Self::is_opaque_list_evidence_error(&error) => {
+                        TrashListEvidence::Opaque { trash_id: *id }
+                    }
+                    Err(error) => return Err(error),
+                };
+            entries.push(evidence);
+        }
+
+        Ok(TrashListPage {
+            next_after: selected.last().copied(),
+            entries,
+            invalid_name_count,
+            has_more,
+            scanned_entries,
+        })
+    }
+
+    fn open_optional_items_directory(&self) -> Result<Option<Dir>> {
+        let mut current = self.vault.root_dir.try_clone()?;
+        for (name, portable) in [
+            (".trash", ".trash"),
+            ("v1", ".trash/v1"),
+            ("items", ".trash/v1/items"),
+        ] {
+            let path = VaultPath::from_portable(portable)?;
+            let parent = current;
+            self.vault.reject_sibling_collision(&parent, name, &path)?;
+            match parent.symlink_metadata(name) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
+            let display = self.vault.root_path.join(path.as_path());
+            current = open_child_dir_nofollow(&parent, OsStr::new(name), &display)?;
+            self.vault.reject_sibling_collision(&parent, name, &path)?;
+        }
+        Ok(Some(current))
+    }
+
+    fn is_opaque_list_evidence_error(error: &CoreError) -> bool {
+        matches!(
+            error,
+            CoreError::InvalidRelativePath(_)
+                | CoreError::SymlinkRejected(_)
+                | CoreError::InvalidTrashPath(_)
+                | CoreError::InvalidTrashManifest(_)
+                | CoreError::NonCanonicalTrashManifest
+                | CoreError::TrashManifestDigestMismatch
+                | CoreError::InvalidTrashTopology(_)
+                | CoreError::InvalidRevision
+                | CoreError::ResourceLimitExceeded {
+                    resource: "trash manifest bytes" | "trash payload bytes",
+                    ..
+                }
+        )
+    }
+
+    fn inspect_list_item<F>(
+        &self,
+        items: &Dir,
+        id: TrashId,
+        before_authoritative_reopen: &mut F,
+    ) -> Result<TrashListEvidence>
+    where
+        F: FnMut(TrashId) -> Result<()>,
+    {
+        let name = OsString::from(id.to_string());
+        let held = self.open_trash_item_directory(TrashArea::Items, id, items, &name)?;
+        let mut manifest_seen = false;
+        let mut payload_seen = false;
+        let mut temp_count = 0_usize;
+        let mut entry_count = 0_usize;
+        for entry in held.entries()? {
+            let entry = entry?;
+            entry_count += 1;
+            if entry_count > MAX_TRASH_ITEM_ENTRIES {
+                return Err(CoreError::InvalidTrashTopology(
+                    "trash item contains too many entries",
+                ));
+            }
+            let name = entry.file_name();
+            let Some(text) = name.to_str() else {
+                return Err(CoreError::InvalidTrashTopology(
+                    "trash item entry name is not UTF-8",
+                ));
+            };
+            match text {
+                "manifest.json" if !manifest_seen => manifest_seen = true,
+                "payload" if !payload_seen => payload_seen = true,
+                _ if Self::is_reserved_manifest_temp(text) => {
+                    temp_count += 1;
+                    if temp_count > MAX_RESERVED_MANIFEST_TEMPS {
+                        return Err(CoreError::InvalidTrashTopology(
+                            "too many reserved manifest temp files",
+                        ));
+                    }
+                    Self::validate_reserved_temp(&held, &name)?;
+                }
+                _ => {
+                    return Err(CoreError::InvalidTrashTopology(
+                        "trash item contains an unrecognized entry",
+                    ));
+                }
+            }
+        }
+        if !manifest_seen || !payload_seen {
+            return Err(CoreError::InvalidTrashTopology(
+                "published trash item is incomplete",
+            ));
+        }
+
+        let stored = Self::read_manifest_from_directory(id, &held, false)?;
+        let payload_metadata = held.symlink_metadata("payload")?;
+        if !payload_metadata.is_file()
+            || payload_metadata.file_type().is_symlink()
+            || payload_metadata.len() != stored.manifest.revision.byte_len
+        {
+            return Err(CoreError::InvalidTrashTopology(
+                "payload metadata does not match manifest",
+            ));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let payload = held.open_with("payload", &options)?;
+        let opened = payload.metadata()?;
+        if !opened.is_file()
+            || opened.nlink() != 1
+            || opened.len() != stored.manifest.revision.byte_len
+        {
+            return Err(CoreError::InvalidTrashTopology(
+                "payload must be a matching single-link regular file",
+            ));
+        }
+
+        before_authoritative_reopen(id)?;
+        let authoritative = self
+            .open_trash_item_directory(TrashArea::Items, id, items, &name)
+            .map_err(|error| match error {
+                CoreError::SymlinkRejected(_) | CoreError::InvalidRelativePath(_) => {
+                    CoreError::TrashItemIdentityChanged
+                }
+                CoreError::Io(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    CoreError::TrashItemIdentityChanged
+                }
+                other => other,
+            })?;
+        Self::require_same_list_item_identity(&held, &authoritative)?;
+        let manifest_digest = ManifestDigest::from_bytes(&stored.bytes);
+        Ok(TrashListEvidence::Supported {
+            trash_id: id,
+            manifest: stored.manifest,
+            manifest_digest,
+        })
+    }
+
+    fn require_same_list_item_identity(expected: &Dir, actual: &Dir) -> Result<()> {
+        if myvault_platform_fs::directory_identity(expected)?
+            != myvault_platform_fs::directory_identity(actual)?
+        {
+            return Err(CoreError::TrashItemIdentityChanged);
+        }
+        Ok(())
+    }
+
     /// Creates one immutable canonical staging manifest, or confirms an exact
     /// existing manifest. No production path removes abandoned temp files.
     ///
@@ -3928,6 +4241,65 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+
+    fn list_item_fixture(label: &str) -> (tempfile::TempDir, Vault, TrashId, PathBuf) {
+        let root = tempfile::tempdir().expect("temp vault");
+        let canonical = fs::canonicalize(root.path()).expect("canonical root");
+        let id = TrashId::parse("00000000-0000-4000-8000-000000000001").expect("id");
+        let item = canonical.join(format!(".trash/v1/items/{id}"));
+        fs::create_dir_all(&item).expect("item");
+        let payload = label.as_bytes();
+        let manifest = TrashManifestV1::new(
+            id,
+            uuid::Uuid::new_v4(),
+            &VaultPath::from_portable("note.md").expect("path"),
+            FileRevision::from_bytes(payload),
+            1,
+        )
+        .expect("manifest");
+        fs::write(
+            item.join("manifest.json"),
+            manifest.canonical_bytes().expect("manifest bytes"),
+        )
+        .expect("manifest");
+        fs::write(item.join("payload"), payload).expect("payload");
+        let vault = Vault::open(&canonical).expect("vault");
+        (root, vault, id, item)
+    }
+
+    #[test]
+    fn trash_listing_propagates_injected_io_after_evidence_validation() {
+        let (_root, vault, _id, _item) = list_item_fixture("io");
+        let error = vault
+            .trash_store()
+            .list_items_page_with_hook(None, 1, |_| {
+                Err(CoreError::Io(std::io::Error::other("injected list I/O")))
+            })
+            .expect_err("injected I/O");
+        assert!(matches!(error, CoreError::Io(_)));
+    }
+
+    #[test]
+    fn trash_listing_rejects_exact_looking_item_identity_replacement() {
+        let (_root, vault, id, item) = list_item_fixture("identity");
+        let detached = item.with_extension("detached");
+        let error = vault
+            .trash_store()
+            .list_items_page_with_hook(None, 1, |_| {
+                fs::rename(&item, &detached)?;
+                fs::create_dir(&item)?;
+                fs::copy(detached.join("manifest.json"), item.join("manifest.json"))?;
+                fs::copy(detached.join("payload"), item.join("payload"))?;
+                Ok(())
+            })
+            .expect_err("identity replacement");
+        assert!(matches!(error, CoreError::TrashItemIdentityChanged));
+        assert_eq!(
+            fs::read(item.join("payload")).expect("replacement payload"),
+            b"identity"
+        );
+        assert_eq!(id.to_string(), "00000000-0000-4000-8000-000000000001");
+    }
 
     #[cfg(unix)]
     #[test]

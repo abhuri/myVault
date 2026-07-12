@@ -8,6 +8,8 @@ use crate::path::VaultPathClass;
 use crate::{CoreError, FileRevision, Result, Vault, VaultPath, MAX_TRASH_PAYLOAD_BYTES};
 
 pub const MAX_TRASH_MANIFEST_BYTES: usize = 16 * 1024;
+pub const MAX_TRASH_LIST_SCAN: usize = 8_192;
+pub const MAX_TRASH_PAGE_SIZE: usize = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrashArea {
@@ -24,7 +26,7 @@ impl TrashArea {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct TrashId(Uuid);
 
@@ -215,6 +217,27 @@ impl TrashManifestV1 {
 
 pub struct TrashStore<'vault> {
     pub(crate) vault: &'vault Vault,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TrashListEvidence {
+    Supported {
+        trash_id: TrashId,
+        manifest: TrashManifestV1,
+        manifest_digest: ManifestDigest,
+    },
+    Opaque {
+        trash_id: TrashId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrashListPage {
+    pub entries: Vec<TrashListEvidence>,
+    pub invalid_name_count: usize,
+    pub next_after: Option<TrashId>,
+    pub has_more: bool,
+    pub scanned_entries: usize,
 }
 
 impl<'vault> TrashStore<'vault> {

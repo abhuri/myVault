@@ -16,6 +16,7 @@ pub enum CoreError {
     TrashManifestCollision(PathBuf),
     TrashManifestDigestMismatch,
     InvalidTrashTopology(&'static str),
+    TrashItemIdentityChanged,
     TrashManifestOutcomeUnknown {
         path: PathBuf,
         cause: Box<CoreError>,
@@ -142,6 +143,7 @@ impl fmt::Display for CoreError {
             | Self::TrashManifestCollision(_)
             | Self::TrashManifestDigestMismatch
             | Self::InvalidTrashTopology(_)
+            | Self::TrashItemIdentityChanged
             | Self::TrashManifestOutcomeUnknown { .. }
             | Self::TrashPayloadOutcomeUnknown { .. }
             | Self::InvalidRevision
@@ -279,6 +281,9 @@ impl CoreError {
             }
             Self::InvalidTrashTopology(reason) => {
                 Some(write!(formatter, "invalid trash topology: {reason}"))
+            }
+            Self::TrashItemIdentityChanged => {
+                Some(formatter.write_str("trash item identity changed during inspection"))
             }
             Self::TrashManifestOutcomeUnknown { path, cause } => Some(write!(
                 formatter,

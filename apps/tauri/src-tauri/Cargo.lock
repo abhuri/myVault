@@ -2291,6 +2291,7 @@ name = "myvault"
 version = "0.1.0"
 dependencies = [
  "drive-sync-spike",
+ "myvault-app-service",
  "myvault-core",
  "myvault-desktop-auth",
  "serde",
@@ -2299,6 +2300,15 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-google-auth",
  "tauri-plugin-private-root",
+]
+
+[[package]]
+name = "myvault-app-service"
+version = "0.1.0"
+dependencies = [
+ "myvault-core",
+ "serde",
+ "uuid",
 ]
 
 [[package]]
@@ -2344,6 +2354,7 @@ version = "0.1.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
+ "rustix",
  "windows-sys 0.61.2",
 ]
 
