@@ -586,6 +586,8 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - local gates ผ่าน TypeScript, Vitest 19, Vite build, app-service 10 tests, Tauri 6 tests, strict host Clippy, Android aarch64 cross-Clippy และ macOS debug `.app` bundle ค่ะ
 - live macOS test ผ่าน native picker, 5-note explorer, Thai read, Reader table/code, exact autosave และ external-edit conflict ที่ไม่ overwrite disk ค่ะ
 - GitHub Release คือ `https://github.com/abhuri/myVault/releases/tag/v0.1.0-demo` พร้อม macOS ARM64, Windows x64, Linux amd64 และ SHA-256 checksums ค่ะ
+- session checkpoint นี้บันทึกหลัง release สำเร็จบน `main` ที่ commit `99d42c4` โดย working tree สะอาดและไม่มี sub-agent หรืองาน implementation ค้างค่ะ
+- session ใหม่ให้เริ่มด้วยการอ่าน `PROJECT_PLAN.md`, `docs/demo/RESULTS.md`, `docs/demo/ACCEPTANCE.md` และ `CHANGELOG.md` ก่อนวางแผนรอบถัดไปค่ะ
 - malicious same-UID syscall race บน Unix/macOS อยู่นอก threat model ที่ประกาศไว้ เพราะไม่มี portable unlink-by-handle primitive; cooperating myVault processes ถูก serialize ด้วย operation lock ค่ะ
 - Phase 0 diagnostic shell และ contracts ถูกสร้างแล้วค่ะ
 - local checks ที่ผ่านคือ TypeScript, Vitest 8 tests, Vite build, Rust fmt/clippy, Rust 49 tests, macOS Keychain live probe และ Tauri debug build ค่ะ
@@ -603,8 +605,8 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 - Phase 1 portable paths, bounded inventory/read, no-overwrite create, revision-checked overwrite, derived index schema v2, atomic no-replace move และ file-only Trash/Restore/NormalMove/CaseRename state transitions พร้อมแล้วและผ่าน core 148 tests ค่ะ
 - append-only recovery journal schema v4 ผ่าน 38 tests ไม่มี production unlink/hardlink cleanup API, typed operation บังคับ endpoint topology และ unsupported evidence ถูก report แบบ bounded/fail-closed ค่ะ
 - Trash, original-path Restore, NormalMove และ CaseRename services แบบ journal-first ผ่าน 45 tests โดย retained NormalMove/CaseRename ปฏิเสธ source-only topology ที่กำกวมเพื่อป้องกัน ABA ค่ะ
-- งานถัดไปคือ merge Android trusted no-backup proof PR → immutable private snapshot store → retention/quarantine GC ค่ะ OAuth client configuration รอคุณโอยืนยัน User Data Policy และ physical Android validation ถูกเลื่อนไว้ค่ะ
 - งานถัดไปคือคุณโอทดลอง release กับ Vault สำเนา → รวบรวม feedback → วาง milestone persistent index และ P3 polish ค่ะ OAuth/Drive กับ physical Android validation ยังเป็นงานถัดไปและไม่ย้อนกลับไปบล็อก Demo ที่ release แล้วค่ะ
+- ไม่มี approval หรือ credential ที่ต้องจัดการทันทีในตอนเริ่ม session ใหม่ค่ะ ก่อนเริ่ม Drive Sync ต้องรอคุณโอยืนยัน Google API Services User Data Policy ตามเดิมค่ะ
 
 ### Handoff Update Template
 
