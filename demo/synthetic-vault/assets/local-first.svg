@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="240" viewBox="0 0 720 240" role="img" aria-labelledby="title desc">
+  <title id="title">Local-first data flow</title>
+  <desc id="desc">A local vault flows through a revision guard to an optional remote copy.</desc>
+  <rect width="720" height="240" fill="#0b0e14"/>
+  <g font-family="system-ui, sans-serif" text-anchor="middle">
+    <rect x="44" y="72" width="170" height="96" rx="12" fill="#161d27" stroke="#70d6bc"/>
+    <text x="129" y="112" fill="#e8edf4" font-size="20">Local Vault</text>
+    <text x="129" y="140" fill="#91a0b4" font-size="14">source of truth</text>
+    <rect x="275" y="72" width="170" height="96" rx="12" fill="#161d27" stroke="#f0bd69"/>
+    <text x="360" y="112" fill="#e8edf4" font-size="20">Revision Guard</text>
+    <text x="360" y="140" fill="#91a0b4" font-size="14">no silent overwrite</text>
+    <rect x="506" y="72" width="170" height="96" rx="12" fill="#161d27" stroke="#53657d"/>
+    <text x="591" y="112" fill="#e8edf4" font-size="20">Remote Copy</text>
+    <text x="591" y="140" fill="#91a0b4" font-size="14">deferred in demo</text>
+  </g>
+  <g fill="none" stroke="#70d6bc" stroke-width="3">
+    <path d="M214 120h51"/>
+    <path d="m257 112 8 8-8 8"/>
+    <path d="M445 120h51"/>
+    <path d="m488 112 8 8-8 8"/>
+  </g>
+</svg>
+
