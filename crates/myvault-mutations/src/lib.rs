@@ -6,7 +6,10 @@ mod revision;
 mod service;
 
 pub use error::MutationError;
-pub use operation::{NormalMoveOperation, OperationId, RestoreOperation, TrashOperation};
+pub use operation::{
+    CaseRenameOperation, NormalMoveOperation, OperationId, RestoreOperation, TrashOperation,
+};
 pub use service::{
-    MutationService, NormalMoveExecutionOutcome, RestoreExecutionOutcome, TrashExecutionOutcome,
+    CaseRenameExecutionOutcome, MutationService, NormalMoveExecutionOutcome,
+    RestoreExecutionOutcome, TrashExecutionOutcome,
 };

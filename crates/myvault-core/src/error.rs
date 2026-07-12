@@ -48,6 +48,21 @@ pub enum CoreError {
         source_sync: crate::DirectorySyncStatus,
         cause: Box<CoreError>,
     },
+    CaseRenamePrepublicationSyncFailed {
+        source_path: PathBuf,
+        destination_path: PathBuf,
+        temporary_path: PathBuf,
+        directory_sync: crate::DirectorySyncStatus,
+        cause: Box<CoreError>,
+    },
+    CaseRenameOutcomeUnknown {
+        source_path: PathBuf,
+        destination_path: PathBuf,
+        temporary_path: PathBuf,
+        phase: crate::CaseRenamePhase,
+        directory_sync: crate::DirectorySyncStatus,
+        verification: Box<CoreError>,
+    },
     AppDataInsideVault {
         app_data: PathBuf,
         vault: PathBuf,
@@ -130,6 +145,8 @@ impl fmt::Display for CoreError {
             | Self::MoveDurabilitySyncFailed
             | Self::StagePayloadPrepublicationSyncFailed { .. }
             | Self::MoveContentPrepublicationSyncFailed { .. }
+            | Self::CaseRenamePrepublicationSyncFailed { .. }
+            | Self::CaseRenameOutcomeUnknown { .. }
             | Self::VerifiedMoveOutcomeUnknown { .. } => {
                 unreachable!("handled before main error formatting")
             }
@@ -319,6 +336,19 @@ impl CoreError {
                 source_path.display(),
                 destination_path.display()
             )),
+            Self::CaseRenamePrepublicationSyncFailed {
+                source_path,
+                destination_path,
+                temporary_path,
+                directory_sync,
+                cause,
+            } => Some(write!(
+                formatter,
+                "case rename from {} to {} through {} was not published because the parent prepublication sync failed ({directory_sync}): {cause}",
+                source_path.display(),
+                destination_path.display(),
+                temporary_path.display()
+            )),
             Self::VerifiedMoveOutcomeUnknown {
                 source_path,
                 destination_path,
@@ -330,6 +360,20 @@ impl CoreError {
                 "verified move from {} to {} may be published (destination sync: {destination_sync}; source sync: {source_sync}); topology verification failed: {verification}",
                 source_path.display(),
                 destination_path.display()
+            )),
+            Self::CaseRenameOutcomeUnknown {
+                source_path,
+                destination_path,
+                temporary_path,
+                phase,
+                directory_sync,
+                verification,
+            } => Some(write!(
+                formatter,
+                "case rename from {} to {} through {} has an unknown outcome in phase {phase:?} (directory sync: {directory_sync}); verification failed: {verification}",
+                source_path.display(),
+                destination_path.display(),
+                temporary_path.display()
             )),
             _ => None,
         }
@@ -347,9 +391,11 @@ impl std::error::Error for CoreError {
                 source_sync,
                 ..
             } => destination_sync.error().or_else(|| source_sync.error()),
-            Self::VerifiedMoveOutcomeUnknown { verification, .. } => Some(verification.as_ref()),
+            Self::VerifiedMoveOutcomeUnknown { verification, .. }
+            | Self::CaseRenameOutcomeUnknown { verification, .. } => Some(verification.as_ref()),
             Self::StagePayloadPrepublicationSyncFailed { cause, .. }
             | Self::MoveContentPrepublicationSyncFailed { cause, .. }
+            | Self::CaseRenamePrepublicationSyncFailed { cause, .. }
             | Self::TrashManifestOutcomeUnknown { cause, .. }
             | Self::TrashPayloadOutcomeUnknown { cause, .. } => Some(cause.as_ref()),
             Self::Sqlite(error) => Some(error),

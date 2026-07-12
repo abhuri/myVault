@@ -1,11 +1,14 @@
 use std::io;
 
 use crate::revision::{to_core, to_recovery};
-use crate::{MutationError, NormalMoveOperation, OperationId, RestoreOperation, TrashOperation};
+use crate::{
+    CaseRenameOperation, MutationError, NormalMoveOperation, OperationId, RestoreOperation,
+    TrashOperation,
+};
 use myvault_core::{
-    ManifestDigest, MoveContentOutcome, PrepareManifestOutcome, PublishItemOutcome,
-    RestoreItemOutcome, StagePayloadOutcome, TrashArea, TrashId, Vault, VaultPath,
-    MAX_TRASH_PAYLOAD_BYTES,
+    CaseRenameOutcome, ManifestDigest, MoveContentOutcome, PrepareManifestOutcome,
+    PublishItemOutcome, RestoreItemOutcome, StagePayloadOutcome, TrashArea, TrashId, Vault,
+    VaultPath, MAX_TRASH_PAYLOAD_BYTES,
 };
 use myvault_recovery::{
     CompleteOutcome, JournalEvidence, PublishOutcome, RecoveryJournal, RecoveryOperationKind,
@@ -32,6 +35,13 @@ pub struct RestoreExecutionOutcome {
 pub struct NormalMoveExecutionOutcome {
     pub operation_id: OperationId,
     pub moved: MoveContentOutcome,
+    pub completion: CompleteOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaseRenameExecutionOutcome {
+    pub operation_id: OperationId,
+    pub renamed: CaseRenameOutcome,
     pub completion: CompleteOutcome,
 }
 
@@ -112,6 +122,29 @@ impl<'service> MutationService<'service> {
         )?;
         let revision = vault.revision(source, MAX_TRASH_PAYLOAD_BYTES)?;
         NormalMoveOperation::new(operation_id, source, destination, revision)
+    }
+
+    /// Plans a bounded, file-only case rename without mutating vault or journal.
+    ///
+    /// # Errors
+    /// Returns an error unless both paths are canonical collision aliases in the
+    /// same exact parent and the source is a supported bounded content file.
+    pub fn plan_case_rename(
+        vault: &Vault,
+        source: &VaultPath,
+        destination: &VaultPath,
+    ) -> Result<CaseRenameOperation, MutationError> {
+        let operation_id = OperationId::new();
+        // Validate the complete topology before reading source content. The
+        // operation constructor repeats this check with the observed revision.
+        CaseRenameOperation::new(
+            operation_id,
+            source,
+            destination,
+            myvault_core::FileRevision::from_bytes(&[]),
+        )?;
+        let revision = vault.single_link_content_revision(source, MAX_TRASH_PAYLOAD_BYTES)?;
+        CaseRenameOperation::new(operation_id, source, destination, revision)
     }
 
     /// Executes a fresh operation or safely routes an existing journal ID to retry.
@@ -427,6 +460,107 @@ impl<'service> MutationService<'service> {
             completion,
         })
     }
+
+    /// Executes a fresh case rename or routes retained evidence to the
+    /// fail-closed resume path.
+    ///
+    /// # Errors
+    /// Preserves core/recovery outcome-unknown errors without reclassification.
+    pub fn execute_case_rename(
+        &self,
+        operation: &CaseRenameOperation,
+    ) -> Result<CaseRenameExecutionOutcome, MutationError> {
+        match self
+            .journal
+            .read_evidence(operation.operation_id().as_uuid())
+        {
+            Ok(evidence) => return self.retry_case_rename_from_evidence(operation, evidence),
+            Err(myvault_recovery::Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let intent = build_case_rename_intent(operation)?;
+        let published = self.journal.publish(&intent)?;
+        self.continue_case_rename(
+            operation,
+            &intent,
+            matches!(published, PublishOutcome::Published),
+        )
+    }
+
+    /// Retries only exact supported journal evidence for a retained case rename.
+    ///
+    /// # Errors
+    /// Mismatched or unsupported evidence fails before core mutation.
+    pub fn retry_case_rename(
+        &self,
+        operation: &CaseRenameOperation,
+    ) -> Result<CaseRenameExecutionOutcome, MutationError> {
+        let evidence = self
+            .journal
+            .read_evidence(operation.operation_id().as_uuid())?;
+        self.retry_case_rename_from_evidence(operation, evidence)
+    }
+
+    /// Resumes one supported v4 case rename from journal evidence alone.
+    ///
+    /// # Errors
+    /// Unsupported, wrong-kind, nondeterministic-temp, or mismatched evidence
+    /// fails before mutation.
+    pub fn resume_case_rename(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<CaseRenameExecutionOutcome, MutationError> {
+        let evidence = self.journal.read_evidence(operation_id.as_uuid())?;
+        let intent = supported_case_rename_intent(evidence)?;
+        let operation = case_rename_operation_from_intent(&intent)?;
+        if operation.operation_id() != operation_id {
+            return Err(MutationError::IntentMismatch);
+        }
+        validate_case_rename_intent(&operation, &intent)?;
+        self.continue_case_rename(&operation, &intent, false)
+    }
+
+    fn retry_case_rename_from_evidence(
+        &self,
+        operation: &CaseRenameOperation,
+        evidence: JournalEvidence,
+    ) -> Result<CaseRenameExecutionOutcome, MutationError> {
+        let intent = supported_case_rename_intent(evidence)?;
+        validate_case_rename_intent(operation, &intent)?;
+        self.continue_case_rename(operation, &intent, false)
+    }
+
+    fn continue_case_rename(
+        &self,
+        operation: &CaseRenameOperation,
+        intent: &RenameMoveIntent,
+        allow_source_rename: bool,
+    ) -> Result<CaseRenameExecutionOutcome, MutationError> {
+        let (source, destination, temporary) = operation.paths()?;
+        let renamed = if allow_source_rename {
+            self.vault.case_rename_content_file_if_revision(
+                &source,
+                &destination,
+                &temporary,
+                operation.revision(),
+            )?
+        } else {
+            self.vault.resume_case_rename_content_file_if_revision(
+                &source,
+                &destination,
+                &temporary,
+                operation.revision(),
+            )?
+        };
+        let completion = self
+            .journal
+            .complete(operation.operation_id().as_uuid(), intent)?;
+        Ok(CaseRenameExecutionOutcome {
+            operation_id: operation.operation_id(),
+            renamed,
+            completion,
+        })
+    }
 }
 
 fn build_intent(
@@ -625,4 +759,72 @@ fn normal_operation_from_intent(
         &destination,
         to_core(&intent.expected)?,
     )
+}
+
+fn build_case_rename_intent(
+    operation: &CaseRenameOperation,
+) -> Result<RenameMoveIntent, MutationError> {
+    Ok(RenameMoveIntent::new_case_rename(
+        operation.operation_id().as_uuid(),
+        operation.source(),
+        operation.destination(),
+        to_recovery(operation.revision()),
+        operation.temporary(),
+    )?)
+}
+
+fn validate_case_rename_intent(
+    operation: &CaseRenameOperation,
+    observed: &RenameMoveIntent,
+) -> Result<(), MutationError> {
+    if build_case_rename_intent(operation)? == *observed {
+        Ok(())
+    } else {
+        Err(MutationError::IntentMismatch)
+    }
+}
+
+fn supported_case_rename_intent(
+    evidence: JournalEvidence,
+) -> Result<RenameMoveIntent, MutationError> {
+    match evidence {
+        JournalEvidence::Supported(intent)
+            if matches!(intent.kind, RecoveryOperationKind::CaseRename) =>
+        {
+            Ok(intent)
+        }
+        JournalEvidence::Supported(_) => Err(MutationError::InvalidOperation(
+            "journal operation is not a case rename",
+        )),
+        JournalEvidence::Unsupported {
+            operation_id,
+            version,
+        } => Err(MutationError::UnsupportedEvidence {
+            operation_id,
+            version,
+        }),
+    }
+}
+
+fn case_rename_operation_from_intent(
+    intent: &RenameMoveIntent,
+) -> Result<CaseRenameOperation, MutationError> {
+    if !matches!(intent.kind, RecoveryOperationKind::CaseRename) {
+        return Err(MutationError::InvalidOperation(
+            "journal operation is not a case rename",
+        ));
+    }
+    let operation_id = OperationId::parse(&intent.operation_id.to_string())?;
+    let source = VaultPath::from_portable(&intent.from)?;
+    let destination = VaultPath::from_portable(&intent.to)?;
+    let operation = CaseRenameOperation::new(
+        operation_id,
+        &source,
+        &destination,
+        to_core(&intent.expected)?,
+    )?;
+    if intent.temp.as_deref() != Some(operation.temporary()) {
+        return Err(MutationError::IntentMismatch);
+    }
+    Ok(operation)
 }

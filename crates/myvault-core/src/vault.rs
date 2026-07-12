@@ -84,6 +84,25 @@ pub enum MoveContentOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaseRenameOutcome {
+    Renamed(MoveDurability),
+    ResumedFromTemporary(MoveDurability),
+    AlreadyRenamed(MoveDurability),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaseRenamePhase {
+    SourceToTemporary,
+    TemporaryToDestination,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaseRenameMode {
+    Fresh,
+    Resume,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ContentMoveMode {
     Fresh,
     Resume,
@@ -215,6 +234,25 @@ impl Vault {
     pub fn revision(&self, relative: &VaultPath, max_bytes: usize) -> Result<FileRevision> {
         Self::validate_generic_access(relative)?;
         self.revision_inner(relative, max_bytes)
+    }
+
+    /// Computes a bounded revision for a regular content file that has exactly
+    /// one hard link, suitable for planning a no-overwrite move.
+    ///
+    /// # Errors
+    /// Returns an error for protected/internal paths, unsafe or oversized
+    /// sources, or when the source is not a single-link regular file.
+    pub fn single_link_content_revision(
+        &self,
+        relative: &VaultPath,
+        max_bytes: usize,
+    ) -> Result<FileRevision> {
+        Self::require_content_path(relative)?;
+        let _guard = self.lock_mutations()?;
+        let (parent, name) = self.open_parent_checked(relative)?;
+        let revision = self.revision_from_parent(&parent, &name, relative, max_bytes)?;
+        self.verify_single_link_from_parent(&parent, &name, relative)?;
+        Ok(revision)
     }
 
     /// Verifies a file against a caller-held expected revision.
@@ -636,6 +674,396 @@ impl Vault {
                     .combine(move_report.into_result(source, destination)?);
                 Ok(MoveContentOutcome::Moved(durability))
             }
+        }
+    }
+
+    /// Renames a content file whose old and new names have the same portable
+    /// collision key, using a collision-distinct temporary name in the same
+    /// directory. No destination is ever replaced.
+    ///
+    /// # Errors
+    /// Fails closed unless the exact source name is the only endpoint present,
+    /// the source is a single-link regular file at `expected`, and every path
+    /// has the required same-parent/collision relationship.
+    pub fn case_rename_content_file_if_revision(
+        &self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        temporary: &VaultPath,
+        expected: &FileRevision,
+    ) -> Result<CaseRenameOutcome> {
+        self.case_rename_content_file_with_hooks(
+            source,
+            destination,
+            temporary,
+            expected,
+            CaseRenameMode::Fresh,
+            || {},
+            || {},
+        )
+    }
+
+    /// Resumes a retained case-only rename without accepting a recreated
+    /// source-only topology (an ABA ambiguity).
+    ///
+    /// # Errors
+    /// Accepts only verified temporary-only or destination-only topologies.
+    pub fn resume_case_rename_content_file_if_revision(
+        &self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        temporary: &VaultPath,
+        expected: &FileRevision,
+    ) -> Result<CaseRenameOutcome> {
+        self.case_rename_content_file_with_hooks(
+            source,
+            destination,
+            temporary,
+            expected,
+            CaseRenameMode::Resume,
+            || {},
+            || {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn case_rename_content_file_with_hooks<F, G>(
+        &self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        temporary: &VaultPath,
+        expected: &FileRevision,
+        mode: CaseRenameMode,
+        mut before_first_rename: F,
+        mut before_second_rename: G,
+    ) -> Result<CaseRenameOutcome>
+    where
+        F: FnMut(),
+        G: FnMut(),
+    {
+        Self::validate_case_rename_paths(source, destination, temporary)?;
+        expected.validate()?;
+        if expected.byte_len > MAX_TRASH_PAYLOAD_BYTES as u64 {
+            return Err(CoreError::ResourceLimitExceeded {
+                resource: "case rename revision bytes",
+                limit: MAX_TRASH_PAYLOAD_BYTES,
+            });
+        }
+
+        let _guard = self.lock_mutations()?;
+        let (parent, source_name) = self.open_parent_checked(source)?;
+        let (destination_parent, destination_name) = self.open_parent_checked(destination)?;
+        let (temporary_parent, temporary_name) = self.open_parent_checked(temporary)?;
+        if !Self::same_open_directory(&parent, &destination_parent)?
+            || !Self::same_open_directory(&parent, &temporary_parent)?
+        {
+            return Err(CoreError::InvalidMove {
+                source_path: source.as_path().to_owned(),
+                destination_path: destination.as_path().to_owned(),
+                reason: "case rename parent directory identity changed during preflight",
+            });
+        }
+        let classification_durability = sync_directory_for_move(&parent).map_err(|error| {
+            CoreError::CaseRenamePrepublicationSyncFailed {
+                source_path: source.as_path().to_owned(),
+                destination_path: destination.as_path().to_owned(),
+                temporary_path: temporary.as_path().to_owned(),
+                directory_sync: DirectorySyncStatus::Failed(std::io::Error::new(
+                    error.kind(),
+                    error.to_string(),
+                )),
+                cause: Box::new(CoreError::Io(error)),
+            }
+        })?;
+        let state = self.case_rename_state(
+            &parent,
+            source,
+            destination,
+            temporary,
+            &source_name,
+            &destination_name,
+            &temporary_name,
+        )?;
+
+        match state {
+            (false, false, true) => {
+                self.verify_case_rename_entry(&parent, &destination_name, destination, expected)?;
+                Ok(CaseRenameOutcome::AlreadyRenamed(classification_durability))
+            }
+            (true, false, false) if mode == CaseRenameMode::Resume => Err(CoreError::InvalidMove {
+                source_path: source.as_path().to_owned(),
+                destination_path: destination.as_path().to_owned(),
+                reason: "source-only topology is ambiguous during retained case rename recovery",
+            }),
+            (true, false, false) => {
+                self.verify_case_rename_entry(&parent, &source_name, source, expected)?;
+                before_first_rename();
+                let (latest_parent, latest_source_name) = self.open_parent_checked(source)?;
+                if !Self::same_open_directory(&parent, &latest_parent)? {
+                    return Err(CoreError::InvalidMove {
+                        source_path: source.as_path().to_owned(),
+                        destination_path: destination.as_path().to_owned(),
+                        reason: "case rename parent directory identity changed before source-to-temporary rename",
+                    });
+                }
+                rename_noreplace(
+                    &latest_parent,
+                    &latest_source_name,
+                    &latest_parent,
+                    &temporary_name,
+                )
+                .map_err(|error| Self::map_atomic_move_error(source, temporary, error))?;
+                let first_durability = self.sync_case_rename_phase(
+                    &latest_parent,
+                    source,
+                    destination,
+                    temporary,
+                    expected,
+                    CaseRenamePhase::SourceToTemporary,
+                )?;
+                before_second_rename();
+                let (latest_parent, latest_destination_name) =
+                    self.open_parent_checked(destination)?;
+                if !Self::same_open_directory(&parent, &latest_parent)? {
+                    return Err(CoreError::InvalidMove {
+                        source_path: source.as_path().to_owned(),
+                        destination_path: destination.as_path().to_owned(),
+                        reason: "case rename parent directory identity changed before temporary-to-destination rename",
+                    });
+                }
+                rename_noreplace(
+                    &latest_parent,
+                    &temporary_name,
+                    &latest_parent,
+                    &latest_destination_name,
+                )
+                .map_err(|error| Self::map_atomic_move_error(temporary, destination, error))?;
+                let second_durability = self.sync_case_rename_phase(
+                    &latest_parent,
+                    source,
+                    destination,
+                    temporary,
+                    expected,
+                    CaseRenamePhase::TemporaryToDestination,
+                )?;
+                Ok(CaseRenameOutcome::Renamed(
+                    classification_durability
+                        .combine(first_durability)
+                        .combine(second_durability),
+                ))
+            }
+            (false, true, false) if mode == CaseRenameMode::Resume => {
+                self.verify_case_rename_entry(&parent, &temporary_name, temporary, expected)?;
+                before_second_rename();
+                let (latest_parent, latest_destination_name) =
+                    self.open_parent_checked(destination)?;
+                if !Self::same_open_directory(&parent, &latest_parent)? {
+                    return Err(CoreError::InvalidMove {
+                        source_path: source.as_path().to_owned(),
+                        destination_path: destination.as_path().to_owned(),
+                        reason: "case rename parent directory identity changed before temporary-to-destination rename",
+                    });
+                }
+                rename_noreplace(
+                    &latest_parent,
+                    &temporary_name,
+                    &latest_parent,
+                    &latest_destination_name,
+                )
+                .map_err(|error| Self::map_atomic_move_error(temporary, destination, error))?;
+                let move_durability = self.sync_case_rename_phase(
+                    &latest_parent,
+                    source,
+                    destination,
+                    temporary,
+                    expected,
+                    CaseRenamePhase::TemporaryToDestination,
+                )?;
+                Ok(CaseRenameOutcome::ResumedFromTemporary(
+                    classification_durability.combine(move_durability),
+                ))
+            }
+            (false, true, false) => Err(CoreError::InvalidMove {
+                source_path: source.as_path().to_owned(),
+                destination_path: destination.as_path().to_owned(),
+                reason: "temporary-only topology requires retained case rename recovery",
+            }),
+            (false, false, false) => Err(CoreError::InvalidMove {
+                source_path: source.as_path().to_owned(),
+                destination_path: destination.as_path().to_owned(),
+                reason: "case rename source, temporary, and destination are all absent",
+            }),
+            _ => Err(CoreError::InvalidMove {
+                source_path: source.as_path().to_owned(),
+                destination_path: destination.as_path().to_owned(),
+                reason: "case rename topology contains multiple endpoints",
+            }),
+        }
+    }
+
+    fn validate_case_rename_paths(
+        source: &VaultPath,
+        destination: &VaultPath,
+        temporary: &VaultPath,
+    ) -> Result<()> {
+        Self::require_content_path(source)?;
+        Self::require_content_path(destination)?;
+        Self::require_content_path(temporary)?;
+        let invalid = |reason| CoreError::InvalidMove {
+            source_path: source.as_path().to_owned(),
+            destination_path: destination.as_path().to_owned(),
+            reason,
+        };
+        if source == destination || source.collision_key() != destination.collision_key() {
+            return Err(invalid(
+                "case rename endpoints must be distinct spellings of one portable collision key",
+            ));
+        }
+        if !Self::same_parent_path(source, destination)
+            || !Self::same_parent_path(source, temporary)
+        {
+            return Err(invalid("case rename paths must have the same exact parent"));
+        }
+        if temporary == source
+            || temporary == destination
+            || temporary.collision_key() == source.collision_key()
+        {
+            return Err(invalid(
+                "case rename temporary path must have a distinct portable collision key",
+            ));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn case_rename_state(
+        &self,
+        parent: &Dir,
+        source: &VaultPath,
+        destination: &VaultPath,
+        temporary: &VaultPath,
+        source_name: &OsString,
+        destination_name: &OsString,
+        temporary_name: &OsString,
+    ) -> Result<(bool, bool, bool)> {
+        let source_key = component_collision_key(
+            source_name
+                .to_str()
+                .ok_or_else(|| CoreError::InvalidRelativePath(source.as_path().to_owned()))?,
+        );
+        let temporary_key = component_collision_key(
+            temporary_name
+                .to_str()
+                .ok_or_else(|| CoreError::InvalidRelativePath(temporary.as_path().to_owned()))?,
+        );
+        let mut state = (false, false, false);
+        for entry in parent.read_dir(".")? {
+            let name = entry?.file_name();
+            let text = name
+                .to_str()
+                .ok_or_else(|| CoreError::InvalidRelativePath(self.root_path.join(&name)))?;
+            if name == *source_name {
+                state.0 = true;
+            } else if name == *temporary_name {
+                state.1 = true;
+            } else if name == *destination_name {
+                state.2 = true;
+            } else {
+                let key = component_collision_key(text);
+                if key == source_key || key == temporary_key {
+                    return Err(CoreError::PortablePathCollision {
+                        existing: text.to_owned(),
+                        incoming: if key == source_key {
+                            destination.as_str().to_owned()
+                        } else {
+                            temporary.as_str().to_owned()
+                        },
+                    });
+                }
+            }
+        }
+        Ok(state)
+    }
+
+    fn verify_case_rename_entry(
+        &self,
+        parent: &Dir,
+        name: &OsString,
+        path: &VaultPath,
+        expected: &FileRevision,
+    ) -> Result<()> {
+        self.verify_expected_from_parent(parent, name, path, expected, MAX_TRASH_PAYLOAD_BYTES)?;
+        self.verify_single_link_from_parent(parent, name, path)
+    }
+
+    fn sync_case_rename_phase(
+        &self,
+        parent: &Dir,
+        source: &VaultPath,
+        destination: &VaultPath,
+        temporary: &VaultPath,
+        expected: &FileRevision,
+        phase: CaseRenamePhase,
+    ) -> Result<MoveDurability> {
+        let sync = sync_directory_for_move(parent);
+        let source_name = source
+            .as_path()
+            .file_name()
+            .ok_or_else(|| CoreError::InvalidRelativePath(source.as_path().to_owned()))?
+            .to_owned();
+        let destination_name = destination
+            .as_path()
+            .file_name()
+            .ok_or_else(|| CoreError::InvalidRelativePath(destination.as_path().to_owned()))?
+            .to_owned();
+        let temporary_name = temporary
+            .as_path()
+            .file_name()
+            .ok_or_else(|| CoreError::InvalidRelativePath(temporary.as_path().to_owned()))?
+            .to_owned();
+        let (path, name, expected_state) = match phase {
+            CaseRenamePhase::SourceToTemporary => {
+                (temporary, &temporary_name, (false, true, false))
+            }
+            CaseRenamePhase::TemporaryToDestination => {
+                (destination, &destination_name, (false, false, true))
+            }
+        };
+        let verification = self
+            .case_rename_state(
+                parent,
+                source,
+                destination,
+                temporary,
+                &source_name,
+                &destination_name,
+                &temporary_name,
+            )
+            .and_then(|state| {
+                if state == expected_state {
+                    self.verify_case_rename_entry(parent, name, path, expected)
+                } else {
+                    Err(CoreError::InvalidMove {
+                        source_path: source.as_path().to_owned(),
+                        destination_path: destination.as_path().to_owned(),
+                        reason: "case rename topology changed after publication",
+                    })
+                }
+            });
+        match (sync, verification) {
+            (Ok(durability), Ok(())) => Ok(durability),
+            (sync, verification) => Err(CoreError::CaseRenameOutcomeUnknown {
+                source_path: source.as_path().to_owned(),
+                destination_path: destination.as_path().to_owned(),
+                temporary_path: temporary.as_path().to_owned(),
+                phase,
+                directory_sync: directory_sync_status(sync),
+                verification: Box::new(
+                    verification
+                        .err()
+                        .unwrap_or(CoreError::MoveDurabilitySyncFailed),
+                ),
+            }),
         }
     }
 
@@ -3345,6 +3773,62 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn case_rename_rejects_parent_swap_before_each_rename_boundary() {
+        for swap_before_second in [false, true] {
+            let root = tempfile::tempdir().expect("temp vault");
+            fs::create_dir(root.path().join("notes")).expect("notes");
+            fs::write(root.path().join("notes/Note.md"), b"note").expect("source");
+            let vault = Vault::open(fs::canonicalize(root.path()).expect("canonical")).unwrap();
+            let source = VaultPath::from_portable("notes/Note.md").unwrap();
+            let destination = VaultPath::from_portable("notes/note.md").unwrap();
+            let temporary =
+                VaultPath::from_portable("notes/.mvcr-0123456789abcdef0123456789abcdef.tmp")
+                    .unwrap();
+            let live = root.path().join("notes");
+            let detached = root.path().join("detached");
+            let swap = || {
+                fs::rename(&live, &detached).expect("detach parent");
+                fs::create_dir(&live).expect("replacement parent");
+            };
+
+            let error = if swap_before_second {
+                vault.case_rename_content_file_with_hooks(
+                    &source,
+                    &destination,
+                    &temporary,
+                    &FileRevision::from_bytes(b"note"),
+                    CaseRenameMode::Fresh,
+                    || {},
+                    swap,
+                )
+            } else {
+                vault.case_rename_content_file_with_hooks(
+                    &source,
+                    &destination,
+                    &temporary,
+                    &FileRevision::from_bytes(b"note"),
+                    CaseRenameMode::Fresh,
+                    swap,
+                    || {},
+                )
+            }
+            .expect_err("parent identity swap");
+
+            assert!(matches!(error, CoreError::InvalidMove { .. }));
+            assert!(fs::read_dir(&live).unwrap().next().is_none());
+            if swap_before_second {
+                assert_eq!(
+                    fs::read(detached.join(temporary.as_path().file_name().unwrap())).unwrap(),
+                    b"note"
+                );
+            } else {
+                assert_eq!(fs::read(detached.join("Note.md")).unwrap(), b"note");
+            }
+        }
+    }
 
     #[cfg(unix)]
     #[test]
