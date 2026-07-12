@@ -1,6 +1,7 @@
 use myvault_app_service::{
-    AppErrorCode, AppService, NoteDto, TrashEvidenceDto, TrashItemDto, TrashPageDto,
-    VaultSessionId, VaultStatusDto,
+    AppErrorCode, AppService, ExplorerKindDto, NoteDto, TrashEvidenceDto, TrashItemDto,
+    TrashPageDto, VaultSessionId, VaultStatusDto, EXPLORER_DEFAULT_PAGE_SIZE, EXPLORER_MAX_DEPTH,
+    EXPLORER_MAX_PAGE_SIZE, EXPLORER_MAX_SCAN,
 };
 use myvault_core::{FileRevision, TrashId, TrashManifestV1, Vault, VaultPath};
 use std::fs;
@@ -179,6 +180,84 @@ fn no_stale_switched_and_closed_sessions_are_rejected() {
     );
     service.close(second_id).expect("close current");
     assert!(!service.status().expect("status").active);
+}
+
+#[test]
+fn explorer_is_sorted_bounded_exclusive_and_path_private() {
+    assert_eq!(EXPLORER_MAX_DEPTH, 64);
+    assert_eq!(EXPLORER_MAX_SCAN, 5_000);
+    assert_eq!(EXPLORER_DEFAULT_PAGE_SIZE, 100);
+    assert_eq!(EXPLORER_MAX_PAGE_SIZE, 200);
+    let service = AppService::new();
+    let fixture = Fixture::new("explorer-root-secret");
+    fixture.write("zeta.txt", b"z");
+    fixture.write("folder/ไทย.md", "ไทย".as_bytes());
+    fixture.write("alpha.MD", b"a");
+    fixture.write(".obsidian/private.json", b"{}");
+    fixture.write(".trash/v1/items/hidden", b"");
+    let session = activate(&service, &fixture);
+
+    for limit in [0, 201] {
+        assert_eq!(
+            service
+                .list_explorer(session, None, limit)
+                .expect_err("invalid limit")
+                .code,
+            AppErrorCode::InvalidLimit
+        );
+    }
+    for cursor in ["./alpha.MD", "folder//ไทย.md", "../escape.md"] {
+        assert_eq!(
+            service
+                .list_explorer(session, Some(cursor), 1)
+                .expect_err("noncanonical cursor")
+                .code,
+            AppErrorCode::InvalidCursor
+        );
+    }
+
+    let first = service.list_explorer(session, None, 2).expect("first page");
+    assert_eq!(
+        first
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>(),
+        ["alpha.MD", "folder/ไทย.md"]
+    );
+    assert!(first
+        .entries
+        .iter()
+        .all(|entry| entry.kind == ExplorerKindDto::Markdown));
+    assert!(first.has_more);
+    assert_eq!(first.scanned_entries, 3);
+    let second = service
+        .list_explorer(
+            session,
+            first.next_after.as_deref(),
+            EXPLORER_DEFAULT_PAGE_SIZE,
+        )
+        .expect("exclusive second page");
+    assert_eq!(second.entries.len(), 1);
+    assert_eq!(second.entries[0].path, "zeta.txt");
+    assert_eq!(second.entries[0].kind, ExplorerKindDto::File);
+    assert!(!second.has_more);
+    let json = serde_json::to_string(&first).expect("explorer JSON");
+    assert!(json.contains("\"sessionId\""));
+    assert!(json.contains("\"byteLen\""));
+    assert!(json.contains("\"kind\":\"markdown\""));
+    assert!(!json.contains(fixture.root.to_str().expect("UTF-8 root")));
+    assert!(!json.contains("explorer-root-secret"));
+
+    let switched = Fixture::new("switched-explorer-root");
+    activate(&service, &switched);
+    assert_eq!(
+        service
+            .list_explorer(session, None, 1)
+            .expect_err("stale explorer session")
+            .code,
+        AppErrorCode::StaleSession
+    );
 }
 
 #[test]

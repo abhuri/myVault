@@ -173,9 +173,28 @@ impl Vault {
     /// Returns an error when the root is not an absolute accessible directory
     /// or any component is a symlink.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
-        let supplied = root.as_ref();
+        Self::open_with_hook(root.as_ref(), || {})
+    }
+
+    fn open_with_hook<F>(supplied: &Path, after_held_open: F) -> Result<Self>
+    where
+        F: FnOnce(),
+    {
+        let canonical_before = std::fs::canonicalize(supplied)?;
         let root_dir = open_absolute_dir_nofollow(supplied)?;
-        let root_path = std::fs::canonicalize(supplied)?;
+        after_held_open();
+        let root_path =
+            std::fs::canonicalize(supplied).map_err(|_| CoreError::VaultRootIdentityChanged)?;
+        if canonical_before != root_path {
+            return Err(CoreError::VaultRootIdentityChanged);
+        }
+        let verification = open_absolute_dir_nofollow(&root_path)
+            .map_err(|_| CoreError::VaultRootIdentityChanged)?;
+        if myvault_platform_fs::directory_identity(&root_dir)?
+            != myvault_platform_fs::directory_identity(&verification)?
+        {
+            return Err(CoreError::VaultRootIdentityChanged);
+        }
         let mutation_lock = shared_mutation_lock(&root_path)?;
         Ok(Self {
             root_path,
@@ -4241,6 +4260,80 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+
+    #[test]
+    fn vault_open_retains_the_verified_root_identity() {
+        let temporary = tempfile::tempdir().expect("temporary");
+        let root = temporary.path().canonicalize().expect("canonical root");
+        fs::write(root.join("note.md"), b"verified root").expect("note");
+
+        let vault = Vault::open(&root).expect("verified vault");
+
+        assert_eq!(vault.root(), root);
+        assert_eq!(
+            vault
+                .read_note_with_revision(&VaultPath::from_portable("note.md").expect("path"))
+                .expect("note")
+                .bytes,
+            b"verified root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_open_rejects_root_removal_after_held_open() {
+        let temporary = tempfile::tempdir().expect("temporary");
+        let root = temporary.path().join("vault");
+        fs::create_dir(&root).expect("root");
+        let root = fs::canonicalize(&root).expect("canonical root");
+        let detached = root.with_extension("detached");
+
+        let error = Vault::open_with_hook(&root, || {
+            fs::rename(&root, &detached).expect("detach root");
+        })
+        .expect_err("removed root");
+
+        assert!(matches!(error, CoreError::VaultRootIdentityChanged));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_open_rejects_exact_looking_root_replacement() {
+        let temporary = tempfile::tempdir().expect("temporary");
+        let root = temporary.path().join("vault");
+        fs::create_dir(&root).expect("root");
+        let root = fs::canonicalize(&root).expect("canonical root");
+        let detached = root.with_extension("detached");
+        fs::write(root.join("note.md"), b"original").expect("original note");
+
+        let error = Vault::open_with_hook(&root, || {
+            fs::rename(&root, &detached).expect("detach root");
+            fs::create_dir(&root).expect("replacement root");
+            fs::write(root.join("note.md"), b"original").expect("exact-looking note");
+        })
+        .expect_err("replacement root");
+
+        assert!(matches!(error, CoreError::VaultRootIdentityChanged));
+        assert_eq!(
+            fs::read(detached.join("note.md")).expect("held tree"),
+            b"original"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_open_still_rejects_a_symlink_root_component() {
+        let temporary = tempfile::tempdir().expect("temporary");
+        let real = temporary.path().join("real");
+        let link = temporary.path().join("link");
+        fs::create_dir(&real).expect("real root");
+        symlink(&real, &link).expect("root symlink");
+
+        assert!(matches!(
+            Vault::open(&link),
+            Err(CoreError::SymlinkRejected(_))
+        ));
+    }
 
     fn list_item_fixture(label: &str) -> (tempfile::TempDir, Vault, TrashId, PathBuf) {
         let root = tempfile::tempdir().expect("temp vault");
