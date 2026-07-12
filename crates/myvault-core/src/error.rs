@@ -63,6 +63,11 @@ pub enum CoreError {
         directory_sync: crate::DirectorySyncStatus,
         verification: Box<CoreError>,
     },
+    ReplaceContentOutcomeUnknown {
+        path: PathBuf,
+        directory_sync: crate::DirectorySyncStatus,
+        verification: Box<CoreError>,
+    },
     AppDataInsideVault {
         app_data: PathBuf,
         vault: PathBuf,
@@ -147,6 +152,7 @@ impl fmt::Display for CoreError {
             | Self::MoveContentPrepublicationSyncFailed { .. }
             | Self::CaseRenamePrepublicationSyncFailed { .. }
             | Self::CaseRenameOutcomeUnknown { .. }
+            | Self::ReplaceContentOutcomeUnknown { .. }
             | Self::VerifiedMoveOutcomeUnknown { .. } => {
                 unreachable!("handled before main error formatting")
             }
@@ -375,6 +381,15 @@ impl CoreError {
                 destination_path.display(),
                 temporary_path.display()
             )),
+            Self::ReplaceContentOutcomeUnknown {
+                path,
+                directory_sync,
+                verification,
+            } => Some(write!(
+                formatter,
+                "replacement of {} may be published (directory sync: {directory_sync}); verification failed: {verification}",
+                path.display()
+            )),
             _ => None,
         }
     }
@@ -393,6 +408,13 @@ impl std::error::Error for CoreError {
             } => destination_sync.error().or_else(|| source_sync.error()),
             Self::VerifiedMoveOutcomeUnknown { verification, .. }
             | Self::CaseRenameOutcomeUnknown { verification, .. } => Some(verification.as_ref()),
+            Self::ReplaceContentOutcomeUnknown {
+                directory_sync,
+                verification,
+                ..
+            } => directory_sync
+                .error()
+                .or_else(|| Some(verification.as_ref())),
             Self::StagePayloadPrepublicationSyncFailed { cause, .. }
             | Self::MoveContentPrepublicationSyncFailed { cause, .. }
             | Self::CaseRenamePrepublicationSyncFailed { cause, .. }

@@ -83,6 +83,12 @@ pub enum MoveContentOutcome {
     AlreadyMoved(MoveDurability),
 }
 
+/// Result of publishing a revision-checked content replacement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplaceContentOutcome {
+    Replaced(MoveDurability),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaseRenameOutcome {
     Renamed(MoveDurability),
@@ -420,6 +426,38 @@ impl Vault {
     ) -> Result<()> {
         let _guard = self.lock_mutations()?;
         self.atomic_write_inner(relative, contents, intent, || {})
+    }
+
+    /// Atomically replaces an existing single-link content file only when its
+    /// current bounded revision still equals `expected`.
+    ///
+    /// The parent directory must already exist. The mutation lock spans both
+    /// revision checks and publication; the parent identity is checked again
+    /// immediately before the descriptor-relative rename.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::StaleRevision`] without publishing when the file
+    /// changed, or rejects internal paths, oversized data, symlinks,
+    /// directories, hard links, and parent-identity changes. A publication
+    /// followed by uncertain directory durability is reported as
+    /// [`CoreError::ReplaceContentOutcomeUnknown`].
+    pub fn replace_content_file_if_revision(
+        &self,
+        relative: &VaultPath,
+        expected: &FileRevision,
+        contents: &[u8],
+        max_bytes: usize,
+    ) -> Result<ReplaceContentOutcome> {
+        self.replace_content_file_with_hooks(
+            relative,
+            expected,
+            contents,
+            max_bytes,
+            || {},
+            || {},
+            sync_directory_for_move,
+        )
     }
 
     /// Atomically moves a file or directory and never replaces a destination.
@@ -1627,6 +1665,123 @@ impl Vault {
             let _ = parent.remove_file(&temp_name);
         }
         result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn replace_content_file_with_hooks<F, G, S>(
+        &self,
+        relative: &VaultPath,
+        expected: &FileRevision,
+        contents: &[u8],
+        max_bytes: usize,
+        before_publication: F,
+        after_publication: G,
+        sync: S,
+    ) -> Result<ReplaceContentOutcome>
+    where
+        F: FnOnce(),
+        G: FnOnce(),
+        S: FnOnce(&Dir) -> std::io::Result<MoveDurability>,
+    {
+        Self::require_content_path(relative)?;
+        expected.validate()?;
+        if expected.byte_len > max_bytes as u64 {
+            return Err(CoreError::ResourceLimitExceeded {
+                resource: "expected content revision bytes",
+                limit: max_bytes,
+            });
+        }
+        if contents.len() > max_bytes {
+            return Err(CoreError::ResourceLimitExceeded {
+                resource: "replacement content bytes",
+                limit: max_bytes,
+            });
+        }
+
+        let replacement = FileRevision::from_bytes(contents);
+        let _guard = self.lock_mutations()?;
+        let (parent, destination_name) = self.open_parent_checked(relative)?;
+        let destination_utf8 = destination_name
+            .to_str()
+            .ok_or_else(|| CoreError::InvalidRelativePath(relative.as_path().to_owned()))?;
+        self.reject_sibling_collision(&parent, destination_utf8, relative)?;
+        self.verify_expected_from_parent(
+            &parent,
+            &destination_name,
+            relative,
+            expected,
+            max_bytes,
+        )?;
+        self.verify_single_link_from_parent(&parent, &destination_name, relative)?;
+
+        let (temp_name, mut temporary) = Self::create_temp(&parent)?;
+        let prepublication = (|| {
+            temporary.write_all(contents)?;
+            temporary.sync_all()?;
+            drop(temporary);
+            before_publication();
+
+            let (latest_parent, latest_name) = self.open_parent_checked(relative)?;
+            if !Self::same_open_directory(&parent, &latest_parent)? {
+                return Err(CoreError::InvalidMove {
+                    source_path: relative.as_path().to_owned(),
+                    destination_path: relative.as_path().to_owned(),
+                    reason: "content parent directory identity changed before replacement",
+                });
+            }
+            self.verify_expected_from_parent(
+                &latest_parent,
+                &latest_name,
+                relative,
+                expected,
+                max_bytes,
+            )?;
+            self.verify_single_link_from_parent(&latest_parent, &latest_name, relative)?;
+            self.verify_expected_from_parent(
+                &latest_parent,
+                &temp_name,
+                relative,
+                &replacement,
+                max_bytes,
+            )?;
+            self.verify_single_link_from_parent(&latest_parent, &temp_name, relative)?;
+            latest_parent.rename(&temp_name, &latest_parent, &latest_name)?;
+            Ok::<Dir, CoreError>(latest_parent)
+        })();
+
+        let latest_parent = match prepublication {
+            Ok(parent) => parent,
+            Err(error) => {
+                let _ = parent.remove_file(&temp_name);
+                return Err(error);
+            }
+        };
+        after_publication();
+        let directory_sync = sync(&latest_parent);
+        let verification = self
+            .verify_expected_from_parent(
+                &latest_parent,
+                &destination_name,
+                relative,
+                &replacement,
+                max_bytes,
+            )
+            .and_then(|()| {
+                self.verify_single_link_from_parent(&latest_parent, &destination_name, relative)
+            });
+
+        match (directory_sync, verification) {
+            (Ok(durability), Ok(())) => Ok(ReplaceContentOutcome::Replaced(durability)),
+            (sync_result, verification) => Err(CoreError::ReplaceContentOutcomeUnknown {
+                path: relative.as_path().to_owned(),
+                directory_sync: directory_sync_status(sync_result),
+                verification: Box::new(
+                    verification
+                        .err()
+                        .unwrap_or(CoreError::MoveDurabilitySyncFailed),
+                ),
+            }),
+        }
     }
 
     fn open_parent(&self, relative: &VaultPath) -> Result<(Dir, OsString)> {
@@ -3773,6 +3928,162 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn revision_checked_replace_rejects_parent_swap_before_publication() {
+        let root = tempfile::tempdir().expect("temp vault");
+        fs::create_dir(root.path().join("notes")).expect("notes");
+        fs::write(root.path().join("notes/note.md"), b"old").expect("source");
+        let vault = Vault::open(fs::canonicalize(root.path()).unwrap()).unwrap();
+        let path = VaultPath::from_portable("notes/note.md").unwrap();
+        let live = root.path().join("notes");
+        let detached = root.path().join("detached");
+
+        let error = vault
+            .replace_content_file_with_hooks(
+                &path,
+                &FileRevision::from_bytes(b"old"),
+                b"new",
+                1024,
+                || {
+                    fs::rename(&live, &detached).unwrap();
+                    fs::create_dir(&live).unwrap();
+                },
+                || {},
+                sync_directory_for_move,
+            )
+            .expect_err("swapped parent");
+
+        assert!(matches!(error, CoreError::InvalidMove { .. }));
+        assert_eq!(fs::read(detached.join("note.md")).unwrap(), b"old");
+        assert!(fs::read_dir(&live).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn revision_checked_replace_rechecks_before_publication() {
+        let root = tempfile::tempdir().expect("temp vault");
+        fs::write(root.path().join("note.md"), b"old").unwrap();
+        let vault = Vault::open(fs::canonicalize(root.path()).unwrap()).unwrap();
+        let path = VaultPath::from_portable("note.md").unwrap();
+
+        let error = vault
+            .replace_content_file_with_hooks(
+                &path,
+                &FileRevision::from_bytes(b"old"),
+                b"new",
+                1024,
+                || fs::write(root.path().join("note.md"), b"raced").unwrap(),
+                || {},
+                sync_directory_for_move,
+            )
+            .expect_err("stale at publication boundary");
+
+        assert!(matches!(error, CoreError::StaleRevision { .. }));
+        assert_eq!(fs::read(root.path().join("note.md")).unwrap(), b"raced");
+    }
+
+    #[test]
+    fn revision_checked_replace_revalidates_the_temporary_file() {
+        let root = tempfile::tempdir().expect("temp vault");
+        fs::write(root.path().join("note.md"), b"old").unwrap();
+        let vault = Vault::open(fs::canonicalize(root.path()).unwrap()).unwrap();
+        let path = VaultPath::from_portable("note.md").unwrap();
+
+        let error = vault
+            .replace_content_file_with_hooks(
+                &path,
+                &FileRevision::from_bytes(b"old"),
+                b"new",
+                1024,
+                || {
+                    let temporary = fs::read_dir(root.path())
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path())
+                        .find(|entry| {
+                            entry
+                                .file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .starts_with(".myvault-write-")
+                        })
+                        .unwrap();
+                    fs::write(temporary, b"tampered temporary").unwrap();
+                },
+                || {},
+                sync_directory_for_move,
+            )
+            .expect_err("temporary revision mismatch");
+
+        assert!(matches!(error, CoreError::StaleRevision { .. }));
+        assert_eq!(fs::read(root.path().join("note.md")).unwrap(), b"old");
+        assert!(fs::read_dir(root.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".myvault-write-")
+        }));
+    }
+
+    #[test]
+    fn revision_checked_replace_reports_published_sync_failure_as_unknown() {
+        let root = tempfile::tempdir().expect("temp vault");
+        fs::write(root.path().join("note.md"), b"old").unwrap();
+        let vault = Vault::open(fs::canonicalize(root.path()).unwrap()).unwrap();
+        let path = VaultPath::from_portable("note.md").unwrap();
+
+        let error = vault
+            .replace_content_file_with_hooks(
+                &path,
+                &FileRevision::from_bytes(b"old"),
+                b"new",
+                1024,
+                || {},
+                || {},
+                |_| Err(std::io::Error::other("injected sync failure")),
+            )
+            .expect_err("durability unknown");
+
+        assert!(matches!(
+            error,
+            CoreError::ReplaceContentOutcomeUnknown {
+                directory_sync: DirectorySyncStatus::Failed(_),
+                ..
+            }
+        ));
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            "injected sync failure"
+        );
+        assert_eq!(fs::read(root.path().join("note.md")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn revision_checked_replace_reports_postpublication_tampering_as_unknown() {
+        let root = tempfile::tempdir().expect("temp vault");
+        fs::write(root.path().join("note.md"), b"old").unwrap();
+        let vault = Vault::open(fs::canonicalize(root.path()).unwrap()).unwrap();
+        let path = VaultPath::from_portable("note.md").unwrap();
+
+        let error = vault
+            .replace_content_file_with_hooks(
+                &path,
+                &FileRevision::from_bytes(b"old"),
+                b"new",
+                1024,
+                || {},
+                || fs::write(root.path().join("note.md"), b"tampered").unwrap(),
+                sync_directory_for_move,
+            )
+            .expect_err("publication verification unknown");
+
+        assert!(matches!(
+            error,
+            CoreError::ReplaceContentOutcomeUnknown { verification, .. }
+                if matches!(*verification, CoreError::StaleRevision { .. })
+        ));
+    }
 
     #[cfg(unix)]
     #[test]
