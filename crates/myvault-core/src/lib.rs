@@ -22,8 +22,8 @@ pub use trash::{
     StagePayloadOutcome, TrashArea, TrashId, TrashManifestV1, TrashStore, MAX_TRASH_MANIFEST_BYTES,
 };
 pub use vault::{
-    DirectorySyncStatus, InventoryEntry, InventoryKind, InventoryLimits, MoveDurability, Vault,
-    WriteIntent, DEFAULT_READ_LIMIT, MAX_TRASH_PAYLOAD_BYTES,
+    DirectorySyncStatus, InventoryEntry, InventoryKind, InventoryLimits, MoveContentOutcome,
+    MoveDurability, Vault, WriteIntent, DEFAULT_READ_LIMIT, MAX_TRASH_PAYLOAD_BYTES,
     MUTATION_EXTERNAL_PROCESS_RESIDUAL_RISK, TRASH_REVISION_EXTERNAL_PROCESS_RESIDUAL_RISK,
 };
 pub use watcher::{

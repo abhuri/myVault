@@ -41,6 +41,13 @@ pub enum CoreError {
         source_sync: crate::DirectorySyncStatus,
         cause: Box<CoreError>,
     },
+    MoveContentPrepublicationSyncFailed {
+        source_path: PathBuf,
+        destination_path: PathBuf,
+        destination_sync: crate::DirectorySyncStatus,
+        source_sync: crate::DirectorySyncStatus,
+        cause: Box<CoreError>,
+    },
     AppDataInsideVault {
         app_data: PathBuf,
         vault: PathBuf,
@@ -93,6 +100,7 @@ pub enum CoreError {
 }
 
 impl fmt::Display for CoreError {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(result) = self.fmt_special(formatter) {
             return result;
@@ -121,6 +129,7 @@ impl fmt::Display for CoreError {
             | Self::StaleRevision { .. }
             | Self::MoveDurabilitySyncFailed
             | Self::StagePayloadPrepublicationSyncFailed { .. }
+            | Self::MoveContentPrepublicationSyncFailed { .. }
             | Self::VerifiedMoveOutcomeUnknown { .. } => {
                 unreachable!("handled before main error formatting")
             }
@@ -298,6 +307,18 @@ impl CoreError {
                 source_path.display(),
                 destination_path.display()
             )),
+            Self::MoveContentPrepublicationSyncFailed {
+                source_path,
+                destination_path,
+                destination_sync,
+                source_sync,
+                cause,
+            } => Some(write!(
+                formatter,
+                "content was not moved from {} to {} because prepublication sync failed (destination sync: {destination_sync}; source sync: {source_sync}): {cause}",
+                source_path.display(),
+                destination_path.display()
+            )),
             Self::VerifiedMoveOutcomeUnknown {
                 source_path,
                 destination_path,
@@ -328,6 +349,7 @@ impl std::error::Error for CoreError {
             } => destination_sync.error().or_else(|| source_sync.error()),
             Self::VerifiedMoveOutcomeUnknown { verification, .. } => Some(verification.as_ref()),
             Self::StagePayloadPrepublicationSyncFailed { cause, .. }
+            | Self::MoveContentPrepublicationSyncFailed { cause, .. }
             | Self::TrashManifestOutcomeUnknown { cause, .. }
             | Self::TrashPayloadOutcomeUnknown { cause, .. } => Some(cause.as_ref()),
             Self::Sqlite(error) => Some(error),
