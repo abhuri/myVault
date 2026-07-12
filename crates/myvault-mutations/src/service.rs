@@ -1,10 +1,11 @@
 use std::io;
 
 use crate::revision::{to_core, to_recovery};
-use crate::{MutationError, OperationId, RestoreOperation, TrashOperation};
+use crate::{MutationError, NormalMoveOperation, OperationId, RestoreOperation, TrashOperation};
 use myvault_core::{
-    ManifestDigest, PrepareManifestOutcome, PublishItemOutcome, RestoreItemOutcome,
-    StagePayloadOutcome, TrashArea, TrashId, Vault, VaultPath, MAX_TRASH_PAYLOAD_BYTES,
+    ManifestDigest, MoveContentOutcome, PrepareManifestOutcome, PublishItemOutcome,
+    RestoreItemOutcome, StagePayloadOutcome, TrashArea, TrashId, Vault, VaultPath,
+    MAX_TRASH_PAYLOAD_BYTES,
 };
 use myvault_recovery::{
     CompleteOutcome, JournalEvidence, RecoveryJournal, RecoveryOperationKind, RenameMoveIntent,
@@ -23,6 +24,13 @@ pub struct TrashExecutionOutcome {
 pub struct RestoreExecutionOutcome {
     pub operation_id: OperationId,
     pub restored: RestoreItemOutcome,
+    pub completion: CompleteOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NormalMoveExecutionOutcome {
+    pub operation_id: OperationId,
+    pub moved: MoveContentOutcome,
     pub completion: CompleteOutcome,
 }
 
@@ -82,6 +90,27 @@ impl<'service> MutationService<'service> {
             manifest.revision,
             digest.as_str(),
         )
+    }
+
+    /// Plans a bounded file-only normal move without mutating vault or journal.
+    ///
+    /// # Errors
+    /// Returns an error for internal paths, aliases, invalid destinations,
+    /// non-files, or sources exceeding the bounded move limit.
+    pub fn plan_normal_move(
+        vault: &Vault,
+        source: &VaultPath,
+        destination: &VaultPath,
+    ) -> Result<NormalMoveOperation, MutationError> {
+        let operation_id = OperationId::new();
+        RenameMoveIntent::new(
+            operation_id.as_uuid(),
+            source.as_str(),
+            destination.as_str(),
+            myvault_recovery::FileRevision::from_bytes(&[]),
+        )?;
+        let revision = vault.revision(source, MAX_TRASH_PAYLOAD_BYTES)?;
+        NormalMoveOperation::new(operation_id, source, destination, revision)
     }
 
     /// Executes a fresh operation or safely routes an existing journal ID to retry.
@@ -303,6 +332,90 @@ impl<'service> MutationService<'service> {
         }
         Ok(expected_digest)
     }
+
+    /// Executes a fresh normal move or routes existing evidence to retry.
+    ///
+    /// # Errors
+    /// Preserves core/recovery outcome-unknown errors without reclassification.
+    pub fn execute_normal_move(
+        &self,
+        operation: &NormalMoveOperation,
+    ) -> Result<NormalMoveExecutionOutcome, MutationError> {
+        match self
+            .journal
+            .read_evidence(operation.operation_id().as_uuid())
+        {
+            Ok(evidence) => return self.retry_normal_from_evidence(operation, evidence),
+            Err(myvault_recovery::Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let intent = build_normal_intent(operation)?;
+        self.journal.publish(&intent)?;
+        self.continue_normal_move(operation, &intent)
+    }
+
+    /// Retries only exact supported journal evidence for a retained normal move.
+    ///
+    /// # Errors
+    /// Mismatched or unsupported evidence fails before core mutation.
+    pub fn retry_normal_move(
+        &self,
+        operation: &NormalMoveOperation,
+    ) -> Result<NormalMoveExecutionOutcome, MutationError> {
+        let evidence = self
+            .journal
+            .read_evidence(operation.operation_id().as_uuid())?;
+        self.retry_normal_from_evidence(operation, evidence)
+    }
+
+    /// Resumes one supported v4 normal move from journal evidence alone.
+    ///
+    /// # Errors
+    /// Unsupported, wrong-kind, or invalid evidence fails before mutation.
+    pub fn resume_normal_move(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<NormalMoveExecutionOutcome, MutationError> {
+        let evidence = self.journal.read_evidence(operation_id.as_uuid())?;
+        let intent = supported_normal_intent(evidence)?;
+        let operation = normal_operation_from_intent(&intent)?;
+        if operation.operation_id() != operation_id {
+            return Err(MutationError::IntentMismatch);
+        }
+        validate_normal_intent(&operation, &intent)?;
+        self.continue_normal_move(&operation, &intent)
+    }
+
+    fn retry_normal_from_evidence(
+        &self,
+        operation: &NormalMoveOperation,
+        evidence: JournalEvidence,
+    ) -> Result<NormalMoveExecutionOutcome, MutationError> {
+        let intent = supported_normal_intent(evidence)?;
+        validate_normal_intent(operation, &intent)?;
+        self.continue_normal_move(operation, &intent)
+    }
+
+    fn continue_normal_move(
+        &self,
+        operation: &NormalMoveOperation,
+        intent: &RenameMoveIntent,
+    ) -> Result<NormalMoveExecutionOutcome, MutationError> {
+        let (source, destination) = operation.paths()?;
+        let moved = self.vault.move_content_file_if_revision(
+            &source,
+            &destination,
+            operation.revision(),
+        )?;
+        let completion = self
+            .journal
+            .complete(operation.operation_id().as_uuid(), intent)?;
+        Ok(NormalMoveExecutionOutcome {
+            operation_id: operation.operation_id(),
+            moved,
+            completion,
+        })
+    }
 }
 
 fn build_intent(
@@ -441,5 +554,64 @@ fn restore_operation_from_intent(
         &destination,
         to_core(&intent.expected)?,
         manifest_blake3.clone(),
+    )
+}
+
+fn build_normal_intent(operation: &NormalMoveOperation) -> Result<RenameMoveIntent, MutationError> {
+    Ok(RenameMoveIntent::new(
+        operation.operation_id().as_uuid(),
+        operation.source(),
+        operation.destination(),
+        to_recovery(operation.revision()),
+    )?)
+}
+
+fn validate_normal_intent(
+    operation: &NormalMoveOperation,
+    observed: &RenameMoveIntent,
+) -> Result<(), MutationError> {
+    if build_normal_intent(operation)? == *observed {
+        Ok(())
+    } else {
+        Err(MutationError::IntentMismatch)
+    }
+}
+
+fn supported_normal_intent(evidence: JournalEvidence) -> Result<RenameMoveIntent, MutationError> {
+    match evidence {
+        JournalEvidence::Supported(intent)
+            if matches!(intent.kind, RecoveryOperationKind::NormalMove) =>
+        {
+            Ok(intent)
+        }
+        JournalEvidence::Supported(_) => Err(MutationError::InvalidOperation(
+            "journal operation is not a normal move",
+        )),
+        JournalEvidence::Unsupported {
+            operation_id,
+            version,
+        } => Err(MutationError::UnsupportedEvidence {
+            operation_id,
+            version,
+        }),
+    }
+}
+
+fn normal_operation_from_intent(
+    intent: &RenameMoveIntent,
+) -> Result<NormalMoveOperation, MutationError> {
+    if !matches!(intent.kind, RecoveryOperationKind::NormalMove) {
+        return Err(MutationError::InvalidOperation(
+            "journal operation is not a normal move",
+        ));
+    }
+    let operation_id = OperationId::parse(&intent.operation_id.to_string())?;
+    let source = VaultPath::from_portable(&intent.from)?;
+    let destination = VaultPath::from_portable(&intent.to)?;
+    NormalMoveOperation::new(
+        operation_id,
+        &source,
+        &destination,
+        to_core(&intent.expected)?,
     )
 }

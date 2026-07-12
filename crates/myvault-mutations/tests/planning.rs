@@ -82,3 +82,28 @@ fn restore_planning_reads_immutable_item_without_moving_payload() {
         manifest
     );
 }
+
+#[test]
+fn normal_move_planning_is_side_effect_free_and_rejects_case_aliases() {
+    let (_temporary, root, vault) = vault();
+    let source = VaultPath::from_portable("บันทึก/ต้นทาง.md").unwrap();
+    let destination = VaultPath::from_portable("คลัง/ปลายทาง.md").unwrap();
+    vault
+        .create_new(&source, b"unicode", WriteIntent::UserInitiated)
+        .unwrap();
+
+    let operation = MutationService::plan_normal_move(&vault, &source, &destination).unwrap();
+
+    assert_eq!(operation.source(), source.as_str());
+    assert_eq!(operation.destination(), destination.as_str());
+    assert_eq!(operation.revision(), &FileRevision::from_bytes(b"unicode"));
+    assert!(root.join(source.as_path()).exists());
+    assert!(!root.join(destination.as_path()).exists());
+
+    let alias_source = VaultPath::from_portable("Note.md").unwrap();
+    vault
+        .create_new(&alias_source, b"alias", WriteIntent::UserInitiated)
+        .unwrap();
+    let alias_destination = VaultPath::from_portable("note.md").unwrap();
+    assert!(MutationService::plan_normal_move(&vault, &alias_source, &alias_destination).is_err());
+}

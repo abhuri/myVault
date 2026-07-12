@@ -192,3 +192,64 @@ impl RestoreOperation {
         &self.manifest_digest
     }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NormalMoveOperation {
+    operation_id: OperationId,
+    source: String,
+    destination: String,
+    revision: FileRevision,
+}
+
+impl NormalMoveOperation {
+    pub(crate) fn new(
+        operation_id: OperationId,
+        source: &VaultPath,
+        destination: &VaultPath,
+        revision: FileRevision,
+    ) -> Result<Self, MutationError> {
+        myvault_recovery::RenameMoveIntent::new(
+            operation_id.as_uuid(),
+            source.as_str(),
+            destination.as_str(),
+            crate::revision::to_recovery(&revision),
+        )?;
+        Ok(Self {
+            operation_id,
+            source: source.as_str().to_owned(),
+            destination: destination.as_str().to_owned(),
+            revision,
+        })
+    }
+
+    pub(crate) fn paths(&self) -> Result<(VaultPath, VaultPath), MutationError> {
+        let source = VaultPath::from_portable(&self.source)?;
+        let destination = VaultPath::from_portable(&self.destination)?;
+        if source.as_str() != self.source || destination.as_str() != self.destination {
+            return Err(MutationError::InvalidOperation(
+                "normal move paths are not canonical",
+            ));
+        }
+        Ok((source, destination))
+    }
+
+    #[must_use]
+    pub fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    #[must_use]
+    pub fn destination(&self) -> &str {
+        &self.destination
+    }
+
+    #[must_use]
+    pub fn revision(&self) -> &FileRevision {
+        &self.revision
+    }
+}
