@@ -9,6 +9,7 @@ description = "Held-capability private filesystem boundary for myVault"
 [dependencies]
 cap-fs-ext = "=4.0.2"
 cap-std = "=4.0.2"
+myvault-platform-fs = { path = "../myvault-platform-fs" }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "=1.1.4", features = ["process"] }
@@ -24,7 +25,6 @@ myvault-platform-acl = { path = "../myvault-platform-acl" }
 
 [target.'cfg(windows)'.dependencies]
 myvault-platform-acl = { path = "../myvault-platform-acl" }
-myvault-platform-fs = { path = "../myvault-platform-fs" }
 
 [dev-dependencies]
 tempfile = "=3.23.0"

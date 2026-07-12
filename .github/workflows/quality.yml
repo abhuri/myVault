@@ -74,8 +74,10 @@ jobs:
           cargo fmt --manifest-path crates/myvault-core/Cargo.toml --all -- --check
           cargo fmt --manifest-path crates/myvault-platform-acl/Cargo.toml --all -- --check
           cargo fmt --manifest-path crates/myvault-platform-fs/Cargo.toml --all -- --check
+          cargo fmt --manifest-path crates/myvault-private-fs/Cargo.toml --all -- --check
           cargo fmt --manifest-path crates/myvault-recovery/Cargo.toml --all -- --check
           cargo fmt --manifest-path crates/myvault-mutations/Cargo.toml --all -- --check
+          cargo fmt --manifest-path crates/myvault-snapshots/Cargo.toml --all -- --check
           cargo fmt --manifest-path crates/desktop-auth/Cargo.toml --all -- --check
           cargo fmt --manifest-path crates/drive-sync-spike/Cargo.toml --all -- --check
           cargo fmt --manifest-path crates/tauri-plugin-google-auth/Cargo.toml --all -- --check
@@ -86,8 +88,10 @@ jobs:
           cargo clippy --manifest-path crates/myvault-core/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path crates/myvault-platform-acl/Cargo.toml --all-targets --all-features -- -D warnings
           cargo clippy --manifest-path crates/myvault-platform-fs/Cargo.toml --all-targets --all-features -- -D warnings
+          cargo clippy --manifest-path crates/myvault-private-fs/Cargo.toml --all-targets --all-features -- -D warnings
           cargo clippy --manifest-path crates/myvault-recovery/Cargo.toml --all-targets --all-features -- -D warnings
           cargo clippy --manifest-path crates/myvault-mutations/Cargo.toml --all-targets --all-features -- -D warnings
+          cargo clippy --manifest-path crates/myvault-snapshots/Cargo.toml --all-targets --all-features -- -D warnings
           cargo clippy --manifest-path crates/desktop-auth/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path crates/drive-sync-spike/Cargo.toml --all-targets -- -D warnings
 
@@ -97,8 +101,10 @@ jobs:
           cargo test --manifest-path crates/myvault-core/Cargo.toml
           cargo test --manifest-path crates/myvault-platform-acl/Cargo.toml
           cargo test --manifest-path crates/myvault-platform-fs/Cargo.toml
+          cargo test --manifest-path crates/myvault-private-fs/Cargo.toml
           cargo test --manifest-path crates/myvault-recovery/Cargo.toml
           cargo test --manifest-path crates/myvault-mutations/Cargo.toml
+          cargo test --manifest-path crates/myvault-snapshots/Cargo.toml
           cargo test --manifest-path crates/desktop-auth/Cargo.toml
           cargo test --manifest-path crates/drive-sync-spike/Cargo.toml
 
