@@ -1,0 +1,24 @@
+[package]
+name = "tauri-plugin-private-root"
+version = "0.1.0"
+description = "Native Android no-backup private-root capability for myVault"
+edition = "2021"
+rust-version = "1.85"
+links = "tauri-plugin-private-root"
+
+[dependencies]
+cap-fs-ext = "4.0.2"
+cap-std = "4.0.2"
+myvault-private-fs = { path = "../myvault-private-fs" }
+serde = { version = "1", features = ["derive"] }
+tauri = "2.11.3"
+
+[build-dependencies]
+tauri-plugin = { version = "2.6.3", features = ["build"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"

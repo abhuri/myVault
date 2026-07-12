@@ -28,6 +28,160 @@ pub enum Error {
     ExternalMutation,
 }
 
+#[cfg(target_os = "android")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AndroidAclInspection {
+    Clean,
+    Unsupported,
+}
+
+/// A held Android directory whose filesystem facts were inspected without
+/// claiming native no-backup provenance.
+#[cfg(target_os = "android")]
+pub struct InspectedAndroidPrivateRoot {
+    directory: Dir,
+    acl: AndroidAclInspection,
+}
+
+#[cfg(target_os = "android")]
+impl InspectedAndroidPrivateRoot {
+    /// Returns whether ACL xattrs were proven absent or unsupported.
+    #[must_use]
+    pub fn acl_inspection(&self) -> AndroidAclInspection {
+        self.acl
+    }
+
+    /// Consumes the untrusted inspection wrapper for use by a native adapter.
+    /// This does not itself confer no-backup provenance.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn into_untrusted_directory(self) -> Dir {
+        self.directory
+    }
+}
+
+/// Applies mode 0700 to a held, newly created Android directory.
+///
+/// # Errors
+/// Returns an I/O error when the held permission update fails.
+#[cfg(target_os = "android")]
+pub fn harden_android_new_directory(directory: &Dir) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
+    directory
+        .try_clone()?
+        .into_std_file()
+        .set_permissions(fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+/// Inspects a held Android directory without granting native provenance.
+///
+/// # Errors
+/// Rejects wrong type, owner, exact mode, or present ACL xattrs.
+#[cfg(target_os = "android")]
+pub fn inspect_android_held_directory(directory: &Dir) -> Result<AndroidAclInspection, Error> {
+    use std::os::unix::fs::MetadataExt;
+    let held = directory.try_clone()?.into_std_file();
+    let metadata = held.metadata()?;
+    if !metadata.is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o777 != 0o700
+    {
+        return Err(Error::ExternalMutation);
+    }
+    inspect_android_acl(&held)
+}
+
+/// Applies mode 0600 to a held, newly created Android file.
+///
+/// # Errors
+/// Returns an I/O error when the held permission update fails.
+#[cfg(target_os = "android")]
+pub fn harden_android_new_file(file: &File) -> Result<(), Error> {
+    use cap_std::fs::{Permissions, PermissionsExt};
+    file.set_permissions(Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+/// Inspects a held Android file without granting native provenance.
+///
+/// # Errors
+/// Rejects wrong type, owner, exact mode, nlink other than one, or present ACL xattrs.
+#[cfg(target_os = "android")]
+pub fn inspect_android_held_file(file: &File) -> Result<AndroidAclInspection, Error> {
+    use std::os::unix::fs::MetadataExt;
+    let held = file.try_clone()?.into_std();
+    let metadata = held.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(Error::ExternalMutation);
+    }
+    inspect_android_acl(&held)
+}
+
+/// Inspects a candidate Android private root without granting trust. Only a
+/// native adapter that obtained the path from `getNoBackupFilesDir()` may turn
+/// an `Unsupported` ACL result into a trusted no-backup capability.
+///
+/// # Errors
+/// Fails for unstable, overlapping, symlinked, incorrectly owned, or non-0700 roots.
+#[cfg(target_os = "android")]
+pub fn inspect_android_private_root(
+    candidate: &Path,
+    other_root: &Path,
+) -> Result<InspectedAndroidPrivateRoot, Error> {
+    use std::os::unix::fs::MetadataExt;
+
+    let candidate_before = candidate.canonicalize()?;
+    let other_before = other_root.canonicalize()?;
+    let directory = open_absolute_dir_nofollow(candidate)?;
+    let other = open_absolute_dir_nofollow(other_root)?;
+    let candidate_after = candidate.canonicalize()?;
+    let other_after = other_root.canonicalize()?;
+    if candidate_before != candidate_after || other_before != other_after {
+        return Err(Error::InvalidRoot("root changed while it was opened"));
+    }
+    verify_root_identity(&directory, &candidate_after)?;
+    verify_root_identity(&other, &other_after)?;
+    validate_disjoint_canonical(&candidate_after, &other_after)?;
+    let held = directory.try_clone()?.into_std_file();
+    let metadata = held.metadata()?;
+    if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o777 != 0o700 {
+        return Err(Error::InvalidRoot(
+            "Android no-backup directory must be current-user owned with mode 0700",
+        ));
+    }
+    let acl = inspect_android_acl(&held)?;
+    Ok(InspectedAndroidPrivateRoot { directory, acl })
+}
+
+#[cfg(target_os = "android")]
+fn inspect_android_acl(file: &std::fs::File) -> Result<AndroidAclInspection, Error> {
+    use xattr::FileExt;
+    let mut unsupported = false;
+    for name in ["system.posix_acl_access", "system.posix_acl_default"] {
+        match file.get_xattr(name) {
+            Ok(Some(_)) => return Err(Error::ExtendedAcl),
+            Ok(None) => {}
+            Err(error)
+                if error.kind() == io::ErrorKind::Unsupported
+                    || error.raw_os_error() == Some(rustix::io::Errno::NOTSUP.raw_os_error()) =>
+            {
+                unsupported = true;
+            }
+            Err(error) => return Err(Error::Io(error)),
+        }
+    }
+    Ok(if unsupported {
+        AndroidAclInspection::Unsupported
+    } else {
+        AndroidAclInspection::Clean
+    })
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

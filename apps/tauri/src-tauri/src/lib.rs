@@ -150,7 +150,9 @@ pub fn run() {
     let builder = tauri::Builder::default().manage(GoogleAuthSession::default());
 
     #[cfg(target_os = "android")]
-    let builder = builder.plugin(tauri_plugin_google_auth::init());
+    let builder = builder
+        .plugin(tauri_plugin_google_auth::init())
+        .plugin(tauri_plugin_private_root::init());
 
     builder
         .invoke_handler(tauri::generate_handler![
