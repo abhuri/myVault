@@ -77,6 +77,18 @@ pub enum MoveDurability {
     DirectorySyncUnsupported,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MoveContentOutcome {
+    Moved(MoveDurability),
+    AlreadyMoved(MoveDurability),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContentMoveMode {
+    Fresh,
+    Resume,
+}
+
 /// Result of flushing one parent directory after a published move.
 #[derive(Debug)]
 pub enum DirectorySyncStatus {
@@ -394,6 +406,239 @@ impl Vault {
         })
     }
 
+    /// Atomically moves one revision-bound content file without replacing an
+    /// existing destination, and safely confirms exact retries.
+    ///
+    /// # Errors
+    /// Returns a typed prepublication sync error when the file is known not to
+    /// have moved, or an explicit outcome-unknown error after publication.
+    pub fn move_content_file_if_revision(
+        &self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        expected: &FileRevision,
+    ) -> Result<MoveContentOutcome> {
+        self.move_content_file_with_hooks(
+            source,
+            destination,
+            expected,
+            |_, directory| sync_directory_for_move(directory),
+            || {},
+            || {},
+        )
+    }
+
+    /// Confirms a retained revision-bound content move without publishing a
+    /// source-only topology that may have been recreated after the first move.
+    ///
+    /// # Errors
+    /// Returns an invalid-move error when only the source exists because that
+    /// topology is ambiguous during recovery, or the same validation and
+    /// topology errors as [`Self::move_content_file_if_revision`].
+    pub fn resume_content_file_move_if_revision(
+        &self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        expected: &FileRevision,
+    ) -> Result<MoveContentOutcome> {
+        self.move_content_file_with_hooks_and_mode(
+            source,
+            destination,
+            expected,
+            |_, directory| sync_directory_for_move(directory),
+            || {},
+            || {},
+            ContentMoveMode::Resume,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn move_content_file_with_hooks<F, G, H>(
+        &self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        expected: &FileRevision,
+        sync: F,
+        before_rename: G,
+        after_move: H,
+    ) -> Result<MoveContentOutcome>
+    where
+        F: FnMut(MoveSyncParent, &Dir) -> std::io::Result<MoveDurability>,
+        G: FnOnce(),
+        H: FnOnce(),
+    {
+        self.move_content_file_with_hooks_and_mode(
+            source,
+            destination,
+            expected,
+            sync,
+            before_rename,
+            after_move,
+            ContentMoveMode::Fresh,
+        )
+    }
+
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    fn move_content_file_with_hooks_and_mode<F, G, H>(
+        &self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        expected: &FileRevision,
+        mut sync: F,
+        before_rename: G,
+        after_move: H,
+        mode: ContentMoveMode,
+    ) -> Result<MoveContentOutcome>
+    where
+        F: FnMut(MoveSyncParent, &Dir) -> std::io::Result<MoveDurability>,
+        G: FnOnce(),
+        H: FnOnce(),
+    {
+        Self::require_content_path(source)?;
+        Self::require_content_path(destination)?;
+        if source == destination || source.collision_key() == destination.collision_key() {
+            return Err(CoreError::InvalidMove {
+                source_path: source.as_path().to_owned(),
+                destination_path: destination.as_path().to_owned(),
+                reason: "content move endpoints must have distinct portable collision keys",
+            });
+        }
+        expected.validate()?;
+        if expected.byte_len > MAX_TRASH_PAYLOAD_BYTES as u64 {
+            return Err(CoreError::ResourceLimitExceeded {
+                resource: "move content revision bytes",
+                limit: MAX_TRASH_PAYLOAD_BYTES,
+            });
+        }
+        let _guard = self.lock_mutations()?;
+        let (destination_parent, _) = self.open_parent(destination)?;
+        let (source_parent, _) = self.open_parent(source)?;
+        let same_parent = Self::same_parent_path(source, destination);
+        let classification_report = MoveSyncReport {
+            destination: sync(MoveSyncParent::Destination, &destination_parent),
+            source: (!same_parent).then(|| sync(MoveSyncParent::Source, &source_parent)),
+        };
+        if classification_report.has_failure() {
+            return Err(
+                classification_report.into_content_prepublication_sync_failed(
+                    source,
+                    destination,
+                    CoreError::MoveDurabilitySyncFailed,
+                ),
+            );
+        }
+        let classification_durability = classification_report.into_result(source, destination)?;
+        let (authoritative_destination, checked_destination_name) =
+            self.open_parent_checked(destination)?;
+        let (authoritative_source, checked_source_name) = self.open_parent_checked(source)?;
+        if !Self::same_open_directory(&destination_parent, &authoritative_destination)?
+            || !Self::same_open_directory(&source_parent, &authoritative_source)?
+        {
+            return Err(CoreError::InvalidMove {
+                source_path: source.as_path().to_owned(),
+                destination_path: destination.as_path().to_owned(),
+                reason: "content parent directory identity changed",
+            });
+        }
+        let source_utf8 = checked_source_name
+            .to_str()
+            .ok_or_else(|| CoreError::InvalidRelativePath(source.as_path().to_owned()))?;
+        let destination_utf8 = checked_destination_name
+            .to_str()
+            .ok_or_else(|| CoreError::InvalidRelativePath(destination.as_path().to_owned()))?;
+        self.reject_sibling_collision(&authoritative_source, source_utf8, source)?;
+        self.reject_sibling_collision(&authoritative_destination, destination_utf8, destination)?;
+        let source_exists =
+            Self::entry_exists_from_parent(&authoritative_source, &checked_source_name)?;
+        let destination_exists =
+            Self::entry_exists_from_parent(&authoritative_destination, &checked_destination_name)?;
+        match (source_exists, destination_exists) {
+            (true, true) => Err(CoreError::AlreadyExists(destination.as_path().to_owned())),
+            (false, false) => Err(CoreError::InvalidMove {
+                source_path: source.as_path().to_owned(),
+                destination_path: destination.as_path().to_owned(),
+                reason: "source and destination are both absent",
+            }),
+            (false, true) => {
+                self.verify_content_move_topology(
+                    source,
+                    destination,
+                    expected,
+                    &authoritative_source,
+                    &authoritative_destination,
+                )?;
+                Ok(MoveContentOutcome::AlreadyMoved(classification_durability))
+            }
+            (true, false) if mode == ContentMoveMode::Resume => Err(CoreError::InvalidMove {
+                source_path: source.as_path().to_owned(),
+                destination_path: destination.as_path().to_owned(),
+                reason: "source-only topology is ambiguous during retained move recovery",
+            }),
+            (true, false) => {
+                self.verify_expected_from_parent(
+                    &authoritative_source,
+                    &checked_source_name,
+                    source,
+                    expected,
+                    MAX_TRASH_PAYLOAD_BYTES,
+                )?;
+                self.verify_single_link_from_parent(
+                    &authoritative_source,
+                    &checked_source_name,
+                    source,
+                )?;
+                before_rename();
+                let (latest_destination, latest_destination_name) =
+                    self.open_parent_checked(destination)?;
+                let (latest_source, latest_source_name) = self.open_parent_checked(source)?;
+                if !Self::same_open_directory(&authoritative_destination, &latest_destination)?
+                    || !Self::same_open_directory(&authoritative_source, &latest_source)?
+                {
+                    return Err(CoreError::InvalidMove {
+                        source_path: source.as_path().to_owned(),
+                        destination_path: destination.as_path().to_owned(),
+                        reason: "content parent directory identity changed before rename",
+                    });
+                }
+                rename_noreplace(
+                    &latest_source,
+                    &latest_source_name,
+                    &latest_destination,
+                    &latest_destination_name,
+                )
+                .map_err(|error| Self::map_atomic_move_error(source, destination, error))?;
+                let move_report = MoveSyncReport {
+                    destination: sync(MoveSyncParent::Destination, &latest_destination),
+                    source: (!same_parent).then(|| sync(MoveSyncParent::Source, &latest_source)),
+                };
+                after_move();
+                if move_report.has_failure() {
+                    return self.confirm_content_move(
+                        source,
+                        destination,
+                        expected,
+                        &latest_source,
+                        &latest_destination,
+                        classification_durability,
+                        &mut sync,
+                    );
+                }
+                if let Err(cause) = self.verify_content_move_topology(
+                    source,
+                    destination,
+                    expected,
+                    &latest_source,
+                    &latest_destination,
+                ) {
+                    return Err(move_report.into_verified_unknown(source, destination, cause));
+                }
+                let durability = classification_durability
+                    .combine(move_report.into_result(source, destination)?);
+                Ok(MoveContentOutcome::Moved(durability))
+            }
+        }
+    }
+
     fn atomic_move_inner<F>(
         &self,
         source: &VaultPath,
@@ -409,6 +654,152 @@ impl Vault {
         Self::validate_mutation_policy(destination, intent)?;
         self.atomic_move_locked_report(source, destination, sync)?
             .into_result(source, destination)
+    }
+
+    fn same_parent_path(source: &VaultPath, destination: &VaultPath) -> bool {
+        source
+            .as_str()
+            .rsplit_once('/')
+            .map_or("", |(parent, _)| parent)
+            == destination
+                .as_str()
+                .rsplit_once('/')
+                .map_or("", |(parent, _)| parent)
+    }
+
+    fn entry_exists_from_parent(parent: &Dir, name: &OsString) -> Result<bool> {
+        match parent.symlink_metadata(name) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn same_open_directory(expected: &Dir, actual: &Dir) -> Result<bool> {
+        Ok(myvault_platform_fs::directory_identity(expected)?
+            == myvault_platform_fs::directory_identity(actual)?)
+    }
+
+    fn verify_content_move_topology(
+        &self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        expected: &FileRevision,
+        expected_source_parent: &Dir,
+        expected_destination_parent: &Dir,
+    ) -> Result<()> {
+        let (destination_parent, destination_name) = self.open_parent_checked(destination)?;
+        let (source_parent, source_name) = self.open_parent_checked(source)?;
+        if !Self::same_open_directory(expected_destination_parent, &destination_parent)?
+            || !Self::same_open_directory(expected_source_parent, &source_parent)?
+        {
+            return Err(CoreError::InvalidMove {
+                source_path: source.as_path().to_owned(),
+                destination_path: destination.as_path().to_owned(),
+                reason: "content parent directory identity changed",
+            });
+        }
+        self.verify_expected_from_parent(
+            &destination_parent,
+            &destination_name,
+            destination,
+            expected,
+            MAX_TRASH_PAYLOAD_BYTES,
+        )?;
+        self.verify_single_link_from_parent(&destination_parent, &destination_name, destination)?;
+        Self::verify_source_absent(&source_parent, &source_name, source, destination)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn confirm_content_move<F>(
+        &self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        expected: &FileRevision,
+        expected_source_parent: &Dir,
+        expected_destination_parent: &Dir,
+        classification_durability: MoveDurability,
+        sync: &mut F,
+    ) -> Result<MoveContentOutcome>
+    where
+        F: FnMut(MoveSyncParent, &Dir) -> std::io::Result<MoveDurability>,
+    {
+        let same_parent = Self::same_parent_path(source, destination);
+        let destination_open = self.open_parent(destination);
+        let source_open = self.open_parent(source);
+        let (destination_parent, source_parent) = match (destination_open, source_open) {
+            (Ok((destination_parent, _)), Ok((source_parent, _))) => {
+                (destination_parent, source_parent)
+            }
+            (Err(cause), Ok((source_parent, _))) => {
+                let (destination_status, source_status) = if same_parent {
+                    (
+                        directory_sync_status(sync(MoveSyncParent::Destination, &source_parent)),
+                        DirectorySyncStatus::SharedWithDestination,
+                    )
+                } else {
+                    (
+                        DirectorySyncStatus::NotAttempted,
+                        directory_sync_status(sync(MoveSyncParent::Source, &source_parent)),
+                    )
+                };
+                return Err(Self::verified_move_unknown(
+                    source,
+                    destination,
+                    destination_status,
+                    source_status,
+                    cause,
+                ));
+            }
+            (Ok((destination_parent, _)), Err(cause)) => {
+                let destination_status =
+                    directory_sync_status(sync(MoveSyncParent::Destination, &destination_parent));
+                let source_status = if same_parent {
+                    DirectorySyncStatus::SharedWithDestination
+                } else {
+                    DirectorySyncStatus::NotAttempted
+                };
+                return Err(Self::verified_move_unknown(
+                    source,
+                    destination,
+                    destination_status,
+                    source_status,
+                    cause,
+                ));
+            }
+            (Err(cause), Err(_)) => {
+                return Err(Self::verified_move_unknown(
+                    source,
+                    destination,
+                    DirectorySyncStatus::NotAttempted,
+                    DirectorySyncStatus::NotAttempted,
+                    cause,
+                ));
+            }
+        };
+        let report = MoveSyncReport {
+            destination: sync(MoveSyncParent::Destination, &destination_parent),
+            source: (!same_parent).then(|| sync(MoveSyncParent::Source, &source_parent)),
+        };
+        if let Err(cause) = self.verify_content_move_topology(
+            source,
+            destination,
+            expected,
+            expected_source_parent,
+            expected_destination_parent,
+        ) {
+            return Err(report.into_verified_unknown(source, destination, cause));
+        }
+        if report.has_failure() {
+            return Err(report.into_verified_unknown(
+                source,
+                destination,
+                CoreError::MoveDurabilitySyncFailed,
+            ));
+        }
+        let durability =
+            classification_durability.combine(report.into_result(source, destination)?);
+        Ok(MoveContentOutcome::Moved(durability))
     }
 
     fn atomic_move_locked_report<F>(
@@ -697,7 +1088,6 @@ impl Vault {
         Self::verify_source_absent(&source_parent, &source_name, source, destination)
     }
 
-    #[cfg(test)]
     fn verify_source_absent(
         source_parent: &Dir,
         source_name: &OsString,
@@ -736,7 +1126,7 @@ impl Vault {
             return Err(CoreError::InvalidMove {
                 source_path: relative.as_path().to_owned(),
                 destination_path: relative.as_path().to_owned(),
-                reason: "trash payload must be a regular file with exactly one hard link",
+                reason: "file must be regular with exactly one hard link",
             });
         }
         Ok(())
@@ -2851,6 +3241,24 @@ impl MoveSyncReport {
             cause: Box::new(cause),
         }
     }
+
+    fn into_content_prepublication_sync_failed(
+        self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        cause: CoreError,
+    ) -> CoreError {
+        CoreError::MoveContentPrepublicationSyncFailed {
+            source_path: source.as_path().to_owned(),
+            destination_path: destination.as_path().to_owned(),
+            destination_sync: directory_sync_status(self.destination),
+            source_sync: self.source.map_or(
+                DirectorySyncStatus::SharedWithDestination,
+                directory_sync_status,
+            ),
+            cause: Box::new(cause),
+        }
+    }
 }
 
 fn sync_directory(directory: &Dir) -> Result<()> {
@@ -4378,6 +4786,298 @@ mod tests {
             VaultPath::new("source-parent/note.md").expect("source path"),
             VaultPath::new("destination-parent/note.md").expect("destination path"),
         )
+    }
+
+    #[test]
+    fn content_move_prepublication_sync_failure_is_typed_and_does_not_move() {
+        let (base, vault, source, destination) = atomic_move_sync_fixture("content-pre-sync");
+        let expected = FileRevision::from_bytes(b"note");
+        let mut attempts = Vec::new();
+        let error = vault
+            .move_content_file_with_hooks(
+                &source,
+                &destination,
+                &expected,
+                |parent, _| {
+                    attempts.push(parent);
+                    if parent == MoveSyncParent::Destination {
+                        Err(injected_sync_failure(parent))
+                    } else {
+                        Ok(MoveDurability::FullySynced)
+                    }
+                },
+                || {},
+                || {},
+            )
+            .expect_err("known prepublication failure");
+
+        assert_eq!(
+            attempts,
+            [MoveSyncParent::Destination, MoveSyncParent::Source]
+        );
+        assert!(matches!(
+            error,
+            CoreError::MoveContentPrepublicationSyncFailed {
+                destination_sync: DirectorySyncStatus::Failed(_),
+                source_sync: DirectorySyncStatus::Synced,
+                ..
+            }
+        ));
+        assert!(base.join(source.as_path()).is_file());
+        assert!(!base.join(destination.as_path()).exists());
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn content_move_propagates_unsupported_and_confirms_failed_publication_sync() {
+        let (base, vault, source, destination) = atomic_move_sync_fixture("content-confirm");
+        let expected = FileRevision::from_bytes(b"note");
+        let mut source_syncs = 0_u8;
+        let outcome = vault
+            .move_content_file_with_hooks(
+                &source,
+                &destination,
+                &expected,
+                |parent, _| {
+                    if parent == MoveSyncParent::Source {
+                        source_syncs = source_syncs.saturating_add(1);
+                        if source_syncs == 2 {
+                            return Err(injected_sync_failure(parent));
+                        }
+                    }
+                    if parent == MoveSyncParent::Destination {
+                        Ok(MoveDurability::DirectorySyncUnsupported)
+                    } else {
+                        Ok(MoveDurability::FullySynced)
+                    }
+                },
+                || {},
+                || {},
+            )
+            .expect("confirmed content move");
+
+        assert_eq!(
+            outcome,
+            MoveContentOutcome::Moved(MoveDurability::DirectorySyncUnsupported)
+        );
+        let retry = vault
+            .move_content_file_with_hooks(
+                &source,
+                &destination,
+                &expected,
+                |parent, _| {
+                    if parent == MoveSyncParent::Destination {
+                        Ok(MoveDurability::DirectorySyncUnsupported)
+                    } else {
+                        Ok(MoveDurability::FullySynced)
+                    }
+                },
+                || {},
+                || {},
+            )
+            .expect("retry");
+        assert_eq!(
+            retry,
+            MoveContentOutcome::AlreadyMoved(MoveDurability::DirectorySyncUnsupported)
+        );
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn content_move_combines_source_unsupported_symmetrically() {
+        let (base, vault, source, destination) =
+            atomic_move_sync_fixture("content-source-unsupported");
+        let expected = FileRevision::from_bytes(b"note");
+        let sync = |parent, _: &Dir| {
+            if parent == MoveSyncParent::Source {
+                Ok(MoveDurability::DirectorySyncUnsupported)
+            } else {
+                Ok(MoveDurability::FullySynced)
+            }
+        };
+
+        let outcome = vault
+            .move_content_file_with_hooks(&source, &destination, &expected, sync, || {}, || {})
+            .expect("content move with unsupported source sync");
+        assert_eq!(
+            outcome,
+            MoveContentOutcome::Moved(MoveDurability::DirectorySyncUnsupported)
+        );
+
+        let retry = vault
+            .move_content_file_with_hooks(&source, &destination, &expected, sync, || {}, || {})
+            .expect("idempotent retry with unsupported source sync");
+        assert_eq!(
+            retry,
+            MoveContentOutcome::AlreadyMoved(MoveDurability::DirectorySyncUnsupported)
+        );
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn content_move_postrename_destination_mutation_is_explicit_unknown() {
+        let (base, vault, source, destination) = atomic_move_sync_fixture("content-mutated");
+        let expected = FileRevision::from_bytes(b"note");
+        let destination_path = base.join(destination.as_path());
+        let error = vault
+            .move_content_file_with_hooks(
+                &source,
+                &destination,
+                &expected,
+                |_, _| Ok(MoveDurability::FullySynced),
+                || {},
+                || fs::write(&destination_path, b"external").expect("mutate destination"),
+            )
+            .expect_err("postrename mutation");
+
+        assert!(matches!(
+            error,
+            CoreError::VerifiedMoveOutcomeUnknown {
+                destination_sync: DirectorySyncStatus::Synced,
+                source_sync: DirectorySyncStatus::Synced,
+                verification,
+                ..
+            } if matches!(*verification, CoreError::StaleRevision { .. })
+        ));
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn content_move_postrename_source_recreation_is_explicit_unknown() {
+        let (base, vault, source, destination) = atomic_move_sync_fixture("content-recreated");
+        let expected = FileRevision::from_bytes(b"note");
+        let source_path = base.join(source.as_path());
+        let error = vault
+            .move_content_file_with_hooks(
+                &source,
+                &destination,
+                &expected,
+                |parent, _| match parent {
+                    MoveSyncParent::Destination => Ok(MoveDurability::DirectorySyncUnsupported),
+                    MoveSyncParent::Source => Ok(MoveDurability::FullySynced),
+                },
+                || {},
+                || fs::write(&source_path, b"external").expect("recreate source"),
+            )
+            .expect_err("postrename source recreation");
+
+        assert!(matches!(
+            error,
+            CoreError::VerifiedMoveOutcomeUnknown {
+                destination_sync: DirectorySyncStatus::Unsupported,
+                source_sync: DirectorySyncStatus::Synced,
+                verification,
+                ..
+            } if matches!(*verification, CoreError::InvalidMove { .. })
+        ));
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn content_move_rejects_parent_swap_immediately_before_rename() {
+        let (base, vault, source, destination) = atomic_move_sync_fixture("content-parent-swap");
+        let expected = FileRevision::from_bytes(b"note");
+        let source_parent = base.join("source-parent");
+        let detached = base.join("source-parent-detached");
+        let error = vault
+            .move_content_file_with_hooks(
+                &source,
+                &destination,
+                &expected,
+                |_, _| Ok(MoveDurability::FullySynced),
+                || {
+                    fs::rename(&source_parent, &detached).expect("detach source parent");
+                    fs::create_dir(&source_parent).expect("replacement source parent");
+                },
+                || {},
+            )
+            .expect_err("parent identity swap");
+
+        assert!(matches!(error, CoreError::InvalidMove { .. }));
+        assert!(detached.join("note.md").is_file());
+        assert!(!base.join(destination.as_path()).exists());
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn content_move_confirmation_rejects_parent_swap_with_exact_statuses() {
+        let (base, vault, source, destination) = atomic_move_sync_fixture("content-confirm-swap");
+        let expected = FileRevision::from_bytes(b"note");
+        let destination_parent = base.join("destination-parent");
+        let detached = base.join("destination-parent-detached");
+        let mut source_syncs = 0_u8;
+        let error = vault
+            .move_content_file_with_hooks(
+                &source,
+                &destination,
+                &expected,
+                |parent, _| {
+                    if parent == MoveSyncParent::Source {
+                        source_syncs = source_syncs.saturating_add(1);
+                        if source_syncs == 2 {
+                            return Err(injected_sync_failure(parent));
+                        }
+                    }
+                    Ok(MoveDurability::FullySynced)
+                },
+                || {},
+                || {
+                    fs::rename(&destination_parent, &detached).expect("detach destination parent");
+                    fs::create_dir(&destination_parent).expect("replacement destination parent");
+                },
+            )
+            .expect_err("confirmation parent identity swap");
+
+        assert!(matches!(
+            error,
+            CoreError::VerifiedMoveOutcomeUnknown {
+                destination_sync: DirectorySyncStatus::Synced,
+                source_sync: DirectorySyncStatus::Synced,
+                verification,
+                ..
+            } if matches!(*verification, CoreError::InvalidMove { .. })
+        ));
+        assert!(detached.join("note.md").is_file());
+        fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[test]
+    fn content_move_same_parent_syncs_once_per_phase() {
+        let temp_root = fs::canonicalize(std::env::temp_dir()).expect("temp root");
+        let base = temp_root.join(format!(
+            "myvault-content-same-parent-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&base).expect("fixture");
+        fs::write(base.join("from.md"), b"note").expect("source");
+        let vault = Vault::open(&base).expect("vault");
+        let source = VaultPath::from_portable("from.md").expect("source path");
+        let destination = VaultPath::from_portable("to.md").expect("destination path");
+        let mut attempts = Vec::new();
+        let outcome = vault
+            .move_content_file_with_hooks(
+                &source,
+                &destination,
+                &FileRevision::from_bytes(b"note"),
+                |parent, _| {
+                    attempts.push(parent);
+                    Ok(MoveDurability::FullySynced)
+                },
+                || {},
+                || {},
+            )
+            .expect("move");
+
+        assert_eq!(
+            outcome,
+            MoveContentOutcome::Moved(MoveDurability::FullySynced)
+        );
+        assert_eq!(
+            attempts,
+            [MoveSyncParent::Destination, MoveSyncParent::Destination]
+        );
+        fs::remove_dir_all(base).expect("cleanup");
     }
 
     fn injected_sync_failure(parent: MoveSyncParent) -> std::io::Error {

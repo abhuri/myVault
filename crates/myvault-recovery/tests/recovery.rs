@@ -1,9 +1,11 @@
 use myvault_recovery::{
-    decide_recovery, Error, FileRevision, JournalEvidence, RecoveryDecision, RecoveryJournal,
-    RecoveryOperationKind, RecoveryTopology, RenameMoveIntent,
+    decide_recovery, Error, FileRevision, RecoveryDecision, RecoveryJournal, RecoveryOperationKind,
+    RecoveryTopology, RenameMoveIntent,
 };
 #[cfg(unix)]
-use myvault_recovery::{CompleteOutcome, PublishOutcome, MAX_DIRECTORY_ENTRY_COUNT, MAX_PAGE_SIZE};
+use myvault_recovery::{
+    CompleteOutcome, JournalEvidence, PublishOutcome, MAX_DIRECTORY_ENTRY_COUNT, MAX_PAGE_SIZE,
+};
 use std::fs;
 #[cfg(unix)]
 use std::io::Write;
