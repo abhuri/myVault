@@ -201,6 +201,107 @@ pub struct NormalMoveOperation {
     revision: FileRevision,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaseRenameOperation {
+    operation_id: OperationId,
+    source: String,
+    destination: String,
+    temporary: String,
+    revision: FileRevision,
+}
+
+impl CaseRenameOperation {
+    pub(crate) fn new(
+        operation_id: OperationId,
+        source: &VaultPath,
+        destination: &VaultPath,
+        revision: FileRevision,
+    ) -> Result<Self, MutationError> {
+        let temporary = case_rename_temporary(operation_id, source, destination)?;
+        myvault_recovery::RenameMoveIntent::new_case_rename(
+            operation_id.as_uuid(),
+            source.as_str(),
+            destination.as_str(),
+            crate::revision::to_recovery(&revision),
+            temporary.as_str(),
+        )?;
+        Ok(Self {
+            operation_id,
+            source: source.as_str().to_owned(),
+            destination: destination.as_str().to_owned(),
+            temporary: temporary.as_str().to_owned(),
+            revision,
+        })
+    }
+
+    pub(crate) fn paths(&self) -> Result<(VaultPath, VaultPath, VaultPath), MutationError> {
+        let source = VaultPath::from_portable(&self.source)?;
+        let destination = VaultPath::from_portable(&self.destination)?;
+        let temporary = case_rename_temporary(self.operation_id, &source, &destination)?;
+        if source.as_str() != self.source
+            || destination.as_str() != self.destination
+            || temporary.as_str() != self.temporary
+        {
+            return Err(MutationError::InvalidOperation(
+                "case rename paths are not canonical or deterministic",
+            ));
+        }
+        Ok((source, destination, temporary))
+    }
+
+    #[must_use]
+    pub fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    #[must_use]
+    pub fn destination(&self) -> &str {
+        &self.destination
+    }
+
+    #[must_use]
+    pub fn temporary(&self) -> &str {
+        &self.temporary
+    }
+
+    #[must_use]
+    pub fn revision(&self) -> &FileRevision {
+        &self.revision
+    }
+}
+
+fn case_rename_temporary(
+    operation_id: OperationId,
+    source: &VaultPath,
+    destination: &VaultPath,
+) -> Result<VaultPath, MutationError> {
+    let source_parent = source
+        .as_str()
+        .rsplit_once('/')
+        .map_or("", |(parent, _)| parent);
+    let destination_parent = destination
+        .as_str()
+        .rsplit_once('/')
+        .map_or("", |(parent, _)| parent);
+    if source_parent != destination_parent {
+        return Err(MutationError::InvalidOperation(
+            "case rename paths must have the same exact parent",
+        ));
+    }
+    let name = format!(".mvcr-{}.tmp", operation_id.as_uuid().simple());
+    let portable = if source_parent.is_empty() {
+        name
+    } else {
+        format!("{source_parent}/{name}")
+    };
+    Ok(VaultPath::from_portable(portable)?)
+}
+
 impl NormalMoveOperation {
     pub(crate) fn new(
         operation_id: OperationId,
