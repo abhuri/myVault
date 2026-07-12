@@ -83,6 +83,12 @@ pub enum MoveContentOutcome {
     AlreadyMoved(MoveDurability),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContentMoveMode {
+    Fresh,
+    Resume,
+}
+
 /// Result of flushing one parent directory after a published move.
 #[derive(Debug)]
 pub enum DirectorySyncStatus {
@@ -422,8 +428,58 @@ impl Vault {
         )
     }
 
+    /// Confirms a retained revision-bound content move without publishing a
+    /// source-only topology that may have been recreated after the first move.
+    ///
+    /// # Errors
+    /// Returns an invalid-move error when only the source exists because that
+    /// topology is ambiguous during recovery, or the same validation and
+    /// topology errors as [`Self::move_content_file_if_revision`].
+    pub fn resume_content_file_move_if_revision(
+        &self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        expected: &FileRevision,
+    ) -> Result<MoveContentOutcome> {
+        self.move_content_file_with_hooks_and_mode(
+            source,
+            destination,
+            expected,
+            |_, directory| sync_directory_for_move(directory),
+            || {},
+            || {},
+            ContentMoveMode::Resume,
+        )
+    }
+
     #[allow(clippy::too_many_lines)]
     fn move_content_file_with_hooks<F, G, H>(
+        &self,
+        source: &VaultPath,
+        destination: &VaultPath,
+        expected: &FileRevision,
+        sync: F,
+        before_rename: G,
+        after_move: H,
+    ) -> Result<MoveContentOutcome>
+    where
+        F: FnMut(MoveSyncParent, &Dir) -> std::io::Result<MoveDurability>,
+        G: FnOnce(),
+        H: FnOnce(),
+    {
+        self.move_content_file_with_hooks_and_mode(
+            source,
+            destination,
+            expected,
+            sync,
+            before_rename,
+            after_move,
+            ContentMoveMode::Fresh,
+        )
+    }
+
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    fn move_content_file_with_hooks_and_mode<F, G, H>(
         &self,
         source: &VaultPath,
         destination: &VaultPath,
@@ -431,6 +487,7 @@ impl Vault {
         mut sync: F,
         before_rename: G,
         after_move: H,
+        mode: ContentMoveMode,
     ) -> Result<MoveContentOutcome>
     where
         F: FnMut(MoveSyncParent, &Dir) -> std::io::Result<MoveDurability>,
@@ -512,6 +569,11 @@ impl Vault {
                 )?;
                 Ok(MoveContentOutcome::AlreadyMoved(classification_durability))
             }
+            (true, false) if mode == ContentMoveMode::Resume => Err(CoreError::InvalidMove {
+                source_path: source.as_path().to_owned(),
+                destination_path: destination.as_path().to_owned(),
+                reason: "source-only topology is ambiguous during retained move recovery",
+            }),
             (true, false) => {
                 self.verify_expected_from_parent(
                     &authoritative_source,

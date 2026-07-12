@@ -90,7 +90,7 @@ fn fresh_unicode_move_completes_without_unlinking_journal() {
 }
 
 #[test]
-fn new_service_resumes_journal_only_move() {
+fn new_service_refuses_ambiguous_source_only_journal() {
     let fixture = fixture("journal");
     fixture
         .journal
@@ -99,10 +99,12 @@ fn new_service_resumes_journal_only_move() {
 
     let vault = Vault::open(&fixture.vault_path).unwrap();
     let journal = RecoveryJournal::open(&fixture.app, &fixture.vault_path).unwrap();
-    MutationService::new(&vault, &journal)
-        .resume_normal_move(fixture.operation.operation_id())
-        .unwrap();
-    assert!(fixture
+    assert!(matches!(
+        MutationService::new(&vault, &journal).resume_normal_move(fixture.operation.operation_id()),
+        Err(MutationError::Core(CoreError::InvalidMove { .. }))
+    ));
+    assert!(fixture.vault_path.join(fixture.source.as_path()).exists());
+    assert!(!fixture
         .vault_path
         .join(fixture.destination.as_path())
         .exists());
@@ -153,7 +155,7 @@ fn retained_mismatch_blocks_before_move() {
 }
 
 #[test]
-fn concurrent_resumes_converge() {
+fn concurrent_source_only_resumes_fail_closed() {
     let fixture = fixture("concurrent");
     fixture
         .journal
@@ -175,14 +177,60 @@ fn concurrent_resumes_converge() {
     }
     let outcomes = handles
         .into_iter()
-        .map(|handle| handle.join().unwrap().unwrap().moved)
+        .map(|handle| handle.join().unwrap())
         .collect::<Vec<_>>();
-    assert!(outcomes
-        .iter()
-        .any(|outcome| matches!(outcome, MoveContentOutcome::Moved(_))));
-    assert!(outcomes
-        .iter()
-        .any(|outcome| matches!(outcome, MoveContentOutcome::AlreadyMoved(_))));
+    assert!(outcomes.iter().all(|outcome| matches!(
+        outcome,
+        Err(MutationError::Core(CoreError::InvalidMove { .. }))
+    )));
+    assert!(fixture.vault_path.join(fixture.source.as_path()).exists());
+    assert!(!fixture
+        .vault_path
+        .join(fixture.destination.as_path())
+        .exists());
+}
+
+#[test]
+fn retained_source_only_aba_does_not_move_recreated_file() {
+    let fixture = fixture("aba");
+    fixture
+        .journal
+        .publish(&intent(&fixture.operation))
+        .unwrap();
+    fixture
+        .vault
+        .move_content_file_if_revision(
+            &fixture.source,
+            &fixture.destination,
+            fixture.operation.revision(),
+        )
+        .unwrap();
+    let relocated = fixture.vault_path.join("คลัง/relocated.md");
+    fs::rename(
+        fixture.vault_path.join(fixture.destination.as_path()),
+        &relocated,
+    )
+    .unwrap();
+    fs::write(
+        fixture.vault_path.join(fixture.source.as_path()),
+        &fixture.bytes,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        MutationService::new(&fixture.vault, &fixture.journal)
+            .resume_normal_move(fixture.operation.operation_id()),
+        Err(MutationError::Core(CoreError::InvalidMove { .. }))
+    ));
+    assert_eq!(
+        fs::read(fixture.vault_path.join(fixture.source.as_path())).unwrap(),
+        fixture.bytes
+    );
+    assert_eq!(fs::read(relocated).unwrap(), fixture.bytes);
+    assert!(!fixture
+        .vault_path
+        .join(fixture.destination.as_path())
+        .exists());
 }
 
 #[test]
@@ -257,7 +305,7 @@ fn stale_wrong_revision_paths_and_kind_fail_closed() {
         if case == 0 {
             assert!(matches!(
                 result,
-                Err(MutationError::Core(CoreError::StaleRevision { .. }))
+                Err(MutationError::Core(CoreError::InvalidMove { .. }))
             ));
         } else {
             assert!(matches!(result, Err(MutationError::InvalidOperation(_))));

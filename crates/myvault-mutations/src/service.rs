@@ -8,7 +8,8 @@ use myvault_core::{
     MAX_TRASH_PAYLOAD_BYTES,
 };
 use myvault_recovery::{
-    CompleteOutcome, JournalEvidence, RecoveryJournal, RecoveryOperationKind, RenameMoveIntent,
+    CompleteOutcome, JournalEvidence, PublishOutcome, RecoveryJournal, RecoveryOperationKind,
+    RenameMoveIntent,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -350,8 +351,12 @@ impl<'service> MutationService<'service> {
             Err(error) => return Err(error.into()),
         }
         let intent = build_normal_intent(operation)?;
-        self.journal.publish(&intent)?;
-        self.continue_normal_move(operation, &intent)
+        let published = self.journal.publish(&intent)?;
+        self.continue_normal_move(
+            operation,
+            &intent,
+            matches!(published, PublishOutcome::Published),
+        )
     }
 
     /// Retries only exact supported journal evidence for a retained normal move.
@@ -383,7 +388,7 @@ impl<'service> MutationService<'service> {
             return Err(MutationError::IntentMismatch);
         }
         validate_normal_intent(&operation, &intent)?;
-        self.continue_normal_move(&operation, &intent)
+        self.continue_normal_move(&operation, &intent, false)
     }
 
     fn retry_normal_from_evidence(
@@ -393,20 +398,26 @@ impl<'service> MutationService<'service> {
     ) -> Result<NormalMoveExecutionOutcome, MutationError> {
         let intent = supported_normal_intent(evidence)?;
         validate_normal_intent(operation, &intent)?;
-        self.continue_normal_move(operation, &intent)
+        self.continue_normal_move(operation, &intent, false)
     }
 
     fn continue_normal_move(
         &self,
         operation: &NormalMoveOperation,
         intent: &RenameMoveIntent,
+        allow_source_move: bool,
     ) -> Result<NormalMoveExecutionOutcome, MutationError> {
         let (source, destination) = operation.paths()?;
-        let moved = self.vault.move_content_file_if_revision(
-            &source,
-            &destination,
-            operation.revision(),
-        )?;
+        let moved = if allow_source_move {
+            self.vault
+                .move_content_file_if_revision(&source, &destination, operation.revision())?
+        } else {
+            self.vault.resume_content_file_move_if_revision(
+                &source,
+                &destination,
+                operation.revision(),
+            )?
+        };
         let completion = self
             .journal
             .complete(operation.operation_id().as_uuid(), intent)?;

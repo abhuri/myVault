@@ -35,6 +35,97 @@ fn content_move_is_atomic_and_idempotent_across_two_retries() {
 }
 
 #[test]
+fn retained_content_move_recovery_fails_closed_for_source_only_topology() {
+    let (root, vault) = fixture();
+    let source = VaultPath::from_portable("from.md").unwrap();
+    let destination = VaultPath::from_portable("to.md").unwrap();
+    fs::write(root.path().join(source.as_path()), b"note").unwrap();
+
+    assert!(matches!(
+        vault.resume_content_file_move_if_revision(
+            &source,
+            &destination,
+            &FileRevision::from_bytes(b"note")
+        ),
+        Err(CoreError::InvalidMove {
+            reason: "source-only topology is ambiguous during retained move recovery",
+            ..
+        })
+    ));
+    assert_eq!(
+        fs::read(root.path().join(source.as_path())).unwrap(),
+        b"note"
+    );
+    assert!(!root.path().join(destination.as_path()).exists());
+}
+
+#[test]
+fn retained_content_move_recovery_accepts_verified_destination_only_topology() {
+    let (root, vault) = fixture();
+    let source = VaultPath::from_portable("from.md").unwrap();
+    let destination = VaultPath::from_portable("to.md").unwrap();
+    fs::write(root.path().join(destination.as_path()), b"note").unwrap();
+
+    assert!(matches!(
+        vault
+            .resume_content_file_move_if_revision(
+                &source,
+                &destination,
+                &FileRevision::from_bytes(b"note")
+            )
+            .unwrap(),
+        MoveContentOutcome::AlreadyMoved(_)
+    ));
+}
+
+#[test]
+fn retained_content_move_recovery_preserves_topology_and_revision_checks() {
+    let (root, vault) = fixture();
+    let source = VaultPath::from_portable("from.md").unwrap();
+    let destination = VaultPath::from_portable("to.md").unwrap();
+    fs::write(root.path().join(destination.as_path()), b"other").unwrap();
+    assert!(matches!(
+        vault.resume_content_file_move_if_revision(
+            &source,
+            &destination,
+            &FileRevision::from_bytes(b"expected")
+        ),
+        Err(CoreError::StaleRevision { .. })
+    ));
+
+    fs::write(root.path().join(source.as_path()), b"other").unwrap();
+    assert!(matches!(
+        vault.resume_content_file_move_if_revision(
+            &source,
+            &destination,
+            &FileRevision::from_bytes(b"other")
+        ),
+        Err(CoreError::AlreadyExists(_))
+    ));
+
+    fs::remove_file(root.path().join(source.as_path())).unwrap();
+    fs::remove_file(root.path().join(destination.as_path())).unwrap();
+    assert!(matches!(
+        vault.resume_content_file_move_if_revision(
+            &source,
+            &destination,
+            &FileRevision::from_bytes(b"other")
+        ),
+        Err(CoreError::InvalidMove { .. })
+    ));
+
+    let case_alias = VaultPath::from_portable("FROM.md").unwrap();
+    assert!(matches!(
+        vault.resume_content_file_move_if_revision(
+            &source,
+            &case_alias,
+            &FileRevision::from_bytes(b"other")
+        ),
+        Err(CoreError::InvalidMove { .. })
+    ));
+}
+
+#[test]
 fn concurrent_content_move_callers_serialize_to_moved_and_already_moved() {
     use std::sync::{Arc, Barrier};
 
