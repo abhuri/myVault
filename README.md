@@ -6,7 +6,9 @@ The first release targets macOS, Windows, Ubuntu, and Android through Tauri 2 wi
 
 ## Status
 
-The project is in Phase 0, which is focused on validating platform support, local storage, OAuth, Google Drive access, and the editor stack before full product developmentค่ะ Automated spike results and honest external blockers are tracked in [docs/phase-0/RESULTS.md](docs/phase-0/RESULTS.md)ค่ะ
+`v0.1.0-demo` เป็น Local Desktop Demo สำหรับใช้คนเดียวบน macOS ก่อนค่ะ รุ่นนี้เปิด Vault ผ่าน native folder picker, แสดง file explorer, แก้ Markdown แบบ revision-checked autosave, อ่าน GFM/table/code/Mermaid และมี outline, backlinks, quick switcher กับ graph prototype ค่ะ
+
+Google Drive Sync, physical Android acceptance และ store distribution ยังไม่รวมใน Demo ค่ะ ผลทดสอบล่าสุดอยู่ที่ [docs/demo/RESULTS.md](docs/demo/RESULTS.md) และเกณฑ์ตรวจอยู่ที่ [docs/demo/ACCEPTANCE.md](docs/demo/ACCEPTANCE.md) ค่ะ
 
 See [PROJECT_PLAN.md](PROJECT_PLAN.md) for architecture decisions, delivery phases, safety rules, and the current session handoffค่ะ
 
@@ -20,11 +22,11 @@ See [PROJECT_PLAN.md](PROJECT_PLAN.md) for architecture decisions, delivery phas
 
 ## Development
 
-Install dependencies and run the Phase 0 native shellค่ะ
+Install dependencies and run the native Demo ค่ะ
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm dev
+pnpm --dir apps/tauri tauri dev
 ```
 
 Run the baseline verification contractค่ะ
@@ -39,6 +41,8 @@ cargo test --manifest-path apps/tauri/src-tauri/Cargo.toml
 pnpm test:rust
 pnpm tauri:info
 ```
+
+Synthetic Vault สำหรับทดลองอยู่ที่ `demo/synthetic-vault` ค่ะ ควร copy ไป temporary folder ก่อนทดสอบ save/conflict เพื่อไม่แก้ fixture ใน repository ค่ะ
 
 Phase 0 platform gates and environment gaps are documented in [docs/phase-0](docs/phase-0)ค่ะ
 

@@ -1,7 +1,7 @@
 use myvault_app_service::{
-    AppErrorCode, AppService, ExplorerKindDto, NoteDto, TrashEvidenceDto, TrashItemDto,
-    TrashPageDto, VaultSessionId, VaultStatusDto, EXPLORER_DEFAULT_PAGE_SIZE, EXPLORER_MAX_DEPTH,
-    EXPLORER_MAX_PAGE_SIZE, EXPLORER_MAX_SCAN,
+    AppError, AppErrorCode, AppService, ExplorerKindDto, NoteDto, SaveDurabilityDto,
+    TrashEvidenceDto, TrashItemDto, TrashPageDto, VaultSessionId, VaultStatusDto,
+    EXPLORER_DEFAULT_PAGE_SIZE, EXPLORER_MAX_DEPTH, EXPLORER_MAX_PAGE_SIZE, EXPLORER_MAX_SCAN,
 };
 use myvault_core::{FileRevision, TrashId, TrashManifestV1, Vault, VaultPath};
 use std::fs;
@@ -282,6 +282,116 @@ fn thai_markdown_and_uppercase_md_round_trip_with_exact_revision() {
             .code,
         AppErrorCode::InvalidPath
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn save_note_is_revision_checked_bounded_utf8_and_frontend_safe() {
+    let service = AppService::new();
+    let fixture = Fixture::new("save-root-secret");
+    let initial = "เดิม".as_bytes();
+    fixture.write("บันทึก.md", initial);
+    let session = activate(&service, &fixture);
+    let expected = FileRevision::from_bytes(initial);
+    let replacement = "เนื้อหาใหม่ 🪷";
+    let saved = service
+        .save_note(
+            session,
+            "บันทึก.md",
+            replacement,
+            &expected.hex,
+            expected.byte_len,
+        )
+        .expect("save Thai note");
+    assert_eq!(saved.path, "บันทึก.md");
+    assert_eq!(saved.byte_len, replacement.len() as u64);
+    assert_eq!(
+        saved.revision_hex,
+        FileRevision::from_bytes(replacement.as_bytes()).hex
+    );
+    assert!(matches!(
+        saved.durability,
+        SaveDurabilityDto::FullySynced | SaveDurabilityDto::DirectorySyncUnsupported
+    ));
+    assert_eq!(
+        fs::read(fixture.root.join("บันทึก.md")).expect("saved disk bytes"),
+        replacement.as_bytes()
+    );
+    assert_eq!(
+        service
+            .read_note(session, "บันทึก.md")
+            .expect("round trip")
+            .text,
+        replacement
+    );
+    let json = serde_json::to_string(&saved).expect("save JSON");
+    for key in ["sessionId", "path", "revisionHex", "byteLen", "durability"] {
+        assert!(json.contains(&format!("\"{key}\"")));
+    }
+    assert!(!json.contains(fixture.root.to_str().expect("UTF-8 root")));
+    assert!(!json.contains("save-root-secret"));
+    assert!(json.contains(match saved.durability {
+        SaveDurabilityDto::FullySynced => "\"durability\":\"fullySynced\"",
+        SaveDurabilityDto::DirectorySyncUnsupported => {
+            "\"durability\":\"directorySyncUnsupported\""
+        }
+    }));
+
+    let disk_before_stale = fs::read(fixture.root.join("บันทึก.md")).expect("before stale");
+    let stale = service
+        .save_note(
+            session,
+            "บันทึก.md",
+            "must not land",
+            &expected.hex,
+            expected.byte_len,
+        )
+        .expect_err("stale revision");
+    assert_eq!(stale.code, AppErrorCode::StaleRevision);
+    assert_eq!(
+        fs::read(fixture.root.join("บันทึก.md")).expect("after stale"),
+        disk_before_stale
+    );
+    assert!(serde_json::to_string(&stale)
+        .expect("stale JSON")
+        .contains("\"code\":\"staleRevision\""));
+    assert_eq!(
+        service
+            .save_note(session, "บันทึก.md", "x", "INVALID", 1)
+            .expect_err("invalid revision")
+            .code,
+        AppErrorCode::InvalidRevision
+    );
+    for path in ["note.txt", "../escape.md", ".trash/note.md"] {
+        let error = service
+            .save_note(session, path, "x", &saved.revision_hex, saved.byte_len)
+            .expect_err("invalid save path");
+        assert_eq!(
+            error.code,
+            AppErrorCode::InvalidPath,
+            "unexpected code for {path}"
+        );
+    }
+    let oversized = "x".repeat(myvault_core::MAX_NOTE_BYTES + 1);
+    assert_eq!(
+        service
+            .save_note(
+                session,
+                "บันทึก.md",
+                &oversized,
+                &saved.revision_hex,
+                saved.byte_len,
+            )
+            .expect_err("oversized")
+            .code,
+        AppErrorCode::ResourceLimit
+    );
+    for error in [stale, AppError::internal()] {
+        let error_json = serde_json::to_string(&error).expect("error JSON");
+        assert!(!error_json.contains("save-root-secret"));
+        assert!(!error_json.contains(fixture.root.to_str().expect("UTF-8 root")));
+        assert!(!error_json.contains("filesystem"));
+    }
 }
 
 #[test]

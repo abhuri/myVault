@@ -1,53 +1,103 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { basicSetup } from "codemirror";
 import { markdown } from "@codemirror/lang-markdown";
 import { EditorState } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
+import DOMPurify from "dompurify";
 import Graph from "graphology";
 import Sigma from "sigma";
-import { formatMilliseconds, percentile } from "./spike/metrics";
+import {
+  buildTree,
+  extractOutline,
+  extractWikiLinks,
+  filterEntries,
+  matchesDocumentIdentity,
+  saveReducer,
+  shouldAutosave,
+  type ExplorerEntry,
+  type SaveState,
+  type TreeNode,
+} from "./workspace";
+import { markdownHtml, preventReaderAnchorNavigation } from "./reader";
 import "./App.css";
 
-type PlatformInfo = {
-  os: string;
-  arch: string;
-  family: string;
-  debugBuild: boolean;
+type VaultStatus = { active: boolean; sessionId: string | null };
+type VaultChoice =
+  | { outcome: "activated"; status: VaultStatus }
+  | { outcome: "cancelled" };
+type ExplorerPage = {
+  sessionId: string;
+  entries: ExplorerEntry[];
+  nextAfter: string | null;
+  hasMore: boolean;
+  scannedEntries: number;
 };
-
-type GoogleAuthStatus = {
-  supported: boolean;
-  connected: boolean;
-  grantedScopeCount: number;
+type NoteDto = {
+  sessionId: string;
+  path: string;
+  text: string;
+  revisionHex: string;
+  byteLen: number;
 };
+type SaveDto = {
+  sessionId: string;
+  path: string;
+  revisionHex: string;
+  byteLen: number;
+  durability: "fullySynced" | "directorySyncUnsupported";
+};
+type AppFailure = { code?: string; message?: string };
 
-const sampleMarkdown = `# myVault Phase 0
+const INITIAL_SAVE: SaveState = { phase: "clean", revisionHex: "", byteLen: 0 };
 
-ทดลองพิมพ์ภาษาไทย การเลือกข้อความ และ undo/redo ที่นี่
+function failureOf(reason: unknown): AppFailure {
+  if (typeof reason === "object" && reason !== null) return reason as AppFailure;
+  return { message: String(reason) };
+}
 
-- [x] Tauri bridge
-- [ ] Android IME บนอุปกรณ์จริง
-- [ ] Drive round trip
+function noteLabel(path: string): string {
+  return path.split("/").pop()?.replace(/\.(?:md|markdown)$/i, "") ?? path;
+}
 
-\`\`\`mermaid
-flowchart LR
-  Local[Local Vault] --> Sync[Sync Engine]
-  Sync --> Drive[Google Drive]
-\`\`\`
-`;
+function useMedia(query: string): boolean {
+  const [matches, setMatches] = useState(() => window.matchMedia(query).matches);
+  useEffect(() => {
+    const media = window.matchMedia(query);
+    const update = () => setMatches(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, [query]);
+  return matches;
+}
 
-function EditorProbe() {
-  const hostRef = useRef<HTMLDivElement>(null);
-  const [compositionSamples, setCompositionSamples] = useState<number[]>([]);
-  const [documentChanges, setDocumentChanges] = useState(0);
+function trapTab(event: import("react").KeyboardEvent, container: HTMLElement | null) {
+  if (event.key !== "Tab" || !container) return;
+  const controls = [...container.querySelectorAll<HTMLElement>('button,input,summary,[tabindex]:not([tabindex="-1"])')]
+    .filter((element) => !element.hasAttribute("disabled") && element.getAttribute("aria-hidden") !== "true");
+  if (!controls.length) return;
+  const first = controls[0];
+  const last = controls[controls.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+function Editor({ text, onChange }: { text: string; onChange: (next: string) => void }) {
+  const host = useRef<HTMLDivElement>(null);
+  const initialText = useRef(text);
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
 
   useEffect(() => {
-    if (!hostRef.current) return;
-
+    if (!host.current) return;
     const state = EditorState.create({
-      doc: sampleMarkdown,
+      doc: initialText.current,
       extensions: [
         basicSetup,
         history(),
@@ -55,305 +105,434 @@ function EditorProbe() {
         markdown(),
         EditorView.lineWrapping,
         EditorView.updateListener.of((update) => {
-          if (update.docChanged) setDocumentChanges((count) => count + 1);
+          if (update.docChanged) onChangeRef.current(update.state.doc.toString());
         }),
         EditorView.theme({
-          "&": { height: "100%", background: "#10151f", color: "#ecf2ff" },
-          ".cm-content": { caretColor: "#71e1c4", padding: "16px" },
-          ".cm-cursor": { borderLeftColor: "#71e1c4" },
-          ".cm-gutters": { background: "#0b1018", color: "#607087", border: "none" },
-          ".cm-activeLine, .cm-activeLineGutter": { background: "#172131" },
+          "&": { height: "100%", background: "#0e1116", color: "#dfe6ee" },
+          ".cm-content": { padding: "28px 7vw 48px", caretColor: "#b6ceff", maxWidth: "900px", margin: "0 auto" },
+          ".cm-gutters": { background: "#0e1116", color: "#596371", border: "none" },
+          ".cm-activeLine, .cm-activeLineGutter": { background: "#151a21" },
+          ".cm-selectionBackground": { background: "#294064 !important" },
+          "&.cm-focused": { outline: "none" },
         }),
       ],
     });
-
-    const view = new EditorView({ state, parent: hostRef.current });
-    let compositionStartedAt: number | null = null;
-    const onCompositionStart = () => {
-      compositionStartedAt = performance.now();
-    };
-    const onCompositionEnd = () => {
-      if (compositionStartedAt === null) return;
-      const startedAt = compositionStartedAt;
-      compositionStartedAt = null;
-      requestAnimationFrame(() => {
-        setCompositionSamples((samples) => [...samples.slice(-99), performance.now() - startedAt]);
-      });
-    };
-    view.contentDOM.addEventListener("compositionstart", onCompositionStart);
-    view.contentDOM.addEventListener("compositionend", onCompositionEnd);
-
-    return () => {
-      view.contentDOM.removeEventListener("compositionstart", onCompositionStart);
-      view.contentDOM.removeEventListener("compositionend", onCompositionEnd);
-      view.destroy();
-    };
+    const view = new EditorView({ state, parent: host.current });
+    return () => view.destroy();
   }, []);
 
-  const p95 = percentile(compositionSamples, 0.95);
-  return (
-    <>
-      <div className="editor-host" ref={hostRef} aria-label="Markdown editor probe" />
-      <div className="probe-metrics" aria-live="polite">
-        <span>Thai composition samples: {compositionSamples.length}</span>
-        <span className={p95 !== null && p95 >= 50 ? "metric-fail" : "metric-pass"}>
-          p95 composition-to-paint: {formatMilliseconds(p95)}
-        </span>
-        <span>Document changes: {documentChanges}</span>
-      </div>
-    </>
-  );
+  return <div className="editor" ref={host} aria-label="Markdown editor" />;
 }
 
-function MermaidProbe() {
-  const [svg, setSvg] = useState("");
-  const [error, setError] = useState<string | null>(null);
+function Reader({ text }: { text: string }) {
+  const host = useRef<HTMLDivElement>(null);
+  const html = useMemo(() => markdownHtml(text), [text]);
+
+  useEffect(() => {
+    const reader = host.current;
+    if (!reader) return;
+    reader.addEventListener("click", preventReaderAnchorNavigation);
+    return () => reader.removeEventListener("click", preventReaderAnchorNavigation);
+  }, []);
 
   useEffect(() => {
     let active = true;
-    import("mermaid")
-      .then(({ default: mermaid }) => {
-        mermaid.initialize({
-          startOnLoad: false,
-          securityLevel: "strict",
-          theme: "dark",
-        });
-
-        return mermaid.render(
-          "phase-zero-flow",
-          "flowchart LR; Local[Local Vault] --> Queue[Durable Queue]; Queue --> Drive[Google Drive];",
-        );
-      })
-      .then(({ svg: renderedSvg }) => active && setSvg(renderedSvg))
-      .catch((reason: unknown) => active && setError(String(reason)));
-
+    const nodes = [...(host.current?.querySelectorAll<HTMLElement>("pre.mermaid-source") ?? [])];
+    if (!nodes.length) return;
+    void import("mermaid").then(async ({ default: mermaid }) => {
+      mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "dark" });
+      for (const [index, node] of nodes.entries()) {
+        const source = node.textContent ?? "";
+        try {
+          const rendered = await mermaid.render(`myvault-mermaid-${Date.now()}-${index}`, source);
+          if (active) node.outerHTML = DOMPurify.sanitize(rendered.svg, { USE_PROFILES: { svg: true } });
+        } catch {
+          node.classList.add("render-error");
+          node.setAttribute("aria-label", "Mermaid diagram could not be rendered");
+        }
+      }
+    });
     return () => {
       active = false;
     };
-  }, []);
+  }, [html]);
 
-  if (error) return <p className="probe-error">Mermaid failed: {error}</p>;
-
-  return <div className="mermaid-host" dangerouslySetInnerHTML={{ __html: svg }} />;
+  return <article className="reader" ref={host} dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
-function GraphProbe() {
-  const hostRef = useRef<HTMLDivElement>(null);
-  const [nodeCount, setNodeCount] = useState(1_000);
-  const [renderTime, setRenderTime] = useState<number | null>(null);
-
-  useEffect(() => {
-    if (!hostRef.current) return;
-
-    const startedAt = performance.now();
-    const graph = new Graph();
-    const count = nodeCount;
-
-    for (let index = 0; index < count; index += 1) {
-      const angle = (Math.PI * 2 * index) / count;
-      graph.addNode(`note-${index}`, {
-        x: Math.cos(angle),
-        y: Math.sin(angle),
-        size: index % 10 === 0 ? 8 : 4,
-        color: index % 10 === 0 ? "#f2bd5d" : "#71e1c4",
-        label: index % 10 === 0 ? `Note ${index}` : undefined,
-      });
-    }
-
-    for (let index = 0; index < count; index += 1) {
-      graph.addEdge(`note-${index}`, `note-${(index + 1) % count}`, {
-        color: "#34455c",
-      });
-      if (index % 3 === 0) {
-        graph.addEdge(`note-${index}`, `note-${(index + 10) % count}`, {
-          color: "#27354a",
-        });
-      }
-    }
-
-    const renderer = new Sigma(graph, hostRef.current, {
-      renderEdgeLabels: false,
-      allowInvalidContainer: false,
-    });
-    const host = hostRef.current;
-    const observer = new IntersectionObserver((entries) => {
-      if (entries.some((entry) => entry.isIntersecting)) {
-        renderer.resize();
-        renderer.refresh();
-      }
-    });
-    observer.observe(host);
-    let paintFrame = 0;
-    const frame = requestAnimationFrame(() => {
-      renderer.refresh();
-      paintFrame = requestAnimationFrame(() => setRenderTime(performance.now() - startedAt));
-    });
-
-    return () => {
-      cancelAnimationFrame(frame);
-      cancelAnimationFrame(paintFrame);
-      observer.disconnect();
-      renderer.kill();
-    };
-  }, [nodeCount]);
-
+function Tree({ nodes, selected, onSelect }: { nodes: TreeNode[]; selected?: string; onSelect: (path: string) => void }) {
   return (
-    <>
-      <div className="probe-controls" role="group" aria-label="Graph capacity">
-        {[1_000, 5_000].map((count) => (
-          <button
-            className={nodeCount === count ? "active" : ""}
-            key={count}
-            onClick={() => setNodeCount(count)}
-            type="button"
-          >
-            {count.toLocaleString()} nodes
-          </button>
-        ))}
-        <span>first paint: {formatMilliseconds(renderTime)}</span>
-      </div>
-      <div className="graph-host" ref={hostRef} aria-label="Knowledge graph probe" />
-    </>
-  );
-}
-
-function GoogleAuthProbe() {
-  const [status, setStatus] = useState<GoogleAuthStatus | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-
-  useEffect(() => {
-    invoke<GoogleAuthStatus>("google_auth_status")
-      .then(setStatus)
-      .catch((reason: unknown) => setError(String(reason)));
-  }, []);
-
-  const run = (command: "google_auth_connect" | "google_auth_disconnect") => {
-    setBusy(true);
-    setError(null);
-    invoke<GoogleAuthStatus>(command)
-      .then(setStatus)
-      .catch((reason: unknown) => setError(String(reason)))
-      .finally(() => setBusy(false));
-  };
-
-  return (
-    <section className="auth-probe" aria-label="Google authorization probe">
-      <div>
-        <strong>Google Drive authorization</strong>
-        <span>
-          {status?.supported
-            ? status.connected
-              ? `Connected · ${status.grantedScopeCount} scope`
-              : "Ready for Android consent"
-            : "Android native flow only"}
-        </span>
-      </div>
-      {status?.supported && (
-        <button
-          disabled={busy}
-          onClick={() => run(status.connected ? "google_auth_disconnect" : "google_auth_connect")}
-          type="button"
-        >
-          {busy ? "Waiting…" : status.connected ? "Disconnect" : "Connect Google Drive"}
-        </button>
+    <ul className="tree-list">
+      {nodes.map((node) =>
+        node.type === "folder" ? (
+          <li key={`folder-${node.path}`}>
+            <details open>
+              <summary><span className="tree-mark">⌄</span>{node.name}</summary>
+              <Tree nodes={node.children} selected={selected} onSelect={onSelect} />
+            </details>
+          </li>
+        ) : (
+          <li key={node.path}>
+            <button className={selected === node.path ? "tree-file selected" : "tree-file"} onClick={() => onSelect(node.path)} type="button">
+              <span className="file-mark">M</span><span>{node.name}</span>
+            </button>
+          </li>
+        ),
       )}
-      {error && <span className="probe-error">{error}</span>}
-    </section>
+    </ul>
   );
+}
+
+function KnowledgeGraph({ notes, activePath }: { notes: Record<string, string>; activePath?: string }) {
+  const host = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!host.current) return;
+    const paths = Object.keys(notes);
+    const graph = new Graph();
+    paths.forEach((path, index) => {
+      const angle = (Math.PI * 2 * index) / Math.max(paths.length, 1);
+      graph.addNode(path, { x: Math.cos(angle), y: Math.sin(angle), label: noteLabel(path), size: path === activePath ? 9 : 6, color: path === activePath ? "#8db7ff" : "#71849b" });
+    });
+    const byLabel = new Map(paths.map((path) => [noteLabel(path).toLocaleLowerCase("th"), path]));
+    paths.forEach((path) => extractWikiLinks(notes[path]).forEach((target) => {
+      const destination = byLabel.get(noteLabel(target).toLocaleLowerCase("th"));
+      if (destination && destination !== path && !graph.hasEdge(path, destination)) graph.addDirectedEdge(path, destination, { color: "#36414f" });
+    }));
+    const renderer = new Sigma(graph, host.current, { renderEdgeLabels: false, allowInvalidContainer: true });
+    return () => renderer.kill();
+  }, [notes, activePath]);
+  return <div className="mini-graph" ref={host} aria-label="Graph of opened notes" />;
 }
 
 function App() {
-  const [platform, setPlatform] = useState<PlatformInfo | null>(null);
-  const [bridgeError, setBridgeError] = useState<string | null>(null);
-  const [visibilityEvents, setVisibilityEvents] = useState(0);
+  const [status, setStatus] = useState<VaultStatus | null>(null);
+  const [entries, setEntries] = useState<ExplorerEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [opening, setOpening] = useState(false);
+  const [error, setError] = useState<string>();
+  const [filter, setFilter] = useState("");
+  const [activePath, setActivePath] = useState<string>();
+  const [text, setText] = useState("");
+  const [documentVersion, setDocumentVersion] = useState(0);
+  const [mode, setMode] = useState<"edit" | "read">("edit");
+  const [save, setSave] = useState<SaveState>(INITIAL_SAVE);
+  const [notes, setNotes] = useState<Record<string, string>>({});
+  const [quickOpen, setQuickOpen] = useState(false);
+  const [quickQuery, setQuickQuery] = useState("");
+  const [quickIndex, setQuickIndex] = useState(0);
+  const [leftDrawer, setLeftDrawer] = useState(false);
+  const [rightDrawer, setRightDrawer] = useState(false);
+  const saveRef = useRef(save);
+  const textRef = useRef(text);
+  const activePathRef = useRef(activePath);
+  const statusRef = useRef(status);
+  const noteRequest = useRef(0);
+  const explorerRequest = useRef(0);
+  const pickerPending = useRef(false);
+  const saveInFlight = useRef(false);
+  const quickDialog = useRef<HTMLElement>(null);
+  const quickInput = useRef<HTMLInputElement>(null);
+  const restoreFocus = useRef<HTMLElement | null>(null);
+  const restoreDrawerFocus = useRef<HTMLElement | null>(null);
+  const explorerDrawerRef = useRef<HTMLElement>(null);
+  const contextDrawerRef = useRef<HTMLElement>(null);
+  const compactExplorer = useMedia("(max-width: 700px)");
+  const compactContext = useMedia("(max-width: 980px)");
+  const compactDrawerOpen = (compactExplorer && leftDrawer) || (compactContext && rightDrawer);
+  saveRef.current = save;
+  textRef.current = text;
+  activePathRef.current = activePath;
+  statusRef.current = status;
 
-  useEffect(() => {
-    invoke<PlatformInfo>("get_platform_info")
-      .then(setPlatform)
-      .catch((error: unknown) => setBridgeError(String(error)));
+  const loadExplorer = useCallback(async (sessionId: string) => {
+    const request = ++explorerRequest.current;
+    const all: ExplorerEntry[] = [];
+    let after: string | null = null;
+    for (let pageIndex = 0; pageIndex < 50; pageIndex += 1) {
+      const page: ExplorerPage = await invoke<ExplorerPage>("vault_list_explorer", { sessionId, after, limit: 200 });
+      if (page.sessionId !== sessionId) throw new Error("Explorer response identity mismatch");
+      all.push(...page.entries);
+      if (!page.hasMore) break;
+      if (!page.nextAfter) throw new Error("Explorer response is missing its continuation cursor");
+      if (page.nextAfter === after) throw new Error("Explorer cursor did not advance");
+      after = page.nextAfter;
+    }
+    if (request !== explorerRequest.current || statusRef.current?.sessionId !== sessionId) return;
+    setEntries([...new Map(all.map((entry) => [entry.path, entry])).values()]);
   }, []);
 
   useEffect(() => {
-    const recordVisibility = () => setVisibilityEvents((count) => count + 1);
-    document.addEventListener("visibilitychange", recordVisibility);
-    return () => document.removeEventListener("visibilitychange", recordVisibility);
+    invoke<VaultStatus>("vault_status")
+      .then(async (next) => {
+        statusRef.current = next;
+        setStatus(next);
+        if (next.active && next.sessionId) await loadExplorer(next.sessionId);
+      })
+      .catch(() => setError("Native desktop bridge unavailable in browser preview."))
+      .finally(() => setLoading(false));
+  }, [loadExplorer]);
+
+  const chooseVault = async () => {
+    if (pickerPending.current || opening || saveInFlight.current) return;
+    if (statusRef.current?.active && !["clean", "saved"].includes(saveRef.current.phase)) {
+      setError("Save or reload the current note before opening another Vault.");
+      return;
+    }
+    pickerPending.current = true;
+    setOpening(true);
+    setError(undefined);
+    try {
+      const choice = await invoke<VaultChoice>("vault_choose_folder");
+      if (choice.outcome === "activated") {
+        const sessionId = choice.status.sessionId;
+        if (!choice.status.active || !sessionId) throw new Error("Activated Vault response did not include an active session");
+        noteRequest.current += 1;
+        explorerRequest.current += 1;
+        statusRef.current = choice.status;
+        setStatus(choice.status);
+        setEntries([]);
+        setActivePath(undefined);
+        setText("");
+        setDocumentVersion((version) => version + 1);
+        setNotes({});
+        setSave(INITIAL_SAVE);
+        setFilter("");
+        setQuickQuery("");
+        setError(undefined);
+        await loadExplorer(sessionId);
+      }
+    } catch (reason) {
+      setError(failureOf(reason).message ?? "Could not open this Vault");
+    } finally {
+      pickerPending.current = false;
+      setOpening(false);
+    }
+  };
+
+  const openNote = useCallback(async (path: string) => {
+    if (!status?.sessionId || path === activePath) return;
+    if (!["clean", "saved"].includes(saveRef.current.phase)) {
+      setError("Finish or resolve the current note before switching.");
+      return;
+    }
+    setError(undefined);
+    const request = ++noteRequest.current;
+    const sessionId = status.sessionId;
+    try {
+      const note = await invoke<NoteDto>("vault_read_note", { sessionId, path });
+      if (request !== noteRequest.current || statusRef.current?.sessionId !== sessionId) return;
+      if (!matchesDocumentIdentity(sessionId, path, note)) throw new Error("Note response identity mismatch");
+      setActivePath(note.path);
+      setText(note.text);
+      setDocumentVersion((version) => version + 1);
+      setNotes((current) => ({ ...current, [note.path]: note.text }));
+      setSave(saveReducer(INITIAL_SAVE, { type: "load", revisionHex: note.revisionHex, byteLen: note.byteLen }));
+      setLeftDrawer(false);
+    } catch (reason) {
+      setError(failureOf(reason).message ?? "Could not read this note");
+    }
+  }, [activePath, status?.sessionId]);
+
+  const saveNow = useCallback(async () => {
+    const current = saveRef.current;
+    if (!status?.sessionId || !activePath || current.phase !== "dirty" || saveInFlight.current) return;
+    const sessionId = status.sessionId;
+    const path = activePath;
+    const submittedText = textRef.current;
+    saveInFlight.current = true;
+    setSave((state) => saveReducer(state, { type: "saving" }));
+    try {
+      const result = await invoke<SaveDto>("vault_save_note", {
+        sessionId,
+        path,
+        text: submittedText,
+        expectedRevisionHex: current.revisionHex,
+        expectedByteLen: current.byteLen,
+      });
+      if (!matchesDocumentIdentity(sessionId, path, result)
+          || statusRef.current?.sessionId !== sessionId
+          || activePathRef.current !== path) {
+        setSave((state) => saveReducer(state, { type: "failed", code: "error", message: "Save response identity mismatch" }));
+        return;
+      }
+      const stillCurrent = textRef.current === submittedText;
+      setSave((state) => saveReducer(state, { type: "saved", revisionHex: result.revisionHex, byteLen: result.byteLen, stillCurrent }));
+      setNotes((cache) => ({ ...cache, [path]: textRef.current }));
+    } catch (reason) {
+      const failure = failureOf(reason);
+      setSave((state) => saveReducer(state, { type: "failed", code: failure.code ?? "error", message: failure.message }));
+    } finally {
+      saveInFlight.current = false;
+    }
+  }, [activePath, status?.sessionId]);
+
+  const reloadFromDisk = useCallback(async () => {
+    const sessionId = statusRef.current?.sessionId;
+    const path = activePathRef.current;
+    if (!sessionId || !path) return;
+    if (!window.confirm("Reload from disk and discard the current editor buffer?")) return;
+    const request = ++noteRequest.current;
+    setError(undefined);
+    try {
+      const note = await invoke<NoteDto>("vault_read_note", { sessionId, path });
+      if (request !== noteRequest.current || statusRef.current?.sessionId !== sessionId || activePathRef.current !== path) return;
+      if (!matchesDocumentIdentity(sessionId, path, note)) throw new Error("Note response identity mismatch");
+      setText(note.text);
+      setDocumentVersion((version) => version + 1);
+      setNotes((cache) => ({ ...cache, [path]: note.text }));
+      setSave(saveReducer(INITIAL_SAVE, { type: "load", revisionHex: note.revisionHex, byteLen: note.byteLen }));
+    } catch (reason) {
+      setError(failureOf(reason).message ?? "Could not reload this note");
+    }
   }, []);
+
+  useEffect(() => {
+    if (!shouldAutosave(save)) return;
+    const timer = window.setTimeout(() => void saveNow(), 750);
+    return () => window.clearTimeout(timer);
+  }, [save, saveNow, text]);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const command = event.metaKey || event.ctrlKey;
+      if (command && event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        void saveNow();
+      }
+      if (command && event.key.toLowerCase() === "p") {
+        event.preventDefault();
+        restoreDrawerFocus.current = null;
+        setLeftDrawer(false);
+        setRightDrawer(false);
+        setQuickOpen(true);
+        setQuickQuery("");
+        setQuickIndex(0);
+      }
+      if (event.key === "Escape") {
+        setQuickOpen(false);
+        setLeftDrawer(false);
+        setRightDrawer(false);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [saveNow]);
+
+  useEffect(() => {
+    if (quickOpen) {
+      restoreFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      window.requestAnimationFrame(() => quickInput.current?.focus());
+    } else {
+      restoreFocus.current?.focus();
+      restoreFocus.current = null;
+    }
+  }, [quickOpen]);
+
+  useEffect(() => {
+    if (compactDrawerOpen) {
+      const drawer = leftDrawer ? explorerDrawerRef.current : contextDrawerRef.current;
+      window.requestAnimationFrame(() => drawer?.querySelector<HTMLElement>(".mobile-close")?.focus());
+    } else if (restoreDrawerFocus.current) {
+      restoreDrawerFocus.current.focus();
+      restoreDrawerFocus.current = null;
+    }
+  }, [compactDrawerOpen, leftDrawer]);
+
+  const openQuickSwitcher = () => {
+    restoreDrawerFocus.current = null;
+    setLeftDrawer(false);
+    setRightDrawer(false);
+    setQuickQuery("");
+    setQuickIndex(0);
+    setQuickOpen(true);
+  };
+
+  const openExplorerDrawer = () => {
+    if (compactExplorer) restoreDrawerFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setRightDrawer(false);
+    setLeftDrawer(true);
+  };
+
+  const openContextDrawer = () => {
+    if (compactContext) restoreDrawerFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setLeftDrawer(false);
+    setRightDrawer(true);
+  };
+
+  const markdownEntries = useMemo(() => entries.filter((entry) => entry.kind === "markdown"), [entries]);
+  const filtered = useMemo(() => filterEntries(markdownEntries, filter), [markdownEntries, filter]);
+  const quickResults = useMemo(() => filterEntries(markdownEntries, quickQuery).slice(0, 12), [markdownEntries, quickQuery]);
+  const tree = useMemo(() => buildTree(filtered), [filtered]);
+  const outline = useMemo(() => extractOutline(text), [text]);
+  const backlinks = useMemo(() => activePath ? Object.entries(notes).filter(([path, body]) => path !== activePath && extractWikiLinks(body).some((link) => noteLabel(link).toLocaleLowerCase("th") === noteLabel(activePath).toLocaleLowerCase("th"))).map(([path]) => path) : [], [activePath, notes]);
+
+  if (loading) return <main className="boot-screen" aria-live="polite"><span className="spinner" />Opening myVault…</main>;
+  if (!status?.active || !status.sessionId) {
+    return (
+      <main className="vault-empty">
+        <div className="wordmark"><span>mV</span> myVault</div>
+        <section>
+          <p className="section-label">LOCAL WORKSPACE</p>
+          <h1>Open a folder as your Vault</h1>
+          <p>Your notes stay as ordinary Markdown files. This Demo does not connect to Google Drive yet.</p>
+          <button className="primary-button" disabled={opening} onClick={() => void chooseVault()} type="button">{opening ? "Opening…" : "Choose Vault folder"}</button>
+          {error && <p className="inline-error" role="alert">{error}</p>}
+        </section>
+        <small>Desktop prototype · No hosting · No account required</small>
+      </main>
+    );
+  }
 
   return (
-    <main className="app-shell">
-      <header className="hero">
-        <div>
-          <p className="eyebrow">PHASE 0 · TECHNICAL SPIKE</p>
-          <h1>myVault platform laboratory</h1>
-          <p className="hero-copy">
-            Validate the native bridge, Thai input, Markdown editor, safe diagrams, and graph rendering
-            before the product layer begins.
-          </p>
-        </div>
-        <div className="runtime-card" aria-live="polite">
-          <span className="status-dot" />
-          {platform ? (
-            <>
-              <strong>{platform.os}</strong>
-              <span>{platform.arch}</span>
-              <span>{platform.debugBuild ? "debug build" : "release build"}</span>
-            </>
-          ) : bridgeError ? (
-            <span className="probe-error">Bridge unavailable: {bridgeError}</span>
-          ) : (
-            <span>Probing native runtime…</span>
-          )}
-        </div>
-      </header>
+    <main className="workspace">
+      <nav className="activity-rail" aria-label="Workspace tools" inert={quickOpen || compactDrawerOpen} aria-hidden={quickOpen || compactDrawerOpen || undefined}>
+        <div className="rail-logo">mV</div>
+        <button className="active" aria-label="Files" onClick={openExplorerDrawer} type="button">F</button>
+        <button aria-label="Quick switcher" onClick={openQuickSwitcher} type="button">Q</button>
+        <button aria-label="Context" onClick={openContextDrawer} type="button">C</button>
+        <button className="rail-bottom" aria-label="Open another Vault" onClick={() => void chooseVault()} type="button">↗</button>
+      </nav>
 
-      <section className="probe-grid">
-        <article className="probe-card editor-card">
-          <div className="card-heading">
-            <div>
-              <p className="card-kicker">INPUT + EDITOR</p>
-              <h2>Markdown and Thai IME</h2>
-            </div>
-            <span className="badge">CodeMirror 6</span>
-          </div>
-          <EditorProbe />
-        </article>
+      <aside ref={explorerDrawerRef} className={leftDrawer ? "explorer-panel drawer-open" : "explorer-panel"} aria-label="File explorer" role={compactExplorer && leftDrawer ? "dialog" : undefined} aria-modal={compactExplorer && leftDrawer ? "true" : undefined} inert={quickOpen || (compactExplorer && !leftDrawer) || (compactDrawerOpen && !leftDrawer)} aria-hidden={quickOpen || (compactExplorer && !leftDrawer) || (compactDrawerOpen && !leftDrawer) || undefined} onKeyDown={(event) => { if (compactExplorer && leftDrawer) trapTab(event, explorerDrawerRef.current); }}>
+        <header><strong>myVault</strong><button className="mobile-close" onClick={() => setLeftDrawer(false)} aria-label="Close file explorer" type="button">×</button></header>
+        <label className="search-box"><span>⌕</span><input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="Filter notes" aria-label="Filter notes" /></label>
+        <div className="panel-title"><span>FILES</span><span>{markdownEntries.length}</span></div>
+        <div className="tree-scroll">{tree.length ? <Tree nodes={tree} selected={activePath} onSelect={(path) => void openNote(path)} /> : <p className="panel-empty">No Markdown notes found.</p>}</div>
+        <footer><span className="status-led" />Local Vault</footer>
+      </aside>
 
-        <article className="probe-card">
-          <div className="card-heading">
-            <div>
-              <p className="card-kicker">SAFE RENDERING</p>
-              <h2>Diagram pipeline</h2>
-            </div>
-            <span className="badge">Mermaid strict</span>
+      <section className="document-panel" inert={quickOpen || compactDrawerOpen} aria-hidden={quickOpen || compactDrawerOpen || undefined}>
+        <header className="document-toolbar">
+          <button className="compact-only" onClick={openExplorerDrawer} aria-label="Open file explorer" type="button">☰</button>
+          <div className="document-title"><strong>{activePath ? noteLabel(activePath) : "No note selected"}</strong><span>{activePath ?? "Choose a Markdown file from the explorer"}</span></div>
+          <div className="mode-switch" aria-label="Document mode"><button className={mode === "edit" ? "active" : ""} onClick={() => setMode("edit")} type="button">Edit</button><button className={mode === "read" ? "active" : ""} onClick={() => setMode("read")} type="button">Read</button></div>
+          <button className="compact-only" onClick={openContextDrawer} aria-label="Open note context" type="button">⋯</button>
+        </header>
+        {error && <div className="workspace-alert" role="alert">{error}<button onClick={() => setError(undefined)} aria-label="Dismiss error" type="button">×</button></div>}
+        {activePath ? (
+          <div className="document-body">
+            {mode === "edit" ? <Editor key={`${activePath}:${documentVersion}`} text={text} onChange={(next) => { setText(next); setSave((state) => saveReducer(state, { type: "edit" })); }} /> : <Reader text={text} />}
           </div>
-          <MermaidProbe />
-        </article>
-
-        <article className="probe-card">
-          <div className="card-heading">
-            <div>
-              <p className="card-kicker">WEBGL</p>
-              <h2>Knowledge graph</h2>
-            </div>
-            <span className="badge">capacity probe</span>
-          </div>
-          <GraphProbe />
-        </article>
+        ) : (
+          <div className="document-empty"><span>M</span><h2>Select a note</h2><p>Use the explorer or press <kbd>⌘/Ctrl</kbd> + <kbd>P</kbd>.</p></div>
+        )}
+        <footer className="status-bar">
+          <span className={`save-state ${save.phase}`}><i />{save.message ?? ({ clean: "Ready", dirty: "Unsaved", saving: "Saving…", saved: "Saved", conflict: "Conflict", unknown: "Verify save", error: "Save failed" }[save.phase])}</span>
+          {["conflict", "unknown", "error"].includes(save.phase) && <button className="reload-button" onClick={() => void reloadFromDisk()} type="button">Reload from disk</button>}
+          <span>{text ? `${text.trim() ? text.trim().split(/\s+/).length : 0} words · ${new TextEncoder().encode(text).length} bytes` : "UTF-8 Markdown"}</span>
+        </footer>
       </section>
 
-      <section className="runtime-evidence" aria-label="Runtime evidence">
-        <strong>Runtime evidence</strong>
-        <span>{navigator.userAgent}</span>
-        <span>Visibility transitions: {visibilityEvents}</span>
-      </section>
+      <aside ref={contextDrawerRef} className={rightDrawer ? "context-panel drawer-open" : "context-panel"} aria-label="Note context" role={compactContext && rightDrawer ? "dialog" : undefined} aria-modal={compactContext && rightDrawer ? "true" : undefined} inert={quickOpen || (compactContext && !rightDrawer) || (compactDrawerOpen && !rightDrawer)} aria-hidden={quickOpen || (compactContext && !rightDrawer) || (compactDrawerOpen && !rightDrawer) || undefined} onKeyDown={(event) => { if (compactContext && rightDrawer) trapTab(event, contextDrawerRef.current); }}>
+        <header><strong>CONTEXT</strong><button className="mobile-close" onClick={() => setRightDrawer(false)} aria-label="Close context" type="button">×</button></header>
+        <section><h2>Outline</h2>{outline.length ? <ol className="outline-list">{outline.map((item) => <li key={item.id} style={{ paddingLeft: `${(item.level - 1) * 10}px` }}>{item.text}</li>)}</ol> : <p className="panel-empty">Headings appear here.</p>}</section>
+        <section><h2>Backlinks <span>{backlinks.length}</span></h2>{backlinks.length ? backlinks.map((path) => <button className="backlink" key={path} onClick={() => void openNote(path)} type="button">{noteLabel(path)}<small>{path}</small></button>) : <p className="panel-empty">Open linked notes to build local context.</p>}</section>
+        <section className="graph-section"><h2>Opened-note graph</h2><KnowledgeGraph notes={notes} activePath={activePath} /></section>
+      </aside>
 
-      <GoogleAuthProbe />
+      {(leftDrawer || rightDrawer) && <button className="drawer-backdrop" inert={quickOpen} aria-hidden={quickOpen || undefined} onClick={() => { setLeftDrawer(false); setRightDrawer(false); }} aria-label="Close drawer" type="button" />}
 
-      <footer className="spike-footer">
-        <span>Next gates</span>
-        <strong>Android OAuth · Atomic filesystem · SQLite · Drive fixture</strong>
-      </footer>
+      {quickOpen && <div className="dialog-backdrop" role="presentation"><section ref={quickDialog} className="quick-switcher" role="dialog" aria-modal="true" aria-label="Quick switcher" onKeyDown={(event) => trapTab(event, quickDialog.current)}><header><span>⌕</span><input ref={quickInput} value={quickQuery} onChange={(event) => { setQuickQuery(event.target.value); setQuickIndex(0); }} onKeyDown={(event) => { if (event.key === "ArrowDown") { event.preventDefault(); setQuickIndex((index) => Math.min(index + 1, Math.max(0, quickResults.length - 1))); } else if (event.key === "ArrowUp") { event.preventDefault(); setQuickIndex((index) => Math.max(0, index - 1)); } else if (event.key === "Enter" && quickResults[quickIndex]) { setQuickOpen(false); void openNote(quickResults[quickIndex].path); } }} placeholder="Type a note name…" aria-label="Find a note" /></header><div>{quickResults.map((entry, index) => <button className={index === quickIndex ? "active" : ""} key={entry.path} onClick={() => { setQuickOpen(false); void openNote(entry.path); }} type="button"><span>{noteLabel(entry.path)}</span><small>{entry.path}</small>{index === quickIndex && <kbd>Enter</kbd>}</button>)}</div><footer><span>↑↓ navigate</span><span>Esc close</span></footer></section></div>}
     </main>
   );
 }
