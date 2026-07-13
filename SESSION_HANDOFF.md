@@ -1,6 +1,6 @@
 # myVault — Latest Session Handoff
 
-Updated 2026-07-13 18:05 Asia/Bangkokค่ะ
+Updated 2026-07-13 21:23 Asia/Bangkokค่ะ
 
 ## Start Here
 
@@ -13,7 +13,7 @@ Sunday ต้องตรวจ `git status --short` และ `git diff` ก่
 - Compatibility path คือ `/Users/awb/My Apps/myVault` และ physical path อยู่บน `/Volumes/AWB-Apps/My Apps/myVault` ค่ะ
 - Branch ปัจจุบันคือ `codex/phase-3-sync-foundation` และ base คือ `cbde0c1` ซึ่งตรงกับ `origin/main` ตอนสร้าง branch ค่ะ
 - Phase 1 closure ถูกแยก commit เป็น `66c299f` และ `cbde0c1` แล้ว push ไป `origin/main` สำเร็จค่ะ
-- Phase 3A published commits ก่อน final remediation คือ `6639d42`, `9a9a065` และ `34429d0` ค่ะ Branch อยู่ใน PR #23 และยังไม่ merge ค่ะ Remediation head ต้องผ่าน scope review, latest-head CI และ Final Merge Review ก่อนขออนุมัติ merge ค่ะ
+- Phase 3A branch อยู่ใน PR #23 และยังไม่ merge ค่ะ ให้เปรียบเทียบ current local, remote และ PR head เป็น source of truth แทน static commit list ค่ะ ทุก head ใหม่ต้องผ่าน scope review, latest-head CI และ Final Merge Review ก่อนขออนุมัติ merge และห้ามทำ commit/push ซ้ำเมื่อ head ตรงกันค่ะ
 
 ## Completed This Session
 
@@ -29,6 +29,7 @@ Sunday ต้องตรวจ `git status --short` และ `git diff` ก่
 - คุณโอเลือกทำ Phase 3 Production Drive Sync ก่อน Phase 2 และอนุมัติแผน Phase 3A ค่ะ
 - Phase 3A สร้าง `myvault-sync-engine` แยกจาก `drive-sync-spike` พร้อม private SQLite schema v1, exact remote-root binding, typed remote checksums, start-token-before-scan orchestration, durable completed-operation tombstones, `NeedsReconcile`, exact schema validation และ crash-aware local-mutation cursor protocol ค่ะ
 - Final Merge Review พบ live-worker false recovery และ version-zero malformed-schema mutation ค่ะ คุณโออนุมัติ remediation ที่เพิ่ม exclusive per-Vault Sync lease และ transactional all-object schema validation แล้วค่ะ
+- Final hardening review พบ negative `user_version` ที่หลุด fail-closed gate ค่ะ คุณโออนุมัติให้แก้ regression และเดิน Phase 3A ต่อเนื่องจนพร้อม merge โดยการ merge เข้า `main` ยังต้องขออนุมัติแยกค่ะ
 - Phase 3A ไม่มี OAuth runtime, Google Drive network request, live Drive read/write หรือ personal Vault access ค่ะ Architecture, acceptance และ results อยู่ใน `docs/sync` ค่ะ
 
 ## Verification Passed — Phase 1 Local Implementation Closure Checkpoint
@@ -50,10 +51,10 @@ Checkpoint นี้รันเมื่อ 2026-07-13 กับ uncommitted Ph
 
 ## Verification Passed — Phase 3A Sync Foundation Checkpoint
 
-- `myvault-sync-engine` isolated suite ผ่าน 16 integration tests ค่ะ
+- `myvault-sync-engine` isolated suite ผ่าน 17 integration tests ค่ะ
 - Strict Clippy `-D warnings` และ Rust formatting สำหรับ crate ใหม่ผ่านค่ะ
 - `pnpm test:rust` ผ่าน Tauri 8 tests, myvault-core suites, Desktop Auth 9 tests, Drive spike 25 tests และ Sync Foundation tests ค่ะ
-- Initial sync, restart resume, stale scan cursor, removed changes, duplicate remote paths, typed checksums, post-completion exact queue retry, operation collision, exclusive live-worker lease, interrupted remote/local unknown outcomes, atomic history, partial cursor blocking, constraint-weakened schema, view-only v0 schema และ corrupt evidence preservation มี regression tests ค่ะ
+- Initial sync, restart resume, stale scan cursor, removed changes, duplicate remote paths, typed checksums, post-completion exact queue retry, operation collision, exclusive live-worker lease, interrupted remote/local unknown outcomes, atomic history, partial cursor blocking, constraint-weakened schema, negative schema version, view-only v0 schema และ corrupt evidence preservation มี regression tests ค่ะ
 - Native Linux platform CI รัน Sync Foundation suite และ native Windows compile tests แบบ `--no-run` ค่ะ Windows Sync runtime acceptance ยัง deferred จนกว่าจะเชื่อม private-root provisioning ค่ะ
 - Live Drive fixture และ OS keyring mutation tests ยังคง ignored by default และไม่ได้ถูกรันใน Phase 3A ค่ะ
 
@@ -89,8 +90,8 @@ Checkpoint นี้รันเมื่อ 2026-07-13 กับ uncommitted Ph
 - Phase 1 closure commits และ direct push ไป `origin/main` ได้รับอนุมัติและดำเนินการแล้วค่ะ
 - Phase 3 plan และ Phase 3A Sync Foundation implementation ได้รับอนุมัติและดำเนินการแล้วค่ะ
 - Phase 3A commit-blocker remediation ได้รับอนุมัติและดำเนินการแล้วค่ะ
-- Phase 3A Commit 1–3, push, PR creation และการเปลี่ยน PR #23 เป็น Ready for review ได้รับอนุมัติและดำเนินการแล้วค่ะ Published head `34429d0` ผ่าน CI และ PR ยังไม่ merge ค่ะ
-- Final Merge Review Phase 3A และแผนแก้ blockers ได้รับอนุมัติแล้วค่ะ Remediation ยังต้องผ่าน Commit Scope, commit, push, latest-head CI และ review ซ้ำค่ะ
+- Phase 3A implementation, documentation, remediation commits, push, PR creation และการเปลี่ยน PR #23 เป็น Ready for review ได้รับอนุมัติแล้วค่ะ Current PR head เป็น source of truth และ PR ยังไม่ merge ค่ะ
+- Final Merge Review และ blocker-fix rounds ได้รับอนุมัติให้ดำเนินการต่อเนื่องจน Phase 3A พร้อม merge ค่ะ ทุก head ใหม่ยังต้องผ่าน scope review, latest-head CI และ review ซ้ำ ส่วนการ merge เข้า `main` ต้องขอ explicit approval แยกค่ะ
 - Phase 3B และ live Google Drive access ยังไม่ได้รับ approval ค่ะ
 - ไม่มี approval ด้าน OAuth หรือ User Data Policy ค้างอยู่ค่ะ
 - งาน implementation ใหม่หลัง handoff ต้องเสนอแผนและขออนุมัติคุณโอตาม `AGENTS.md` ค่ะ

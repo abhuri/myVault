@@ -27,7 +27,7 @@ The database is durable but not a source of user contentค่ะ If it is corru
 
 `SQLite` uses foreign keys, `journal_mode=DELETE`, `synchronous=FULL`, and a private pre-created database fileค่ะ Bundled SQLite still opens by ambient path, so the held private directory, no-follow pre-creation, exact permissions, and post-open verification reduce accidental path substitution but are not a security boundary against a hostile process running as the same OS userค่ะ
 
-Before opening SQLite, `SyncStore` acquires an exclusive OS-level lease on a private per-Vault lock file and holds it for the store lifetimeค่ะ A second live worker fails closed without reading or mutating queue stateค่ะ Only a later opener that acquires the released lease may classify retained `Running` jobs as interruptedค่ะ Version-zero migration treats a database as new only when it contains no user table, index, view, or trigger, and exact schema validation occurs inside the same transaction before commitค่ะ
+Before opening SQLite, `SyncStore` acquires an exclusive OS-level lease on a private per-Vault lock file and holds it for the store lifetimeค่ะ A second live worker fails closed without reading or mutating queue stateค่ะ Only a later opener that acquires the released lease may classify retained `Running` jobs as interruptedค่ะ Version-zero migration treats a database as new only when it contains no user table, index, view, or trigger, and exact schema validation occurs inside the same transaction before commitค่ะ Negative schema versions are malformed evidence and fail closed without normalizationค่ะ
 
 ## Initial Sync Ordering
 

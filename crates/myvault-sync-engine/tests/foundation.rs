@@ -778,6 +778,31 @@ fn newer_and_partial_schemas_are_preserved_and_rejected() {
 }
 
 #[test]
+fn negative_schema_version_is_preserved_and_rejected() {
+    let fixture = Fixture::new();
+    let database_path = {
+        let store = fixture.open();
+        store.database_path().to_path_buf()
+    };
+    let connection = rusqlite::Connection::open(&database_path).unwrap();
+    connection.pragma_update(None, "user_version", -1).unwrap();
+    drop(connection);
+    let before = fs::read(&database_path).unwrap();
+
+    assert!(matches!(
+        SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+        Err(Error::InvalidSchema)
+    ));
+    assert_eq!(fs::read(&database_path).unwrap(), before);
+
+    let connection = rusqlite::Connection::open(&database_path).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, -1);
+}
+
+#[test]
 fn view_only_version_zero_schema_is_preserved_and_rejected() {
     let fixture = Fixture::new();
     let database_path = {

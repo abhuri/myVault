@@ -1114,6 +1114,9 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     if current > SCHEMA_VERSION {
         return Err(Error::UnsupportedSchema(current));
     }
+    if current < 0 {
+        return Err(Error::InvalidSchema);
+    }
     if current == 0 {
         let existing: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM sqlite_master

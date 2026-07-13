@@ -1,6 +1,6 @@
 # Phase 3 Sync Evidence
 
-Updated 2026-07-13 18:05 Asia/Bangkokค่ะ
+Updated 2026-07-13 21:23 Asia/Bangkokค่ะ
 
 ## Phase 3A — Sync Foundation
 
@@ -16,12 +16,12 @@ Status: `FOUNDATION IMPLEMENTED — PR #23 MERGE REQUIRES LATEST-HEAD CI AND EXP
 - Durable queue รองรับ upload, download, move และ Trash metadata โดยไม่เก็บ note/attachment body หรือ OAuth token ค่ะ Completed operation คงเป็น non-runnable tombstone ทำให้ exact retry หลัง completion ไม่ทำงานซ้ำ และ mismatched ID reuse fail closed ค่ะ Download, Move และ Trash บังคับ exact remote file ID ค่ะ
 - Exclusive per-Vault OS-level lease ถูก acquire ก่อนเปิด SQLite และถือไว้ตลอดอายุ store ค่ะ Live worker ตัวที่สองถูก reject โดยไม่เปลี่ยน queue ส่วน retained `Running` jobs จะเปลี่ยนเป็น `NeedsReconcile` หลัง process เดิมปล่อย lease แล้วเท่านั้นค่ะ
 - Incremental cursor batch ใช้ durable `Pending` → `Applying` → `Committed` state ค่ะ Crash ระหว่าง local operation จะค้างที่ `Applying` และบังคับ reconciliation ก่อน retry, abort หรือ cursor commit ค่ะ
-- Newer, partial, constraint-weakened และ corrupt database evidence ถูกเก็บไว้และ fail closed โดยไม่มี automatic delete/rebuild ค่ะ Version-zero migration ตรวจ user table/index/view/trigger ทั้งหมดและ validate exact schema ใน transaction ก่อน commit ค่ะ
+- Newer, negative-version, partial, constraint-weakened และ corrupt database evidence ถูกเก็บไว้และ fail closed โดยไม่มี automatic delete/rebuild ค่ะ Version-zero migration ตรวจ user table/index/view/trigger ทั้งหมดและ validate exact schema ใน transaction ก่อน commit ค่ะ
 - เพิ่ม new-crate fmt, strict Clippy และ test commands ใน local `test:rust` กับ quality CI ค่ะ Platform CI รัน suite บน native Linux และ compile tests บน native Windows โดยไม่อ้าง Windows runtime acceptance ค่ะ
 
 ### Verification
 
-- `cargo test --manifest-path crates/myvault-sync-engine/Cargo.toml` ผ่าน 16 integration tests ค่ะ
+- `cargo test --manifest-path crates/myvault-sync-engine/Cargo.toml` ผ่าน 17 integration tests ค่ะ
 - `cargo clippy --manifest-path crates/myvault-sync-engine/Cargo.toml --all-targets -- -D warnings` ผ่านค่ะ
 - `pnpm test:rust` ผ่าน Tauri 8 tests, myvault-core suites, Desktop Auth 9 tests, Drive spike 25 tests และ Sync Foundation tests ค่ะ Live Drive test และ OS keyring mutation test ยังคง ignored by default ตาม contract ค่ะ
 - GitHub Actions validation เป็น head-specific ค่ะ Latest PR head ต้องผ่าน Quality, Android Compile, Ubuntu AppImage และ Windows NSIS ก่อน merge ค่ะ
