@@ -1,6 +1,6 @@
 # myVault — Latest Session Handoff
 
-Updated 2026-07-13 15:42 Asia/Bangkokค่ะ
+Updated 2026-07-13 16:38 Asia/Bangkokค่ะ
 
 ## Start Here
 
@@ -13,7 +13,7 @@ Sunday ต้องตรวจ `git status --short` และ `git diff` ก่
 - Compatibility path คือ `/Users/awb/My Apps/myVault` และ physical path อยู่บน `/Volumes/AWB-Apps/My Apps/myVault` ค่ะ
 - Branch ปัจจุบันคือ `codex/phase-3-sync-foundation` และ base คือ `cbde0c1` ซึ่งตรงกับ `origin/main` ตอนสร้าง branch ค่ะ
 - Phase 1 closure ถูกแยก commit เป็น `66c299f` และ `cbde0c1` แล้ว push ไป `origin/main` สำเร็จค่ะ
-- Phase 3A implementation commit คือ `6639d42` และ documentation checkpoint อยู่ใน commit ปัจจุบันของ branch ค่ะ ทั้งสอง local commits ยังไม่ push ค่ะ
+- Phase 3A implementation commit คือ `6639d42` และ documentation commit คือ `9a9a065` ค่ะ Branch ถูก push ใน PR #23 ซึ่งพร้อม review และยังไม่ merge ค่ะ CI ของ head `9a9a065` ผ่านครบ; documentation checkpoint ถัดจาก head นี้ต้องผ่าน CI ของตัวเองหลัง push ค่ะ
 
 ## Completed This Session
 
@@ -73,8 +73,8 @@ Checkpoint นี้รันเมื่อ 2026-07-13 กับ uncommitted Ph
 
 ## Recommended Next Actions
 
-1. Phase 3A deep review, commit-blocker remediation, final Commit Scope และ local commits ผ่านแล้วค่ะ
-2. ให้คุณโอตัดสินใจเรื่อง push ของ Phase 3A แยกต่างหากค่ะ
+1. Phase 3A deep review, commit-blocker remediation, implementation/documentation commits, push และ PR #23 ผ่านแล้วค่ะ
+2. Commit/push documentation checkpoint นี้, ตรวจ CI ของ head ใหม่ แล้วทำ final merge review ค่ะ
 3. หลัง 3A ผ่าน review ให้เสนอ Phase 3B Native Auth + Read-only Existing Drive Binding และขอ approval ใหม่ก่อน live Drive access ค่ะ
 4. แยก persistent content index และ P3 frontend code splitting ออกจาก Sync operational state ค่ะ
 5. ทำ Windows/Ubuntu native acceptance และ physical Android validation เมื่อมี environment/อุปกรณ์ที่เหมาะสมค่ะ
@@ -88,7 +88,7 @@ Checkpoint นี้รันเมื่อ 2026-07-13 กับ uncommitted Ph
 - Phase 1 closure commits และ direct push ไป `origin/main` ได้รับอนุมัติและดำเนินการแล้วค่ะ
 - Phase 3 plan และ Phase 3A Sync Foundation implementation ได้รับอนุมัติและดำเนินการแล้วค่ะ
 - Phase 3A commit-blocker remediation ได้รับอนุมัติและดำเนินการแล้วค่ะ
-- Phase 3A Commit 1 และ Commit 2 ได้รับอนุมัติและดำเนินการแล้วค่ะ ทั้งสอง commits ยังไม่ push ค่ะ
+- Phase 3A Commit 1, Commit 2, push, PR creation และการเปลี่ยน PR #23 เป็น Ready for review ได้รับอนุมัติและดำเนินการแล้วค่ะ CI ของ head `9a9a065` ผ่านครบและ PR ยังไม่ merge ค่ะ
 - Phase 3B และ live Google Drive access ยังไม่ได้รับ approval ค่ะ
 - ไม่มี approval ด้าน OAuth หรือ User Data Policy ค้างอยู่ค่ะ
 - งาน implementation ใหม่หลัง handoff ต้องเสนอแผนและขออนุมัติคุณโอตาม `AGENTS.md` ค่ะ

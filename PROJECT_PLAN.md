@@ -388,7 +388,7 @@ Sunday มีหน้าที่ดังนี้ค่ะ
 
 | Slice | Status | Scope / gate |
 |---|---|---|
-| 3A — Sync Foundation | LOCAL IMPLEMENTATION COMPLETE — COMMITTED LOCALLY — NOT PUSHED | แยก production `myvault-sync-engine` จาก spike harness, เพิ่ม private SQLite schema v1, exact remote binding, initial-scan/cursor state machine, completed-operation tombstones, `NeedsReconcile`, exact schema validation และ crash-aware local-mutation cursor protocol ค่ะ Architecture, acceptance และผลทดสอบอยู่ใน [`docs/sync`](docs/sync) ค่ะ |
+| 3A — Sync Foundation | IMPLEMENTATION COMPLETE — PUBLISHED IN PR #23 | แยก production `myvault-sync-engine` จาก spike harness, เพิ่ม private SQLite schema v1, exact remote binding, initial-scan/cursor state machine, completed-operation tombstones, `NeedsReconcile`, exact schema validation และ crash-aware local-mutation cursor protocol ค่ะ Architecture, acceptance และผลทดสอบอยู่ใน [`docs/sync`](docs/sync) ค่ะ |
 | 3B — Native Auth + Read-only Binding | NEXT — REQUIRES APPROVAL | เชื่อม Desktop OAuth runtime, รวม native authorization provider, เลือก Existing Drive root ด้วย exact ID และทำ read-only start-token/scan/drain ค่ะ Live Drive access ต้องขออนุมัติแยกค่ะ |
 | 3C — Guarded Upload/Download | PLANNED | durable local queue integration, verified resumable upload, staged/hashed download, retry/backoff และ unknown-outcome reconciliation ค่ะ |
 | 3D — Mutations + Conflicts | PLANNED | rename/move/Trash, attachments, base objects, three-way merge, conflict copies และ delete-versus-edit ค่ะ |
@@ -499,7 +499,7 @@ Phase 3A ไม่เรียก OAuth หรือ Google Drive network แล
 
 ## 14. Current Status
 
-- สถานะโครงการคือ Phase 0 OAuth/Live Drive Spike Complete — Phase 1 Local Implementation Closure Complete — Phase 3A Sync Foundation Local Implementation Complete ค่ะ Phase 3A ถูกแยกเป็นสอง local commits บน feature branch และยังไม่ push ค่ะ Phase 3B live read-only binding ยังไม่เริ่มค่ะ Windows/Ubuntu native runtime และ physical Android evidence ยัง deferred จึงยังไม่ใช่ cross-platform runtime PASS ค่ะ
+- สถานะโครงการคือ Phase 0 OAuth/Live Drive Spike Complete — Phase 1 Local Implementation Closure Complete — Phase 3A Sync Foundation Ready for Review ค่ะ ณ checkpoint 2026-07-13 16:38 PR #23 พร้อม review, CI ของ head `9a9a065` ผ่านครบและยังไม่ merge ค่ะ Documentation checkpoint ถัดจาก head นี้ต้องผ่าน CI ของตัวเองหลัง push ค่ะ Phase 3B live read-only binding ยังไม่เริ่มค่ะ Windows/Ubuntu native runtime และ physical Android evidence ยัง deferred จึงยังไม่ใช่ cross-platform runtime PASS ค่ะ
 - Git repository เชื่อมกับ `https://github.com/abhuri/myVault.git` แล้วค่ะ
 - initial repository safeguards ถูก push ไปที่ `main` ใน commit `6597e18` แล้วค่ะ
 - Phase 0 ถูก merge เข้า `main` ผ่าน PR #1 ที่ merge commit `dab395a` แล้วค่ะ
@@ -568,7 +568,7 @@ Phase 3A ไม่เรียก OAuth หรือ Google Drive network แล
 
 ## 15. Next Actions
 
-1. Phase 3A deep review, commit-blocker remediation, final Commit Scope และ local commits ผ่านแล้วค่ะ รอคุณโอตัดสินใจเรื่อง push แยกต่างหากค่ะ ห้ามดำเนินการ Git mutation เพิ่มโดยไม่มีคำสั่งจากคุณโอค่ะ
+1. Phase 3A deep review, commit-blocker remediation, implementation/documentation commits, push และ PR #23 ผ่านแล้วค่ะ งานถัดไปคือ commit/push documentation checkpoint นี้, ตรวจ CI ของ head ใหม่ แล้วทำ final merge review ค่ะ ห้าม merge โดยไม่มีคำสั่งแยกต่างหากจากคุณโอค่ะ
 2. หลัง 3A ผ่าน review ให้เสนอ Phase 3B Native Auth + Read-only Existing Drive Binding พร้อม exact live-account safety gate และขอ approval ก่อนแตะ Google Drive จริงค่ะ
 3. วาง milestone แยกสำหรับ persistent full-vault content index, backlinks/graph และ frontmatter/properties presentation โดยไม่ดึงมาปนกับ Sync operational database ค่ะ
 4. ทำ P3 code splitting ของ Mermaid/Sigma และ modules ขนาดใหญ่หลัง Sync foundation โดยไม่กระทบ safety contracts ค่ะ
@@ -588,9 +588,9 @@ Phase 3A ไม่เรียก OAuth หรือ Google Drive network แล
 
 ### Current Handoff
 
-- วันที่อัปเดตคือ 2026-07-13 15:42 เขตเวลา Asia/Bangkok ค่ะ Phase 1 closure ถูก push แล้วและ Phase 3A blocker-remediated local commits checkpoint ถูกบันทึกแล้วค่ะ
+- วันที่อัปเดตคือ 2026-07-13 16:38 เขตเวลา Asia/Bangkok ค่ะ Phase 1 closure ถูก push แล้วและ Phase 3A PR #23 พร้อม review ค่ะ CI ของ head `9a9a065` ผ่านครบค่ะ
 - restart checkpoint หลักอยู่ที่ `SESSION_HANDOFF.md` ค่ะ ให้ session ใหม่อ่านไฟล์นั้นก่อนเอกสารอื่นค่ะ
-- branch ปัจจุบันคือ `codex/phase-3-sync-foundation`, base คือ `cbde0c1` และ Phase 3A implementation commit คือ `6639d42` ค่ะ Documentation checkpoint อยู่ใน commit ปัจจุบันของ branch และทั้งสอง local commits ยังไม่ push ค่ะ
+- branch ปัจจุบันคือ `codex/phase-3-sync-foundation`, base คือ `cbde0c1`, Phase 3A implementation commit คือ `6639d42` และ documentation commit คือ `9a9a065` ค่ะ Branch ถูก push ใน PR #23 ซึ่งพร้อม review และยังไม่ merge ค่ะ ผล CI ที่บันทึกไว้เป็นของ head `9a9a065`; documentation checkpoint ถัดจาก head นี้ต้องผ่าน CI ของตัวเองหลัง push ค่ะ
 - คุณโอเลือก Phase 3 ก่อน Phase 2 และอนุมัติ Phase 3A Sync Foundation แล้วค่ะ Phase 3B/live Drive access ยังต้องขอ approval ใหม่ค่ะ
 - ผู้ใช้เรียกว่า คุณโอ หรือบอส ค่ะ
 - Sunday เป็นหัวหน้าทีมและเจ้าของ architecture, logic, mechanics และ final integration ค่ะ
@@ -620,7 +620,7 @@ Phase 3A ไม่เรียก OAuth หรือ Google Drive network แล
 - local gates ผ่าน TypeScript, Vitest 19, Vite build, app-service 10 tests, Tauri 6 tests, strict host Clippy, Android aarch64 cross-Clippy และ macOS debug `.app` bundle ค่ะ
 - live macOS test ผ่าน native picker, 5-note explorer, Thai read, Reader table/code, exact autosave และ external-edit conflict ที่ไม่ overwrite disk ค่ะ
 - GitHub Release คือ `https://github.com/abhuri/myVault/releases/tag/v0.1.0-demo` พร้อม macOS ARM64, Windows x64, Linux amd64 และ SHA-256 checksums ค่ะ
-- checkpoint หลัง release ที่ commit `99d42c4` เป็นประวัติเดิมค่ะ Phase 1 closure อยู่บน `origin/main` ที่ `cbde0c1` และสถานะล่าสุดคือ Phase 3A local commits ที่ยังไม่ push บน branch `codex/phase-3-sync-foundation` ตาม `SESSION_HANDOFF.md` ค่ะ
+- checkpoint หลัง release ที่ commit `99d42c4` เป็นประวัติเดิมค่ะ Phase 1 closure อยู่บน `origin/main` ที่ `cbde0c1` และสถานะล่าสุดคือ Phase 3A branch `codex/phase-3-sync-foundation` ใน PR #23 ค่ะ CI ของ head `9a9a065` ผ่านครบ และ PR ยังไม่ merge ณ checkpoint 2026-07-13 16:38 ตาม `SESSION_HANDOFF.md` ค่ะ
 - session ใหม่ให้เริ่มด้วยการอ่าน `SESSION_HANDOFF.md`, `PROJECT_PLAN.md`, `docs/phase-0/RESULTS.md`, `docs/demo/RESULTS.md`, `docs/demo/ACCEPTANCE.md` และ `CHANGELOG.md` ก่อนวางแผนรอบถัดไปค่ะ
 - Live Copy-of-Vault UAT ผ่านตาม [Phase 1 Hardening — Copy-of-Vault Acceptance](docs/demo/PHASE1_HARDENING_ACCEPTANCE.md) แล้วค่ะ ผลละเอียดอยู่ใน [Demo Results](docs/demo/RESULTS.md) ค่ะ
 - malicious same-UID syscall race บน Unix/macOS อยู่นอก threat model ที่ประกาศไว้ เพราะไม่มี portable unlink-by-handle primitive; cooperating myVault processes ถูก serialize ด้วย operation lock ค่ะ
