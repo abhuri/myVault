@@ -33,6 +33,7 @@ pub enum Error {
     InvalidRevision,
     InvalidTimestamp,
     InvalidErrorCode,
+    SyncLeaseHeld,
     BindingCollision,
     InvalidStateTransition,
     InvalidSchema,
@@ -62,6 +63,9 @@ impl fmt::Display for Error {
             Self::InvalidRevision => formatter.write_str("the local revision is invalid"),
             Self::InvalidTimestamp => formatter.write_str("the sync timestamp is invalid"),
             Self::InvalidErrorCode => formatter.write_str("the redacted error code is invalid"),
+            Self::SyncLeaseHeld => {
+                formatter.write_str("another sync worker already holds this vault lease")
+            }
             Self::BindingCollision => {
                 formatter.write_str("the vault is already bound to a different remote root")
             }

@@ -9,6 +9,7 @@ description = "Crash-safe production sync state foundation for myVault"
 [dependencies]
 cap-fs-ext = "=4.0.2"
 cap-std = "=4.0.2"
+fs2 = "=0.4.3"
 myvault-core = { path = "../myvault-core" }
 myvault-private-fs = { path = "../myvault-private-fs" }
 rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled"] }

@@ -498,6 +498,44 @@ fn interrupted_running_job_requires_reconciliation_after_reopen() {
 }
 
 #[test]
+fn live_second_store_is_rejected_without_recovering_running_job() {
+    let fixture = Fixture::new();
+    let operation = Uuid::new_v4();
+    let mut first = ready_store(&fixture);
+    let job = QueueJob::new(
+        operation,
+        QueueJobKind::Upload,
+        "A.md",
+        None,
+        None,
+        Some(hash(b'a')),
+        10,
+    )
+    .unwrap();
+    first.enqueue_job(&job).unwrap();
+    assert_eq!(
+        first.claim_next_job(10).unwrap().unwrap().state(),
+        JobState::Running
+    );
+
+    assert!(matches!(
+        SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+        Err(Error::SyncLeaseHeld)
+    ));
+    assert_eq!(
+        first.job(operation).unwrap().unwrap().state(),
+        JobState::Running
+    );
+
+    drop(first);
+    let reopened = fixture.open();
+    assert_eq!(
+        reopened.job(operation).unwrap().unwrap().state(),
+        JobState::NeedsReconcile
+    );
+}
+
+#[test]
 fn verified_completion_and_history_commit_together() {
     let fixture = Fixture::new();
     let mut store = ready_store(&fixture);
@@ -737,6 +775,57 @@ fn newer_and_partial_schemas_are_preserved_and_rejected() {
         Err(Error::InvalidSchema)
     ));
     assert!(weakened_path.exists());
+}
+
+#[test]
+fn view_only_version_zero_schema_is_preserved_and_rejected() {
+    let fixture = Fixture::new();
+    let database_path = {
+        let store = fixture.open();
+        store.database_path().to_path_buf()
+    };
+    let connection = rusqlite::Connection::open(&database_path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE change_batch_mutations;
+             DROP TABLE change_batch;
+             DROP TABLE remote_entries;
+             DROP TABLE sync_history;
+             DROP TABLE sync_jobs;
+             DROP TABLE vault_state;
+             PRAGMA user_version = 0;
+             CREATE VIEW unexpected_schema_object AS SELECT 1 AS value;",
+        )
+        .unwrap();
+    drop(connection);
+    let before = fs::read(&database_path).unwrap();
+
+    assert!(matches!(
+        SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+        Err(Error::InvalidSchema)
+    ));
+    assert_eq!(fs::read(&database_path).unwrap(), before);
+
+    let connection = rusqlite::Connection::open(&database_path).unwrap();
+    let view_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'view' AND name = 'unexpected_schema_object'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let created_table_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'vault_state'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(view_count, 1);
+    assert_eq!(created_table_count, 0);
 }
 
 #[test]

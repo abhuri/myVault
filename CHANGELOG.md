@@ -7,9 +7,10 @@
 - เพิ่ม typed MD5/SHA-1/SHA-256 remote checksums, canonical portable paths และ protected `.obsidian`/`.trash` rejection ค่ะ
 - เพิ่ม start-token-before-scan orchestration, exact scan-page cursor, transactional Changes drain และ durable cursor publication หลัง local commit เท่านั้นค่ะ
 - เพิ่ม durable completed-operation tombstones เพื่อคง exact idempotency หลัง completion, exact remote-ID requirements, move destination metadata และ restart recovery ที่เปลี่ยน interrupted `Running` jobs เป็น `NeedsReconcile` เพื่อห้าม blind duplicate upload ค่ะ
-- เพิ่ม crash-aware local mutation state `Pending` → `Applying` → `Committed`, partial-abort protection และ exact schema-definition validation สำหรับ CHECK, UNIQUE และ foreign-key contracts ค่ะ
+- เพิ่ม exclusive per-Vault Sync lease เพื่อห้าม live worker ตัวที่สองทำ false restart recovery ค่ะ
+- เพิ่ม crash-aware local mutation state `Pending` → `Applying` → `Committed`, partial-abort protection และ exact schema-definition validation สำหรับ CHECK, UNIQUE และ foreign-key contracts ค่ะ Version-zero migration ตรวจ user schema objects ทุกชนิดและ validate ใน transaction ก่อน commit เพื่อรักษา malformed evidence ค่ะ
 - เพิ่ม Phase 3A architecture/acceptance/results และ CI gates สำหรับ fmt, strict Clippy, native Linux tests และ native Windows compile-only โดยไม่อ้าง Windows runtime acceptance ค่ะ
-- Phase 3A isolated suite ผ่าน 14 tests และ `pnpm test:rust` ผ่าน Tauri, Core, Desktop Auth, Drive spike และ Sync Foundation matrices ค่ะ
+- Phase 3A isolated suite ผ่าน 16 tests และ `pnpm test:rust` ผ่าน Tauri, Core, Desktop Auth, Drive spike และ Sync Foundation matrices ค่ะ
 
 ## Unreleased — Phase 1 local implementation closure — 2026-07-13
 

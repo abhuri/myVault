@@ -27,6 +27,8 @@ The database is durable but not a source of user contentค่ะ If it is corru
 
 `SQLite` uses foreign keys, `journal_mode=DELETE`, `synchronous=FULL`, and a private pre-created database fileค่ะ Bundled SQLite still opens by ambient path, so the held private directory, no-follow pre-creation, exact permissions, and post-open verification reduce accidental path substitution but are not a security boundary against a hostile process running as the same OS userค่ะ
 
+Before opening SQLite, `SyncStore` acquires an exclusive OS-level lease on a private per-Vault lock file and holds it for the store lifetimeค่ะ A second live worker fails closed without reading or mutating queue stateค่ะ Only a later opener that acquires the released lease may classify retained `Running` jobs as interruptedค่ะ Version-zero migration treats a database as new only when it contains no user table, index, view, or trigger, and exact schema validation occurs inside the same transaction before commitค่ะ
+
 ## Initial Sync Ordering
 
 1. Bind the exact local Vault ID to one exact remote root IDค่ะ
@@ -43,7 +45,7 @@ Restarting repeats at most the last uncommitted remote requestค่ะ Remote e
 
 Queue operation IDs are opaque UUIDs and exact retries remain idempotent after completionค่ะ Completed jobs persist as non-runnable tombstones, and reusing an operation ID with different content is a collision that fails closedค่ะ Jobs contain paths, expected local revisions, exact remote IDs where the operation targets an existing Drive object, attempt counts, scheduling metadata, and redacted error codes onlyค่ะ
 
-A job may leave `Pending` only through an atomic claimค่ะ Any `Running` job observed after process restart becomes `NeedsReconcile`, not `Pending`, because the remote result may be unknownค่ะ Upload retry is allowed only after the production adapter verifies remote parent, name, remote ID candidates, and content hashค่ะ
+A job may leave `Pending` only through an atomic claimค่ะ After the exclusive Sync lease is acquired on process restart, retained `Running` jobs become `NeedsReconcile`, not `Pending`, because the remote result may be unknownค่ะ Upload retry is allowed only after the production adapter verifies remote parent, name, remote ID candidates, and content hashค่ะ
 
 Queue completion, durable tombstone publication, and redacted history publication occur in one transactionค่ะ Completed tombstones are excluded from runnable queue counts but retained to prevent UUID reuseค่ะ
 

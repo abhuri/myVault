@@ -6,6 +6,7 @@ Updated 2026-07-13 Asia/Bangkokค่ะ
 
 - [x] Production sync code is isolated from the Phase 0 fixture harnessค่ะ
 - [x] Private SQLite state is outside and disjoint from the Vaultค่ะ
+- [x] One per-Vault OS-level lease excludes a second live Sync worker before SQLite opensค่ะ
 - [x] A Vault ID cannot be rebound silently to a different remote root IDค่ะ
 - [x] Initial sync captures a start token before the first scan requestค่ะ
 - [x] Scan pages and page tokens commit atomicallyค่ะ
@@ -19,7 +20,7 @@ Updated 2026-07-13 Asia/Bangkokค่ะ
 - [x] A batch with applying or committed local mutations cannot discard its evidence through abortค่ะ
 - [x] Protected `.obsidian/` and `.trash/` paths are rejectedค่ะ
 - [x] Database rows contain no OAuth tokens, authorization payloads, note bodies, or attachment bodiesค่ะ
-- [x] Newer, malformed, constraint-weakened, or corrupt database evidence fails closed without automatic deletionค่ะ
+- [x] Newer, malformed, constraint-weakened, or corrupt database evidence fails closed without automatic deletion or migration commitค่ะ Version-zero detection covers user tables, indexes, views, and triggersค่ะ
 - [x] Rust formatting, strict Clippy, isolated tests, existing Tauri tests, and secret/diff checks passค่ะ
 - [x] Native Linux runs the Sync Foundation suite, while Windows compiles the tests without claiming runtime acceptanceค่ะ
 
@@ -36,6 +37,8 @@ Updated 2026-07-13 Asia/Bangkokค่ะ
 9. Supply a protected or noncanonical path and confirm no state is writtenค่ะ
 10. Open a partial, constraint-weakened, malformed, or newer schema and confirm the database is preserved and rejectedค่ะ
 11. Restart with an `Applying` local mutation and confirm retry, abort, and cursor commit are blocked until explicit reconciliationค่ะ
+12. Keep one store alive with a `Running` job, reject a second opener, and confirm the live job remains `Running` until the first lease is releasedค่ะ
+13. Open a version-zero database containing only a view and confirm its bytes and schema object remain unchanged after rejectionค่ะ
 
 ## External Safety
 

@@ -5,6 +5,7 @@ use crate::{
 };
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
+use fs2::FileExt;
 use myvault_private_fs as private_fs;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::collections::BTreeSet;
@@ -14,6 +15,7 @@ use uuid::Uuid;
 const ROOT_DIRECTORY: &str = "sync-state";
 const VERSION_DIRECTORY: &str = "v1";
 const VAULTS_DIRECTORY: &str = "vaults";
+const LEASE_NAME: &str = "sync-operation.lock";
 const DATABASE_NAME: &str = "myvault-sync.sqlite3";
 
 const VAULT_STATE_SCHEMA: &str = "CREATE TABLE vault_state (
@@ -375,6 +377,7 @@ pub struct SyncStore {
     connection: Connection,
     database_path: PathBuf,
     vault_id: Uuid,
+    _lease_file: std::fs::File,
     _private_root: Dir,
     _vault_directory: Dir,
 }
@@ -398,6 +401,7 @@ impl SyncStore {
         let vaults = private_fs::create_or_open_private_dir(&version, VAULTS_DIRECTORY)?;
         let vault_directory =
             private_fs::create_or_open_private_dir(&vaults, vault_id.to_string())?;
+        let lease_file = acquire_sync_lease(&vault_directory)?;
         let database_path = canonical_app_root
             .join(ROOT_DIRECTORY)
             .join(VERSION_DIRECTORY)
@@ -425,16 +429,17 @@ impl SyncStore {
 
         let mut connection = Connection::open(&database_path)?;
         connection.pragma_update(None, "foreign_keys", true)?;
-        connection.pragma_update(None, "journal_mode", "DELETE")?;
-        connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "temp_store", "MEMORY")?;
         migrate(&mut connection)?;
+        connection.pragma_update(None, "journal_mode", "DELETE")?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
         private_fs::open_private_file(&vault_directory, DATABASE_NAME, 1)?;
 
         let mut store = Self {
             connection,
             database_path,
             vault_id,
+            _lease_file: lease_file,
             _private_root: private_root,
             _vault_directory: vault_directory,
         };
@@ -1065,32 +1070,67 @@ impl SyncStore {
     }
 }
 
+fn acquire_sync_lease(vault_directory: &Dir) -> Result<std::fs::File> {
+    let mut create = OpenOptions::new();
+    create
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No);
+    let (lease, created) = match vault_directory.open_with(LEASE_NAME, &create) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut existing = OpenOptions::new();
+            existing.read(true).write(true).follow(FollowSymlinks::No);
+            (vault_directory.open_with(LEASE_NAME, &existing)?, false)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if created {
+        private_fs::set_private_file_permissions(&lease)?;
+    }
+    private_fs::verify_private_file(&lease, 1)?;
+    if created {
+        lease.sync_all()?;
+        private_fs::sync_directory(vault_directory)?;
+    }
+    let lease = lease.into_std();
+    if let Err(error) = FileExt::try_lock_exclusive(&lease) {
+        if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+            return Err(Error::SyncLeaseHeld);
+        }
+        return Err(error.into());
+    }
+    Ok(lease)
+}
+
 fn migrate(connection: &mut Connection) -> Result<()> {
-    let integrity: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    let transaction = connection.transaction()?;
+    let integrity: String = transaction.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
     if integrity != "ok" {
         return Err(Error::InvalidSchema);
     }
-    let current: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let current: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if current > SCHEMA_VERSION {
         return Err(Error::UnsupportedSchema(current));
     }
     if current == 0 {
-        let existing: i64 = connection.query_row(
+        let existing: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM sqlite_master
-             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+             WHERE type IN ('table', 'index', 'view', 'trigger')
+               AND name NOT LIKE 'sqlite_%'",
             [],
             |row| row.get(0),
         )?;
         if existing != 0 {
             return Err(Error::InvalidSchema);
         }
-        let transaction = connection.transaction()?;
         create_schema_v1(&transaction)?;
-        transaction.commit()?;
     }
-    if !schema_v1_is_valid(connection)? {
+    if !schema_v1_is_valid(&transaction)? {
         return Err(Error::InvalidSchema);
     }
+    transaction.commit()?;
     Ok(())
 }
 
