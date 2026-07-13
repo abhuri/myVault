@@ -32,7 +32,7 @@ button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px 
 .primary-button:disabled { cursor: wait; opacity: .65; }
 .inline-error { color: #e58b8b !important; font-size: 13px; }
 
-.workspace { display: grid; grid-template-columns: 48px 248px minmax(360px, 1fr) 272px; width: 100vw; height: 100vh; overflow: hidden; background: #0e1116; }
+.workspace { display: grid; grid-template-columns: 48px 248px minmax(360px, 1fr) 272px; grid-template-rows: minmax(0, 1fr); width: 100vw; height: 100vh; overflow: hidden; background: #0e1116; }
 .activity-rail { z-index: 12; display: flex; align-items: center; flex-direction: column; gap: 4px; padding: 10px 6px; border-right: 1px solid #29313b; background: #0a0d11; }
 .activity-rail .rail-logo { width: 32px; margin: 0 0 14px; }
 .activity-rail button { display: grid; width: 34px; height: 34px; place-items: center; border: 0; border-radius: 5px; background: transparent; color: #7f8996; font-family: "SFMono-Regular", Consolas, monospace; font-size: 11px; cursor: pointer; }
@@ -40,7 +40,7 @@ button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px 
 .activity-rail button.active { box-shadow: inset 2px 0 #8db7ff; }
 .activity-rail .rail-bottom { margin-top: auto; font-size: 18px; }
 
-.explorer-panel, .context-panel { min-width: 0; border-right: 1px solid #29313b; background: #151a21; }
+.explorer-panel, .context-panel { min-width: 0; min-height: 0; border-right: 1px solid #29313b; background: #151a21; }
 .explorer-panel { display: grid; grid-template-rows: 45px auto 32px 1fr 30px; }
 .explorer-panel > header, .context-panel > header { display: flex; align-items: center; justify-content: space-between; padding: 0 13px; border-bottom: 1px solid #29313b; font-size: 12px; }
 .search-box { display: flex; align-items: center; gap: 7px; height: 32px; margin: 10px 10px 6px; padding: 0 9px; border: 1px solid #303945; border-radius: 5px; background: #0f1318; color: #677383; }
@@ -62,7 +62,7 @@ button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px 
 .status-led { width: 6px; height: 6px; border-radius: 50%; background: #72c497; }
 .panel-empty { color: #77828f; font-size: 11px; line-height: 1.5; }
 
-.document-panel { position: relative; display: grid; min-width: 0; grid-template-rows: 46px minmax(0, 1fr) 26px; background: #0e1116; }
+.document-panel { position: relative; display: grid; min-width: 0; min-height: 0; grid-template-rows: 46px minmax(0, 1fr) 26px; overflow: hidden; background: #0e1116; }
 .document-toolbar { display: flex; align-items: center; gap: 14px; padding: 0 14px; border-bottom: 1px solid #29313b; background: #12161c; }
 .document-title { display: grid; min-width: 0; margin-right: auto; }
 .document-title strong { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
@@ -70,7 +70,7 @@ button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px 
 .mode-switch { display: flex; padding: 2px; border: 1px solid #303945; border-radius: 5px; background: #0d1116; }
 .mode-switch button { min-height: 26px; padding: 0 10px; border: 0; border-radius: 3px; background: transparent; color: #7e8996; font-size: 11px; cursor: pointer; }
 .mode-switch button.active { background: #252d37; color: #e7edf5; }
-.document-body { min-height: 0; overflow: auto; }
+.document-body { min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .editor, .editor .cm-editor { height: 100%; }
 .editor .cm-scroller { overflow: auto; font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 13px; line-height: 1.7; }
 .reader { width: min(820px, calc(100% - 48px)); margin: 0 auto; padding: 34px 0 80px; color: #cbd3dc; font-family: Charter, "Noto Serif Thai", Georgia, serif; font-size: 16px; line-height: 1.72; }
@@ -85,6 +85,10 @@ button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px 
 .reader th { background: #181e26; }
 .reader pre { position: relative; overflow: auto; padding: 16px; border: 1px solid #29313b; border-radius: 6px; background: #090c10; font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; line-height: 1.6; }
 .reader pre[data-language]::before { content: attr(data-language); position: absolute; top: 4px; right: 7px; color: #657180; font: 9px Inter, sans-serif; text-transform: uppercase; }
+.reader .mermaid-diagram { margin: 24px 0; overflow-x: auto; }
+.reader .mermaid-diagram svg { display: block; width: 100%; max-width: 100%; height: auto; margin: 0 auto; }
+.reader pre.mermaid-source { white-space: pre-wrap; }
+.reader pre.mermaid-source.render-error::after { content: "Mermaid diagram could not be rendered"; display: block; margin-top: 12px; color: #e5a0a0; font-family: Inter, "Noto Sans Thai", sans-serif; }
 .syntax-keyword { color: #9cbcf2; font-weight: 650; }
 .task-checkbox { display: inline-grid; width: 1.15em; place-items: center; margin-right: 4px; color: #8db7ff; font-family: Inter, sans-serif; }
 .reader .render-error { border-color: #805b5b; color: #e5a0a0; }

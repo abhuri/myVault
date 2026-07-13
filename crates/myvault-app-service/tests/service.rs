@@ -145,6 +145,16 @@ fn canonical_session_input_and_camel_case_json_contract_are_exact() {
 }
 
 #[test]
+fn recovery_unavailable_error_contract_is_stable_and_frontend_safe() {
+    let error = AppError::recovery_unavailable();
+    assert_eq!(error.code, AppErrorCode::RecoveryUnavailable);
+    assert_eq!(
+        serde_json::to_string(&error).expect("recovery error JSON"),
+        "{\"code\":\"recoveryUnavailable\",\"message\":\"the recovery snapshot could not be secured, so the note was not saved\"}"
+    );
+}
+
+#[test]
 fn no_stale_switched_and_closed_sessions_are_rejected() {
     let service = AppService::new();
     let first = Fixture::new("first-vault-secret");
@@ -502,6 +512,174 @@ fn trash_scan_resource_limit_uses_stable_safe_code() {
     let json = serde_json::to_string(&error).expect("safe error");
     assert!(!json.contains(fixture.root.to_str().expect("UTF-8 root")));
     assert!(!json.contains("bounded-trash-root-secret"));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn configured_runtime_publishes_exact_pre_save_recovery_snapshot() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().expect("private roots");
+    let base = temporary.path().canonicalize().expect("canonical base");
+    let vault_root = base.join("vault");
+    let app_data = base.join("app-data");
+    fs::create_dir(&vault_root).expect("vault root");
+    fs::create_dir(&app_data).expect("app data");
+    fs::set_permissions(&app_data, fs::Permissions::from_mode(0o700)).expect("private mode");
+    fs::create_dir(vault_root.join("Notes")).expect("notes");
+    fs::write(vault_root.join("Notes/ภาษาไทย.md"), "ก่อนแก้ไข").expect("note");
+
+    let service = AppService::with_app_data_root(&app_data);
+    let session = service
+        .activate_trusted_vault(Vault::open(&vault_root).expect("vault"))
+        .expect("activate")
+        .session_id
+        .expect("session");
+    let before = service
+        .read_note(session, "Notes/ภาษาไทย.md")
+        .expect("read before save");
+    service
+        .save_note(
+            session,
+            "Notes/ภาษาไทย.md",
+            "หลังแก้ไข",
+            &before.revision_hex,
+            before.byte_len,
+        )
+        .expect("guarded save");
+
+    let vaults = app_data.join("recovery-snapshots/v1/vaults");
+    let vault_directory = fs::read_dir(vaults)
+        .expect("vault snapshot roots")
+        .filter_map(Result::ok)
+        .find(|entry| entry.path().is_dir())
+        .expect("one vault snapshot root")
+        .path();
+    let object = fs::read_dir(vault_directory.join("objects"))
+        .expect("snapshot objects")
+        .filter_map(Result::ok)
+        .find(|entry| entry.path().is_dir())
+        .expect("published snapshot")
+        .path();
+    assert_eq!(
+        fs::read(object.join("payload")).expect("snapshot payload"),
+        "ก่อนแก้ไข".as_bytes()
+    );
+    assert_eq!(
+        fs::read(vault_root.join("Notes/ภาษาไทย.md")).expect("saved note"),
+        "หลังแก้ไข".as_bytes()
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn stale_save_does_not_publish_a_recovery_snapshot() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().expect("private roots");
+    let base = temporary.path().canonicalize().expect("canonical base");
+    let vault_root = base.join("vault");
+    let app_data = base.join("app-data");
+    fs::create_dir(&vault_root).expect("vault root");
+    fs::create_dir(&app_data).expect("app data");
+    fs::set_permissions(&app_data, fs::Permissions::from_mode(0o700)).expect("private mode");
+    fs::create_dir(vault_root.join("Notes")).expect("notes");
+    let note_path = vault_root.join("Notes/external-change.md");
+    fs::write(&note_path, "before").expect("note");
+
+    let service = AppService::with_app_data_root(&app_data);
+    let session = service
+        .activate_trusted_vault(Vault::open(&vault_root).expect("vault"))
+        .expect("activate")
+        .session_id
+        .expect("session");
+    let before = service
+        .read_note(session, "Notes/external-change.md")
+        .expect("read before external change");
+    fs::write(&note_path, "external writer wins").expect("external change");
+
+    let error = service
+        .save_note(
+            session,
+            "Notes/external-change.md",
+            "editor buffer",
+            &before.revision_hex,
+            before.byte_len,
+        )
+        .expect_err("stale save must stop before snapshot publication");
+    assert_eq!(error.code, AppErrorCode::StaleRevision);
+    assert_eq!(
+        fs::read(&note_path).expect("external payload remains"),
+        b"external writer wins"
+    );
+
+    let vaults = app_data.join("recovery-snapshots/v1/vaults");
+    let vault_directory = fs::read_dir(vaults)
+        .expect("vault snapshot roots")
+        .filter_map(Result::ok)
+        .find(|entry| entry.path().is_dir())
+        .expect("one vault snapshot root")
+        .path();
+    let published_objects = fs::read_dir(vault_directory.join("objects"))
+        .expect("snapshot objects")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .count();
+    assert_eq!(published_objects, 0);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn recovery_snapshot_failure_stops_save_before_vault_mutation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().expect("private roots");
+    let base = temporary.path().canonicalize().expect("canonical base");
+    let vault_root = base.join("vault");
+    let app_data = base.join("app-data");
+    fs::create_dir(&vault_root).expect("vault root");
+    fs::create_dir(&app_data).expect("app data");
+    fs::set_permissions(&app_data, fs::Permissions::from_mode(0o700)).expect("private mode");
+    let note_path = vault_root.join("fail-closed.md");
+    fs::write(&note_path, "protected original").expect("note");
+
+    let service = AppService::with_app_data_root(&app_data);
+    let session = service
+        .activate_trusted_vault(Vault::open(&vault_root).expect("vault"))
+        .expect("activate")
+        .session_id
+        .expect("session");
+    let before = service
+        .read_note(session, "fail-closed.md")
+        .expect("read before save");
+
+    let vault_directory = fs::read_dir(app_data.join("recovery-snapshots/v1/vaults"))
+        .expect("vault snapshot roots")
+        .filter_map(Result::ok)
+        .find(|entry| entry.path().is_dir())
+        .expect("one vault snapshot root")
+        .path();
+    let staging = vault_directory.join("staging");
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o500))
+        .expect("make snapshot publication fail");
+
+    let error = service
+        .save_note(
+            session,
+            "fail-closed.md",
+            "must not be written",
+            &before.revision_hex,
+            before.byte_len,
+        )
+        .expect_err("snapshot failure must stop the Vault write");
+    assert_eq!(error.code, AppErrorCode::RecoveryUnavailable);
+    assert_eq!(
+        fs::read(&note_path).expect("original remains"),
+        b"protected original"
+    );
+
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))
+        .expect("restore cleanup permission");
 }
 
 fn write_supported_trash(

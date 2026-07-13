@@ -26,7 +26,7 @@ export function markdownHtml(text: string): string {
         return html.replace(/<a\b[^>]*>/gi, "<a>").replace(/<\/a\s*>/gi, "</a>");
       },
       code({ text: code, lang = "" }) {
-        const language = lang.trim().split(/\s+/)[0];
+        const language = lang.trim().split(/\s+/)[0].toLowerCase();
         if (language === "mermaid") {
           return `<pre class="mermaid-source"><code class="language-mermaid">${escapeHtml(code)}</code></pre>`;
         }
@@ -83,4 +83,81 @@ export function markdownHtml(text: string): string {
 export function preventReaderAnchorNavigation(event: MouseEvent): void {
   const target = event.target;
   if (target instanceof Element && target.closest("a")) event.preventDefault();
+}
+
+export type MermaidRenderResult = {
+  svg: string;
+};
+
+export type MermaidRenderer = (id: string, source: string) => Promise<MermaidRenderResult>;
+
+let mermaidRenderSequence = 0;
+
+/** Render every diagram independently so one invalid fence cannot block later diagrams. */
+export async function renderMermaidSources(
+  nodes: HTMLElement[],
+  render: MermaidRenderer,
+  isActive: () => boolean = () => true,
+): Promise<void> {
+  const batch = ++mermaidRenderSequence;
+  for (const [index, node] of nodes.entries()) {
+    try {
+      const rendered = await render(`myvault-mermaid-${batch}-${index}`, node.textContent ?? "");
+      if (!isActive()) return;
+      const wrapper = document.createElement("figure");
+      wrapper.className = "mermaid-diagram";
+      wrapper.setAttribute("role", "img");
+      wrapper.setAttribute("aria-label", "Mermaid diagram");
+      wrapper.innerHTML = DOMPurify.sanitize(rendered.svg, { USE_PROFILES: { svg: true } });
+      node.replaceWith(wrapper);
+    } catch {
+      if (!isActive()) return;
+      node.classList.add("render-error");
+      node.setAttribute("aria-label", "Mermaid diagram could not be rendered");
+    }
+  }
+}
+
+export const VAULT_CHANGE_DEBOUNCE_MS = 150;
+
+type RefreshableSavePhase = "clean" | "saved";
+
+export type VaultChangePlan =
+  | { type: "ignore" }
+  | { type: "refresh"; sessionId: string; activePath?: string };
+
+/**
+ * Keep the native session opaque and reload an active note only when replacing
+ * its in-memory buffer cannot discard an edit or an unresolved save outcome.
+ */
+export function planVaultChange(
+  payload: unknown,
+  current: { sessionId: string | null | undefined; activePath: string | undefined; savePhase: string },
+): VaultChangePlan {
+  if (typeof payload !== "object" || payload === null || !("sessionId" in payload)) return { type: "ignore" };
+  const sessionId = (payload as { sessionId?: unknown }).sessionId;
+  if (typeof sessionId !== "string" || !sessionId || sessionId !== current.sessionId) return { type: "ignore" };
+  const canReloadActive = (["clean", "saved"] satisfies RefreshableSavePhase[]).includes(current.savePhase as RefreshableSavePhase);
+  return {
+    type: "refresh",
+    sessionId,
+    activePath: canReloadActive ? current.activePath : undefined,
+  };
+}
+
+export type ReaderScrollCommand =
+  | { type: "page"; pages: number }
+  | { type: "edge"; edge: "start" | "end" };
+
+export function readerScrollCommand(event: Pick<KeyboardEvent, "key" | "metaKey" | "ctrlKey" | "altKey" | "shiftKey">): ReaderScrollCommand | undefined {
+  if (event.altKey) return undefined;
+  const command = event.metaKey || event.ctrlKey;
+  if (command && event.key === "ArrowDown") return { type: "edge", edge: "end" };
+  if (command && event.key === "ArrowUp") return { type: "edge", edge: "start" };
+  if (command) return undefined;
+  if (event.key === "PageDown" || event.key === " ") return { type: "page", pages: event.shiftKey ? -1 : 1 };
+  if (event.key === "PageUp") return { type: "page", pages: -1 };
+  if (event.key === "Home") return { type: "edge", edge: "start" };
+  if (event.key === "End") return { type: "edge", edge: "end" };
+  return undefined;
 }

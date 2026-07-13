@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { basicSetup } from "codemirror";
 import { markdown } from "@codemirror/lang-markdown";
 import { EditorState } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
-import DOMPurify from "dompurify";
 import Graph from "graphology";
 import Sigma from "sigma";
 import {
@@ -20,7 +20,14 @@ import {
   type SaveState,
   type TreeNode,
 } from "./workspace";
-import { markdownHtml, preventReaderAnchorNavigation } from "./reader";
+import {
+  markdownHtml,
+  planVaultChange,
+  preventReaderAnchorNavigation,
+  readerScrollCommand,
+  renderMermaidSources,
+  VAULT_CHANGE_DEBOUNCE_MS,
+} from "./reader";
 import "./App.css";
 
 type VaultStatus = { active: boolean; sessionId: string | null };
@@ -124,7 +131,7 @@ function Editor({ text, onChange }: { text: string; onChange: (next: string) => 
   return <div className="editor" ref={host} aria-label="Markdown editor" />;
 }
 
-function Reader({ text }: { text: string }) {
+const Reader = memo(function Reader({ text }: { text: string }) {
   const host = useRef<HTMLDivElement>(null);
   const html = useMemo(() => markdownHtml(text), [text]);
 
@@ -139,26 +146,25 @@ function Reader({ text }: { text: string }) {
     let active = true;
     const nodes = [...(host.current?.querySelectorAll<HTMLElement>("pre.mermaid-source") ?? [])];
     if (!nodes.length) return;
-    void import("mermaid").then(async ({ default: mermaid }) => {
-      mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "dark" });
-      for (const [index, node] of nodes.entries()) {
-        const source = node.textContent ?? "";
-        try {
-          const rendered = await mermaid.render(`myvault-mermaid-${Date.now()}-${index}`, source);
-          if (active) node.outerHTML = DOMPurify.sanitize(rendered.svg, { USE_PROFILES: { svg: true } });
-        } catch {
+    void (async () => {
+      try {
+        const { default: mermaid } = await import("mermaid");
+        mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "dark", htmlLabels: false });
+        await renderMermaidSources(nodes, mermaid.render.bind(mermaid), () => active);
+      } catch {
+        if (active) nodes.filter((node) => node.isConnected).forEach((node) => {
           node.classList.add("render-error");
           node.setAttribute("aria-label", "Mermaid diagram could not be rendered");
-        }
+        });
       }
-    });
+    })();
     return () => {
       active = false;
     };
   }, [html]);
 
   return <article className="reader" ref={host} dangerouslySetInnerHTML={{ __html: html }} />;
-}
+});
 
 function Tree({ nodes, selected, onSelect }: { nodes: TreeNode[]; selected?: string; onSelect: (path: string) => void }) {
   return (
@@ -228,6 +234,7 @@ function App() {
   const statusRef = useRef(status);
   const noteRequest = useRef(0);
   const explorerRequest = useRef(0);
+  const externalNoteRequest = useRef(0);
   const pickerPending = useRef(false);
   const saveInFlight = useRef(false);
   const quickDialog = useRef<HTMLElement>(null);
@@ -236,6 +243,7 @@ function App() {
   const restoreDrawerFocus = useRef<HTMLElement | null>(null);
   const explorerDrawerRef = useRef<HTMLElement>(null);
   const contextDrawerRef = useRef<HTMLElement>(null);
+  const documentBodyRef = useRef<HTMLDivElement>(null);
   const compactExplorer = useMedia("(max-width: 700px)");
   const compactContext = useMedia("(max-width: 980px)");
   const compactDrawerOpen = (compactExplorer && leftDrawer) || (compactContext && rightDrawer);
@@ -270,6 +278,53 @@ function App() {
       })
       .catch(() => setError("Native desktop bridge unavailable in browser preview."))
       .finally(() => setLoading(false));
+  }, [loadExplorer]);
+
+  useEffect(() => {
+    let refreshTimer: number | undefined;
+    let disposed = false;
+    const refreshActiveNote = async (sessionId: string, path: string) => {
+      const request = ++externalNoteRequest.current;
+      const note = await invoke<NoteDto>("vault_read_note", { sessionId, path });
+      if (disposed || request !== externalNoteRequest.current) return;
+      const latestPlan = planVaultChange(
+        { sessionId },
+        { sessionId: statusRef.current?.sessionId, activePath: activePathRef.current, savePhase: saveRef.current.phase },
+      );
+      if (latestPlan.type !== "refresh" || latestPlan.activePath !== path) return;
+      if (!matchesDocumentIdentity(sessionId, path, note)) throw new Error("Note response identity mismatch");
+      if (saveRef.current.revisionHex === note.revisionHex && saveRef.current.byteLen === note.byteLen) return;
+      setText(note.text);
+      setDocumentVersion((version) => version + 1);
+      setNotes((cache) => ({ ...cache, [path]: note.text }));
+      setSave(saveReducer(INITIAL_SAVE, { type: "load", revisionHex: note.revisionHex, byteLen: note.byteLen }));
+    };
+    const unlisten = listen<unknown>("myvault-vault-changed", ({ payload }) => {
+      const plan = planVaultChange(
+        payload,
+        { sessionId: statusRef.current?.sessionId, activePath: activePathRef.current, savePhase: saveRef.current.phase },
+      );
+      if (plan.type === "ignore") return;
+      window.clearTimeout(refreshTimer);
+      refreshTimer = window.setTimeout(() => {
+        if (disposed) return;
+        const latestPlan = planVaultChange(
+          { sessionId: plan.sessionId },
+          { sessionId: statusRef.current?.sessionId, activePath: activePathRef.current, savePhase: saveRef.current.phase },
+        );
+        if (latestPlan.type === "ignore") return;
+        void loadExplorer(latestPlan.sessionId).catch(() => setError("Could not refresh the Vault after an external change."));
+        if (latestPlan.activePath) {
+          void refreshActiveNote(latestPlan.sessionId, latestPlan.activePath)
+            .catch(() => setError("Could not refresh the active note after an external change."));
+        }
+      }, VAULT_CHANGE_DEBOUNCE_MS);
+    });
+    return () => {
+      disposed = true;
+      window.clearTimeout(refreshTimer);
+      void unlisten.then((stop) => stop());
+    };
   }, [loadExplorer]);
 
   const chooseVault = async () => {
@@ -429,6 +484,10 @@ function App() {
   }, [quickOpen]);
 
   useEffect(() => {
+    if (mode === "read" && activePath) window.requestAnimationFrame(() => documentBodyRef.current?.focus({ preventScroll: true }));
+  }, [activePath, mode]);
+
+  useEffect(() => {
     if (compactDrawerOpen) {
       const drawer = leftDrawer ? explorerDrawerRef.current : contextDrawerRef.current;
       window.requestAnimationFrame(() => drawer?.querySelector<HTMLElement>(".mobile-close")?.focus());
@@ -510,7 +569,21 @@ function App() {
         </header>
         {error && <div className="workspace-alert" role="alert">{error}<button onClick={() => setError(undefined)} aria-label="Dismiss error" type="button">×</button></div>}
         {activePath ? (
-          <div className="document-body">
+          <div
+            className="document-body"
+            ref={documentBodyRef}
+            role={mode === "read" ? "region" : undefined}
+            aria-label={mode === "read" ? "Markdown reader" : undefined}
+            tabIndex={mode === "read" ? 0 : undefined}
+            onKeyDown={mode === "read" ? (event) => {
+              const command = readerScrollCommand(event.nativeEvent);
+              if (!command) return;
+              event.preventDefault();
+              const scroller = event.currentTarget;
+              if (command.type === "edge") scroller.scrollTo({ top: command.edge === "start" ? 0 : scroller.scrollHeight, behavior: "auto" });
+              else scroller.scrollBy({ top: command.pages * scroller.clientHeight * 0.9, behavior: "auto" });
+            } : undefined}
+          >
             {mode === "edit" ? <Editor key={`${activePath}:${documentVersion}`} text={text} onChange={(next) => { setText(next); setSave((state) => saveReducer(state, { type: "edit" })); }} /> : <Reader text={text} />}
           </div>
         ) : (

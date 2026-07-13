@@ -27,11 +27,13 @@ myvault-app-service = { path = "../../../crates/myvault-app-service" }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 myvault-desktop-auth = { path = "../../../crates/desktop-auth" }
+notify = "8"
 tauri-plugin-dialog = "2"
 
 [target.'cfg(target_os = "android")'.dependencies]
 tauri-plugin-google-auth = { path = "../../../crates/tauri-plugin-google-auth" }
 tauri-plugin-private-root = { path = "../../../crates/tauri-plugin-private-root" }
+tauri-plugin-vault-saf = { path = "../../../crates/tauri-plugin-vault-saf" }
 
 [dev-dependencies]
 tempfile = "3.23.0"

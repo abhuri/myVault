@@ -1,0 +1,17 @@
+[package]
+name = "tauri-plugin-vault-saf"
+version = "0.1.0"
+description = "Native Android Storage Access Framework capability for myVault"
+edition = "2021"
+rust-version = "1.85"
+links = "tauri-plugin-vault-saf"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tauri = "2.11.3"
+
+[build-dependencies]
+tauri-plugin = { version = "2.6.3", features = ["build"] }
+
+[lints.rust]
+unsafe_code = "forbid"

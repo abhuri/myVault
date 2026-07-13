@@ -1,4 +1,5 @@
 use serde::Serialize;
+#[cfg(not(target_os = "android"))]
 use std::sync::Arc;
 #[cfg(target_os = "android")]
 use std::sync::Mutex;
@@ -150,17 +151,32 @@ fn google_auth_disconnect(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default()
-        .manage(GoogleAuthSession::default())
-        .manage(Arc::new(myvault_app_service::AppService::new()));
+    let builder = tauri::Builder::default().manage(GoogleAuthSession::default());
 
     #[cfg(target_os = "android")]
     let builder = builder
+        .manage(app_commands::AndroidVaultSession::default())
         .plugin(tauri_plugin_google_auth::init())
-        .plugin(tauri_plugin_private_root::init());
+        .plugin(tauri_plugin_private_root::init())
+        .plugin(tauri_plugin_vault_saf::init());
 
     #[cfg(not(target_os = "android"))]
-    let builder = builder.plugin(tauri_plugin_dialog::init());
+    let builder = builder.plugin(tauri_plugin_dialog::init()).setup(|app| {
+        use tauri::Manager;
+
+        let app_data = app.path().app_data_dir()?;
+        std::fs::create_dir_all(&app_data)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&app_data, std::fs::Permissions::from_mode(0o700))?;
+        }
+        app.manage(Arc::new(
+            myvault_app_service::AppService::with_app_data_root(app_data),
+        ));
+        app.manage(app_commands::DesktopVaultWatcher::default());
+        Ok(())
+    });
 
     builder
         .invoke_handler(tauri::generate_handler![

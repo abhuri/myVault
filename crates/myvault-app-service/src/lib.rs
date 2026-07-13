@@ -1,8 +1,13 @@
 //! Tauri-free, frontend-safe read service for one active local vault.
 
 use myvault_core::{CoreError, TrashId, TrashListEvidence, Vault, VaultPath, MAX_TRASH_PAGE_SIZE};
+use myvault_snapshots::{SnapshotManifest, SnapshotRevision, SnapshotStore};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::sync::{Arc, RwLock};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, RwLock},
+    time::{SystemTime, UNIX_EPOCH},
+};
 use uuid::Uuid;
 
 pub const EXPLORER_MAX_DEPTH: usize = 64;
@@ -15,6 +20,13 @@ pub const EXPLORER_MAX_PAGE_SIZE: usize = 200;
 pub struct VaultSessionId(Uuid);
 
 impl VaultSessionId {
+    /// Creates a fresh opaque session identifier for another trusted native
+    /// vault capability implementation.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
     /// Parses one canonical lowercase, hyphenated, nonnil session UUID.
     ///
     /// # Errors
@@ -25,6 +37,12 @@ impl VaultSessionId {
             return Err(invalid_session_id_error());
         }
         Ok(Self(id))
+    }
+}
+
+impl Default for VaultSessionId {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -150,6 +168,7 @@ pub enum AppErrorCode {
     InvalidRevision,
     StaleRevision,
     WriteOutcomeUnknown,
+    RecoveryUnavailable,
     NoteNotFound,
     NoteNotUtf8,
     VaultUnavailable,
@@ -202,6 +221,65 @@ impl AppError {
             "the note write outcome is unknown",
         )
     }
+
+    /// Recovery snapshots are a fail-closed prerequisite for configured
+    /// desktop saves. The safe error deliberately omits private filesystem
+    /// details while still distinguishing this policy stop from an unknown
+    /// Vault write outcome.
+    #[must_use]
+    pub const fn recovery_unavailable() -> Self {
+        Self::new(
+            AppErrorCode::RecoveryUnavailable,
+            "the recovery snapshot could not be secured, so the note was not saved",
+        )
+    }
+
+    #[must_use]
+    pub const fn no_active_session() -> Self {
+        Self::new(AppErrorCode::NoActiveSession, "no vault session is active")
+    }
+
+    #[must_use]
+    pub const fn stale_session() -> Self {
+        Self::new(
+            AppErrorCode::StaleSession,
+            "the vault session is no longer active",
+        )
+    }
+
+    #[must_use]
+    pub const fn vault_unavailable() -> Self {
+        Self::new(
+            AppErrorCode::VaultUnavailable,
+            "vault evidence is unavailable",
+        )
+    }
+
+    #[must_use]
+    pub const fn invalid_cursor_or_limit() -> Self {
+        Self::new(AppErrorCode::InvalidLimit, "the requested page is invalid")
+    }
+
+    #[must_use]
+    pub const fn stale_revision() -> Self {
+        Self::new(
+            AppErrorCode::StaleRevision,
+            "the note changed after it was opened",
+        )
+    }
+
+    #[must_use]
+    pub const fn note_not_found() -> Self {
+        Self::new(AppErrorCode::NoteNotFound, "the note was not found")
+    }
+
+    #[must_use]
+    pub const fn invalid_revision_or_path() -> Self {
+        Self::new(
+            AppErrorCode::InvalidRevision,
+            "the note revision or path is invalid",
+        )
+    }
 }
 
 impl std::fmt::Display for AppError {
@@ -215,11 +293,18 @@ impl std::error::Error for AppError {}
 struct VaultSession {
     id: VaultSessionId,
     vault: Vault,
+    snapshots: Option<SnapshotRuntime>,
+}
+
+struct SnapshotRuntime {
+    vault_id: Uuid,
+    store: SnapshotStore,
 }
 
 #[derive(Default)]
 pub struct AppService {
     session: RwLock<Option<Arc<VaultSession>>>,
+    app_data_root: Option<PathBuf>,
 }
 
 impl AppService {
@@ -228,13 +313,31 @@ impl AppService {
         Self::default()
     }
 
+    /// Enables private recovery snapshots for activated desktop vaults.
+    #[must_use]
+    pub fn with_app_data_root(app_data_root: impl Into<PathBuf>) -> Self {
+        Self {
+            session: RwLock::new(None),
+            app_data_root: Some(app_data_root.into()),
+        }
+    }
+
     /// Activates an already-open capability supplied by a trusted native picker adapter.
     ///
     /// # Errors
     /// Returns a safe internal error if the session lock is unavailable.
     pub fn activate_trusted_vault(&self, vault: Vault) -> Result<VaultStatusDto, AppError> {
         let id = VaultSessionId(Uuid::new_v4());
-        let session = Arc::new(VaultSession { id, vault });
+        let snapshots = self
+            .app_data_root
+            .as_ref()
+            .map(|root| open_snapshot_runtime(root, &vault))
+            .transpose()?;
+        let session = Arc::new(VaultSession {
+            id,
+            vault,
+            snapshots,
+        });
         *self.session.write().map_err(|_| internal_error())? = Some(session);
         Ok(VaultStatusDto {
             active: true,
@@ -467,6 +570,33 @@ impl AppService {
             return Err(stale_session_error());
         }
         after_mutating_session_lock();
+        if let Some(runtime) = &session.snapshots {
+            let current_note = session
+                .vault
+                .read_note_with_revision(&path)
+                .map_err(map_save_error)?;
+            if current_note.revision != expected {
+                return Err(AppError::stale_revision());
+            }
+            let created_at_unix_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| AppError::recovery_unavailable())?
+                .as_millis()
+                .try_into()
+                .map_err(|_| AppError::recovery_unavailable())?;
+            let manifest = SnapshotManifest::new(
+                Uuid::new_v4(),
+                runtime.vault_id,
+                path.as_str(),
+                created_at_unix_ms,
+                SnapshotRevision::from_bytes(&current_note.bytes),
+            )
+            .map_err(|_| AppError::recovery_unavailable())?;
+            runtime
+                .store
+                .publish(&manifest, &current_note.bytes)
+                .map_err(|_| AppError::recovery_unavailable())?;
+        }
         let outcome = session
             .vault
             .replace_content_file_if_revision(&path, &expected, bytes, myvault_core::MAX_NOTE_BYTES)
@@ -506,6 +636,32 @@ impl AppService {
         }
         Ok(result)
     }
+}
+
+fn open_snapshot_runtime(app_data_root: &Path, vault: &Vault) -> Result<SnapshotRuntime, AppError> {
+    let vault_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, &vault_identity_bytes(vault.root()));
+    let store = SnapshotStore::open(app_data_root, vault.root(), vault_id)
+        .map_err(|_| AppError::recovery_unavailable())?;
+    Ok(SnapshotRuntime { vault_id, store })
+}
+
+fn vault_identity_bytes(root: &Path) -> Vec<u8> {
+    let mut identity = b"myvault:local-vault:v1\0".to_vec();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        identity.extend_from_slice(root.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        for unit in root.as_os_str().encode_wide() {
+            identity.extend_from_slice(&unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    identity.extend_from_slice(root.to_string_lossy().as_bytes());
+    identity
 }
 
 fn map_trash_entry(entry: TrashListEvidence) -> TrashItemDto {
