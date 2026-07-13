@@ -1,6 +1,6 @@
 # Phase 0 Environment Record
 
-Recorded on 2026-07-11 in Asia/Bangkokค่ะ
+Recorded on 2026-07-11 and updated on 2026-07-13 in Asia/Bangkokค่ะ
 
 ## Current macOS host
 
@@ -44,8 +44,13 @@ Recorded on 2026-07-11 in Asia/Bangkokค่ะ
 - Emulator System WebView is `133.0.6943.137` ค่ะ
 - The 1,000-node Sigma graph renders after an intersection-triggered refresh; the 5,000-node headless-emulator probe blacks out the display surface and remains physical-device capacity dataค่ะ
 - APK alignment verification passes Build Tools 36 `zipalign -c -P 16 -v 4`ค่ะ
+- The production APK activates an emulator document tree through Android SAF and retains its read/write URI grant across APK replacement and cold relaunchค่ะ
+- The SAF capability remains native-onlyค่ะ Its guarded-save contract uses synchronized revision comparison, descriptor sync, and byte-for-byte readback, while unsupported directory durability and uncertain publication are surfaced as `directorySyncUnsupported` and `writeOutcomeUnknown` rather than being treated as desktop-equivalent atomic successค่ะ
+- The final uncommitted production APK SHA-256 is `ace5ca1504ea06a0964a67904172b21d1babc2630b999e3ea18b9a803fd20a5f`ค่ะ Full debug APK build, 3 SAF policy tests, Android aarch64 Clippy, 16 KB zip alignment, and APK Signature Scheme v2 verification passค่ะ
 
 ## External storage layout
+
+- Project policy is to place new Android tools, SDK components, system images, AVDs, and large caches on `AWB-Apps` or `AWB Storage` whenever the tool supports itค่ะ Macintosh HD is reserved for components that genuinely require internal storageค่ะ
 
 - `/Users/awb/My Apps` is a compatibility symlink to `/Volumes/AWB-Apps/My Apps`ค่ะ
 - `~/Library/Android/sdk` is a compatibility symlink to `/Volumes/AWB-Apps/Developer/Android/sdk`ค่ะ

@@ -73,3 +73,12 @@ Changes entries represent current state rather than a deltaค่ะ Removed ite
 - Create one Desktop OAuth client for macOS, Windows, and Ubuntu spike buildsค่ะ
 - Create Android OAuth clients for the debug and release package/signing combinationsค่ะ
 - Keep exported credential files and all tokens outside Gitค่ะ
+
+## Live Execution Evidence — 2026-07-13
+
+- Google Auth Platform is configured as External/Testing with only the approved personal test accountค่ะ
+- The exact full Drive scope is saved, and separate Android plus Desktop OAuth clients are activeค่ะ
+- Desktop loopback OAuth with PKCE completed successfullyค่ะ Credential JSON and short-lived tokens remained outside the repositoryค่ะ
+- The env-gated acceptance harness created `myVault-spike-2026-07-13-31b8e077`, exercised the nested Unicode fixtures and resumable upload, listed the fixture, and moved only verified folder ID `1Ob-tJFCpYQ4KxXAMscMf_5isRYsDXWMZ` to Trashค่ะ
+- A post-cleanup exact-name query returned one matching folder with `trashed=true` and the expected random fixture markerค่ะ No permanent delete was usedค่ะ
+- This closes the Phase 0 Drive round-trip spike onlyค่ะ Production Drive Sync remains a separate Phase 3 milestoneค่ะ
