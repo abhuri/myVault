@@ -1,0 +1,503 @@
+#![forbid(unsafe_code)]
+
+//! Crash-safe production sync state and orchestration contracts.
+//!
+//! This crate performs no OAuth flow and contains no concrete network client.
+//! Native adapters provide typed, already-authorized Drive pages while secrets
+//! stay outside this boundary.
+
+use myvault_core::VaultPath;
+use serde::{Deserialize, Serialize};
+use std::{fmt, io};
+use uuid::Uuid;
+
+mod store;
+
+pub use store::{
+    BindOutcome, ChangeBatch, EnqueueOutcome, JobState, LocalMutationState, LocalMutationStatus,
+    QueueJob, QueueJobKind, SyncStore, VaultSyncState, SCHEMA_VERSION, SQLITE_OPEN_RESIDUAL_RISK,
+};
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug)]
+pub enum Error {
+    Io(io::Error),
+    PrivateStorage(myvault_private_fs::Error),
+    Database(rusqlite::Error),
+    InvalidVaultId,
+    InvalidRemoteId,
+    InvalidRemoteToken,
+    InvalidRemoteEntry,
+    InvalidPortablePath,
+    InvalidRevision,
+    InvalidTimestamp,
+    InvalidErrorCode,
+    BindingCollision,
+    InvalidStateTransition,
+    InvalidSchema,
+    UnsupportedSchema(i64),
+    QueueCollision,
+    JobNotFound,
+    CursorMismatch,
+    BatchAlreadyActive,
+    NoActiveBatch,
+    UnknownMutation,
+    LocalMutationIncomplete,
+    MutationNeedsReconcile,
+    Remote(RemoteError),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(_) => formatter.write_str("sync state I/O failed"),
+            Self::PrivateStorage(_) => formatter.write_str("private sync storage is unavailable"),
+            Self::Database(_) => formatter.write_str("sync database operation failed"),
+            Self::InvalidVaultId => formatter.write_str("the local vault identifier is invalid"),
+            Self::InvalidRemoteId => formatter.write_str("a remote identifier is invalid"),
+            Self::InvalidRemoteToken => formatter.write_str("a remote page token is invalid"),
+            Self::InvalidRemoteEntry => formatter.write_str("remote metadata is invalid"),
+            Self::InvalidPortablePath => formatter.write_str("the portable sync path is invalid"),
+            Self::InvalidRevision => formatter.write_str("the local revision is invalid"),
+            Self::InvalidTimestamp => formatter.write_str("the sync timestamp is invalid"),
+            Self::InvalidErrorCode => formatter.write_str("the redacted error code is invalid"),
+            Self::BindingCollision => {
+                formatter.write_str("the vault is already bound to a different remote root")
+            }
+            Self::InvalidStateTransition => {
+                formatter.write_str("the requested sync state transition is invalid")
+            }
+            Self::InvalidSchema => formatter.write_str("the sync database schema is invalid"),
+            Self::UnsupportedSchema(version) => {
+                write!(
+                    formatter,
+                    "sync database schema version {version} is unsupported"
+                )
+            }
+            Self::QueueCollision => {
+                formatter.write_str("the queue operation identifier has conflicting content")
+            }
+            Self::JobNotFound => formatter.write_str("the sync queue job was not found"),
+            Self::CursorMismatch => formatter.write_str("the durable cursor changed unexpectedly"),
+            Self::BatchAlreadyActive => {
+                formatter.write_str("an incremental change batch is already active")
+            }
+            Self::NoActiveBatch => formatter.write_str("no incremental change batch is active"),
+            Self::UnknownMutation => {
+                formatter.write_str("the local mutation was not declared by the active batch")
+            }
+            Self::LocalMutationIncomplete => {
+                formatter.write_str("not all declared local mutations are committed")
+            }
+            Self::MutationNeedsReconcile => formatter
+                .write_str("a local mutation has an unknown outcome and needs reconciliation"),
+            Self::Remote(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::PrivateStorage(error) => Some(error),
+            Self::Database(error) => Some(error),
+            Self::Remote(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<myvault_private_fs::Error> for Error {
+    fn from(error: myvault_private_fs::Error) -> Self {
+        Self::PrivateStorage(error)
+    }
+}
+
+impl From<rusqlite::Error> for Error {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteError {
+    code: String,
+}
+
+impl RemoteError {
+    /// Creates a redacted remote error containing only a stable bounded code.
+    ///
+    /// # Errors
+    /// Rejects empty, oversized, or non-portable codes.
+    pub fn new(code: impl Into<String>) -> Result<Self> {
+        let code = code.into();
+        validate_redacted_code(&code)?;
+        Ok(Self { code })
+    }
+
+    #[must_use]
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+}
+
+impl fmt::Display for RemoteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "remote sync request failed ({})", self.code)
+    }
+}
+
+impl std::error::Error for RemoteError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteEntryKind {
+    File,
+    Folder,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteHashAlgorithm {
+    Md5,
+    Sha1,
+    Sha256,
+}
+
+impl RemoteHashAlgorithm {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Md5 => "md5",
+            Self::Sha1 => "sha1",
+            Self::Sha256 => "sha256",
+        }
+    }
+
+    const fn expected_hex_len(self) -> usize {
+        match self {
+            Self::Md5 => 32,
+            Self::Sha1 => 40,
+            Self::Sha256 => 64,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteContentHash {
+    pub algorithm: RemoteHashAlgorithm,
+    pub hex: String,
+}
+
+impl RemoteContentHash {
+    /// Creates a typed, canonical lowercase remote checksum.
+    ///
+    /// # Errors
+    /// Rejects an incorrect digest length or non-lowercase hexadecimal value.
+    pub fn new(algorithm: RemoteHashAlgorithm, hex: impl Into<String>) -> Result<Self> {
+        let value = Self {
+            algorithm,
+            hex: hex.into(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.hex.len() != self.algorithm.expected_hex_len()
+            || !self
+                .hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(Error::InvalidRemoteEntry);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteEntry {
+    pub file_id: String,
+    pub parent_id: String,
+    pub path: String,
+    pub kind: RemoteEntryKind,
+    pub content_hash: Option<RemoteContentHash>,
+    pub remote_revision: String,
+}
+
+impl RemoteEntry {
+    /// Validates bounded identifiers, a canonical content path, and revision metadata.
+    ///
+    /// # Errors
+    /// Rejects protected paths, empty identifiers, and malformed hashes/revisions.
+    pub fn validate(&self) -> Result<()> {
+        validate_remote_id(&self.file_id)?;
+        validate_remote_id(&self.parent_id)?;
+        validate_content_path(&self.path)?;
+        validate_remote_token(&self.remote_revision)?;
+        if let Some(hash) = &self.content_hash {
+            hash.validate()?;
+        }
+        if self.kind == RemoteEntryKind::Folder && self.content_hash.is_some() {
+            return Err(Error::InvalidRemoteEntry);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScanPage {
+    pub entries: Vec<RemoteEntry>,
+    pub next_page_token: Option<String>,
+}
+
+impl ScanPage {
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_entries(&self.entries)?;
+        if let Some(token) = &self.next_page_token {
+            validate_remote_token(token)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RemoteChange {
+    Upsert(RemoteEntry),
+    Removed { file_id: String },
+}
+
+impl RemoteChange {
+    pub(crate) fn validate(&self) -> Result<()> {
+        match self {
+            Self::Upsert(entry) => entry.validate(),
+            Self::Removed { file_id } => validate_remote_id(file_id),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChangesPage {
+    pub changes: Vec<RemoteChange>,
+    pub next_page_token: Option<String>,
+    pub new_start_page_token: Option<String>,
+}
+
+impl ChangesPage {
+    pub(crate) fn validate(&self) -> Result<()> {
+        for change in &self.changes {
+            change.validate()?;
+        }
+        match (&self.next_page_token, &self.new_start_page_token) {
+            (Some(next), None) => validate_remote_token(next),
+            (None, Some(start)) => validate_remote_token(start),
+            _ => Err(Error::InvalidRemoteEntry),
+        }
+    }
+}
+
+/// Native production adapters implement this trait without exposing credentials.
+pub trait DriveClient {
+    /// Captures the Changes token that must precede an initial scan.
+    ///
+    /// # Errors
+    /// Returns only a redacted remote error.
+    fn get_start_page_token(&mut self) -> std::result::Result<String, RemoteError>;
+
+    /// Fetches one recursive remote metadata page for the bound root.
+    ///
+    /// # Errors
+    /// Returns only a redacted remote error.
+    fn scan_page(
+        &mut self,
+        remote_root_id: &str,
+        page_token: Option<&str>,
+    ) -> std::result::Result<ScanPage, RemoteError>;
+
+    /// Fetches one Changes page from the exact supplied cursor.
+    ///
+    /// # Errors
+    /// Returns only a redacted remote error.
+    fn changes_page(&mut self, page_token: &str) -> std::result::Result<ChangesPage, RemoteError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitialSyncProgress {
+    StartTokenCaptured,
+    ScanPageCommitted,
+    ScanComplete,
+    ChangesPageCommitted,
+    Ready,
+}
+
+/// Advances exactly one durable initial-sync step.
+///
+/// Network results are committed only through `SyncStore` transactions. A
+/// caller may safely repeat this function after a crash.
+///
+/// # Errors
+/// Returns typed local validation/storage errors or a redacted remote error.
+pub fn advance_initial_sync<C: DriveClient>(
+    store: &mut SyncStore,
+    client: &mut C,
+    now_unix_ms: u64,
+) -> Result<InitialSyncProgress> {
+    let state = store.vault_state()?.ok_or(Error::InvalidStateTransition)?;
+    match state.phase {
+        SyncPhase::NeedStartToken => {
+            let token = client.get_start_page_token().map_err(Error::Remote)?;
+            validate_remote_token(&token)?;
+            store.begin_initial_scan(&token, now_unix_ms)?;
+            Ok(InitialSyncProgress::StartTokenCaptured)
+        }
+        SyncPhase::Scanning => {
+            let expected_page_token = state.scan_page_token.as_deref();
+            let page = client
+                .scan_page(&state.remote_root_id, expected_page_token)
+                .map_err(Error::Remote)?;
+            page.validate()?;
+            let complete = page.next_page_token.is_none();
+            store.apply_scan_page(expected_page_token, &page, now_unix_ms)?;
+            Ok(if complete {
+                InitialSyncProgress::ScanComplete
+            } else {
+                InitialSyncProgress::ScanPageCommitted
+            })
+        }
+        SyncPhase::Draining => {
+            let cursor = state
+                .changes_page_token
+                .as_deref()
+                .ok_or(Error::InvalidStateTransition)?;
+            let page = client.changes_page(cursor).map_err(Error::Remote)?;
+            page.validate()?;
+            let complete = page.new_start_page_token.is_some();
+            store.apply_changes_page(cursor, &page, now_unix_ms)?;
+            Ok(if complete {
+                InitialSyncProgress::Ready
+            } else {
+                InitialSyncProgress::ChangesPageCommitted
+            })
+        }
+        SyncPhase::Ready => Ok(InitialSyncProgress::Ready),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncPhase {
+    NeedStartToken,
+    Scanning,
+    Draining,
+    Ready,
+}
+
+impl SyncPhase {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NeedStartToken => "need_start_token",
+            Self::Scanning => "scanning",
+            Self::Draining => "draining",
+            Self::Ready => "ready",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "need_start_token" => Ok(Self::NeedStartToken),
+            "scanning" => Ok(Self::Scanning),
+            "draining" => Ok(Self::Draining),
+            "ready" => Ok(Self::Ready),
+            _ => Err(Error::InvalidSchema),
+        }
+    }
+}
+
+pub(crate) fn validate_remote_id(value: &str) -> Result<()> {
+    if (1..=512).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        Ok(())
+    } else {
+        Err(Error::InvalidRemoteId)
+    }
+}
+
+pub(crate) fn validate_remote_token(value: &str) -> Result<()> {
+    if (1..=4096).contains(&value.len()) && !value.bytes().any(|byte| byte.is_ascii_control()) {
+        Ok(())
+    } else {
+        Err(Error::InvalidRemoteToken)
+    }
+}
+
+pub(crate) fn validate_content_path(value: &str) -> Result<()> {
+    let path = VaultPath::from_portable(value).map_err(|_| Error::InvalidPortablePath)?;
+    let collision_key = path.collision_key();
+    let protected = matches!(
+        collision_key.split('/').next(),
+        Some(".obsidian" | ".trash")
+    );
+    if path.as_str() != value || path.is_obsidian_metadata() || protected {
+        return Err(Error::InvalidPortablePath);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_revision(value: &str) -> Result<()> {
+    if is_lower_hex_hash(value) {
+        Ok(())
+    } else {
+        Err(Error::InvalidRevision)
+    }
+}
+
+pub(crate) fn validate_redacted_code(value: &str) -> Result<()> {
+    if (1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        Ok(())
+    } else {
+        Err(Error::InvalidErrorCode)
+    }
+}
+
+pub(crate) fn u64_to_i64(value: u64) -> Result<i64> {
+    i64::try_from(value).map_err(|_| Error::InvalidTimestamp)
+}
+
+pub(crate) fn parse_uuid(value: &str) -> Result<Uuid> {
+    let id = Uuid::parse_str(value).map_err(|_| Error::InvalidSchema)?;
+    if id.is_nil() || id.to_string() != value {
+        return Err(Error::InvalidSchema);
+    }
+    Ok(id)
+}
+
+fn validate_entries(entries: &[RemoteEntry]) -> Result<()> {
+    for entry in entries {
+        entry.validate()?;
+    }
+    Ok(())
+}
+
+fn is_lower_hex_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
