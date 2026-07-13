@@ -1,19 +1,19 @@
 # myVault — Latest Session Handoff
 
-Updated 2026-07-13 13:50 Asia/Bangkokค่ะ
+Updated 2026-07-13 15:42 Asia/Bangkokค่ะ
 
 ## Start Here
 
 Session ใหม่ให้อ่านไฟล์นี้ก่อน แล้วอ่าน `PROJECT_PLAN.md`, `docs/phase-0/RESULTS.md`, `docs/demo/RESULTS.md`, `docs/demo/ACCEPTANCE.md` และ `CHANGELOG.md` ค่ะ
 
-Sunday ต้องตรวจ `git status --short` และ `git diff` ก่อนแก้ไฟล์เสมอค่ะ Working tree มีงานที่ยังไม่ commit และต้องรักษาการแก้ไขทั้งหมด ห้าม reset, checkout, clean หรือ overwrite งานเดิมค่ะ
+Sunday ต้องตรวจ `git status --short` และ `git diff` ก่อนแก้ไฟล์เสมอค่ะ หาก working tree มีงานใหม่ ต้องรักษาการแก้ไขทั้งหมดและห้าม reset, checkout, clean หรือ overwrite งานเดิมค่ะ
 
 ## Repository Checkpoint
 
 - Compatibility path คือ `/Users/awb/My Apps/myVault` และ physical path อยู่บน `/Volumes/AWB-Apps/My Apps/myVault` ค่ะ
-- Branch ปัจจุบันคือ `main` และ HEAD ตอนบันทึก handoff คือ `0e25170` ค่ะ
-- Working tree ไม่สะอาดและยังไม่มีการ stage/commit งานรอบล่าสุดค่ะ
-- checkpoint เดิมเวลา 11:11 ไม่มี active sub-agent ค่ะ หลังจากนั้นคุณโออนุมัติ documentation-only hardening round ที่แยก ownership ชัดเจนค่ะ
+- Branch ปัจจุบันคือ `codex/phase-3-sync-foundation` และ base คือ `cbde0c1` ซึ่งตรงกับ `origin/main` ตอนสร้าง branch ค่ะ
+- Phase 1 closure ถูกแยก commit เป็น `66c299f` และ `cbde0c1` แล้ว push ไป `origin/main` สำเร็จค่ะ
+- Phase 3A implementation commit คือ `6639d42` และ documentation checkpoint อยู่ใน commit ปัจจุบันของ branch ค่ะ ทั้งสอง local commits ยังไม่ push ค่ะ
 
 ## Completed This Session
 
@@ -26,6 +26,9 @@ Sunday ต้องตรวจ `git status --short` และ `git diff` ก่
 - Native recursive desktop watcher ผูกกับ opaque Vault session และ frontend debounce event ก่อน bounded explorer refresh ค่ะ Event ไม่เผย ambient Vault path ค่ะ
 - SQLite Phase 1 contract คือ private derived-index schema v2, migrations และ transactional rebuild ซึ่งเสร็จแล้วค่ะ Persistent full-content search/backlinks/graph index เป็น milestone ถัดไปค่ะ
 - Live Copy-of-Vault UAT บน macOS ผ่านโดยใช้ disposable Vault `/tmp/myvault-phase1-uat.ykjiuo/Vault` ค่ะ Native picker, watcher refresh, conflict protection, explicit reload, sequential guarded saves, recovery snapshots, Reader keyboard navigation, Mermaid isolation และ restart continuity ผ่านครบค่ะ
+- คุณโอเลือกทำ Phase 3 Production Drive Sync ก่อน Phase 2 และอนุมัติแผน Phase 3A ค่ะ
+- Phase 3A สร้าง `myvault-sync-engine` แยกจาก `drive-sync-spike` พร้อม private SQLite schema v1, exact remote-root binding, typed remote checksums, start-token-before-scan orchestration, durable completed-operation tombstones, `NeedsReconcile`, exact schema validation และ crash-aware local-mutation cursor protocol ค่ะ
+- Phase 3A ไม่มี OAuth runtime, Google Drive network request, live Drive read/write หรือ personal Vault access ค่ะ Architecture, acceptance และ results อยู่ใน `docs/sync` ค่ะ
 
 ## Verification Passed — Phase 1 Local Implementation Closure Checkpoint
 
@@ -44,14 +47,21 @@ Checkpoint นี้รันเมื่อ 2026-07-13 กับ uncommitted Ph
 - Secret scan ไม่พบ OAuth client secret หรือ token จริงใน repository ค่ะ
 - [Phase 1 Hardening — Copy-of-Vault Acceptance](docs/demo/PHASE1_HARDENING_ACCEPTANCE.md) ผ่าน live macOS UAT แล้วค่ะ Guarded saves สาม revision จบที่ `1080` bytes และ recovery payload ก่อนบันทึก `845`, `937`, `1009` bytes เทียบ byte-exact ผ่านทั้งหมดค่ะ Reader keys และ Mermaid failure isolation ผ่าน และ restart แล้วยังอ่าน Explorer `6` ไฟล์พร้อม snapshot objects `3` ก้อนได้ค่ะ
 
-## Uncommitted Scope
+## Verification Passed — Phase 3A Sync Foundation Checkpoint
 
-- Phase 1 local implementation closure/runtime wiring อยู่ใน `crates/myvault-app-service`, `apps/tauri/src-tauri` และ `apps/tauri/src/App.tsx` ค่ะ
-- Android SAF production activation bridge อยู่ใน `crates/tauri-plugin-vault-saf` และไฟล์ Tauri/Android ที่เกี่ยวข้องค่ะ
-- Reader scrolling/Mermaid และ UI fixes ก่อนหน้าอยู่ใน `apps/tauri/src/reader.ts`, tests, `App.tsx` และ `App.css` ค่ะ
-- OAuth/Drive/Android evidence และ progress อยู่ใน `docs/phase-0` ค่ะ
-- Progress และ release notes อยู่ใน `PROJECT_PLAN.md` และ `CHANGELOG.md` ค่ะ
-- Documentation-only hardening round ที่คุณโออนุมัติปรับ chronology, Phase 3 Drive wording, Android SAF contract และ checkpoint labels เฉพาะเอกสาร โดยไม่แก้ source code ค่ะ
+- `myvault-sync-engine` isolated suite ผ่าน 14 integration tests ค่ะ
+- Strict Clippy `-D warnings` และ Rust formatting สำหรับ crate ใหม่ผ่านค่ะ
+- `pnpm test:rust` ผ่าน Tauri 8 tests, myvault-core suites, Desktop Auth 9 tests, Drive spike 25 tests และ Sync Foundation tests ค่ะ
+- Initial sync, restart resume, stale scan cursor, removed changes, duplicate remote paths, typed checksums, post-completion exact queue retry, operation collision, interrupted remote/local unknown outcomes, atomic history, partial cursor blocking, constraint-weakened schema และ corrupt evidence preservation มี regression tests ค่ะ
+- Native Linux platform CI รัน Sync Foundation suite และ native Windows compile tests แบบ `--no-run` ค่ะ Windows Sync runtime acceptance ยัง deferred จนกว่าจะเชื่อม private-root provisioning ค่ะ
+- Live Drive fixture และ OS keyring mutation tests ยังคง ignored by default และไม่ได้ถูกรันใน Phase 3A ค่ะ
+
+## Phase 3A Commit Scope
+
+- Production foundation crate อยู่ใน `crates/myvault-sync-engine` ค่ะ Generated `Cargo.lock` และ `target/` ของ crate ถูก ignore และห้าม commit ค่ะ
+- Architecture, acceptance และ results อยู่ใน `docs/sync` ค่ะ
+- Local/CI test registration เปลี่ยนที่ `package.json`, `.github/workflows/quality.yml` และ `.github/workflows/platform-build.yml` ค่ะ
+- Phase 3 status/handoff เปลี่ยนที่ `PROJECT_PLAN.md`, `CHANGELOG.md` และ `SESSION_HANDOFF.md` ค่ะ
 
 ห้ามสมมติว่าไฟล์ใดไฟล์หนึ่งเป็น disposable เพียงเพราะยัง untracked หรือไม่ถูก commit ค่ะ ตรวจ diff และความสัมพันธ์ของงานก่อนทุกครั้งค่ะ
 
@@ -63,10 +73,10 @@ Checkpoint นี้รันเมื่อ 2026-07-13 กับ uncommitted Ph
 
 ## Recommended Next Actions
 
-1. Combined diff, `git status --short`, secret scan, automated closure gates และ live macOS Copy-of-Vault UAT ตรวจครบแล้วค่ะ Working tree ยังไม่ stage/commit และต้องรักษาไว้ทั้งหมดค่ะ
-2. ให้คุณโอเลือก milestone ถัดไประหว่าง Phase 2 Editor/Reader polish กับ Phase 3 Production Drive Sync พร้อม effort/risk breakdown ก่อนขออนุมัติ implementation ค่ะ
-3. ก่อนเริ่ม implementation รอบใหม่ ให้คุณโอตัดสินใจเรื่องการ stage/commit/push ของ current closure diff แยกต่างหากค่ะ
-4. แยก P3 code splitting และ persistent content index เป็น milestone ชัดเจน ไม่ดึงกลับมาปนกับ Phase 1 local implementation closure ค่ะ
+1. Phase 3A deep review, commit-blocker remediation, final Commit Scope และ local commits ผ่านแล้วค่ะ
+2. ให้คุณโอตัดสินใจเรื่อง push ของ Phase 3A แยกต่างหากค่ะ
+3. หลัง 3A ผ่าน review ให้เสนอ Phase 3B Native Auth + Read-only Existing Drive Binding และขอ approval ใหม่ก่อน live Drive access ค่ะ
+4. แยก persistent content index และ P3 frontend code splitting ออกจาก Sync operational state ค่ะ
 5. ทำ Windows/Ubuntu native acceptance และ physical Android validation เมื่อมี environment/อุปกรณ์ที่เหมาะสมค่ะ
 
 ## Approval State
@@ -75,5 +85,10 @@ Checkpoint นี้รันเมื่อ 2026-07-13 กับ uncommitted Ph
 - OAuth configuration, User Data Policy และ live Drive fixture ได้รับอนุมัติและดำเนินการแล้วค่ะ
 - Documentation-only hardening round สำหรับ plan/handoff/changelog และ Phase 0 evidence ได้รับอนุมัติและดำเนินการแล้วค่ะ ไม่มี source code อยู่ใน ownership รอบนี้ค่ะ
 - Live Copy-of-Vault UAT และ documentation finalization ได้รับอนุมัติและดำเนินการแล้วค่ะ
+- Phase 1 closure commits และ direct push ไป `origin/main` ได้รับอนุมัติและดำเนินการแล้วค่ะ
+- Phase 3 plan และ Phase 3A Sync Foundation implementation ได้รับอนุมัติและดำเนินการแล้วค่ะ
+- Phase 3A commit-blocker remediation ได้รับอนุมัติและดำเนินการแล้วค่ะ
+- Phase 3A Commit 1 และ Commit 2 ได้รับอนุมัติและดำเนินการแล้วค่ะ ทั้งสอง commits ยังไม่ push ค่ะ
+- Phase 3B และ live Google Drive access ยังไม่ได้รับ approval ค่ะ
 - ไม่มี approval ด้าน OAuth หรือ User Data Policy ค้างอยู่ค่ะ
 - งาน implementation ใหม่หลัง handoff ต้องเสนอแผนและขออนุมัติคุณโอตาม `AGENTS.md` ค่ะ
