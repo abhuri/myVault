@@ -1,16 +1,8 @@
 use serde::Serialize;
-#[cfg(not(target_os = "android"))]
 use std::sync::Arc;
-#[cfg(target_os = "android")]
-use std::sync::Mutex;
 
 mod app_commands;
-
-#[cfg(target_os = "android")]
-use tauri_plugin_google_auth::GoogleAuthExt;
-
-#[cfg(target_os = "android")]
-const GOOGLE_DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive";
+mod sync_commands;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,123 +27,9 @@ fn get_platform_info() -> PlatformInfo {
     platform_info()
 }
 
-#[derive(Default)]
-struct GoogleAuthSession {
-    #[cfg(target_os = "android")]
-    authorization: Mutex<Option<tauri_plugin_google_auth::Authorization>>,
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct GoogleAuthStatus {
-    supported: bool,
-    connected: bool,
-    granted_scope_count: usize,
-}
-
-#[cfg(not(target_os = "android"))]
-impl GoogleAuthStatus {
-    fn unsupported() -> Self {
-        Self {
-            supported: false,
-            connected: false,
-            granted_scope_count: 0,
-        }
-    }
-}
-
-#[tauri::command]
-fn google_auth_status(
-    session: tauri::State<'_, GoogleAuthSession>,
-) -> Result<GoogleAuthStatus, String> {
-    #[cfg(target_os = "android")]
-    {
-        let authorization = session
-            .authorization
-            .lock()
-            .map_err(|_| "Authorization state is unavailable".to_owned())?;
-        Ok(GoogleAuthStatus {
-            supported: true,
-            connected: authorization.is_some(),
-            granted_scope_count: authorization
-                .as_ref()
-                .map_or(0, |value| value.granted_scope_count),
-        })
-    }
-
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = session;
-        Ok(GoogleAuthStatus::unsupported())
-    }
-}
-
-#[tauri::command]
-fn google_auth_connect(
-    app: tauri::AppHandle,
-    session: tauri::State<'_, GoogleAuthSession>,
-) -> Result<GoogleAuthStatus, String> {
-    #[cfg(target_os = "android")]
-    {
-        let authorization = app
-            .google_auth()
-            .authorize(&[GOOGLE_DRIVE_SCOPE])
-            .map_err(|_| "Google authorization failed".to_owned())?;
-        let scope_count = authorization.granted_scope_count;
-        *session
-            .authorization
-            .lock()
-            .map_err(|_| "Authorization state is unavailable".to_owned())? = Some(authorization);
-        Ok(GoogleAuthStatus {
-            supported: true,
-            connected: true,
-            granted_scope_count: scope_count,
-        })
-    }
-
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = (app, session);
-        Ok(GoogleAuthStatus::unsupported())
-    }
-}
-
-#[tauri::command]
-fn google_auth_disconnect(
-    app: tauri::AppHandle,
-    session: tauri::State<'_, GoogleAuthSession>,
-) -> Result<GoogleAuthStatus, String> {
-    #[cfg(target_os = "android")]
-    {
-        let mut authorization = session
-            .authorization
-            .lock()
-            .map_err(|_| "Authorization state is unavailable".to_owned())?;
-
-        if let Some(current) = authorization.as_ref() {
-            app.google_auth()
-                .disconnect(&current.access_token)
-                .map_err(|_| "Google disconnect failed".to_owned())?;
-        }
-        authorization.take();
-
-        Ok(GoogleAuthStatus {
-            supported: true,
-            connected: false,
-            granted_scope_count: 0,
-        })
-    }
-
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = (app, session);
-        Ok(GoogleAuthStatus::unsupported())
-    }
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default().manage(GoogleAuthSession::default());
+    let builder = tauri::Builder::default().manage(Arc::new(sync_commands::SyncRuntime::default()));
 
     #[cfg(target_os = "android")]
     let builder = builder
@@ -181,9 +59,13 @@ pub fn run() {
     builder
         .invoke_handler(tauri::generate_handler![
             get_platform_info,
-            google_auth_status,
-            google_auth_connect,
-            google_auth_disconnect,
+            sync_commands::sync_status,
+            sync_commands::sync_connect,
+            sync_commands::sync_list_folders,
+            sync_commands::sync_bind_root,
+            sync_commands::sync_scan_step,
+            sync_commands::sync_preview,
+            sync_commands::sync_disconnect,
             app_commands::vault_status,
             app_commands::vault_read_note,
             app_commands::vault_save_note,
@@ -206,17 +88,5 @@ mod tests {
         assert!(!info.os.is_empty());
         assert!(!info.arch.is_empty());
         assert!(!info.family.is_empty());
-    }
-
-    #[test]
-    fn unsupported_auth_status_is_frontend_safe() {
-        let status = GoogleAuthStatus::unsupported();
-
-        assert!(!status.supported);
-        assert!(!status.connected);
-        assert_eq!(status.granted_scope_count, 0);
-        assert!(!serde_json::to_string(&status)
-            .expect("status should serialize")
-            .contains("token"));
     }
 }

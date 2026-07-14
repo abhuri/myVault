@@ -155,6 +155,13 @@ pub struct TokenSet {
     pub expires_in: Option<Duration>,
 }
 
+impl TokenSet {
+    /// Borrows the bearer token exclusively for native provider integration.
+    pub fn access_token(&self) -> &str {
+        self.access_token.expose_secret()
+    }
+}
+
 impl fmt::Debug for TokenSet {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -264,9 +271,9 @@ impl TokenRefresher for GoogleTokenClient {
 
 #[derive(Deserialize)]
 struct TokenEndpointResponse {
-    access_token: Zeroizing<String>,
+    access_token: SecretString,
     #[serde(default)]
-    refresh_token: Option<Zeroizing<String>>,
+    refresh_token: Option<SecretString>,
     #[serde(default)]
     expires_in: Option<u64>,
     #[serde(default)]
@@ -302,7 +309,7 @@ fn parse_token_response(mut response: Response) -> Result<TokenSet, AuthError> {
 
     let payload: TokenEndpointResponse = serde_json::from_slice(body.as_slice())
         .map_err(|_| AuthError::ExchangeFailed("token endpoint response was invalid"))?;
-    if payload.access_token.trim().is_empty() {
+    if payload.access_token.expose_secret().trim().is_empty() {
         return Err(AuthError::ExchangeFailed("access token was missing"));
     }
     if payload
@@ -323,11 +330,8 @@ fn parse_token_response(mut response: Response) -> Result<TokenSet, AuthError> {
     }
 
     Ok(TokenSet {
-        access_token: SecretString::from(payload.access_token.as_str().to_owned()),
-        refresh_token: payload
-            .refresh_token
-            .as_deref()
-            .map(|token| SecretString::from(token.to_owned())),
+        access_token: payload.access_token,
+        refresh_token: payload.refresh_token,
         expires_in: payload.expires_in.map(Duration::from_secs),
     })
 }

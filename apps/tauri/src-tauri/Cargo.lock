@@ -949,19 +949,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "drive-sync-spike"
-version = "0.1.0"
-dependencies = [
- "getrandom 0.3.4",
- "reqwest 0.12.28",
- "secrecy",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "dtoa"
 version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1208,6 +1195,16 @@ dependencies = [
  "io-lifetimes 2.0.4",
  "rustix",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]
@@ -2340,10 +2337,12 @@ dependencies = [
 name = "myvault"
 version = "0.1.0"
 dependencies = [
- "drive-sync-spike",
+ "base64 0.22.1",
  "myvault-app-service",
  "myvault-core",
  "myvault-desktop-auth",
+ "myvault-drive",
+ "myvault-sync-engine",
  "notify",
  "serde",
  "serde_json",
@@ -2390,10 +2389,25 @@ dependencies = [
  "base64 0.22.1",
  "keyring",
  "rand 0.9.5",
+ "reqwest 0.12.28",
  "secrecy",
+ "serde",
+ "serde_json",
  "sha2",
  "subtle",
  "url",
+ "zeroize",
+]
+
+[[package]]
+name = "myvault-drive"
+version = "0.1.0"
+dependencies = [
+ "myvault-sync-engine",
+ "reqwest 0.12.28",
+ "secrecy",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2437,6 +2451,20 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "myvault-sync-engine"
+version = "0.1.0"
+dependencies = [
+ "cap-fs-ext",
+ "cap-std",
+ "fs2",
+ "myvault-core",
+ "myvault-private-fs",
+ "rusqlite",
+ "serde",
  "uuid",
 ]
 
@@ -3594,6 +3622,7 @@ version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
 dependencies = [
+ "serde",
  "zeroize",
 ]
 
@@ -5919,6 +5948,9 @@ name = "zeroize"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "zerotrie"

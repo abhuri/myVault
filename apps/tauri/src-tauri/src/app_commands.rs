@@ -75,12 +75,24 @@ impl DesktopVaultWatcher {
 pub struct AndroidVaultSession(Mutex<Option<VaultSessionId>>);
 
 #[cfg(target_os = "android")]
-fn android_session_id(
+pub(crate) fn android_session_id(
     session: &AndroidVaultSession,
     requested: VaultSessionId,
 ) -> Result<VaultSessionId, AppError> {
     let active = *session.0.lock().map_err(|_| AppError::internal())?;
     validate_android_session(active, requested)
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn with_android_session_lease<T>(
+    session: &AndroidVaultSession,
+    requested: VaultSessionId,
+    operation: impl FnOnce() -> T,
+) -> Result<T, AppError> {
+    let active = session.0.lock().map_err(|_| AppError::internal())?;
+    validate_android_session(*active, requested)?;
+    // `active` deliberately stays in scope while the native operation runs.
+    Ok(operation())
 }
 
 #[cfg(any(target_os = "android", test))]

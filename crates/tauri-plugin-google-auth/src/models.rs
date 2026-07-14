@@ -22,6 +22,14 @@ pub struct Authorization {
     pub granted_scope_count: usize,
 }
 
+impl Authorization {
+    /// Gives native Rust integration a scoped borrow of the bearer token.
+    /// The token remains non-serializable and cannot cross a Tauri command DTO.
+    pub fn with_native_access_token<T>(&self, operation: impl FnOnce(&str) -> T) -> T {
+        operation(self.access_token.expose_to_native())
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AuthorizeRequest<'a> {
