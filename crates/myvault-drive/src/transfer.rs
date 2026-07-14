@@ -537,6 +537,46 @@ impl TransferDrive {
         }
     }
 
+    /// Proves that a completed create is still unique by both its operation
+    /// marker and exact display name before callers publish durable completion.
+    /// Both queries must return exactly the just-created file, and a final
+    /// metadata read must preserve its revision, parent, content, and marker.
+    ///
+    /// # Errors
+    /// Fails closed when either identity is absent, duplicated, points at a
+    /// different file, or when the final exact metadata no longer matches.
+    pub fn verify_created_upload(
+        &self,
+        intent: &CreateIntent,
+        created: &RemoteObject,
+    ) -> Result<RemoteObject> {
+        let marker_query = format!(
+            "'{}' in parents and trashed = false and appProperties has {{ key='myvaultOperation' and value='{}' }}",
+            intent.parent_id,
+            escape_query_literal(&intent.operation_marker)
+        );
+        let marker_matches =
+            self.query_files_with_page_size(&marker_query, &intent.parent_id, "2")?;
+        require_unique_created_match(&marker_matches, intent, created)?;
+
+        let name_query = format!(
+            "'{}' in parents and trashed = false and name = '{}'",
+            intent.parent_id,
+            escape_query_literal(&intent.name)
+        );
+        let name_matches = self.query_files_with_page_size(&name_query, &intent.parent_id, "2")?;
+        require_unique_created_match(&name_matches, intent, created)?;
+
+        let verified = self
+            .recheck_existing(created.file_id(), intent, true)?
+            .ok_or_else(|| Error::new(ErrorCode::RevisionMismatch))?;
+        let final_object = remote_object(&verified, intent)?;
+        if final_object.provider_version != created.provider_version {
+            return Err(Error::new(ErrorCode::RevisionMismatch));
+        }
+        Ok(final_object)
+    }
+
     /// Initiates a create-only resumable upload after a consumed absence
     /// permit. No existing file id can be supplied to this endpoint.
     ///
@@ -851,7 +891,19 @@ impl TransferDrive {
     }
 
     fn query_files(&self, query: &str, parent_id: &str) -> Result<Vec<TransferFile>> {
+        self.query_files_with_page_size(query, parent_id, "100")
+    }
+
+    fn query_files_with_page_size(
+        &self,
+        query: &str,
+        parent_id: &str,
+        page_size: &str,
+    ) -> Result<Vec<TransferFile>> {
         if query.len() > 4096 || query.chars().any(char::is_control) {
+            return Err(Error::new(ErrorCode::InvalidInput));
+        }
+        if page_size != "2" && page_size != "100" {
             return Err(Error::new(ErrorCode::InvalidInput));
         }
         self.ensure_folder_below_root(parent_id)?;
@@ -862,7 +914,7 @@ impl TransferDrive {
             &[
                 ("q", query),
                 ("fields", &fields),
-                ("pageSize", "100"),
+                ("pageSize", page_size),
                 ("spaces", "drive"),
                 ("corpora", "user"),
                 ("includeItemsFromAllDrives", "true"),
@@ -1024,6 +1076,17 @@ impl TransferDrive {
             return Err(Error::new(ErrorCode::UnexpectedOrigin));
         }
         Ok(())
+    }
+}
+
+fn require_unique_created_match(
+    matches: &[TransferFile],
+    intent: &CreateIntent,
+    created: &RemoteObject,
+) -> Result<()> {
+    match matches {
+        [file] if file.id == created.file_id && file_matches_intent(file, intent) => Ok(()),
+        _ => Err(Error::new(ErrorCode::AmbiguousRemote)),
     }
 }
 
@@ -1396,6 +1459,114 @@ mod tests {
             .reconcile_create(intent())
             .unwrap();
         assert!(matches!(result, CreateReconciliation::Absent(_)));
+        marker.assert();
+        name.assert();
+    }
+
+    #[test]
+    fn post_create_verification_captures_unique_marker_name_and_exact_metadata() {
+        let mut server = Server::new();
+        binding_mocks(&mut server, 3);
+        let marker = server
+            .mock("GET", "/drive/v3/files")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("pageSize".into(), "2".into()),
+                Matcher::Regex("myvaultOperation.*operation_1".into()),
+            ]))
+            .with_body(format!(r#"{{"files":[{}]}}"#, complete_file_json()))
+            .create();
+        let name = server
+            .mock("GET", "/drive/v3/files")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("pageSize".into(), "2".into()),
+                Matcher::Regex("name.*note%2Emd|name.*note.md".into()),
+            ]))
+            .with_body(format!(r#"{{"files":[{}]}}"#, complete_file_json()))
+            .create();
+        let metadata = server
+            .mock("GET", "/drive/v3/files/file_1")
+            .match_query(Matcher::Regex("fields".into()))
+            .with_body(complete_file_json())
+            .create();
+        let intent = intent();
+        let created_file: TransferFile = serde_json::from_str(&complete_file_json()).unwrap();
+        let created = remote_object(&created_file, &intent).unwrap();
+
+        let verified = TransferDrive::for_test(&server, 1024)
+            .verify_created_upload(&intent, &created)
+            .unwrap();
+
+        assert_eq!(verified, created);
+        marker.assert();
+        name.assert();
+        metadata.assert();
+    }
+
+    #[test]
+    fn post_create_verification_rejects_concurrent_duplicate_marker() {
+        let mut server = Server::new();
+        binding_mocks(&mut server, 1);
+        let duplicate = complete_file_json().replace("file_1", "file_2");
+        let marker = server
+            .mock("GET", "/drive/v3/files")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("pageSize".into(), "2".into()),
+                Matcher::Regex("myvaultOperation.*operation_1".into()),
+            ]))
+            .with_body(format!(
+                r#"{{"files":[{},{}]}}"#,
+                complete_file_json(),
+                duplicate
+            ))
+            .create();
+        let intent = intent();
+        let created_file: TransferFile = serde_json::from_str(&complete_file_json()).unwrap();
+        let created = remote_object(&created_file, &intent).unwrap();
+
+        let error = TransferDrive::for_test(&server, 1024)
+            .verify_created_upload(&intent, &created)
+            .unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::AmbiguousRemote);
+        marker.assert();
+    }
+
+    #[test]
+    fn post_create_verification_rejects_concurrent_duplicate_name() {
+        let mut server = Server::new();
+        binding_mocks(&mut server, 2);
+        let marker = server
+            .mock("GET", "/drive/v3/files")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("pageSize".into(), "2".into()),
+                Matcher::Regex("myvaultOperation.*operation_1".into()),
+            ]))
+            .with_body(format!(r#"{{"files":[{}]}}"#, complete_file_json()))
+            .create();
+        let duplicate = complete_file_json()
+            .replace("file_1", "file_2")
+            .replace("operation_1", "operation_2");
+        let name = server
+            .mock("GET", "/drive/v3/files")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("pageSize".into(), "2".into()),
+                Matcher::Regex("name.*note%2Emd|name.*note.md".into()),
+            ]))
+            .with_body(format!(
+                r#"{{"files":[{},{}]}}"#,
+                complete_file_json(),
+                duplicate
+            ))
+            .create();
+        let intent = intent();
+        let created_file: TransferFile = serde_json::from_str(&complete_file_json()).unwrap();
+        let created = remote_object(&created_file, &intent).unwrap();
+
+        let error = TransferDrive::for_test(&server, 1024)
+            .verify_created_upload(&intent, &created)
+            .unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::AmbiguousRemote);
         marker.assert();
         name.assert();
     }
