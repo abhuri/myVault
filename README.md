@@ -6,11 +6,15 @@ The first release targets macOS, Windows, Ubuntu, and Android through Tauri 2 wi
 
 ## Status
 
-`v0.1.0-demo` เป็น Local Desktop Demo สำหรับใช้คนเดียวบน macOS ก่อนค่ะ รุ่นนี้เปิด Vault ผ่าน native folder picker, แสดง file explorer, แก้ Markdown แบบ revision-checked autosave, อ่าน GFM/table/code/Mermaid และมี outline, backlinks, quick switcher กับ graph prototype ค่ะ
+- `v0.1.0-demo` เปิด Local Vault, แสดง explorer, อ่าน/แก้ Markdown ด้วย revision-checked autosave และมี Reader, Mermaid, outline, quick switcher, opened-note backlinks กับ graph prototype ค่ะ
+- Phase 1 local safety foundation และ macOS live Copy-of-Vault UAT ผ่านแล้วค่ะ Windows/Ubuntu native runtime และ physical Android evidence ยัง deferred ค่ะ
+- Phase 3A Sync Foundation ถูก merge ผ่าน PR #23 ที่ `db85177` แล้วค่ะ Foundation นี้ยังไม่ถูกต่อเข้ากับ Tauri/UI และยังไม่มี production Drive read/write ค่ะ
+- เป้าหมายถัดไปคือ Phase 3B Native Auth + Read-only Existing Drive Binding ซึ่งยังต้องขอ approval ก่อนแตะ OAuth runtime หรือ Google Drive จริงค่ะ
+- Roadmap ถูกล็อกเป็น `R1 → R2 → R3 → R4 → R5 → R6 → R7 → R8` จนถึง Personal First Release โดยรายละเอียด scope และ exit gates อยู่ใน [PROJECT_PLAN.md](PROJECT_PLAN.md) ค่ะ
 
-Google Drive Sync, physical Android acceptance และ store distribution ยังไม่รวมใน Demo ค่ะ ผลทดสอบล่าสุดอยู่ที่ [docs/demo/RESULTS.md](docs/demo/RESULTS.md) และเกณฑ์ตรวจอยู่ที่ [docs/demo/ACCEPTANCE.md](docs/demo/ACCEPTANCE.md) ค่ะ
+สถานะโดยประมาณคือ 40–45% ของ personal first release เมื่อวัดจาก user-visible outcome ค่ะ รายละเอียดทิศทางและ capability gaps อยู่ใน [PROJECT_PLAN.md](PROJECT_PLAN.md) ส่วน Git checkpoint, verification ล่าสุด และงานถัดไปอยู่ใน [SESSION_HANDOFF.md](SESSION_HANDOFF.md) ค่ะ
 
-See [PROJECT_PLAN.md](PROJECT_PLAN.md) for architecture decisions, delivery phases, safety rules, and the current session handoffค่ะ
+ผล Demo อยู่ที่ [docs/demo/RESULTS.md](docs/demo/RESULTS.md) และหลักฐาน Sync Foundation อยู่ที่ [docs/sync/RESULTS.md](docs/sync/RESULTS.md) ค่ะ
 
 ## First-release constraints
 

@@ -52,9 +52,9 @@ c55fa98359bfa3e8c6ccd702091e57a364c35146d1b99a644b8fbe04be02c125  myVault-v0.1.0
 
 ### Outcome
 
-Live macOS scope ผ่านตาม [Phase 1 Hardening — Copy-of-Vault Acceptance](PHASE1_HARDENING_ACCEPTANCE.md) ค่ะ การทดสอบใช้เฉพาะ disposable Vault `/tmp/myvault-phase1-uat.ykjiuo/Vault` และ debug application bundle `apps/tauri/src-tauri/target/debug/bundle/macos/myVault.app` ค่ะ Source fixture, personal Vault และ project working tree ไม่ถูกแก้ไขโดย UAT ค่ะ
+Live macOS scope ผ่านตาม [Phase 1 Hardening — Copy-of-Vault Acceptance](PHASE1_HARDENING_ACCEPTANCE.md) ค่ะ การทดสอบเกิดขึ้นก่อน commit โดยใช้เฉพาะ disposable Vault `/tmp/myvault-phase1-uat.ykjiuo/Vault` และ debug application bundle `apps/tauri/src-tauri/target/debug/bundle/macos/myVault.app` ค่ะ Source fixture, personal Vault และ project working tree ไม่ถูกแก้ไขโดย UAT ค่ะ Implementation ที่ทดสอบถูกบันทึกภายหลังใน commits `66c299f` และ `cbde0c1` ค่ะ
 
-ผลนี้ยืนยัน macOS local runtime ของ current uncommitted Phase 1 build เท่านั้นค่ะ ไม่ใช้แทน Windows/Ubuntu native runtime หรือ physical Android evidence ค่ะ
+ผลนี้ยืนยัน macOS local runtime ของ Phase 1 build ณ วันที่ 2026-07-13 เท่านั้นค่ะ ไม่ใช้แทน Windows/Ubuntu native runtime หรือ physical Android evidence ค่ะ
 
 ### Watcher and Conflict Evidence
 

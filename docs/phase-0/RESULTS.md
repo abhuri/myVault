@@ -1,6 +1,6 @@
 # Phase 0 Evidence and Gate Status
 
-Updated 2026-07-13 Asia/Bangkokค่ะ Phase 0 checkpoint counts below remain historical; the current Android SAF artifact entry was refreshed from the final uncommitted closure verificationค่ะ
+Updated 2026-07-14 Asia/Bangkok ค่ะ Phase 0 checkpoint counts and APK hash `dfa259d3…` below are historical Phase 0 evidenceค่ะ Phase 1 SAF closure evidence uses APK hash `ace5ca15…`; it was tested before commit and the implementation was later captured by `66c299f` and `cbde0c1` ค่ะ
 
 Status values are `PASS`, `PARTIAL`, and `BLOCKED`ค่ะ A gate is never marked `PASS` from compilation or mocks when its contract requires a physical device, another native operating system, or a live Google Drive accountค่ะ
 
@@ -69,8 +69,8 @@ This baseline predates the SAF activation bridge and is retained to show the ori
 - Native operations reject absolute, empty, dot-segment, backslash, NUL, non-Markdown write, ambiguous, over-depth, over-count, and over-16-MiB inputsค่ะ Inventory is capped at 5,000 entries and depth 64ค่ะ
 - Save uses a native synchronized revision compare, truncating write, descriptor sync, and byte-for-byte readback verificationค่ะ A deliberately stale revision returns `staleRevision` and leaves the 1,576-byte fixture unchangedค่ะ SAF cannot provide the descriptor-relative atomic rename plus parent-directory fsync contract available to the desktop core, so Android reports `directorySyncUnsupported` and treats uncertain publication as `writeOutcomeUnknown`ค่ะ
 - Reader verification used the live production WebView DOM because the software-rendered emulator intermittently presents a black captured surface without an app crashค่ะ The scroll container measured 5,717 px over a 795 px viewport and moved from 0 to approximately 900 px, then to approximately 1,615 px with PageDownค่ะ Mermaid produced sanitized SVG with no `script`, `foreignObject`, or `onclick` nodesค่ะ
-- Final uncommitted closure verification passes 3 Android SAF policy tests, Android aarch64 Clippy, and the full Android debug APK buildค่ะ
-- Current APK SHA-256 is `ace5ca1504ea06a0964a67904172b21d1babc2630b999e3ea18b9a803fd20a5f`; Build Tools 36 reports 16 KB alignment verification successful and APK Signature Scheme v2 verification passesค่ะ
+- Phase 1 SAF closure verification passed 3 Android SAF policy tests, Android aarch64 Clippy, and the full Android debug APK build before commitค่ะ
+- Phase 1 SAF closure APK SHA-256 is `ace5ca1504ea06a0964a67904172b21d1babc2630b999e3ea18b9a803fd20a5f`; Build Tools 36 reported 16 KB alignment verification successful and APK Signature Scheme v2 verification passedค่ะ
 - The [Phase 1 Hardening — Copy-of-Vault Acceptance](../demo/PHASE1_HARDENING_ACCEPTANCE.md) runbook completed on macOS on 2026-07-13, and the live copy-of-Vault UAT passedค่ะ Windows/Ubuntu native runtime and physical Android evidence remain deferredค่ะ
 
 - Cold launch completed in approximately 2.0 seconds on the first clean emulator launch and approximately 0.7 seconds on later cold launchesค่ะ
