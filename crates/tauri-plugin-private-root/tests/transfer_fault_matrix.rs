@@ -1,7 +1,9 @@
 #[path = "../src/transfer_store.rs"]
 mod transfer_store;
 
-use cap_std::{ambient_authority, fs::Dir};
+#[cfg(not(unix))]
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io;
@@ -24,7 +26,7 @@ impl Fixture {
         let root_path = temporary.path().join("no-backup");
         fs::create_dir(&root_path).expect("no-backup root");
         make_private(&root_path);
-        let root = Dir::open_ambient_dir(&root_path, ambient_authority()).expect("held root");
+        let root = open_syncable_directory(&root_path);
         Self {
             _temporary: temporary,
             root_path,
@@ -60,6 +62,16 @@ impl Fixture {
             .join("objects")
             .join(format!("{digest}.blob"))
     }
+}
+
+#[cfg(unix)]
+fn open_syncable_directory(path: &Path) -> Dir {
+    Dir::from_std_file(fs::File::open(path).expect("syncable held root"))
+}
+
+#[cfg(not(unix))]
+fn open_syncable_directory(path: &Path) -> Dir {
+    Dir::open_ambient_dir(path, ambient_authority()).expect("held root")
 }
 
 #[cfg(unix)]
