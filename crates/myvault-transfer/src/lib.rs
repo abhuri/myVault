@@ -48,6 +48,8 @@ pub struct TransferIntent {
     byte_len: u64,
     content_kind: ContentKind,
     operation_marker: String,
+    stage_ref: Option<String>,
+    base_ref: Option<String>,
 }
 
 impl TransferIntent {
@@ -70,6 +72,8 @@ impl TransferIntent {
         byte_len: u64,
         content_kind: ContentKind,
         operation_marker: impl Into<String>,
+        stage_ref: Option<String>,
+        base_ref: Option<String>,
     ) -> Result<Self> {
         let value = Self {
             operation_id,
@@ -83,6 +87,8 @@ impl TransferIntent {
             byte_len,
             content_kind,
             operation_marker: operation_marker.into(),
+            stage_ref,
+            base_ref,
         };
         value.validate()?;
         Ok(value)
@@ -108,6 +114,12 @@ impl TransferIntent {
             return Err(Error::InvalidIntent);
         }
         validate_opaque(&self.operation_marker, MAX_REMOTE_ID_BYTES)?;
+        if let Some(stage_ref) = self.stage_ref.as_deref() {
+            validate_opaque(stage_ref, MAX_REMOTE_ID_BYTES)?;
+        }
+        if let Some(base_ref) = self.base_ref.as_deref() {
+            validate_opaque(base_ref, MAX_REMOTE_ID_BYTES)?;
+        }
         if self.direction == TransferDirection::Download && self.remote_file_id.is_none() {
             return Err(Error::InvalidIntent);
         }
@@ -167,6 +179,16 @@ impl TransferIntent {
     #[must_use]
     pub fn operation_marker(&self) -> &str {
         &self.operation_marker
+    }
+
+    #[must_use]
+    pub fn stage_ref(&self) -> Option<&str> {
+        self.stage_ref.as_deref()
+    }
+
+    #[must_use]
+    pub fn base_ref(&self) -> Option<&str> {
+        self.base_ref.as_deref()
     }
 }
 
@@ -375,6 +397,8 @@ impl TransferStore for SyncStore {
                 TransferMimeClass::Blob => ContentKind::Blob,
             },
             record.operation_marker,
+            record.stage_reference,
+            record.base_reference,
         )
         .map(Some)
     }
@@ -655,6 +679,8 @@ mod tests {
             12,
             ContentKind::Markdown,
             "operation1",
+            Some("stage-operation1".into()),
+            None,
         )
         .unwrap()
     }
@@ -877,6 +903,8 @@ mod tests {
                 1,
                 ContentKind::Blob,
                 "marker",
+                None,
+                None,
             )
             .is_err());
         }
@@ -892,6 +920,8 @@ mod tests {
             1,
             ContentKind::Blob,
             "marker",
+            None,
+            None,
         )
         .is_err());
     }
