@@ -896,6 +896,19 @@ mod platform {
                         .ok_or_else(SyncCommandError::internal)
                 })
                 .transpose()?;
+            let matching_base = matching_remote
+                .map(|entry| store.remote_base(&entry.file_id).map_err(map_sync_error))
+                .transpose()?
+                .flatten();
+            if matching_durable.as_ref().is_some_and(|durable| {
+                matching_base.as_ref().is_some_and(|base| {
+                    base.local_revision == snapshot.revision.hex
+                        && base.remote_revision == durable.remote_revision
+                        && base.content_hash == snapshot.sha256.as_str()
+                })
+            }) {
+                continue;
+            }
             let parent_id = if let Some(remote) = matching_remote {
                 remote.parent_id.as_str()
             } else if let Some(parent) = parent_path(&local.path) {

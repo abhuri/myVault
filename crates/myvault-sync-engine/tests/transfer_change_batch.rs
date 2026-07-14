@@ -96,6 +96,17 @@ fn completion(entry: &RemoteEntry, occurred_at: u64) -> TransferCompletion {
     .expect("completion")
 }
 
+fn assert_remote_base(store: &SyncStore, entry: &RemoteEntry) {
+    assert_eq!(
+        store.remote_base("remote-file").unwrap().unwrap(),
+        myvault_sync_engine::RemoteBaseEvidence {
+            local_revision: hash(b'c'),
+            remote_revision: entry.remote_revision.clone(),
+            content_hash: hash(b'a'),
+        }
+    );
+}
+
 fn ready_store(fixture: &Fixture, initial: &[RemoteEntry]) -> SyncStore {
     let mut store = fixture.open();
     let binding =
@@ -140,7 +151,6 @@ fn transfer_batch_survives_restart_and_advances_only_after_verified_completion()
     let operation_id = Uuid::new_v4();
     let entry = remote_file("notes/hello.md", "remote-revision-2", &hash(b'a'));
     let transfer = download(operation_id, &entry);
-
     store
         .begin_transfer_change_batch(
             batch_id,
@@ -188,7 +198,6 @@ fn transfer_batch_survives_restart_and_advances_only_after_verified_completion()
         .begin_transfer_local_publish(operation_id, 11)
         .expect("begin local publish");
     drop(store);
-
     let mut reopened = fixture.open();
     assert_eq!(
         reopened.transfer(operation_id).unwrap().unwrap().phase,
@@ -218,20 +227,7 @@ fn transfer_batch_survives_restart_and_advances_only_after_verified_completion()
         reopened.local_mutations(batch_id).unwrap()[0].state,
         LocalMutationState::Committed
     );
-
-    let connection = rusqlite::Connection::open(reopened.database_path()).unwrap();
-    let base: (String, String, String) = connection
-        .query_row(
-            "SELECT base_local_revision, base_remote_revision, base_content_hash
-             FROM remote_entries WHERE file_id = 'remote-file'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
-    assert_eq!(
-        base,
-        (hash(b'c'), entry.remote_revision.clone(), hash(b'a'))
-    );
+    assert_remote_base(&reopened, &entry);
     reopened
         .commit_transfer_change_batch(batch_id, 21)
         .expect("commit cursor");

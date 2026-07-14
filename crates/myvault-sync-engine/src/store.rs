@@ -268,6 +268,15 @@ pub struct RemotePreviewPage {
     pub rescan_required: bool,
 }
 
+/// Exact three-way base evidence for one remote file, when a verified transfer
+/// has established the same bytes on both sides.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteBaseEvidence {
+    pub local_revision: String,
+    pub remote_revision: String,
+    pub content_hash: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueueJobKind {
     Upload,
@@ -1296,6 +1305,37 @@ impl SyncStore {
         Ok(Some(entry))
     }
 
+    /// Reads verified base evidence for one exact remote file.
+    ///
+    /// # Errors
+    /// Rejects malformed IDs or partially persisted base evidence.
+    pub fn remote_base(&self, file_id: &str) -> Result<Option<RemoteBaseEvidence>> {
+        validate_remote_id(file_id)?;
+        let persisted: Option<(Option<String>, Option<String>, Option<String>)> = self
+            .connection
+            .query_row(
+                "SELECT base_local_revision, base_remote_revision, base_content_hash
+                 FROM remote_entries WHERE file_id = ?1",
+                [file_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        match persisted {
+            None | Some((None, None, None)) => Ok(None),
+            Some((Some(local_revision), Some(remote_revision), Some(content_hash))) => {
+                validate_revision(&local_revision)?;
+                validate_remote_token(&remote_revision)?;
+                RemoteContentHash::new(RemoteHashAlgorithm::Sha256, content_hash.clone())?;
+                Ok(Some(RemoteBaseEvidence {
+                    local_revision,
+                    remote_revision,
+                    content_hash,
+                }))
+            }
+            Some(_) => Err(Error::InvalidSchema),
+        }
+    }
+
     /// Returns one bounded, deterministic remote metadata preview page.
     ///
     /// # Errors
@@ -1990,8 +2030,9 @@ impl SyncStore {
         if changed != 1 {
             return Err(Error::InvalidStateTransition);
         }
+        update_remote_base_if_present(&transaction, &existing, completion)?;
         if mutation_state == Some(LocalMutationState::Applying) {
-            commit_transfer_mutation(&transaction, &existing, completion, &mutation_id)?;
+            commit_transfer_mutation(&transaction, &mutation_id)?;
         }
         transaction.commit()?;
         Ok(TransferCompletionOutcome::Completed)
@@ -3514,12 +3555,22 @@ fn validate_resolved_transfer_changes(
     Ok(())
 }
 
-fn commit_transfer_mutation(
+fn update_remote_base_if_present(
     transaction: &Transaction<'_>,
     transfer: &TransferRecord,
     completion: &TransferCompletion,
-    mutation_id: &str,
 ) -> Result<()> {
+    let exists = transaction
+        .query_row(
+            "SELECT 1 FROM remote_entries WHERE file_id = ?1",
+            [&completion.remote_file_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !exists {
+        return Ok(());
+    }
     let metadata_changed = transaction.execute(
         "UPDATE remote_entries
          SET base_local_revision = ?1, base_remote_revision = ?2,
@@ -3540,6 +3591,10 @@ fn commit_transfer_mutation(
     if metadata_changed != 1 {
         return Err(Error::TransferChangeMismatch);
     }
+    Ok(())
+}
+
+fn commit_transfer_mutation(transaction: &Transaction<'_>, mutation_id: &str) -> Result<()> {
     let mutation_changed = transaction.execute(
         "UPDATE change_batch_mutations SET state = ?1
          WHERE mutation_id = ?2 AND state = ?3
