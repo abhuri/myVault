@@ -116,8 +116,8 @@ Planning range รวมที่เหลือจากผลรวม milesto
 
 | Milestone | Outcome | Dependency | Planning range | Status |
 |---|---|---|---|---|
-| R1 — Native Auth + Read-only Binding | แอปเชื่อม account, bind exact root และอ่าน remote state โดยไม่เขียน Drive ค่ะ | Phase 3A | 1–2 weeks | NEXT — approval required |
-| R2 — Guarded Transfer | Markdown และ attachment upload/download แบบ verified และ restart-safe ค่ะ | R1 | 2–3 weeks | Locked planned |
+| R1 — Native Auth + Read-only Binding | แอปเชื่อม account, bind exact root และอ่าน remote state โดยไม่เขียน Drive ค่ะ | Phase 3A | 1–2 weeks | Complete — merged via PR #26 |
+| R2 — Guarded Transfer | Markdown และ attachment upload/download แบบ verified และ restart-safe ค่ะ | R1 | 2–3 weeks | Active — approved 2026-07-14 |
 | R3 — Mutations + Conflict Safety | Rename/move/Trash และ two-sided conflicts ปลอดภัยข้ามอุปกรณ์ค่ะ | R2 | 2–3 weeks | Locked planned |
 | R4 — Sync Control Plane + Safe Sync Alpha | ผู้ใช้ควบคุมและเข้าใจ Sync ได้ พร้อม end-to-end alpha acceptance ค่ะ | R3 | 1–2 weeks | Locked planned |
 | R5 — Local Product Completion | Local CRUD, attachment และ remaining editor/reader journey เชื่อม UI ครบค่ะ | R4 | 1–2 weeks | Locked planned |
@@ -395,7 +395,13 @@ Milestone จะถือว่า complete เมื่อครบทุกข
 
 ## 15. Current Transition
 
-- Locked roadmap ถูก merge เข้า `main` ผ่าน PR #24 ที่ merge commit `5160882` แล้วค่ะ Post-merge Quality run `29295471872` ผ่านทั้ง `quality` และ `android-compile` ค่ะ
-- Canonical roadmap checkpoint อยู่บน `origin/main` ที่ `5160882` ค่ะ Session ใหม่ต้องเริ่มจาก commit นี้หรือ descendant ของ commit นี้ค่ะ
-- Active implementation milestone คือ R1 — Native Auth + Read-only Existing Drive Binding ค่ะ Shared workspace มี branch `codex/r1-readonly-binding` ที่แตกจาก `5160882` และมีงานอยู่ จึงต้องตรวจ Git state และรักษางานเดิมก่อนแก้ไฟล์ค่ะ
-- R1 implementation plan ต้องคง exact fixture/root, credential boundary, production adapter boundary, rollback/cleanup, acceptance commands และแยก approval สำหรับ browser/live Google Drive access ตาม handoff ของ active session ค่ะ
+- R1 ถูก merge เข้า `main` ผ่าน PR #26 ที่ merge commit `681271a` หลัง live
+  read-only acceptance, final review, Quality, Android compile, Ubuntu AppImage,
+  และ Windows NSIS ผ่านค่ะ
+- Canonical R2 baseline คือ `origin/main` ที่ `681271a` และ active branch คือ
+  `codex/r2-guarded-transfer` ค่ะ
+- Active implementation milestone คือ R2 — Guarded Upload and Download ตาม
+  [R2 implementation plan](docs/sync/R2_PLAN.md) และ
+  [R2 acceptance](docs/sync/R2_ACCEPTANCE.md) ค่ะ
+- คุณโออนุมัติ one-time execution ครอบคลุม implementation, bounded subagents,
+  disposable Drive fixture, tests, CI, PR และ merge เมื่อ R2 gate ผ่านค่ะ

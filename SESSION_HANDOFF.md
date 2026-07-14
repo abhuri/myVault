@@ -16,11 +16,12 @@ Updated 2026-07-14 Asia/Bangkok ค่ะ
 ## 2. Repository Checkpoint
 
 - Physical path คือ `/Volumes/AWB-Apps/My Apps/myVault` และ compatibility path คือ `/Users/awb/My Apps/myVault` ค่ะ
-- Canonical branch คือ `main` และ canonical checkpoint คือ merge commit `5160882` จาก PR #24 ค่ะ
-- Phase 3A source head `7f5b8d6` ถูก merge ผ่าน PR #23 ที่ `db85177` และ locked roadmap commit `f5fba4d` ถูก merge ผ่าน PR #24 ที่ `5160882` ค่ะ
-- PR #24 ผ่าน Final Merge Review, Quality, Android compile, Ubuntu AppImage และ Windows NSIS ก่อน merge ค่ะ
-- Post-merge Quality run `29295471872` บน `5160882` ผ่านทั้ง `quality` และ `android-compile` ค่ะ
-- Active implementation milestone คือ R1 ค่ะ Shared workspace ล่าสุดอยู่บน `codex/r1-readonly-binding` ซึ่งแตกจาก `5160882` และมีงานที่ต้องรักษาไว้ค่ะ Session ใหม่ต้องตรวจ Git state จริงเพราะ active branch อาจเดินหน้าจาก checkpoint นี้แล้วค่ะ
+- Canonical branch คือ `main` และ canonical checkpoint คือ R1 merge commit
+  `681271a` จาก PR #26 ค่ะ
+- R1 live acceptance, final review, Quality, Android compile, Ubuntu AppImage,
+  และ Windows NSIS ผ่านบน candidate เดียวก่อน mergeค่ะ
+- Active implementation milestone คือ R2 และ shared workspace อยู่บน
+  `codex/r2-guarded-transfer` ซึ่งเริ่มจาก `681271a` ค่ะ
 
 ## 3. Current Truth
 
@@ -31,10 +32,13 @@ Updated 2026-07-14 Asia/Bangkok ค่ะ
 - Create/Rename/Move/Trash/Restore มี core/mutation foundation แต่ยังไม่มี Tauri/UI journey ครบค่ะ
 - Editor/Reader ใช้งานได้บางส่วน ส่วน attachments, properties และ embeds ยังไม่ครบค่ะ
 - Search/backlinks/graph ที่เห็นใน Demo เป็น filter หรือ opened-note prototype ไม่ใช่ persistent full-vault index ค่ะ
-- Desktop OAuth/Keyring primitives, Android auth bridge และ Drive fixture harness มีจริง แต่ยังไม่รวมเป็น production authorization/Drive runtime เดียวกันค่ะ
-- Phase 3A Sync Foundation complete ตาม slice และผ่าน 17 tests แต่ `myvault-sync-engine` ยังไม่เป็น dependency ของ Tauri app ค่ะ
-- แอปยังไม่มี production Existing Drive binding, read-only scan, upload/download, conflict engine หรือ Sync UI ค่ะ
-- UI ยังแสดงข้อความตามจริงว่า Demo ไม่เชื่อม Google Drive ค่ะ
+- R1 production Desktop OAuth/Keyring, Android auth bridge, exact account/root
+  binding, recursive read-only scan, Changes drain, restart restoration และ
+  bounded preview เชื่อม Tauri runtime แล้วค่ะ
+- `myvault-sync-engine` และ production GET-only Drive adapter เป็น Tauri
+  dependencies แล้ว โดย token/body/ambient path ไม่ออกสู่ frontend/SQLite/logค่ะ
+- แอปยังไม่มี guarded content upload/download, conflict engine หรือ full Sync
+  control-plane UI ซึ่งเป็นงาน R2–R4 ค่ะ
 
 ## 4. Verification — Current Audit
 
@@ -71,7 +75,7 @@ Ignored-by-default tests คือ live Drive fixture และ OS keyring mutat
 - R6 ปิด Persistent Knowledge Core ค่ะ
 - R7 บังคับ native runtime acceptance บน macOS, Windows, Ubuntu และ physical Android ค่ะ
 - R8 ทำ recovery drill, release verification และ Personal First Release ค่ะ
-- Active implementation milestone คือ R1 — Native Auth + Read-only Existing Drive Binding ค่ะ
+- Active implementation milestone คือ R2 — Guarded Upload and Download ค่ะ
 - เปิด implementation milestone ได้ครั้งละหนึ่ง milestone และต้องผ่าน exit gate พร้อม approval ก่อน transition ค่ะ
 - Planning range ที่เหลือจากผลรวม milestone คือ 10–19 focused engineering weeks โดยไม่รวมเวลารอ environment, device, external review หรือ account approval ค่ะ
 - Scope, order และ exit gates ถูกล็อกค่ะ Planning range ไม่ใช่ deadline lock ค่ะ
@@ -80,7 +84,6 @@ Ignored-by-default tests คือ live Drive fixture และ OS keyring mutat
 
 ### Product blockers
 
-- ไม่มี production native auth integration และ exact Existing Drive binding ค่ะ
 - ไม่มี production Drive read/write path หรือ cross-device end-to-end journey ค่ะ
 - ไม่มี user-visible Sync status/retry/conflict recovery ค่ะ
 - Local mutation services ยังไม่ถูก expose ถึง UI ครบค่ะ
@@ -99,18 +102,21 @@ Ignored-by-default tests คือ live Drive fixture และ OS keyring mutat
 
 ## 8. Next Actions
 
-1. รักษา active R1 branch และ uncommitted work ทั้งหมดก่อนแก้ไฟล์ค่ะ
-2. ตรวจว่า R1 implementation plan และ approval state ใน active session ครอบคลุม read-only fixture/root, native credential boundary, production adapter boundary, rollback/cleanup และ acceptance ค่ะ
-3. เดิน R1 ตาม locked scope โดยแยก approval ก่อนเปิด OAuth browser หรือใช้ live Google Drive fixture ค่ะ
-4. ปิด R1 ด้วย exit-gate evidence บน source head เดียวกันและขอ approval ก่อน transition ค่ะ
-5. ห้ามเริ่ม R2 upload/download, remote mutation หรือแตะ personal Existing Vault ก่อน R1 exit gate ผ่านค่ะ
+1. รักษา `codex/r2-guarded-transfer` และ uncommitted work ทั้งหมดก่อนแก้ไฟล์ค่ะ
+2. ใช้ [R2_PLAN.md](docs/sync/R2_PLAN.md) กับ
+   [R2_ACCEPTANCE.md](docs/sync/R2_ACCEPTANCE.md) เป็น implementation contractค่ะ
+3. Freeze schema/state/API contracts ก่อนแยก bounded worktreesค่ะ
+4. รวม final implementation และรันทุก R2 gate บน source HEAD เดียวกันค่ะ
+5. ห้ามแตะ personal Vault/Drive หรือเริ่ม R3 rename/move/Trash/conflict workค่ะ
 
 ## 9. Approval State
 
 - Documentation audit, alignment, roadmap lock, PR review และ merge เข้า `main` ได้รับอนุมัติและดำเนินการแล้วค่ะ
 - Locked scope/order/gates ได้รับ approval ด้วยข้อความ `Approve lock roadmap` เมื่อ 2026-07-14 และอยู่บน `main` ที่ `5160882` ค่ะ
-- Active R1 branch มี implementation work แล้วค่ะ Session ที่ทำ R1 ต้องถือ approval state ของตัวเองเป็น source of truth และห้ามตีความ roadmap merge ว่าอนุมัติ live external access ค่ะ
-- OAuth browser และ live Google Drive access ยังต้องมี explicit approval ตาม R1 plan ค่ะ
+- R1 ถูก merge ผ่าน PR #26 และ R2 transition ได้รับ approval แล้วค่ะ
+- คุณโออนุมัติ R2 one-time execution ครอบคลุม code/docs/tests, subagents,
+  browser OAuth, restricted full Drive re-consent, read/write เฉพาะ disposable
+  R2 root, emulator, CI, commit, PR และ merge เมื่อทุก gate ผ่านค่ะ
 - ไม่มี approval ด้าน User Data Policy ค้างอยู่ค่ะ OAuth credential และ token ต้องอยู่ภายนอก repository และห้ามแสดงใน log ค่ะ
 - งาน implementation ใหม่ต้องเสนอแผนและขออนุมัติคุณโอก่อนลงมือค่ะ
 
