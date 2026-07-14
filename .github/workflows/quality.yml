@@ -82,6 +82,7 @@ jobs:
           cargo fmt --manifest-path crates/desktop-auth/Cargo.toml --all -- --check
           cargo fmt --manifest-path crates/drive-sync-spike/Cargo.toml --all -- --check
           cargo fmt --manifest-path crates/myvault-sync-engine/Cargo.toml --all -- --check
+          cargo fmt --manifest-path crates/myvault-drive/Cargo.toml --all -- --check
           cargo fmt --manifest-path crates/tauri-plugin-google-auth/Cargo.toml --all -- --check
 
       - name: Lint Rust
@@ -98,6 +99,8 @@ jobs:
           cargo clippy --manifest-path crates/desktop-auth/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path crates/drive-sync-spike/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path crates/myvault-sync-engine/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path crates/myvault-drive/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path crates/tauri-plugin-google-auth/Cargo.toml --all-targets -- -D warnings
 
       - name: Test Rust
         run: |
@@ -113,6 +116,34 @@ jobs:
           cargo test --manifest-path crates/desktop-auth/Cargo.toml
           cargo test --manifest-path crates/drive-sync-spike/Cargo.toml
           cargo test --manifest-path crates/myvault-sync-engine/Cargo.toml
+          cargo test --manifest-path crates/myvault-drive/Cargo.toml
+          cargo test --manifest-path crates/tauri-plugin-google-auth/Cargo.toml
+
+      - name: Audit R1 static trust boundaries
+        shell: bash
+        run: |
+          set +e
+          git grep -n -E '\.(post|put|patch|delete)[[:space:]]*\(|Method::(POST|PUT|PATCH|DELETE)' -- crates/myvault-drive/src
+          drive_audit_status=$?
+          set -e
+          if [[ $drive_audit_status -eq 0 ]]; then
+            echo "::error::The production Drive adapter contains a mutating HTTP construction path."
+            exit 1
+          elif [[ $drive_audit_status -ne 1 ]]; then
+            echo "::error::The production Drive adapter audit could not run."
+            exit "$drive_audit_status"
+          fi
+          set +e
+          git grep -n -I -E '(access[_-]?token|refresh[_-]?token|authorization[_-]?code|code[_-]?verifier)' -- ':(glob)apps/tauri/src/**/*.ts' ':(glob)apps/tauri/src/**/*.tsx' ':(exclude,glob)apps/tauri/src/**/*.test.ts' ':(exclude,glob)apps/tauri/src/**/*.test.tsx'
+          ui_audit_status=$?
+          set -e
+          if [[ $ui_audit_status -eq 0 ]]; then
+            echo "::error::A token-shaped field crossed into frontend source."
+            exit 1
+          elif [[ $ui_audit_status -ne 1 ]]; then
+            echo "::error::The frontend token-field audit could not run."
+            exit "$ui_audit_status"
+          fi
 
   android-compile:
     name: android-compile
@@ -161,7 +192,7 @@ jobs:
       - name: Install JavaScript dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Compile Android GIS bridge and APK
+      - name: Compile Android Google auth bridge and APK
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/29.0.13846066
         run: pnpm --dir apps/tauri tauri android build --debug --apk --target aarch64
