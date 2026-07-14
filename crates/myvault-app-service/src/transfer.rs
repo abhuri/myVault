@@ -275,6 +275,40 @@ impl PrivateTransferStore {
         })
     }
 
+    pub(crate) fn discard_incomplete_stage(
+        &self,
+        operation_id: Uuid,
+        expected_sha256: &Sha256Digest,
+        expected_byte_len: u64,
+        max_bytes: usize,
+    ) -> Result<(), NativeTransferError> {
+        if operation_id.is_nil() || expected_byte_len > u64::try_from(max_bytes).unwrap_or(u64::MAX)
+        {
+            return Err(NativeTransferError::InvalidRequest);
+        }
+        self.verify_root()?;
+        let name = stage_name(operation_id);
+        let mut file = self.open_stage(operation_id, 1)?;
+        let identity = private_fs::held_private_file_identity(&file).map_err(map_private_error)?;
+        let mut sink = std::io::sink();
+        let snapshot =
+            stream_content_snapshot(&mut file, &mut sink, max_bytes).map_err(map_core_error)?;
+        if snapshot.sha256 == *expected_sha256 && snapshot.byte_len == expected_byte_len {
+            // Exact evidence may already be usable by the durable operation.
+            // Recovery must never turn a verified stage into a fresh download.
+            return Err(NativeTransferError::StageAlreadyExists);
+        }
+        self.verify_root()?;
+        private_fs::remove_private_file_if_identity(&self.staging, name, &file, &identity)
+            .map_err(|error| match error {
+                private_fs::Error::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    NativeTransferError::StageUnavailable
+                }
+                other => map_private_error(other),
+            })?;
+        private_fs::sync_directory(&self.staging).map_err(map_private_error)
+    }
+
     pub(crate) fn open_verified_stage(
         &self,
         stage: &TransferStageRef,

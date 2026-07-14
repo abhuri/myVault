@@ -258,6 +258,158 @@ fn existing_stage_reuses_only_exact_evidence_and_preserves_partial_bytes() {
     ));
 }
 
+#[test]
+fn restart_discards_only_the_exact_operations_incomplete_stage() {
+    let fixture = Fixture::new();
+    let (service, old_session) = fixture.service();
+    let operation_id = Uuid::new_v4();
+    let other_operation_id = Uuid::new_v4();
+    let expected = b"complete downloaded body";
+    let digest = Sha256Digest::from_bytes(expected);
+    let mut partial = service
+        .begin_transfer_stage(old_session, operation_id, 64)
+        .unwrap();
+    partial.write_all(b"partial").unwrap();
+    drop(partial);
+    drop(service);
+
+    let (restarted, session) = fixture.service();
+    assert!(matches!(
+        restarted.discard_incomplete_transfer_stage(
+            old_session,
+            operation_id,
+            digest.as_str(),
+            expected.len() as u64,
+            64,
+        ),
+        Err(NativeTransferError::VaultUnavailable)
+    ));
+    assert!(matches!(
+        restarted.discard_incomplete_transfer_stage(
+            session,
+            other_operation_id,
+            digest.as_str(),
+            expected.len() as u64,
+            64,
+        ),
+        Err(NativeTransferError::StageUnavailable)
+    ));
+    assert!(matches!(
+        restarted.load_transfer_stage(
+            session,
+            operation_id,
+            digest.as_str(),
+            expected.len() as u64,
+            64,
+        ),
+        Err(NativeTransferError::DigestMismatch)
+    ));
+
+    restarted
+        .discard_incomplete_transfer_stage(
+            session,
+            operation_id,
+            digest.as_str(),
+            expected.len() as u64,
+            64,
+        )
+        .unwrap();
+    let stage = restarted
+        .stage_transfer_download(
+            session,
+            operation_id,
+            &mut expected.as_slice(),
+            digest.as_str(),
+            expected.len() as u64,
+            64,
+        )
+        .unwrap();
+    assert_eq!(stage.snapshot().sha256, digest);
+    assert!(fs::read_dir(&fixture.vault).unwrap().next().is_none());
+}
+
+#[test]
+fn incomplete_stage_recovery_refuses_verified_stage_and_preserves_vault() {
+    let fixture = Fixture::new();
+    fs::write(fixture.vault.join("existing.bin"), b"vault bytes").unwrap();
+    let (service, session) = fixture.service();
+    let operation_id = Uuid::new_v4();
+    let bytes = b"verified private stage";
+    let digest = Sha256Digest::from_bytes(bytes);
+    let stage = service
+        .stage_transfer_download(
+            session,
+            operation_id,
+            &mut bytes.as_slice(),
+            digest.as_str(),
+            bytes.len() as u64,
+            64,
+        )
+        .unwrap();
+
+    assert!(matches!(
+        service.discard_incomplete_transfer_stage(
+            session,
+            operation_id,
+            digest.as_str(),
+            bytes.len() as u64,
+            64,
+        ),
+        Err(NativeTransferError::StageAlreadyExists)
+    ));
+    assert_eq!(
+        service
+            .load_transfer_stage(
+                session,
+                operation_id,
+                digest.as_str(),
+                bytes.len() as u64,
+                64,
+            )
+            .unwrap(),
+        stage
+    );
+    assert_eq!(
+        fs::read(fixture.vault.join("existing.bin")).unwrap(),
+        b"vault bytes"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn incomplete_stage_recovery_refuses_hardlinked_private_evidence() {
+    let fixture = Fixture::new();
+    let (service, session) = fixture.service();
+    let operation_id = Uuid::new_v4();
+    let expected = b"complete";
+    let digest = Sha256Digest::from_bytes(expected);
+    let mut partial = service
+        .begin_transfer_stage(session, operation_id, 64)
+        .unwrap();
+    partial.write_all(b"part").unwrap();
+    drop(partial);
+
+    let vault_store = single_child(&fixture.app_data.join("guarded-transfer/v1"));
+    let stage_path = vault_store
+        .join("staging")
+        .join(format!("{operation_id}.part"));
+    let retained = vault_store.join("objects/retained-test-evidence.blob");
+    fs::hard_link(&stage_path, &retained).unwrap();
+
+    assert!(matches!(
+        service.discard_incomplete_transfer_stage(
+            session,
+            operation_id,
+            digest.as_str(),
+            expected.len() as u64,
+            64,
+        ),
+        Err(NativeTransferError::PrivateStoreUnavailable)
+    ));
+    assert_eq!(fs::read(stage_path).unwrap(), b"part");
+    assert_eq!(fs::read(retained).unwrap(), b"part");
+}
+
 #[cfg(unix)]
 #[test]
 fn hardlink_crash_state_recovers_idempotently_and_parent_swap_fails_closed() {

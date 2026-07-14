@@ -620,6 +620,48 @@ impl AppService {
         store.load_stage(operation_id, &expected_sha256, expected_byte_len, max_bytes)
     }
 
+    /// Removes only a private stage whose exact operation-scoped bytes fail to
+    /// match the durable transfer digest/length after an interrupted download.
+    ///
+    /// The removal is descriptor-relative and identity checked. An exact
+    /// verified stage, a hardlinked stage, a missing stage, a stale session,
+    /// and every file outside the operation's private staging entry are
+    /// preserved and rejected.
+    ///
+    /// # Errors
+    /// Rejects stale sessions, nil operation IDs, malformed evidence, exact
+    /// verified stages, missing/replaced/hardlinked stages, unsafe private
+    /// storage, and size-limit violations.
+    pub fn discard_incomplete_transfer_stage(
+        &self,
+        session_id: VaultSessionId,
+        operation_id: Uuid,
+        expected_sha256_hex: &str,
+        expected_byte_len: u64,
+        max_bytes: usize,
+    ) -> Result<(), NativeTransferError> {
+        let expected_sha256 = myvault_core::Sha256Digest::parse(expected_sha256_hex)
+            .map_err(|_| NativeTransferError::InvalidRequest)?;
+        let app_data_root = self
+            .app_data_root
+            .as_deref()
+            .ok_or(NativeTransferError::PrivateStoreUnavailable)?;
+        let current = self
+            .session
+            .read()
+            .map_err(|_| NativeTransferError::VaultUnavailable)?;
+        let session = current
+            .as_ref()
+            .filter(|active| active.id == session_id)
+            .ok_or(NativeTransferError::VaultUnavailable)?;
+        let store = transfer::PrivateTransferStore::open(
+            app_data_root,
+            session.vault.root(),
+            session.vault_id,
+        )?;
+        store.discard_incomplete_stage(operation_id, &expected_sha256, expected_byte_len, max_bytes)
+    }
+
     /// Copies one local source into a verified private stage before any network
     /// upload starts, so the Vault lock is not held during remote I/O.
     ///
