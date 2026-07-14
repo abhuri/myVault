@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.provider.DocumentsContract
+import android.util.Base64
 import androidx.activity.result.ActivityResult
 import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
@@ -31,6 +32,14 @@ internal class SaveArgs {
     lateinit var text: String
     lateinit var expectedRevisionHex: String
     var expectedByteLen: Long = -1
+}
+
+@InvokeArg
+internal class BinaryWriteArgs {
+    lateinit var path: String
+    lateinit var bytesBase64: String
+    lateinit var sha256Hex: String
+    var byteLen: Long = -1
 }
 
 private data class Child(val documentId: String, val name: String, val mime: String, val size: Long)
@@ -229,6 +238,138 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
+    @Command
+    fun readBinary(invoke: Invoke) {
+        val path = try { canonicalPortablePath(invoke.parseArgs(PathArgs::class.java).path) }
+        catch (_: Exception) {
+            invoke.reject("Invalid transfer path", "INVALID_PATH")
+            return
+        }
+        try {
+            val response = synchronized(ioLock) {
+                val root = requireRoot()
+                val document = resolveDocument(root, path) ?: throw MissingException()
+                if (document.mime == DocumentsContract.Document.MIME_TYPE_DIR) throw MissingException()
+                binaryResponse(readBounded(root, document.documentId))
+            }
+            invoke.resolve(response)
+        } catch (_: MissingException) {
+            invoke.reject("Transfer object was not found", "NOTE_NOT_FOUND")
+        } catch (_: LimitException) {
+            invoke.reject("Transfer object exceeds the safety limit", "RESOURCE_LIMIT")
+        } catch (_: SecurityException) {
+            clearRoot()
+            invoke.reject("Vault permission is unavailable", "VAULT_UNAVAILABLE")
+        } catch (_: Exception) {
+            invoke.reject("Transfer object is unavailable", "VAULT_UNAVAILABLE")
+        }
+    }
+
+    @Command
+    fun createBinary(invoke: Invoke) {
+        writeBinary(invoke)
+    }
+
+    @Command
+    fun replaceBinary(invoke: Invoke) {
+        // SAF exposes neither atomic compare-and-swap nor a portable
+        // evacuation/no-replace sequence. R2 therefore never mutates an
+        // existing transfer target; R3 conflict handling owns that decision.
+        invoke.resolve(saveOutcome("unsupportedReplace"))
+    }
+
+    private fun writeBinary(invoke: Invoke) {
+        val args = try { invoke.parseArgs(BinaryWriteArgs::class.java) }
+        catch (_: Exception) {
+            invoke.resolve(saveOutcome("invalidRequest"))
+            return
+        }
+        val path = try { canonicalPortablePath(args.path) }
+        catch (_: Exception) {
+            invoke.resolve(saveOutcome("invalidRequest"))
+            return
+        }
+        val replacement = try { Base64.decode(args.bytesBase64, Base64.NO_WRAP) }
+        catch (_: Exception) {
+            invoke.resolve(saveOutcome("invalidRequest"))
+            return
+        }
+        if (replacement.size > MAX_TRANSFER_BYTES || replacement.size.toLong() != args.byteLen ||
+            !REVISION.matches(args.sha256Hex) || digest(replacement) != args.sha256Hex) {
+            invoke.resolve(saveOutcome("digestMismatch"))
+            return
+        }
+        try {
+            val response = synchronized(ioLock) {
+                val root = requireRoot()
+                createBinaryDocument(root, path, replacement)
+            }
+            invoke.resolve(response)
+        } catch (_: ExistingException) {
+            invoke.resolve(saveOutcome("alreadyExists"))
+        } catch (_: MissingException) {
+            invoke.resolve(saveOutcome("notFound"))
+        } catch (_: LimitException) {
+            invoke.resolve(saveOutcome("resourceLimit"))
+        } catch (_: UnknownWriteException) {
+            invoke.resolve(saveOutcome("writeOutcomeUnknown"))
+        } catch (_: SecurityException) {
+            clearRoot()
+            invoke.resolve(saveOutcome("writeOutcomeUnknown"))
+        } catch (_: Exception) {
+            invoke.resolve(saveOutcome("writeOutcomeUnknown"))
+        }
+    }
+
+    private fun createBinaryDocument(root: Uri, path: String, bytes: ByteArray): JSObject {
+        val parts = path.split('/')
+        var parentId = DocumentsContract.getTreeDocumentId(root)
+        for (component in parts.dropLast(1)) {
+            val matches = queryChildren(root, parentId).filter { it.name == component }
+            parentId = when {
+                matches.size > 1 -> throw UnknownWriteException()
+                matches.size == 1 && matches.single().mime == DocumentsContract.Document.MIME_TYPE_DIR -> matches.single().documentId
+                matches.size == 1 -> throw ExistingException()
+                else -> {
+                    val parentUri = DocumentsContract.buildDocumentUriUsingTree(root, parentId)
+                    val created = DocumentsContract.createDocument(
+                        resolver,
+                        parentUri,
+                        DocumentsContract.Document.MIME_TYPE_DIR,
+                        component,
+                    ) ?: throw UnknownWriteException()
+                    DocumentsContract.getDocumentId(created)
+                }
+            }
+        }
+        val name = parts.last()
+        if (queryChildren(root, parentId).any { it.name == name }) throw ExistingException()
+        val parentUri = DocumentsContract.buildDocumentUriUsingTree(root, parentId)
+        val created = DocumentsContract.createDocument(
+            resolver,
+            parentUri,
+            "application/octet-stream",
+            name,
+        ) ?: throw UnknownWriteException()
+        val documentId = DocumentsContract.getDocumentId(created)
+        writeAndVerify(root, documentId, bytes)
+        val matches = queryChildren(root, parentId).filter { it.name == name }
+        if (matches.size != 1 || matches.single().documentId != documentId) throw UnknownWriteException()
+        return savedBinaryResponse(bytes)
+    }
+
+    private fun writeAndVerify(root: Uri, documentId: String, bytes: ByteArray) {
+        val uri = DocumentsContract.buildDocumentUriUsingTree(root, documentId)
+        resolver.openFileDescriptor(uri, "rwt")?.use { descriptor ->
+            FileOutputStream(descriptor.fileDescriptor).use { output ->
+                output.write(bytes)
+                output.flush()
+                descriptor.fileDescriptor.sync()
+            }
+        } ?: throw MissingException()
+        if (!readBounded(root, documentId).contentEquals(bytes)) throw UnknownWriteException()
+    }
+
     private fun buildInventory(root: Uri): JSObject {
         val queue = ArrayDeque<PendingDirectory>()
         queue.add(PendingDirectory(DocumentsContract.getTreeDocumentId(root), "", 0))
@@ -302,7 +443,7 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
             while (true) {
                 val count = input.read(buffer)
                 if (count < 0) break
-                if (output.size() + count > MAX_NOTE_BYTES) throw LimitException()
+                if (output.size() + count > MAX_TRANSFER_BYTES) throw LimitException()
                 output.write(buffer, 0, count)
             }
             return output.toByteArray()
@@ -324,13 +465,31 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
+    private fun binaryResponse(bytes: ByteArray): JSObject = JSObject().apply {
+        put("bytesBase64", Base64.encodeToString(bytes, Base64.NO_WRAP))
+        put("revisionHex", digest(bytes))
+        put("byteLen", bytes.size.toLong())
+    }
+
+    private fun savedBinaryResponse(bytes: ByteArray): JSObject = JSObject().apply {
+        put("outcome", "saved")
+        put("revisionHex", digest(bytes))
+        put("byteLen", bytes.size.toLong())
+    }
+
     private fun saveOutcome(outcome: String): JSObject = JSObject().apply { put("outcome", outcome) }
 
     private fun canonicalNotePath(value: String): String {
+        val canonical = canonicalPortablePath(value)
+        if (!canonical.endsWith(".md", true)) throw IllegalArgumentException()
+        return canonical
+    }
+
+    private fun canonicalPortablePath(value: String): String {
         if (value.isEmpty() || value.startsWith('/') || value.contains('\\') || value.contains('\u0000')) throw IllegalArgumentException()
         val parts = value.split('/')
         if (parts.size > MAX_DEPTH || parts.any { it.isEmpty() || it == "." || it == ".." }) throw IllegalArgumentException()
-        if (!value.endsWith(".md", true) || isProtectedRootName(parts.first())) throw IllegalArgumentException()
+        if (isProtectedRootName(parts.first())) throw IllegalArgumentException()
         return parts.joinToString("/")
     }
 
@@ -364,12 +523,14 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
     private class MissingException : Exception()
     private class LimitException : Exception()
     private class StaleException : Exception()
+    private class ExistingException : Exception()
     private class UnknownWriteException : Exception()
     private class CharacterCodingException : Exception()
 
     companion object {
         private const val ROOT_KEY = "root-uri"
         private const val MAX_NOTE_BYTES = 16 * 1024 * 1024
+        private const val MAX_TRANSFER_BYTES = 16 * 1024 * 1024
         private const val MAX_ENTRIES = 5000
         private const val MAX_DEPTH = 64
         private val REVISION = Regex("^[0-9a-f]{64}$")

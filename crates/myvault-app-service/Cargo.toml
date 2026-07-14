@@ -7,7 +7,10 @@ license = "MIT"
 description = "Tauri-free safe application service boundary for myVault"
 
 [dependencies]
+cap-fs-ext = "4.0.2"
+cap-std = "4.0.2"
 myvault-core = { path = "../myvault-core" }
+myvault-private-fs = { path = "../myvault-private-fs" }
 myvault-snapshots = { path = "../myvault-snapshots" }
 serde = { version = "=1.0.228", features = ["derive"] }
 uuid = { version = "=1.20.0", features = ["serde", "v4", "v5"] }

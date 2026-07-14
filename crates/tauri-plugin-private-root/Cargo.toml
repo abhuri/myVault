@@ -11,6 +11,7 @@ cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
 myvault-private-fs = { path = "../myvault-private-fs" }
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 tauri = "2.11.3"
 
 [build-dependencies]
