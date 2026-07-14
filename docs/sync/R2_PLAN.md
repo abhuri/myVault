@@ -24,12 +24,18 @@ or stops at `NeedsReconcile` without silently overwriting another revisionค่
 - Normal transfer accepts Markdown and Drive blob files onlyค่ะ Google Workspace
   native MIME types, shortcuts, duplicate portable paths, protected paths, and
   ambiguous ancestry stop at a typed non-destructive outcomeค่ะ
-- R2 may create folders and files below a verified parent, initiate resumable
+- R2 may create files below a verified existing parent, initiate resumable
   uploads, upload chunks, query upload status, and download exact blob IDsค่ะ
+- Creating or restructuring remote folder hierarchies remains a guarded R3
+  mutation; R2 never infers a parent from a display pathค่ะ
 - R2 does not rename, move, Trash, permanently delete, change permissions, or
   mutate content/metadata of an existing remote object with different bytesค่ะ
   Existing same-byte objects are verified no-ops; differing bytes become
   `NeedsReconcile` for R3ค่ะ
+- Guarded local publication in R2 is create-no-replaceค่ะ An existing local
+  target is either verified as the same bytes or becomes `NeedsReconcile`;
+  cross-process/SAF replacement is deferred because neither platform can prove
+  an atomic compare-and-swap without risking a silent overwriteค่ะ
 - No personal Vault or unrelated Drive item is opened or content-readค่ะ
 
 ## Architecture
@@ -94,7 +100,7 @@ Pending
 
 Upload completion commits the exact remote ID/revision/hash, base reference,
 queue tombstone, and redacted history atomicallyค่ะ Download completion commits
-the exact local revision/hash, base reference, queue tombstone, and redacted
+the exact newly-created local revision/hash, base reference, queue tombstone, and redacted
 history only after guarded local publication and readback verificationค่ะ A
 Changes cursor cannot advance until every declared local mutation is committed
 and every remote transfer it depends on is verified completeค่ะ

@@ -161,6 +161,8 @@ In scope มีดังนี้ค่ะ
 - ต่อ local mutation observation เข้ากับ durable queue ค่ะ
 - Verified resumable upload พร้อม exact remote ID/hash reconciliation ค่ะ
 - Staged download ไป private temporary area, hash verification และ guarded local publication ค่ะ
+- R2 local publication เป็น create-no-replace; existing-different local content
+  หยุดที่ `NeedsReconcile` และการ replace ข้าม process/SAF อยู่ใน R3 ค่ะ
 - Markdown และ binary attachment transfer ค่ะ
 - Retry/backoff, auth expiry, offline pause/resume และ unknown-outcome reconciliation ค่ะ
 - Base object/revision capture ที่จำเป็นต่อ R3 conflicts ค่ะ

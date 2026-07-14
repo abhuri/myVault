@@ -55,8 +55,9 @@ live evidence must remain explicitly distinguishedค่ะ
   through bounded descriptor/native capabilitiesค่ะ
 - [ ] Downloaded bytes are staged under a private per-Vault root, fsynced,
   length/hash verified, and rechecked against remote metadata before publishค่ะ
-- [ ] Local publish is create-no-replace or replace-if-exact-revision and never
-  overwrites a stale targetค่ะ
+- [ ] Local publish is create-no-replaceค่ะ Existing same-byte targets are
+  verified no-ops; any existing different/stale target becomes
+  `NeedsReconcile` without replacementค่ะ
 - [ ] Publication outcome is verified by byte-for-byte readback; unsupported
   directory durability or unknown publication is reported truthfullyค่ะ
 - [ ] Base objects are immutable, content-addressed, private, and referenced only
