@@ -28,6 +28,8 @@ import {
   renderMermaidSources,
   VAULT_CHANGE_DEBOUNCE_MS,
 } from "./reader";
+import { SyncPanel } from "./SyncPanel";
+import { canOpenAnotherVault, SYNC_BUSY_VAULT_MESSAGE } from "./sync";
 import "./App.css";
 
 type VaultStatus = { active: boolean; sessionId: string | null };
@@ -215,6 +217,7 @@ function App() {
   const [entries, setEntries] = useState<ExplorerEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [opening, setOpening] = useState(false);
+  const [syncBusy, setSyncBusy] = useState(false);
   const [error, setError] = useState<string>();
   const [filter, setFilter] = useState("");
   const [activePath, setActivePath] = useState<string>();
@@ -329,6 +332,10 @@ function App() {
 
   const chooseVault = async () => {
     if (pickerPending.current || opening || saveInFlight.current) return;
+    if (!canOpenAnotherVault(syncBusy)) {
+      setError(SYNC_BUSY_VAULT_MESSAGE);
+      return;
+    }
     if (statusRef.current?.active && !["clean", "saved"].includes(saveRef.current.phase)) {
       setError("Save or reload the current note before opening another Vault.");
       return;
@@ -533,11 +540,11 @@ function App() {
         <section>
           <p className="section-label">LOCAL WORKSPACE</p>
           <h1>Open a folder as your Vault</h1>
-          <p>Your notes stay as ordinary Markdown files. This Demo does not connect to Google Drive yet.</p>
+          <p>Your notes stay as ordinary Markdown files. After opening a Vault, you can optionally connect Google Drive for read-only metadata browsing.</p>
           <button className="primary-button" disabled={opening} onClick={() => void chooseVault()} type="button">{opening ? "Opening…" : "Choose Vault folder"}</button>
           {error && <p className="inline-error" role="alert">{error}</p>}
         </section>
-        <small>Desktop prototype · No hosting · No account required</small>
+        <small>Local-first desktop · Optional Drive metadata access</small>
       </main>
     );
   }
@@ -549,7 +556,7 @@ function App() {
         <button className="active" aria-label="Files" onClick={openExplorerDrawer} type="button">F</button>
         <button aria-label="Quick switcher" onClick={openQuickSwitcher} type="button">Q</button>
         <button aria-label="Context" onClick={openContextDrawer} type="button">C</button>
-        <button className="rail-bottom" aria-label="Open another Vault" onClick={() => void chooseVault()} type="button">↗</button>
+        <button className="rail-bottom" aria-label="Open another Vault" disabled={!canOpenAnotherVault(syncBusy)} onClick={() => void chooseVault()} type="button">↗</button>
       </nav>
 
       <aside ref={explorerDrawerRef} className={leftDrawer ? "explorer-panel drawer-open" : "explorer-panel"} aria-label="File explorer" role={compactExplorer && leftDrawer ? "dialog" : undefined} aria-modal={compactExplorer && leftDrawer ? "true" : undefined} inert={quickOpen || (compactExplorer && !leftDrawer) || (compactDrawerOpen && !leftDrawer)} aria-hidden={quickOpen || (compactExplorer && !leftDrawer) || (compactDrawerOpen && !leftDrawer) || undefined} onKeyDown={(event) => { if (compactExplorer && leftDrawer) trapTab(event, explorerDrawerRef.current); }}>
@@ -567,7 +574,8 @@ function App() {
           <div className="mode-switch" aria-label="Document mode"><button className={mode === "edit" ? "active" : ""} onClick={() => setMode("edit")} type="button">Edit</button><button className={mode === "read" ? "active" : ""} onClick={() => setMode("read")} type="button">Read</button></div>
           <button className="compact-only" onClick={openContextDrawer} aria-label="Open note context" type="button">⋯</button>
         </header>
-        {error && <div className="workspace-alert" role="alert">{error}<button onClick={() => setError(undefined)} aria-label="Dismiss error" type="button">×</button></div>}
+        {error ? <div className="workspace-alert" role="alert">{error}<button onClick={() => setError(undefined)} aria-label="Dismiss error" type="button">×</button></div>
+          : syncBusy && <div className="workspace-notice" role="status">{SYNC_BUSY_VAULT_MESSAGE}</div>}
         {activePath ? (
           <div
             className="document-body"
@@ -598,6 +606,7 @@ function App() {
 
       <aside ref={contextDrawerRef} className={rightDrawer ? "context-panel drawer-open" : "context-panel"} aria-label="Note context" role={compactContext && rightDrawer ? "dialog" : undefined} aria-modal={compactContext && rightDrawer ? "true" : undefined} inert={quickOpen || (compactContext && !rightDrawer) || (compactDrawerOpen && !rightDrawer)} aria-hidden={quickOpen || (compactContext && !rightDrawer) || (compactDrawerOpen && !rightDrawer) || undefined} onKeyDown={(event) => { if (compactContext && rightDrawer) trapTab(event, contextDrawerRef.current); }}>
         <header><strong>CONTEXT</strong><button className="mobile-close" onClick={() => setRightDrawer(false)} aria-label="Close context" type="button">×</button></header>
+        <SyncPanel key={status.sessionId} sessionId={status.sessionId} onBusyChange={setSyncBusy} />
         <section><h2>Outline</h2>{outline.length ? <ol className="outline-list">{outline.map((item) => <li key={item.id} style={{ paddingLeft: `${(item.level - 1) * 10}px` }}>{item.text}</li>)}</ol> : <p className="panel-empty">Headings appear here.</p>}</section>
         <section><h2>Backlinks <span>{backlinks.length}</span></h2>{backlinks.length ? backlinks.map((path) => <button className="backlink" key={path} onClick={() => void openNote(path)} type="button">{noteLabel(path)}<small>{path}</small></button>) : <p className="panel-empty">Open linked notes to build local context.</p>}</section>
         <section className="graph-section"><h2>Opened-note graph</h2><KnowledgeGraph notes={notes} activePath={activePath} /></section>
