@@ -23,9 +23,9 @@ const FILE_FIELDS: &str =
     "id,name,mimeType,parents,trashed,version,md5Checksum,sha1Checksum,sha256Checksum";
 
 pub struct ReadOnlyDrive {
-    client: Client,
-    token: AccessToken,
-    api_base: Url,
+    pub(crate) client: Client,
+    pub(crate) token: AccessToken,
+    pub(crate) api_base: Url,
     max_response_bytes: usize,
 }
 
@@ -44,7 +44,7 @@ impl ReadOnlyDrive {
     /// Constructs the production client pinned to Google's Drive v3 origin.
     ///
     /// The adapter assumes the caller obtained a token with
-    /// `https://www.googleapis.com/auth/drive.metadata.readonly` and does not
+    /// `https://www.googleapis.com/auth/drive` and does not
     /// broaden or refresh that authorization.
     ///
     /// # Errors
@@ -62,7 +62,7 @@ impl ReadOnlyDrive {
         )
     }
 
-    fn build(
+    pub(crate) fn build(
         token: AccessToken,
         api_base: Url,
         max_response_bytes: usize,
@@ -292,7 +292,7 @@ impl ReadOnlyDrive {
         Ok(page)
     }
 
-    fn endpoint(&self, relative: &str) -> Result<Url> {
+    pub(crate) fn endpoint(&self, relative: &str) -> Result<Url> {
         if relative.is_empty() || relative.starts_with('/') || relative.contains(['?', '#']) {
             return Err(Error::new(ErrorCode::InvalidInput));
         }
@@ -306,7 +306,11 @@ impl ReadOnlyDrive {
         Ok(url)
     }
 
-    fn get_json<T: DeserializeOwned>(&self, url: Url, query: &[(&str, &str)]) -> Result<T> {
+    pub(crate) fn get_json<T: DeserializeOwned>(
+        &self,
+        url: Url,
+        query: &[(&str, &str)],
+    ) -> Result<T> {
         if url.origin() != self.api_base.origin() {
             return Err(Error::new(ErrorCode::UnexpectedOrigin));
         }
@@ -451,7 +455,7 @@ fn validate_changes_page(page: &ChangesPage) -> Result<()> {
     Ok(())
 }
 
-fn validate_identifier(value: &str) -> Result<()> {
+pub(crate) fn validate_identifier(value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > 256
         || !value

@@ -45,7 +45,7 @@ impl<R: Runtime> GoogleAuth<R> {
         })
     }
 
-    /// Requests a fresh native access token for the one exact R1 scope.
+    /// Requests a fresh native access token for the one exact R2 scope.
     pub fn fresh_access_token(&self) -> crate::Result<Authorization> {
         self.authorize(&[crate::GOOGLE_DRIVE_SCOPE])
     }
@@ -88,11 +88,13 @@ mod tests {
     use super::validate_scopes;
 
     #[test]
-    fn scope_allowlist_requires_exactly_one_readonly_metadata_scope() {
+    fn scope_allowlist_requires_exactly_one_full_drive_scope() {
         assert!(validate_scopes(&[crate::GOOGLE_DRIVE_SCOPE]).is_ok());
         assert!(validate_scopes(&[]).is_err());
         assert!(validate_scopes(&[crate::GOOGLE_DRIVE_SCOPE, crate::GOOGLE_DRIVE_SCOPE]).is_err());
-        assert!(validate_scopes(&["https://www.googleapis.com/auth/drive"]).is_err());
+        assert!(
+            validate_scopes(&["https://www.googleapis.com/auth/drive.metadata.readonly"]).is_err()
+        );
         assert!(validate_scopes(&[crate::GOOGLE_DRIVE_SCOPE, "openid"]).is_err());
     }
 }

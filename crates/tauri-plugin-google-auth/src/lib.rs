@@ -10,7 +10,7 @@ mod models;
 pub use error::{Error, Result};
 pub use models::{AccessToken, Authorization};
 
-pub const GOOGLE_DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.metadata.readonly";
+pub const GOOGLE_DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive";
 
 use mobile::GoogleAuth;
 

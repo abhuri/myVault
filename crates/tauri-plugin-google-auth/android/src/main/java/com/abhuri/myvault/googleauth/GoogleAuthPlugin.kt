@@ -36,7 +36,7 @@ internal class DisconnectArgs {
 
 @TauriPlugin
 class GoogleAuthPlugin(private val activity: Activity) : Plugin(activity) {
-    private val allowedScope = "https://www.googleapis.com/auth/drive.metadata.readonly"
+    private val allowedScope = "https://www.googleapis.com/auth/drive"
     private val authorizationClient = Identity.getAuthorizationClient(activity)
     private val operationInFlight = AtomicBoolean(false)
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -65,7 +65,7 @@ class GoogleAuthPlugin(private val activity: Activity) : Plugin(activity) {
         }
 
         if (args.scopes != listOf(allowedScope)) {
-            reject(invoke, "AUTH_INVALID_REQUEST", "Only the configured read-only Drive metadata scope is allowed")
+            reject(invoke, "AUTH_INVALID_REQUEST", "Only the configured full Drive scope is allowed")
             return
         }
 
