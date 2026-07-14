@@ -126,6 +126,11 @@ impl TransferIntent {
         if self.direction == TransferDirection::Download && self.remote_file_id.is_none() {
             return Err(Error::InvalidIntent);
         }
+        if self.direction == TransferDirection::Upload
+            && (self.expected_local_revision.is_none() || self.stage_ref.is_none())
+        {
+            return Err(Error::InvalidIntent);
+        }
         Ok(())
     }
 
