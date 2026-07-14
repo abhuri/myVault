@@ -64,6 +64,37 @@ fn hash(byte: u8) -> String {
     std::iter::repeat_n(char::from(byte), 64).collect()
 }
 
+#[test]
+fn exact_remote_entry_lookup_preserves_transfer_evidence() {
+    let fixture = Fixture::new();
+    let mut store = bound_store(&fixture);
+    store.begin_initial_scan("start-token", 2).unwrap();
+    let expected = RemoteEntry {
+        file_id: "remote-file".into(),
+        parent_id: "remote-root".into(),
+        path: "ภาษาไทย.bin".into(),
+        kind: RemoteEntryKind::File,
+        content_hash: Some(
+            RemoteContentHash::new(RemoteHashAlgorithm::Sha256, hash(b'a')).unwrap(),
+        ),
+        remote_revision: hash(b'b'),
+    };
+    store
+        .apply_scan_page(
+            None,
+            &ScanPage {
+                entries: vec![expected.clone()],
+                next_page_token: None,
+            },
+            3,
+        )
+        .unwrap();
+
+    assert_eq!(store.remote_entry("remote-file").unwrap(), Some(expected));
+    assert!(store.remote_entry("missing-file").unwrap().is_none());
+    assert!(store.remote_entry("../invalid").is_err());
+}
+
 fn upload(operation_id: Uuid, marker: &str) -> TransferRecord {
     TransferRecord::new(
         operation_id,

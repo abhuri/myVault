@@ -1,8 +1,9 @@
 use crate::{
     parse_uuid, u64_to_i64, validate_content_path, validate_private_reference,
     validate_redacted_code, validate_remote_id, validate_remote_token, validate_revision,
-    ChangesPage, Error, RemoteChange, RemoteEntry, RemoteEntryKind, Result, ScanPage, ScanRequest,
-    SyncPhase, VerifiedRemoteBinding, MAX_SCAN_FRONTIER_FOLDERS,
+    ChangesPage, Error, RemoteChange, RemoteContentHash, RemoteEntry, RemoteEntryKind,
+    RemoteHashAlgorithm, Result, ScanPage, ScanRequest, SyncPhase, VerifiedRemoteBinding,
+    MAX_SCAN_FRONTIER_FOLDERS,
 };
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
@@ -18,6 +19,16 @@ const VERSION_DIRECTORY: &str = "v1";
 const VAULTS_DIRECTORY: &str = "vaults";
 const LEASE_NAME: &str = "sync-operation.lock";
 const DATABASE_NAME: &str = "myvault-sync.sqlite3";
+
+type PersistedRemoteEntry = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+);
 
 const VAULT_STATE_SCHEMA_V1: &str = "CREATE TABLE vault_state (
     singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
@@ -1222,6 +1233,67 @@ impl SyncStore {
     /// Returns a database error or invalid count error.
     pub fn remote_entry_count(&self) -> Result<u64> {
         query_count(&self.connection, "SELECT COUNT(*) FROM remote_entries")
+    }
+
+    /// Reads one exact durable remote entry by provider file ID.
+    ///
+    /// # Errors
+    /// Rejects malformed identifiers or persisted metadata evidence.
+    pub fn remote_entry(&self, file_id: &str) -> Result<Option<RemoteEntry>> {
+        validate_remote_id(file_id)?;
+        let persisted: Option<PersistedRemoteEntry> = self
+            .connection
+            .query_row(
+                "SELECT file_id, parent_id, portable_path, kind,
+                        content_hash_algorithm, content_hash, remote_revision
+                 FROM remote_entries WHERE file_id = ?1",
+                [file_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((file_id, parent_id, path, kind, hash_algorithm, hash, remote_revision)) =
+            persisted
+        else {
+            return Ok(None);
+        };
+        let kind = match kind.as_str() {
+            "file" => RemoteEntryKind::File,
+            "folder" => RemoteEntryKind::Folder,
+            _ => return Err(Error::InvalidSchema),
+        };
+        let content_hash = match (hash_algorithm.as_deref(), hash) {
+            (None, None) => None,
+            (Some(algorithm), Some(hash)) => Some(RemoteContentHash::new(
+                match algorithm {
+                    "md5" => RemoteHashAlgorithm::Md5,
+                    "sha1" => RemoteHashAlgorithm::Sha1,
+                    "sha256" => RemoteHashAlgorithm::Sha256,
+                    _ => return Err(Error::InvalidSchema),
+                },
+                hash,
+            )?),
+            _ => return Err(Error::InvalidSchema),
+        };
+        let entry = RemoteEntry {
+            file_id,
+            parent_id,
+            path,
+            kind,
+            content_hash,
+            remote_revision,
+        };
+        entry.validate()?;
+        Ok(Some(entry))
     }
 
     /// Returns one bounded, deterministic remote metadata preview page.
