@@ -1,11 +1,13 @@
 package com.abhuri.myvault.vaultsaf
 
 import android.app.Activity
+import android.database.ContentObserver
 import android.content.Intent
 import android.net.Uri
 import android.provider.DocumentsContract
 import android.util.Base64
 import androidx.activity.result.ActivityResult
+import androidx.appcompat.app.AppCompatActivity
 import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
@@ -50,7 +52,13 @@ internal class BinaryWriteArgs {
     var byteLen: Long = -1
 }
 
-private data class Child(val documentId: String, val name: String, val mime: String, val size: Long)
+private data class Child(
+    val documentId: String,
+    val name: String,
+    val mime: String,
+    val size: Long,
+    val sizeKnown: Boolean,
+)
 private data class PendingDirectory(val documentId: String, val path: String, val depth: Int)
 
 internal fun isProtectedRootName(name: String): Boolean = name == ".trash" || name == ".obsidian"
@@ -73,12 +81,89 @@ internal fun stableRootIdentityHex(rootUri: String): String = MessageDigest
     .digest((ROOT_IDENTITY_DOMAIN + rootUri).toByteArray(StandardCharsets.UTF_8))
     .joinToString("") { "%02x".format(it) }
 
+internal data class SafChangeHint(val dirty: Boolean, val generation: Long)
+
+/**
+ * Coalesces any number of provider callbacks into one opaque dirty generation.
+ *
+ * This tracker intentionally carries no URI, document ID, display name, or
+ * content evidence. A successful bounded inventory consumes only the exact
+ * generation it observed, so a later callback cannot be cleared by an older
+ * scan.
+ */
+internal class SafDirtyGeneration {
+    private var dirty = false
+    private var generation = 0L
+
+    fun markDirty() {
+        if (dirty) return
+        generation = if (generation >= MAX_SAFE_GENERATION) 1 else generation + 1
+        dirty = true
+    }
+
+    fun resetForNewRoot() {
+        dirty = false
+        generation = 0
+        markDirty()
+    }
+
+    fun snapshot(): SafChangeHint = SafChangeHint(dirty, generation)
+
+    fun consume(observedGeneration: Long) {
+        if (dirty && observedGeneration == generation) dirty = false
+    }
+
+    companion object {
+        // Keep the value exact across the JSON bridge as well as Kotlin/Rust.
+        private const val MAX_SAFE_GENERATION = 9_007_199_254_740_991L
+    }
+}
+
 @TauriPlugin
 class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
     private val resolver = activity.applicationContext.contentResolver
     private val preferences = activity.applicationContext.getSharedPreferences("myvault-saf", 0)
     private val operationInFlight = AtomicBoolean(false)
     private val ioLock = Any()
+    private val dirtyGeneration = SafDirtyGeneration()
+    private var foreground = true
+    private var observedRootIdentity: String? = null
+    private var observerRegistered = false
+    private val contentObserver = object : ContentObserver(null) {
+        override fun onChange(selfChange: Boolean, uri: Uri?) {
+            synchronized(ioLock) {
+                // The callback URI is deliberately ignored. Registration is
+                // already scoped to the held tree capability, and only an
+                // opaque coalesced hint may cross the native bridge.
+                if (observedRootIdentity != null) dirtyGeneration.markDirty()
+            }
+        }
+    }
+
+    override fun onResume() {
+        synchronized(ioLock) {
+            foreground = true
+            val root = persistedRoot() ?: return@synchronized
+            // The observer is absent while paused, so resumption itself is a
+            // conservative dirty hint even when no callback was delivered.
+            dirtyGeneration.markDirty()
+            ensureObserver(root)
+        }
+    }
+
+    override fun onPause() {
+        synchronized(ioLock) {
+            foreground = false
+            unregisterObserver()
+        }
+    }
+
+    override fun onDestroy(activity: AppCompatActivity) {
+        synchronized(ioLock) {
+            foreground = false
+            unregisterObserver()
+        }
+    }
 
     @Command
     fun status(invoke: Invoke) {
@@ -87,6 +172,7 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
                 val root = persistedRoot() ?: return@synchronized inactiveRootResponse()
                 DocumentsContract.getTreeDocumentId(root)
                 queryChildren(root, DocumentsContract.getTreeDocumentId(root))
+                ensureObserver(root)
                 activeRootResponse(root)
             } catch (_: Exception) {
                 clearRoot()
@@ -152,6 +238,7 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
                     throw IllegalStateException("root preference was not persisted")
                 }
                 activationCommitted = true
+                activateObserver(uri)
                 if (previousRoot != null && previousRoot != uri) releasePermissionQuietly(previousRoot)
                 JSObject().apply {
                     put("outcome", "activated")
@@ -173,7 +260,15 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
             return
         }
         try {
-            val response = synchronized(ioLock) { buildInventory(requireRoot(expectedRootIdentity)) }
+            val response = synchronized(ioLock) {
+                val root = requireRoot(expectedRootIdentity)
+                ensureObserver(root)
+                val hint = dirtyGeneration.snapshot()
+                val inventory = buildInventory(root)
+                dirtyGeneration.consume(hint.generation)
+                inventory.put("changeGeneration", hint.generation)
+                inventory
+            }
             invoke.resolve(response)
         } catch (_: RootMismatchException) {
             invoke.reject("Vault capability is stale", "VAULT_UNAVAILABLE")
@@ -184,6 +279,30 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.reject("Vault inventory exceeds the safety limit", "RESOURCE_LIMIT")
         } catch (_: Exception) {
             invoke.reject("Vault inventory is unavailable", "VAULT_UNAVAILABLE")
+        }
+    }
+
+    @Command
+    fun changeHint(invoke: Invoke) {
+        val expectedRootIdentity = try { invoke.parseArgs(RootArgs::class.java).expectedRootIdentityHex }
+        catch (_: Exception) {
+            invoke.reject("Vault capability is invalid", "VAULT_UNAVAILABLE")
+            return
+        }
+        try {
+            val response = synchronized(ioLock) {
+                val root = requireRoot(expectedRootIdentity)
+                ensureObserver(root)
+                changeHintResponse(dirtyGeneration.snapshot())
+            }
+            invoke.resolve(response)
+        } catch (_: RootMismatchException) {
+            invoke.reject("Vault capability is stale", "VAULT_UNAVAILABLE")
+        } catch (_: SecurityException) {
+            clearRootIfMatches(expectedRootIdentity)
+            invoke.reject("Vault permission is unavailable", "VAULT_UNAVAILABLE")
+        } catch (_: Exception) {
+            invoke.reject("Vault change hint is unavailable", "VAULT_UNAVAILABLE")
         }
     }
 
@@ -442,6 +561,7 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
                     entry.put("path", path)
                     entry.put("kind", if (path.endsWith(".md", true)) "markdown" else "file")
                     entry.put("byteLen", child.size.coerceAtLeast(0))
+                    entry.put("byteLenKnown", child.sizeKnown)
                     entries.add(entry)
                 }
             }
@@ -468,7 +588,16 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
         val children = mutableListOf<Child>()
         resolver.query(uri, projection, null, null, null)?.use { cursor ->
             while (cursor.moveToNext()) {
-                children.add(Child(cursor.getString(0), cursor.getString(1) ?: "", cursor.getString(2) ?: "", if (cursor.isNull(3)) 0 else cursor.getLong(3)))
+                val sizeKnown = !cursor.isNull(3)
+                children.add(
+                    Child(
+                        cursor.getString(0),
+                        cursor.getString(1) ?: "",
+                        cursor.getString(2) ?: "",
+                        if (sizeKnown) cursor.getLong(3) else 0,
+                        sizeKnown,
+                    ),
+                )
             }
         } ?: throw SecurityException("query failed")
         return children
@@ -530,6 +659,11 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
 
     private fun saveOutcome(outcome: String): JSObject = JSObject().apply { put("outcome", outcome) }
 
+    private fun changeHintResponse(hint: SafChangeHint): JSObject = JSObject().apply {
+        put("dirty", hint.dirty)
+        put("generation", hint.generation)
+    }
+
     private fun canonicalNotePath(value: String): String {
         val canonical = canonicalPortablePath(value)
         if (!canonical.endsWith(".md", true)) throw IllegalArgumentException()
@@ -557,6 +691,41 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
             )
         } catch (_: Exception) {
             // Best effort only: activation state already has an authoritative root.
+        }
+    }
+
+    private fun activateObserver(root: Uri) {
+        unregisterObserver()
+        dirtyGeneration.resetForNewRoot()
+        ensureObserver(root)
+    }
+
+    private fun ensureObserver(root: Uri) {
+        if (!foreground) return
+        val identity = rootIdentity(root)
+        if (observerRegistered && observedRootIdentity == identity) return
+        unregisterObserver()
+        observedRootIdentity = identity
+        try {
+            resolver.registerContentObserver(root, true, contentObserver)
+            observerRegistered = true
+        } catch (_: Exception) {
+            // Manual/startup inventory remains authoritative. Leave the dirty
+            // latch set and retry registration on the next native operation.
+            observedRootIdentity = null
+            observerRegistered = false
+        }
+    }
+
+    private fun unregisterObserver() {
+        observedRootIdentity = null
+        if (!observerRegistered) return
+        try {
+            resolver.unregisterContentObserver(contentObserver)
+        } catch (_: Exception) {
+            // The identity guard above makes any queued callback inert.
+        } finally {
+            observerRegistered = false
         }
     }
 
@@ -593,7 +762,10 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
-    private fun clearRoot() { preferences.edit().remove(ROOT_KEY).commit() }
+    private fun clearRoot() {
+        unregisterObserver()
+        preferences.edit().remove(ROOT_KEY).commit()
+    }
     private fun digest(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
 
     private class MissingException : Exception()

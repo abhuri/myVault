@@ -95,11 +95,44 @@ fn stage_round_trip_and_immutable_base_are_exact_and_restart_safe() {
     drop(store);
 
     let reopened = fixture.store(vault_id);
-    let loaded = reopened
-        .load_verified_stage(operation_id, &sha256(bytes), bytes.len() as u64)
+    assert!(matches!(
+        reopened.load_verified_stage(operation_id, &sha256(bytes), bytes.len() as u64),
+        Err(TransferStoreError::StageUnavailable)
+    ));
+    assert_eq!(
+        fs::read(fixture.object_path(vault_id, &sha256(bytes))).unwrap(),
+        bytes
+    );
+}
+
+#[test]
+fn crash_after_base_link_resumes_and_removes_stage_without_copying() {
+    let fixture = Fixture::new();
+    let vault_id = Uuid::new_v4();
+    let operation_id = Uuid::new_v4();
+    let bytes = b"linked crash evidence";
+    let digest = sha256(bytes);
+    let store = fixture.store(vault_id);
+    let stage = verified_stage(&store, operation_id, bytes);
+    fs::hard_link(
+        fixture.stage_path(vault_id, operation_id),
+        fixture.object_path(vault_id, &digest),
+    )
+    .unwrap();
+    drop(stage);
+    drop(store);
+
+    let reopened = fixture.store(vault_id);
+    let recovered = reopened
+        .load_verified_stage(operation_id, &digest, bytes.len() as u64)
         .unwrap();
-    assert_eq!(reopened.read_verified_stage(&loaded).unwrap(), bytes);
-    assert_eq!(reopened.publish_base(&loaded).unwrap(), base);
+    let base = reopened.publish_base(&recovered).unwrap();
+    assert_eq!(base.opaque_ref(), format!("sha256-{digest}"));
+    assert!(!fixture.stage_path(vault_id, operation_id).exists());
+    assert_eq!(
+        fs::read(fixture.object_path(vault_id, &digest)).unwrap(),
+        bytes
+    );
 }
 
 #[test]

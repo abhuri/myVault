@@ -17,5 +17,6 @@ android {
 dependencies {
     implementation(project(":tauri-android"))
     compileOnly("androidx.activity:activity:1.6.0") { isTransitive = false }
+    compileOnly("androidx.appcompat:appcompat:1.6.0") { isTransitive = false }
     testImplementation("junit:junit:4.13.2")
 }

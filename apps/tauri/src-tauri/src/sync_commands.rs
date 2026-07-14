@@ -184,6 +184,28 @@ fn map_drive_error(error: myvault_drive::Error) -> SyncCommandError {
     }
 }
 
+fn map_drive_with_rescan<T>(
+    store: &mut myvault_sync_engine::SyncStore,
+    result: myvault_drive::Result<T>,
+) -> Result<T, SyncCommandError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error)
+            if matches!(
+                error.code(),
+                DriveErrorCode::CursorExpired | DriveErrorCode::CursorAmbiguous
+            ) =>
+        {
+            let mapped = map_drive_error(error);
+            store
+                .mark_rescan_required(now_unix_ms()?)
+                .map_err(map_sync_error)?;
+            Err(mapped)
+        }
+        Err(error) => Err(map_drive_error(error)),
+    }
+}
+
 fn map_sync_error(error: myvault_sync_engine::Error) -> SyncCommandError {
     use myvault_sync_engine::Error;
     match error {
@@ -1030,6 +1052,7 @@ mod platform {
         Ok(registered)
     }
 
+    #[derive(Debug)]
     struct IncrementalBatch {
         batch_id: Uuid,
         final_page: bool,
@@ -1065,7 +1088,7 @@ mod platform {
                 "Drive metadata must have a durable cursor before transfer",
             )
         })?;
-        let page = read_only.changes_page(cursor).map_err(map_drive_error)?;
+        let page = map_drive_with_rescan(store, read_only.changes_page(cursor))?;
         let next_cursor = page
             .next_page_token
             .as_deref()
@@ -1081,12 +1104,12 @@ mod platform {
 
         for raw in &page.changes {
             let known = store.remote_entry(&raw.file_id).map_err(map_sync_error)?;
-            match read_only
-                .resolve_change_below_root(root_id, raw)
-                .map_err(map_drive_error)?
-            {
+            match map_drive_with_rescan(store, read_only.resolve_change_below_root(root_id, raw))? {
                 ResolvedDriveChange::Removed { .. } | ResolvedDriveChange::OutsideBoundRoot => {
                     if known.is_some() {
+                        store
+                            .mark_rescan_required(now_unix_ms()?)
+                            .map_err(map_sync_error)?;
                         return Err(SyncCommandError::new(
                             SyncCommandCode::RescanRequired,
                             "remote move or removal requires explicit reconciliation",
@@ -1094,11 +1117,23 @@ mod platform {
                     }
                 }
                 ResolvedDriveChange::Inside(entry) => {
+                    if !myvault_sync_engine::is_valid_sync_content_path(&entry.path) {
+                        store
+                            .mark_rescan_required(now_unix_ms()?)
+                            .map_err(map_sync_error)?;
+                        return Err(SyncCommandError::new(
+                            SyncCommandCode::RescanRequired,
+                            "protected or invalid remote paths require explicit reconciliation",
+                        ));
+                    }
                     if let Some(previous) = known.as_ref() {
                         if previous.path != entry.path
                             || previous.parent_id != entry.parent_id
                             || previous.kind != entry.kind
                         {
+                            store
+                                .mark_rescan_required(now_unix_ms()?)
+                                .map_err(map_sync_error)?;
                             return Err(SyncCommandError::new(
                                 SyncCommandCode::RescanRequired,
                                 "remote move or rename requires explicit reconciliation",
@@ -1156,6 +1191,19 @@ mod platform {
         }
 
         let local_entries = collect_local_entries(service, session_id)?;
+        let mut exact_remote_paths = BTreeSet::new();
+        if merged_remote_paths
+            .values()
+            .any(|path| !exact_remote_paths.insert(path.as_str()))
+        {
+            store
+                .mark_rescan_required(now_unix_ms()?)
+                .map_err(map_sync_error)?;
+            return Err(SyncCommandError::new(
+                SyncCommandCode::RescanRequired,
+                "duplicate remote paths require explicit reconciliation",
+            ));
+        }
         reject_portable_path_collisions(
             merged_remote_paths
                 .values()
@@ -2185,6 +2233,93 @@ mod platform {
         }
 
         #[test]
+        fn expired_incremental_cursor_is_durably_invalidated_before_returning() {
+            let temporary = tempfile::tempdir().expect("temporary roots");
+            let base = temporary.path().canonicalize().expect("canonical root");
+            let app_data = base.join("app-data");
+            let vault_root = base.join("vault");
+            std::fs::create_dir(&app_data).expect("app data root");
+            std::fs::create_dir(&vault_root).expect("vault root");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&app_data, std::fs::Permissions::from_mode(0o700))
+                    .expect("private app data permissions");
+            }
+            let service = AppService::with_app_data_root(&app_data);
+            let session_id = service
+                .activate_trusted_vault(
+                    Vault::open(vault_root.canonicalize().expect("canonical vault"))
+                        .expect("open vault"),
+                )
+                .expect("activate vault")
+                .session_id
+                .expect("session");
+            let context = service.native_vault_context(session_id).expect("context");
+            let mut store = SyncStore::open(
+                context.app_data_root().expect("app data"),
+                context.vault_root(),
+                context.vault_id(),
+            )
+            .expect("sync store");
+            let binding = myvault_sync_engine::VerifiedRemoteBinding::new(
+                "account_1",
+                "root_1",
+                "account_1",
+                "root_1",
+            )
+            .expect("binding");
+            store.bind_remote_root(&binding, 1).expect("bind");
+            let mut initial = EmptyInitialDrive;
+            for now in 2..=4 {
+                advance_initial_sync(&mut store, &mut initial, now).expect("initial step");
+            }
+
+            let mut server = mockito::Server::new();
+            let about = server
+                .mock("GET", "/drive/v3/about")
+                .match_query(mockito::Matcher::Any)
+                .with_body(r#"{"user":{"permissionId":"account_1"}}"#)
+                .create();
+            let root = server
+                .mock("GET", "/drive/v3/files/root_1")
+                .match_query(mockito::Matcher::Any)
+                .with_body(
+                    r#"{"id":"root_1","name":"Fixture","mimeType":"application/vnd.google-apps.folder","parents":[],"trashed":false,"version":"1"}"#,
+                )
+                .create();
+            let changes = server
+                .mock("GET", "/drive/v3/changes")
+                .match_query(mockito::Matcher::Any)
+                .with_status(410)
+                .create();
+            let origin = server.url();
+            let read_only = ReadOnlyDrive::for_test_origin(&format!("{origin}/drive/v3/"), 4096)
+                .expect("read-only test Drive");
+            let transfer = TransferDrive::for_test_origins(
+                &format!("{origin}/drive/v3/"),
+                &format!("{origin}/upload/drive/v3/"),
+                "account_1",
+                "root_1",
+                myvault_transfer::MAX_TRANSFER_BYTES,
+            )
+            .expect("transfer test Drive");
+
+            let error = prepare_incremental_change_batch(
+                &service, session_id, &mut store, &read_only, &transfer, "root_1",
+            )
+            .expect_err("expired cursor");
+            assert_eq!(error.code, SyncCommandCode::RescanRequired);
+            let state = store.vault_state().unwrap().unwrap();
+            assert_eq!(state.phase, SyncPhase::NeedStartToken);
+            assert!(state.rescan_required);
+            assert!(state.durable_cursor.is_none());
+            about.assert();
+            root.assert();
+            changes.assert();
+        }
+
+        #[test]
         fn incremental_download_publishes_exact_base_before_advancing_cursor() {
             const SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
             const REMOTE_REVISION: &str =
@@ -2377,6 +2512,7 @@ mod platform {
 #[cfg(target_os = "android")]
 mod platform {
     use super::*;
+    use crate::android_transfer_policy::ANDROID_MAX_TRANSFER_BYTES;
     use crate::android_transfer_runtime::{
         AndroidPrivateStoreAdapter, AndroidSafVaultIo, AndroidTransferExecutor,
     };
@@ -2390,11 +2526,12 @@ mod platform {
         TransferDirection, TransferMimeClass, TransferPhase, TransferRecord,
         TransferRegistrationOutcome, VaultSyncState,
     };
-    use myvault_transfer::{WorkOutcome, Worker, MAX_TRANSFER_BYTES};
+    use myvault_transfer::{WorkOutcome, Worker};
     use std::{
         collections::{BTreeMap, BTreeSet},
         sync::{Arc, Mutex},
     };
+    use tauri::Manager;
     use tauri_plugin_google_auth::{Authorization, GoogleAuthExt};
     use tauri_plugin_private_root::PrivateRootExt;
     use tauri_plugin_vault_saf::{SafEntry, SafVaultCapability, VaultSafExt};
@@ -2439,8 +2576,23 @@ mod platform {
                 .ok_or_else(SyncCommandError::internal)
         }
 
-        fn restore(mut self) -> Result<(), SyncCommandError> {
-            self.restore_inner()
+        fn discard_store(&mut self) -> Result<(), SyncCommandError> {
+            let session_id = self
+                .active
+                .as_ref()
+                .map(|active| active.session_id)
+                .ok_or_else(SyncCommandError::internal)?;
+            drop(self.active.take());
+            let mut state = self
+                .runtime
+                .inner
+                .lock()
+                .map_err(|_| SyncCommandError::internal())?;
+            if state.active.is_some() || state.transfer_running_session != Some(session_id) {
+                return Err(SyncCommandError::internal());
+            }
+            state.transfer_running_session = None;
+            Ok(())
         }
 
         fn restore_inner(&mut self) -> Result<(), SyncCommandError> {
@@ -2473,6 +2625,23 @@ mod platform {
     ) -> Result<VaultSessionId, SyncCommandError> {
         let requested = parse_session_id(session_id)?;
         android_session_id(session, requested).map_err(map_app_error)
+    }
+
+    fn with_current_session<T>(
+        app: &tauri::AppHandle,
+        session_id: VaultSessionId,
+        vault: &SafVaultCapability,
+        operation: impl FnOnce() -> Result<T, SyncCommandError>,
+    ) -> Result<T, SyncCommandError> {
+        let session = app.state::<AndroidVaultSession>();
+        let current = android_vault_capability(&session, session_id).map_err(map_app_error)?;
+        if current != *vault {
+            return Err(SyncCommandError::new(
+                SyncCommandCode::StaleSession,
+                "the local vault session is stale",
+            ));
+        }
+        with_android_session_lease(&session, session_id, operation).map_err(map_app_error)?
     }
 
     fn ensure_store<'a>(
@@ -2740,7 +2909,10 @@ mod platform {
                     .transfer(record.operation_id)
                     .map_err(map_sync_error)?
                     .ok_or_else(SyncCommandError::internal)?;
-                if existing.phase == TransferPhase::NeedsReconcile {
+                if existing.phase == TransferPhase::NeedsReconcile
+                    && existing.last_error_code.as_deref()
+                        != Some("android_local_publication_unknown")
+                {
                     store
                         .requeue_transfer_for_reconciliation(
                             record.operation_id,
@@ -2785,7 +2957,7 @@ mod platform {
         let reconciliation_time = now_unix_ms()?;
 
         for local in local_entries {
-            if local.byte_len > MAX_TRANSFER_BYTES {
+            if local.byte_len_known && local.byte_len > ANDROID_MAX_TRANSFER_BYTES as u64 {
                 return Err(SyncCommandError::new(
                     SyncCommandCode::InvalidRequest,
                     "a local file exceeds the guarded transfer size limit",
@@ -2793,7 +2965,7 @@ mod platform {
             }
             let binary = app
                 .vault_saf()
-                .read_binary(vault, &local.path, MAX_TRANSFER_BYTES as usize)
+                .read_binary(vault, &local.path, ANDROID_MAX_TRANSFER_BYTES)
                 .map_err(|_| {
                     SyncCommandError::new(
                         SyncCommandCode::StorageUnavailable,
@@ -2802,7 +2974,9 @@ mod platform {
                 })?;
             let digest = myvault_core::Sha256Digest::from_bytes(&binary.bytes);
             let revision = myvault_core::FileRevision::from_bytes(&binary.bytes);
-            if binary.byte_len != local.byte_len || binary.revision_hex != revision.hex {
+            if (local.byte_len_known && binary.byte_len != local.byte_len)
+                || binary.revision_hex != revision.hex
+            {
                 return Err(SyncCommandError::new(
                     SyncCommandCode::StorageUnavailable,
                     "exact local transfer evidence is unavailable",
@@ -2895,6 +3069,12 @@ mod platform {
                     &durable.remote_revision,
                 )
                 .map_err(map_drive_error)?;
+            if candidate.size() > ANDROID_MAX_TRANSFER_BYTES as u64 {
+                return Err(SyncCommandError::new(
+                    SyncCommandCode::InvalidRequest,
+                    "a remote file exceeds the Android guarded transfer size limit",
+                ));
+            }
             let operation_id = transfer_operation_id(&[
                 "download",
                 &remote.path,
@@ -2963,7 +3143,7 @@ mod platform {
                 "Drive metadata must have a durable cursor before transfer",
             )
         })?;
-        let page = read_only.changes_page(cursor).map_err(map_drive_error)?;
+        let page = map_drive_with_rescan(store, read_only.changes_page(cursor))?;
         let next_cursor = page
             .next_page_token
             .as_deref()
@@ -2979,12 +3159,12 @@ mod platform {
 
         for raw in &page.changes {
             let known = store.remote_entry(&raw.file_id).map_err(map_sync_error)?;
-            match read_only
-                .resolve_change_below_root(root_id, raw)
-                .map_err(map_drive_error)?
-            {
+            match map_drive_with_rescan(store, read_only.resolve_change_below_root(root_id, raw))? {
                 ResolvedDriveChange::Removed { .. } | ResolvedDriveChange::OutsideBoundRoot => {
                     if known.is_some() {
+                        store
+                            .mark_rescan_required(now_unix_ms()?)
+                            .map_err(map_sync_error)?;
                         return Err(SyncCommandError::new(
                             SyncCommandCode::RescanRequired,
                             "remote move or removal requires explicit reconciliation",
@@ -2992,11 +3172,23 @@ mod platform {
                     }
                 }
                 ResolvedDriveChange::Inside(entry) => {
+                    if !myvault_sync_engine::is_valid_sync_content_path(&entry.path) {
+                        store
+                            .mark_rescan_required(now_unix_ms()?)
+                            .map_err(map_sync_error)?;
+                        return Err(SyncCommandError::new(
+                            SyncCommandCode::RescanRequired,
+                            "protected or invalid remote paths require explicit reconciliation",
+                        ));
+                    }
                     if let Some(previous) = known.as_ref() {
                         if previous.path != entry.path
                             || previous.parent_id != entry.parent_id
                             || previous.kind != entry.kind
                         {
+                            store
+                                .mark_rescan_required(now_unix_ms()?)
+                                .map_err(map_sync_error)?;
                             return Err(SyncCommandError::new(
                                 SyncCommandCode::RescanRequired,
                                 "remote move or rename requires explicit reconciliation",
@@ -3018,6 +3210,12 @@ mod platform {
                                 &entry.remote_revision,
                             )
                             .map_err(map_drive_error)?;
+                        if candidate.size() > ANDROID_MAX_TRANSFER_BYTES as u64 {
+                            return Err(SyncCommandError::new(
+                                SyncCommandCode::InvalidRequest,
+                                "a remote file exceeds the Android guarded transfer size limit",
+                            ));
+                        }
                         let operation_id = transfer_operation_id(&[
                             "download",
                             &entry.path,
@@ -3052,6 +3250,19 @@ mod platform {
             }
         }
         let local = android_inventory(app, vault)?;
+        let mut exact_remote_paths = BTreeSet::new();
+        if merged_remote_paths
+            .values()
+            .any(|path| !exact_remote_paths.insert(path.as_str()))
+        {
+            store
+                .mark_rescan_required(now_unix_ms()?)
+                .map_err(map_sync_error)?;
+            return Err(SyncCommandError::new(
+                SyncCommandCode::RescanRequired,
+                "duplicate remote paths require explicit reconciliation",
+            ));
+        }
         reject_portable_path_collisions(
             merged_remote_paths
                 .values()
@@ -3080,7 +3291,9 @@ mod platform {
                 .transfer(operation_id)
                 .map_err(map_sync_error)?
                 .ok_or_else(SyncCommandError::internal)?;
-            if transfer.phase == TransferPhase::NeedsReconcile {
+            if transfer.phase == TransferPhase::NeedsReconcile
+                && transfer.last_error_code.as_deref() != Some("android_local_publication_unknown")
+            {
                 store
                     .requeue_transfer_for_reconciliation(
                         operation_id,
@@ -3092,12 +3305,18 @@ mod platform {
         Ok(())
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum GuardedWorkerOutcome {
+        Drained,
+        AuthRequired,
+    }
+
     fn run_guarded_worker(
         app: &tauri::AppHandle,
         vault: &SafVaultCapability,
         store: &mut SyncStore,
         drive: TransferDrive,
-    ) -> Result<(), SyncCommandError> {
+    ) -> Result<GuardedWorkerOutcome, SyncCommandError> {
         let private = app
             .native_no_backup_root()
             .map_err(|_| {
@@ -3124,13 +3343,72 @@ mod platform {
                 .run_once(now_unix_ms()?)
                 .map_err(|_| SyncCommandError::internal())?
             {
-                WorkOutcome::Idle | WorkOutcome::AuthRequired(_) => return Ok(()),
+                WorkOutcome::Idle => return Ok(GuardedWorkerOutcome::Drained),
                 WorkOutcome::Completed(_)
                 | WorkOutcome::RetryScheduled(_)
                 | WorkOutcome::NeedsReconcile(_) => {}
+                WorkOutcome::AuthRequired(_) => {
+                    return Ok(GuardedWorkerOutcome::AuthRequired);
+                }
             }
         }
-        Ok(())
+        Ok(GuardedWorkerOutcome::Drained)
+    }
+
+    fn refresh_run_authorization_once(
+        app: &tauri::AppHandle,
+        expected_account_id: &str,
+        authorization: &mut Authorization,
+        refresh_attempted: &mut bool,
+    ) -> Result<bool, SyncCommandError> {
+        if *refresh_attempted {
+            return Ok(false);
+        }
+        *refresh_attempted = true;
+        let refreshed = app.google_auth().fresh_access_token().map_err(|_| {
+            SyncCommandError::new(
+                SyncCommandCode::AuthRequired,
+                "Google authorization could not be refreshed",
+            )
+        })?;
+        let observed = drive_from(&refreshed)?
+            .account_identity()
+            .map_err(map_drive_error)?;
+        exact_account(Some(expected_account_id), &observed.permission_id)?;
+        *authorization = refreshed;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_guarded_worker_with_auth_refresh(
+        app: &tauri::AppHandle,
+        vault: &SafVaultCapability,
+        store: &mut SyncStore,
+        account_id: &str,
+        root_id: &str,
+        authorization: &mut Authorization,
+        refresh_attempted: &mut bool,
+    ) -> Result<GuardedWorkerOutcome, SyncCommandError> {
+        let first = run_guarded_worker(
+            app,
+            vault,
+            store,
+            transfer_drive_from(authorization, account_id, root_id)?,
+        )?;
+        if first != GuardedWorkerOutcome::AuthRequired
+            || !refresh_run_authorization_once(app, account_id, authorization, refresh_attempted)?
+        {
+            return Ok(first);
+        }
+        store
+            .resume_auth_required_transfers(now_unix_ms()?)
+            .map_err(map_sync_error)?;
+        run_guarded_worker(
+            app,
+            vault,
+            store,
+            transfer_drive_from(authorization, account_id, root_id)?,
+        )
     }
 
     #[tauri::command(rename_all = "camelCase")]
@@ -3142,34 +3420,34 @@ mod platform {
     ) -> Result<SyncStatusDto, SyncCommandError> {
         let session_id = validate_session(&session, &session_id)?;
         let vault = android_vault_capability(&session, session_id).map_err(map_app_error)?;
-        let mut state = runtime
-            .inner
-            .lock()
-            .map_err(|_| SyncCommandError::internal())?;
-        let (persisted, transfers) = {
-            let store = ensure_store(&app, &mut state, session_id, &vault)?;
-            (
-                store.vault_state().map_err(map_sync_error)?,
-                store.transfer_summary().map_err(map_sync_error)?,
-            )
-        };
-        Ok(android_status(
-            session_id,
-            &state,
-            persisted.as_ref(),
-            transfers,
-        ))
+        with_android_session_lease(&session, session_id, || {
+            let mut state = runtime
+                .inner
+                .lock()
+                .map_err(|_| SyncCommandError::internal())?;
+            let (persisted, transfers) = {
+                let store = ensure_store(&app, &mut state, session_id, &vault)?;
+                (
+                    store.vault_state().map_err(map_sync_error)?,
+                    store.transfer_summary().map_err(map_sync_error)?,
+                )
+            };
+            Ok(android_status(
+                session_id,
+                &state,
+                persisted.as_ref(),
+                transfers,
+            ))
+        })
+        .map_err(map_app_error)?
     }
 
-    #[tauri::command(rename_all = "camelCase")]
-    pub fn sync_connect(
+    fn sync_connect_impl(
         app: tauri::AppHandle,
-        session: tauri::State<'_, AndroidVaultSession>,
-        runtime: tauri::State<'_, Arc<SyncRuntime>>,
-        session_id: String,
+        runtime: Arc<SyncRuntime>,
+        requested: VaultSessionId,
+        vault: SafVaultCapability,
     ) -> Result<SyncStatusDto, SyncCommandError> {
-        let requested = parse_session_id(&session_id)?;
-        let vault = android_vault_capability(&session, requested).map_err(map_app_error)?;
         let persisted_account = {
             let mut state = runtime
                 .inner
@@ -3189,30 +3467,111 @@ mod platform {
         let drive = drive_from(&authorization)?;
         let account = drive.account_identity().map_err(map_drive_error)?;
         exact_account(persisted_account.as_deref(), &account.permission_id)?;
-        android_vault_capability(&session, requested).map_err(map_app_error)?;
-        let mut state = runtime
-            .inner
-            .lock()
-            .map_err(|_| SyncCommandError::internal())?;
-        state.account_id = Some(account.permission_id);
-        state.authorization = Some(authorization);
-        let (persisted, transfers) = {
-            let store = ensure_store(&app, &mut state, requested, &vault)?;
-            (
-                store.vault_state().map_err(map_sync_error)?,
-                store.transfer_summary().map_err(map_sync_error)?,
-            )
-        };
-        Ok(android_status(
-            requested,
-            &state,
-            persisted.as_ref(),
-            transfers,
-        ))
+        let finalized = with_current_session(&app, requested, &vault, || {
+            let mut state = runtime
+                .inner
+                .lock()
+                .map_err(|_| SyncCommandError::internal())?;
+            let (persisted, transfers) = {
+                let store = ensure_store(&app, &mut state, requested, &vault)?;
+                (
+                    store.vault_state().map_err(map_sync_error)?,
+                    store.transfer_summary().map_err(map_sync_error)?,
+                )
+            };
+            state.account_id = Some(account.permission_id);
+            state.authorization = Some(authorization);
+            Ok(android_status(
+                requested,
+                &state,
+                persisted.as_ref(),
+                transfers,
+            ))
+        });
+        if finalized.is_err() {
+            let mut state = runtime
+                .inner
+                .lock()
+                .map_err(|_| SyncCommandError::internal())?;
+            if state.transfer_running_session.is_none()
+                && state
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.session_id == requested)
+            {
+                state.active = None;
+                state.root_name = None;
+            }
+        }
+        finalized
     }
 
     #[tauri::command(rename_all = "camelCase")]
-    pub fn sync_list_folders(
+    pub async fn sync_connect(
+        app: tauri::AppHandle,
+        session: tauri::State<'_, AndroidVaultSession>,
+        runtime: tauri::State<'_, Arc<SyncRuntime>>,
+        session_id: String,
+    ) -> Result<SyncStatusDto, SyncCommandError> {
+        let requested = parse_session_id(&session_id)?;
+        let vault = android_vault_capability(&session, requested).map_err(map_app_error)?;
+        let runtime = Arc::clone(runtime.inner());
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            sync_connect_impl(app, runtime, requested, vault)
+        })
+        .await
+        .map_err(|_| SyncCommandError::internal())??;
+        android_vault_capability(&session, requested).map_err(map_app_error)?;
+        Ok(result)
+    }
+
+    fn sync_list_folders_impl(
+        app: tauri::AppHandle,
+        runtime: Arc<SyncRuntime>,
+        requested: VaultSessionId,
+        vault: SafVaultCapability,
+        parent_id: Option<String>,
+        page_token: Option<String>,
+    ) -> Result<RemoteFolderPageDto, SyncCommandError> {
+        let authorization = app.google_auth().fresh_access_token().map_err(|_| {
+            SyncCommandError::new(
+                SyncCommandCode::AuthRequired,
+                "Google authorization could not be refreshed",
+            )
+        })?;
+        let drive = drive_from(&authorization)?;
+        let account = drive.account_identity().map_err(map_drive_error)?;
+        let expected_account_id = runtime
+            .inner
+            .lock()
+            .map_err(|_| SyncCommandError::internal())?
+            .account_id
+            .clone()
+            .ok_or_else(|| {
+                SyncCommandError::new(
+                    SyncCommandCode::AuthRequired,
+                    "Google authorization is required",
+                )
+            })?;
+        exact_account(Some(&expected_account_id), &account.permission_id)?;
+        let page = drive
+            .list_children_page(
+                parent_id.as_deref().unwrap_or("root"),
+                page_token.as_deref(),
+            )
+            .map_err(map_drive_error)?;
+        with_current_session(&app, requested, &vault, || {
+            runtime
+                .inner
+                .lock()
+                .map_err(|_| SyncCommandError::internal())?
+                .authorization = Some(authorization);
+            Ok(folder_page(requested, parent_id, page))
+        })
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn sync_list_folders(
         app: tauri::AppHandle,
         session: tauri::State<'_, AndroidVaultSession>,
         runtime: tauri::State<'_, Arc<SyncRuntime>>,
@@ -3221,60 +3580,25 @@ mod platform {
         page_token: Option<String>,
     ) -> Result<RemoteFolderPageDto, SyncCommandError> {
         let requested = parse_session_id(&session_id)?;
-        with_android_session_lease(&session, requested, || {
-            let authorization = app.google_auth().fresh_access_token().map_err(|_| {
-                SyncCommandError::new(
-                    SyncCommandCode::AuthRequired,
-                    "Google authorization could not be refreshed",
-                )
-            })?;
-            let drive = drive_from(&authorization)?;
-            let account = drive.account_identity().map_err(map_drive_error)?;
-            let expected_account_id = runtime
-                .inner
-                .lock()
-                .map_err(|_| SyncCommandError::internal())?
-                .account_id
-                .clone()
-                .ok_or_else(|| {
-                    SyncCommandError::new(
-                        SyncCommandCode::AuthRequired,
-                        "Google authorization is required",
-                    )
-                })?;
-            if expected_account_id != account.permission_id {
-                return Err(SyncCommandError::new(
-                    SyncCommandCode::BindingMismatch,
-                    "the Google account does not match the connected account",
-                ));
-            }
-            let page = drive
-                .list_children_page(
-                    parent_id.as_deref().unwrap_or("root"),
-                    page_token.as_deref(),
-                )
-                .map_err(map_drive_error)?;
-            runtime
-                .inner
-                .lock()
-                .map_err(|_| SyncCommandError::internal())?
-                .authorization = Some(authorization);
-            Ok(folder_page(requested, parent_id, page))
+        let vault = android_vault_capability(&session, requested).map_err(map_app_error)?;
+        let runtime = Arc::clone(runtime.inner());
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            sync_list_folders_impl(app, runtime, requested, vault, parent_id, page_token)
         })
-        .map_err(map_app_error)?
+        .await
+        .map_err(|_| SyncCommandError::internal())??;
+        android_vault_capability(&session, requested).map_err(map_app_error)?;
+        Ok(result)
     }
 
-    #[tauri::command(rename_all = "camelCase")]
-    pub fn sync_bind_root(
+    fn sync_bind_root_impl(
         app: tauri::AppHandle,
-        session: tauri::State<'_, AndroidVaultSession>,
-        runtime: tauri::State<'_, Arc<SyncRuntime>>,
-        session_id: String,
+        runtime: Arc<SyncRuntime>,
+        session_id: VaultSessionId,
+        vault: SafVaultCapability,
         account_id: String,
         root_id: String,
     ) -> Result<BindRootDto, SyncCommandError> {
-        let session_id = validate_session(&session, &session_id)?;
-        let vault = android_vault_capability(&session, session_id).map_err(map_app_error)?;
         let authorization = app.google_auth().fresh_access_token().map_err(|_| {
             SyncCommandError::new(
                 SyncCommandCode::AuthRequired,
@@ -3288,47 +3612,65 @@ mod platform {
         let binding = drive
             .verify_binding(&account_id, &root_id)
             .map_err(map_drive_error)?;
-        android_vault_capability(&session, session_id).map_err(map_app_error)?;
-        let mut state = runtime
-            .inner
-            .lock()
-            .map_err(|_| SyncCommandError::internal())?;
-        exact_account(state.account_id.as_deref(), &observed.permission_id)?;
-        let (outcome, persisted, transfers) = {
-            let store = ensure_store(&app, &mut state, session_id, &vault)?;
-            let outcome = store
-                .bind_remote_root(&binding, now_unix_ms()?)
-                .map_err(map_sync_error)?;
-            (
-                outcome,
-                store.vault_state().map_err(map_sync_error)?,
-                store.transfer_summary().map_err(map_sync_error)?,
-            )
-        };
-        state.account_id = Some(observed.permission_id);
-        state.authorization = Some(authorization);
-        state.root_name = Some(root.name);
-        Ok(BindRootDto {
-            session_id,
-            outcome: match outcome {
-                BindOutcome::Created => "created",
-                BindOutcome::AlreadyBound => "alreadyBound",
-                BindOutcome::LegacyBindingConfirmed => "legacyBindingConfirmed",
-            },
-            status: android_status(session_id, &state, persisted.as_ref(), transfers),
+        with_current_session(&app, session_id, &vault, || {
+            let mut state = runtime
+                .inner
+                .lock()
+                .map_err(|_| SyncCommandError::internal())?;
+            exact_account(state.account_id.as_deref(), &observed.permission_id)?;
+            let (outcome, persisted, transfers) = {
+                let store = ensure_store(&app, &mut state, session_id, &vault)?;
+                let outcome = store
+                    .bind_remote_root(&binding, now_unix_ms()?)
+                    .map_err(map_sync_error)?;
+                (
+                    outcome,
+                    store.vault_state().map_err(map_sync_error)?,
+                    store.transfer_summary().map_err(map_sync_error)?,
+                )
+            };
+            state.account_id = Some(observed.permission_id);
+            state.authorization = Some(authorization);
+            state.root_name = Some(root.name);
+            Ok(BindRootDto {
+                session_id,
+                outcome: match outcome {
+                    BindOutcome::Created => "created",
+                    BindOutcome::AlreadyBound => "alreadyBound",
+                    BindOutcome::LegacyBindingConfirmed => "legacyBindingConfirmed",
+                },
+                status: android_status(session_id, &state, persisted.as_ref(), transfers),
+            })
         })
     }
 
     #[tauri::command(rename_all = "camelCase")]
-    pub fn sync_scan_step(
+    pub async fn sync_bind_root(
         app: tauri::AppHandle,
         session: tauri::State<'_, AndroidVaultSession>,
         runtime: tauri::State<'_, Arc<SyncRuntime>>,
         session_id: String,
-    ) -> Result<ScanStepDto, SyncCommandError> {
+        account_id: String,
+        root_id: String,
+    ) -> Result<BindRootDto, SyncCommandError> {
         let session_id = validate_session(&session, &session_id)?;
         let vault = android_vault_capability(&session, session_id).map_err(map_app_error)?;
         let runtime = Arc::clone(runtime.inner());
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            sync_bind_root_impl(app, runtime, session_id, vault, account_id, root_id)
+        })
+        .await
+        .map_err(|_| SyncCommandError::internal())??;
+        android_vault_capability(&session, session_id).map_err(map_app_error)?;
+        Ok(result)
+    }
+
+    fn sync_scan_step_impl(
+        app: tauri::AppHandle,
+        runtime: Arc<SyncRuntime>,
+        session_id: VaultSessionId,
+        vault: SafVaultCapability,
+    ) -> Result<ScanStepDto, SyncCommandError> {
         let account_id = {
             let mut state = runtime
                 .inner
@@ -3377,25 +3719,54 @@ mod platform {
             .map_err(map_sync_error)?;
         let progress = advance_initial_sync(detached.store_mut()?, &mut drive, now_unix_ms()?)
             .map_err(map_sync_error)?;
-        android_vault_capability(&session, session_id).map_err(map_app_error)?;
-        detached.restore()?;
-        let mut state = runtime
-            .inner
-            .lock()
-            .map_err(|_| SyncCommandError::internal())?;
-        state.authorization = Some(authorization);
-        let (persisted, transfers) = {
-            let store = ensure_store(&app, &mut state, session_id, &vault)?;
-            (
-                store.vault_state().map_err(map_sync_error)?,
-                store.transfer_summary().map_err(map_sync_error)?,
-            )
-        };
-        Ok(ScanStepDto {
-            session_id,
-            progress: progress_name(progress),
-            status: android_status(session_id, &state, persisted.as_ref(), transfers),
+        let mut restored = false;
+        let finalized = with_current_session(&app, session_id, &vault, || {
+            detached.restore_inner()?;
+            restored = true;
+            let mut state = runtime
+                .inner
+                .lock()
+                .map_err(|_| SyncCommandError::internal())?;
+            state.authorization = Some(authorization);
+            let (persisted, transfers) = {
+                let store = ensure_store(&app, &mut state, session_id, &vault)?;
+                (
+                    store.vault_state().map_err(map_sync_error)?,
+                    store.transfer_summary().map_err(map_sync_error)?,
+                )
+            };
+            Ok(ScanStepDto {
+                session_id,
+                progress: progress_name(progress),
+                status: android_status(session_id, &state, persisted.as_ref(), transfers),
+            })
+        });
+        match finalized {
+            Err(error) if !restored => {
+                detached.discard_store()?;
+                Err(error)
+            }
+            result => result,
+        }
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn sync_scan_step(
+        app: tauri::AppHandle,
+        session: tauri::State<'_, AndroidVaultSession>,
+        runtime: tauri::State<'_, Arc<SyncRuntime>>,
+        session_id: String,
+    ) -> Result<ScanStepDto, SyncCommandError> {
+        let session_id = validate_session(&session, &session_id)?;
+        let vault = android_vault_capability(&session, session_id).map_err(map_app_error)?;
+        let runtime = Arc::clone(runtime.inner());
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            sync_scan_step_impl(app, runtime, session_id, vault)
         })
+        .await
+        .map_err(|_| SyncCommandError::internal())??;
+        android_vault_capability(&session, session_id).map_err(map_app_error)?;
+        Ok(result)
     }
 
     #[tauri::command(rename_all = "camelCase")]
@@ -3421,16 +3792,12 @@ mod platform {
         preview_page(session_id, page)
     }
 
-    #[tauri::command(rename_all = "camelCase")]
-    pub fn sync_run_guarded(
+    fn sync_run_guarded_impl(
         app: tauri::AppHandle,
-        session: tauri::State<'_, AndroidVaultSession>,
-        runtime: tauri::State<'_, Arc<SyncRuntime>>,
-        session_id: String,
+        runtime: Arc<SyncRuntime>,
+        session_id: VaultSessionId,
+        vault: SafVaultCapability,
     ) -> Result<SyncStatusDto, SyncCommandError> {
-        let session_id = validate_session(&session, &session_id)?;
-        let vault = android_vault_capability(&session, session_id).map_err(map_app_error)?;
-        let runtime = Arc::clone(runtime.inner());
         let bound = {
             let mut state = runtime
                 .inner
@@ -3465,7 +3832,7 @@ mod platform {
                 "an exact Drive account must be bound before transfer",
             )
         })?;
-        let authorization = app.google_auth().fresh_access_token().map_err(|_| {
+        let mut authorization = app.google_auth().fresh_access_token().map_err(|_| {
             SyncCommandError::new(
                 SyncCommandCode::AuthRequired,
                 "Google authorization could not be refreshed",
@@ -3474,7 +3841,7 @@ mod platform {
         let read_only = drive_from(&authorization)?;
         let observed = read_only.account_identity().map_err(map_drive_error)?;
         exact_account(Some(&account_id), &observed.permission_id)?;
-        android_vault_capability(&session, session_id).map_err(map_app_error)?;
+        let mut refresh_attempted = false;
 
         let mut detached = detach_store(&app, Arc::clone(&runtime), session_id, &vault)?;
         let run_result = (|| {
@@ -3489,6 +3856,7 @@ mod platform {
                     requeue_active_batch_reconciliation(store, active.batch_id, now_unix_ms()?)?;
                     (active.batch_id, false)
                 } else {
+                    let read_only = drive_from(&authorization)?;
                     let transfer =
                         transfer_drive_from(&authorization, &account_id, &bound.remote_root_id)?;
                     let batch = prepare_incremental_change_batch(
@@ -3501,11 +3869,14 @@ mod platform {
                     )?;
                     (batch.batch_id, batch.final_page)
                 };
-                run_guarded_worker(
+                let _ = run_guarded_worker_with_auth_refresh(
                     &app,
                     &vault,
                     store,
-                    transfer_drive_from(&authorization, &account_id, &bound.remote_root_id)?,
+                    &account_id,
+                    &bound.remote_root_id,
+                    &mut authorization,
+                    &mut refresh_attempted,
                 )?;
                 let active = store
                     .active_change_batch()
@@ -3535,62 +3906,122 @@ mod platform {
                 let transfer =
                     transfer_drive_from(&authorization, &account_id, &bound.remote_root_id)?;
                 prepare_guarded_transfers(&app, &vault, store, &transfer, &bound.remote_root_id)?;
-                run_guarded_worker(&app, &vault, store, transfer)?;
+                let _ = run_guarded_worker_with_auth_refresh(
+                    &app,
+                    &vault,
+                    store,
+                    &account_id,
+                    &bound.remote_root_id,
+                    &mut authorization,
+                    &mut refresh_attempted,
+                )?;
             }
-            android_vault_capability(&session, session_id).map_err(map_app_error)?;
             Ok(())
         })();
-        run_result?;
-        detached.restore()?;
-
-        let mut state = runtime
-            .inner
-            .lock()
-            .map_err(|_| SyncCommandError::internal())?;
-        state.account_id = Some(account_id);
-        state.authorization = Some(authorization);
-        let (persisted, transfers) = {
-            let store = ensure_store(&app, &mut state, session_id, &vault)?;
-            (
-                store.vault_state().map_err(map_sync_error)?,
-                store.transfer_summary().map_err(map_sync_error)?,
-            )
-        };
-        Ok(android_status(
-            session_id,
-            &state,
-            persisted.as_ref(),
-            transfers,
-        ))
+        if let Err(error) = run_result {
+            detached.discard_store()?;
+            return Err(error);
+        }
+        let mut restored = false;
+        let finalized = with_current_session(&app, session_id, &vault, || {
+            detached.restore_inner()?;
+            restored = true;
+            let mut state = runtime
+                .inner
+                .lock()
+                .map_err(|_| SyncCommandError::internal())?;
+            state.account_id = Some(account_id);
+            state.authorization = Some(authorization);
+            let (persisted, transfers) = {
+                let store = ensure_store(&app, &mut state, session_id, &vault)?;
+                (
+                    store.vault_state().map_err(map_sync_error)?,
+                    store.transfer_summary().map_err(map_sync_error)?,
+                )
+            };
+            Ok(android_status(
+                session_id,
+                &state,
+                persisted.as_ref(),
+                transfers,
+            ))
+        });
+        match finalized {
+            Err(error) if !restored => {
+                detached.discard_store()?;
+                Err(error)
+            }
+            result => result,
+        }
     }
 
     #[tauri::command(rename_all = "camelCase")]
-    pub fn sync_disconnect(
+    pub async fn sync_run_guarded(
         app: tauri::AppHandle,
         session: tauri::State<'_, AndroidVaultSession>,
         runtime: tauri::State<'_, Arc<SyncRuntime>>,
         session_id: String,
     ) -> Result<SyncStatusDto, SyncCommandError> {
-        let requested = parse_session_id(&session_id)?;
-        let vault = android_vault_capability(&session, requested).map_err(map_app_error)?;
-        with_android_session_lease(&session, requested, || {
+        let session_id = validate_session(&session, &session_id)?;
+        let vault = android_vault_capability(&session, session_id).map_err(map_app_error)?;
+        let runtime = Arc::clone(runtime.inner());
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            sync_run_guarded_impl(app, runtime, session_id, vault)
+        })
+        .await
+        .map_err(|_| SyncCommandError::internal())??;
+        android_vault_capability(&session, session_id).map_err(map_app_error)?;
+        Ok(result)
+    }
+
+    fn sync_disconnect_impl(
+        app: tauri::AppHandle,
+        runtime: Arc<SyncRuntime>,
+        requested: VaultSessionId,
+        vault: SafVaultCapability,
+    ) -> Result<SyncStatusDto, SyncCommandError> {
+        let authorization = {
             let mut state = runtime
                 .inner
                 .lock()
                 .map_err(|_| SyncCommandError::internal())?;
-            if let Some(authorization) = state.authorization.as_ref() {
-                app.google_auth()
-                    .disconnect(&authorization.access_token)
-                    .map_err(|_| {
-                        SyncCommandError::new(
-                            SyncCommandCode::ProviderUnavailable,
-                            "Google authorization cleanup did not complete",
-                        )
-                    })?;
+            if state.transfer_running_session.is_some() {
+                return Err(SyncCommandError::new(
+                    SyncCommandCode::Busy,
+                    "a guarded transfer is already running",
+                ));
             }
+            state.transfer_running_session = Some(requested);
+            state.authorization.take()
+        };
+        let disconnect_failed = authorization
+            .as_ref()
+            .is_some_and(|current| app.google_auth().disconnect(&current.access_token).is_err());
+        if disconnect_failed {
+            let mut state = runtime
+                .inner
+                .lock()
+                .map_err(|_| SyncCommandError::internal())?;
+            if state.transfer_running_session == Some(requested) {
+                state.transfer_running_session = None;
+                state.authorization = authorization;
+            }
+            return Err(SyncCommandError::new(
+                SyncCommandCode::ProviderUnavailable,
+                "Google authorization cleanup did not complete",
+            ));
+        }
+        let finalized = with_current_session(&app, requested, &vault, || {
+            let mut state = runtime
+                .inner
+                .lock()
+                .map_err(|_| SyncCommandError::internal())?;
+            if state.transfer_running_session != Some(requested) {
+                return Err(SyncCommandError::internal());
+            }
+            state.transfer_running_session = None;
             state.account_id = None;
             state.root_name = None;
-            state.authorization = None;
             let (persisted, transfers) = {
                 let store = ensure_store(&app, &mut state, requested, &vault)?;
                 (
@@ -3604,8 +4035,36 @@ mod platform {
                 persisted.as_ref(),
                 transfers,
             ))
+        });
+        if finalized.is_err() {
+            let mut state = runtime
+                .inner
+                .lock()
+                .map_err(|_| SyncCommandError::internal())?;
+            if state.transfer_running_session == Some(requested) {
+                state.transfer_running_session = None;
+            }
+        }
+        finalized
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub async fn sync_disconnect(
+        app: tauri::AppHandle,
+        session: tauri::State<'_, AndroidVaultSession>,
+        runtime: tauri::State<'_, Arc<SyncRuntime>>,
+        session_id: String,
+    ) -> Result<SyncStatusDto, SyncCommandError> {
+        let requested = parse_session_id(&session_id)?;
+        let vault = android_vault_capability(&session, requested).map_err(map_app_error)?;
+        let runtime = Arc::clone(runtime.inner());
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            sync_disconnect_impl(app, runtime, requested, vault)
         })
-        .map_err(map_app_error)?
+        .await
+        .map_err(|_| SyncCommandError::internal())??;
+        android_vault_capability(&session, requested).map_err(map_app_error)?;
+        Ok(result)
     }
 }
 

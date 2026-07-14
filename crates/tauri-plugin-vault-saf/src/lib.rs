@@ -62,6 +62,7 @@ pub struct SafEntry {
     pub path: String,
     pub kind: String,
     pub byte_len: u64,
+    pub byte_len_known: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -69,6 +70,8 @@ pub struct SafEntry {
 pub struct SafInventory {
     pub entries: Vec<SafEntry>,
     pub scanned_entries: usize,
+    /// Opaque native change generation consumed by this successful bounded scan.
+    pub change_generation: u64,
 }
 
 impl SafInventory {
@@ -106,6 +109,17 @@ pub struct SafBinary {
     pub bytes: Vec<u8>,
     pub revision_hex: String,
     pub byte_len: u64,
+}
+
+/// Opaque, coalesced signal that the held SAF tree may have changed.
+///
+/// The signal intentionally contains no URI, document ID, path, or content.
+/// Callers must treat it only as a reason to run the existing bounded inventory.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SafChangeHint {
+    pub dirty: bool,
+    pub generation: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -314,14 +328,33 @@ impl<R: Runtime> VaultSaf<R> {
     }
 
     pub fn inventory(&self, vault: &SafVaultCapability) -> Result<SafInventory, SafError> {
-        self.0
+        let inventory: SafInventory = self
+            .0
             .run_mobile_plugin(
                 "inventory",
                 RootRequest {
                     expected_root_identity_hex: vault.expected_root_identity_hex(),
                 },
             )
-            .map_err(map_plugin_error)
+            .map_err(map_plugin_error)?;
+        validate_change_generation(inventory.change_generation)?;
+        Ok(inventory)
+    }
+
+    /// Reads one coalesced native dirty hint without enumerating the SAF tree.
+    /// A successful `inventory` call consumes the exact generation it observed.
+    pub fn change_hint(&self, vault: &SafVaultCapability) -> Result<SafChangeHint, SafError> {
+        let hint: SafChangeHint = self
+            .0
+            .run_mobile_plugin(
+                "changeHint",
+                RootRequest {
+                    expected_root_identity_hex: vault.expected_root_identity_hex(),
+                },
+            )
+            .map_err(map_plugin_error)?;
+        validate_change_generation(hint.generation)?;
+        Ok(hint)
     }
 
     pub fn read_note(&self, vault: &SafVaultCapability, path: &str) -> Result<SafNote, SafError> {
@@ -500,6 +533,18 @@ impl<R: Runtime> VaultSaf<R> {
 
 #[cfg(target_os = "android")]
 const MAX_NATIVE_TRANSFER_BYTES: usize = 16 * 1024 * 1024;
+
+#[cfg(any(target_os = "android", test))]
+const MAX_SAFE_CHANGE_GENERATION: u64 = 9_007_199_254_740_991;
+
+#[cfg(any(target_os = "android", test))]
+fn validate_change_generation(generation: u64) -> Result<(), SafError> {
+    if generation <= MAX_SAFE_CHANGE_GENERATION {
+        Ok(())
+    } else {
+        Err(SafError::NativeBridge)
+    }
+}
 
 #[cfg(any(target_os = "android", test))]
 fn native_capability(
@@ -712,5 +757,34 @@ mod transfer_tests {
         for malformed in ["A", "AA=A", "AA==AAAA", "****"] {
             assert!(decode_base64_bounded(malformed, 16).is_err(), "{malformed}");
         }
+    }
+
+    #[test]
+    fn native_change_hint_is_opaque_and_json_safe() {
+        let clean = SafChangeHint {
+            dirty: false,
+            generation: 0,
+        };
+        let dirty = SafChangeHint {
+            dirty: true,
+            generation: MAX_SAFE_CHANGE_GENERATION,
+        };
+        assert_eq!(
+            clean,
+            SafChangeHint {
+                dirty: false,
+                generation: 0
+            }
+        );
+        assert!(dirty.dirty);
+        validate_change_generation(clean.generation).unwrap();
+        validate_change_generation(dirty.generation).unwrap();
+        assert_eq!(
+            validate_change_generation(MAX_SAFE_CHANGE_GENERATION + 1),
+            Err(SafError::NativeBridge)
+        );
+        let debug = format!("{dirty:?}");
+        assert!(!debug.contains("content://"));
+        assert!(!debug.contains('/'));
     }
 }

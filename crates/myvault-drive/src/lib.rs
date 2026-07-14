@@ -27,6 +27,7 @@ pub use model::{
     FOLDER_MIME_TYPE,
 };
 pub use transfer::{
-    CreateIntent, CreatePermit, CreateReconciliation, DownloadIntent, ReconcileReason,
-    RemoteObject, TransferDrive, UploadProgress, UploadSession, VerifiedDownload,
+    plan_resumable_upload_chunk, CreateIntent, CreatePermit, CreateReconciliation, DownloadIntent,
+    ReconcileReason, RemoteObject, TransferDrive, UploadChunkPlan, UploadProgress, UploadSession,
+    VerifiedDownload, RESUMABLE_UPLOAD_CHUNK_BYTES,
 };

@@ -340,13 +340,32 @@ pub fn harden_android_new_file(file: &File) -> Result<(), Error> {
 /// Rejects wrong type, owner, exact mode, nlink other than one, or present ACL xattrs.
 #[cfg(target_os = "android")]
 pub fn inspect_android_held_file(file: &File) -> Result<AndroidAclInspection, Error> {
+    inspect_android_held_file_links(file, 1)
+}
+
+/// Inspects a held Android private file with an exact bounded link count.
+///
+/// This is used only while atomically publishing a fully fsynced private stage
+/// through a temporary second hard link. Ordinary private files require one
+/// link through [`inspect_android_held_file`].
+///
+/// # Errors
+/// Rejects wrong type, owner, exact mode/link count, or present ACL xattrs.
+#[cfg(target_os = "android")]
+pub fn inspect_android_held_file_links(
+    file: &File,
+    expected_links: u64,
+) -> Result<AndroidAclInspection, Error> {
     use std::os::unix::fs::MetadataExt;
+    if !(1..=2).contains(&expected_links) {
+        return Err(Error::ExternalMutation);
+    }
     let held = file.try_clone()?.into_std();
     let metadata = held.metadata()?;
     if !metadata.is_file()
         || metadata.uid() != rustix::process::geteuid().as_raw()
         || metadata.mode() & 0o777 != 0o600
-        || metadata.nlink() != 1
+        || metadata.nlink() != expected_links
     {
         return Err(Error::ExternalMutation);
     }

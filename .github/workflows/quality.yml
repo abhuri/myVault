@@ -218,10 +218,25 @@ jobs:
       - name: Install JavaScript dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Lint Android Rust integration
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/29.0.13846066
+        run: |
+          export CC_aarch64_linux_android="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          export CXX_aarch64_linux_android="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
+          export AR_aarch64_linux_android="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC_aarch64_linux_android"
+          cargo clippy --manifest-path apps/tauri/src-tauri/Cargo.toml \
+            --target aarch64-linux-android --all-targets --all-features -- -D warnings
+
       - name: Compile Android Google auth bridge and APK
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/29.0.13846066
         run: pnpm --dir apps/tauri tauri android build --debug --apk --target aarch64
+
+      - name: Test Android native root identity policy
+        working-directory: apps/tauri/src-tauri/gen/android
+        run: ./gradlew :tauri-plugin-vault-saf:testDebugUnitTest --no-daemon
 
       - name: Verify 16 KB APK alignment
         run: |

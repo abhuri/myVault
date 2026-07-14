@@ -2,8 +2,8 @@
 
 use myvault_app_service::{AppService, NativeTransferError, TransferStageRef, VaultSessionId};
 use myvault_drive::{
-    CreateIntent, CreateReconciliation, DownloadIntent, Error as DriveError,
-    ErrorCode as DriveErrorCode, RemoteObject, TransferDrive, UploadProgress,
+    plan_resumable_upload_chunk, CreateIntent, CreateReconciliation, DownloadIntent,
+    Error as DriveError, ErrorCode as DriveErrorCode, RemoteObject, TransferDrive, UploadProgress,
 };
 use myvault_transfer::{
     ContentKind, ExecutionFailure, ExecutionFailureKind, TransferDirection, TransferExecutor,
@@ -11,7 +11,6 @@ use myvault_transfer::{
 };
 use std::{io::Write, time::Duration};
 
-const UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TRANSFER_BYTES_USIZE: usize = MAX_TRANSFER_BYTES as usize;
 
 /// Native-only bridge between durable transfer intent and the two narrow
@@ -157,31 +156,30 @@ impl<'a> NativeTransferExecutor<'a> {
                     .initiate_resumable_create(permit)
                     .map_err(|error| drive_failure(error, true))?;
                 let created = loop {
-                    let offset = session.next_offset();
-                    let remaining = session.total_size().saturating_sub(offset);
-                    let requested = usize::try_from(remaining.min(UPLOAD_CHUNK_BYTES as u64))
-                        .map_err(|_| {
-                            failure(
-                                ExecutionFailureKind::NeedsReconcile,
-                                "transfer_size_invalid",
-                                None,
-                            )
-                        })?;
+                    let plan =
+                        plan_resumable_upload_chunk(session.total_size(), session.next_offset())
+                            .map_err(|_| {
+                                failure(
+                                    ExecutionFailureKind::NeedsReconcile,
+                                    "transfer_size_invalid",
+                                    None,
+                                )
+                            })?;
                     let bytes = self
                         .service
                         .read_verified_stage_chunk(
                             self.session_id,
                             &stage,
-                            offset,
+                            plan.offset(),
                             if session.total_size() == 0 {
                                 1
                             } else {
-                                requested
+                                plan.byte_len()
                             },
                             MAX_TRANSFER_BYTES_USIZE,
                         )
                         .map_err(local_failure)?;
-                    if bytes.len() != requested {
+                    if bytes.len() != plan.byte_len() {
                         return Err(failure(
                             ExecutionFailureKind::NeedsReconcile,
                             "stage_chunk_length_mismatch",

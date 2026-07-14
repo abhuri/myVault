@@ -13,8 +13,8 @@ use crate::android_transfer_policy::{
 };
 use myvault_core::FileRevision;
 use myvault_drive::{
-    CreateIntent, CreateReconciliation, DownloadIntent, Error as DriveError,
-    ErrorCode as DriveErrorCode, RemoteObject, TransferDrive, UploadProgress,
+    plan_resumable_upload_chunk, CreateIntent, CreateReconciliation, DownloadIntent,
+    Error as DriveError, ErrorCode as DriveErrorCode, RemoteObject, TransferDrive, UploadProgress,
 };
 use myvault_transfer::{
     ContentKind, ExecutionFailure, ExecutionFailureKind, TransferDirection, TransferExecutor,
@@ -22,8 +22,6 @@ use myvault_transfer::{
 };
 use std::time::Duration;
 use uuid::Uuid;
-
-const UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
 /// Stable failures from an adapter already bound to one exact SAF capability.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -258,14 +256,13 @@ where
                     .initiate_resumable_create(permit)
                     .map_err(|error| drive_failure(error, true))?;
                 let created = loop {
-                    let offset = session.next_offset();
-                    let remaining = session.total_size().saturating_sub(offset);
-                    let requested = usize::try_from(remaining.min(UPLOAD_CHUNK_BYTES as u64))
+                    let plan =
+                        plan_resumable_upload_chunk(session.total_size(), session.next_offset())
+                            .map_err(|_| reconcile("transfer_size_invalid"))?;
+                    let start = usize::try_from(plan.offset())
                         .map_err(|_| reconcile("transfer_size_invalid"))?;
-                    let start =
-                        usize::try_from(offset).map_err(|_| reconcile("transfer_size_invalid"))?;
                     let end = start
-                        .checked_add(requested)
+                        .checked_add(plan.byte_len())
                         .filter(|end| *end <= stage.len())
                         .ok_or_else(|| reconcile("stage_chunk_length_mismatch"))?;
                     match self.drive.upload_chunk(&mut session, &stage[start..end]) {

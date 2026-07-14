@@ -1222,6 +1222,95 @@ mod tests {
         assert!(store.retries.is_empty());
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum ExecutorFaultBoundary {
+        BeforeSessionInitiation,
+        AfterSessionInitiation,
+        UploadChunk,
+        UploadStatusQuery,
+        FinalUploadResponseLost,
+        StagedFsync,
+        BasePublication,
+    }
+
+    impl ExecutorFaultBoundary {
+        fn failure(self) -> ExecutionFailure {
+            let (kind, code) = match self {
+                Self::BeforeSessionInitiation => (
+                    ExecutionFailureKind::TransientSafe,
+                    "session_preflight_failed",
+                ),
+                Self::AfterSessionInitiation => (
+                    ExecutionFailureKind::TransientUnknown,
+                    "session_initiation_unknown",
+                ),
+                Self::UploadChunk => (
+                    ExecutionFailureKind::TransientUnknown,
+                    "upload_chunk_unknown",
+                ),
+                Self::UploadStatusQuery => (
+                    ExecutionFailureKind::TransientUnknown,
+                    "upload_status_unknown",
+                ),
+                Self::FinalUploadResponseLost => (
+                    ExecutionFailureKind::TransientUnknown,
+                    "upload_final_response_lost",
+                ),
+                Self::StagedFsync => (ExecutionFailureKind::NeedsReconcile, "stage_fsync_failed"),
+                Self::BasePublication => (
+                    ExecutionFailureKind::NeedsReconcile,
+                    "base_publication_failed",
+                ),
+            };
+            ExecutionFailure::new(kind, code, None)
+                .expect("fault-matrix classifications are bounded")
+        }
+
+        const fn expects_retry(self) -> bool {
+            matches!(self, Self::BeforeSessionInitiation)
+        }
+    }
+
+    #[test]
+    fn executor_fault_matrix_retries_only_the_proven_pre_side_effect_boundary() {
+        // Platform executors inject these classifications at their concrete
+        // protocol/filesystem boundaries. This table proves the Tauri-free
+        // worker converts each injected result into exactly one durable store
+        // command and never treats an unknown side effect as retry-safe.
+        for boundary in [
+            ExecutorFaultBoundary::BeforeSessionInitiation,
+            ExecutorFaultBoundary::AfterSessionInitiation,
+            ExecutorFaultBoundary::UploadChunk,
+            ExecutorFaultBoundary::UploadStatusQuery,
+            ExecutorFaultBoundary::FinalUploadResponseLost,
+            ExecutorFaultBoundary::StagedFsync,
+            ExecutorFaultBoundary::BasePublication,
+        ] {
+            let operation_id = Uuid::new_v4();
+            let store = MemoryStore {
+                jobs: VecDeque::from([intent(operation_id)]),
+                ..MemoryStore::default()
+            };
+            let executor = ScriptedExecutor {
+                results: VecDeque::from([Err(boundary.failure())]),
+            };
+            let mut worker = Worker::new(store, executor);
+
+            let outcome = worker.run_once(1_000).expect("fault disposition");
+            let (store, _) = worker.into_parts();
+            if boundary.expects_retry() {
+                assert_eq!(outcome, WorkOutcome::RetryScheduled(operation_id));
+                assert_eq!(store.retries.len(), 1, "boundary: {boundary:?}");
+                assert!(store.reconcile.is_empty(), "boundary: {boundary:?}");
+            } else {
+                assert_eq!(outcome, WorkOutcome::NeedsReconcile(operation_id));
+                assert!(store.retries.is_empty(), "boundary: {boundary:?}");
+                assert_eq!(store.reconcile, [operation_id], "boundary: {boundary:?}");
+            }
+            assert!(store.completed.is_empty(), "boundary: {boundary:?}");
+        }
+    }
+
     #[test]
     fn path_and_identity_validation_is_fail_closed() {
         let id = Uuid::new_v4();

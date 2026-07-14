@@ -28,11 +28,58 @@ const DEFAULT_MAX_METADATA_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_MAX_BLOB_BYTES: u64 = 512 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const CHUNK_ALIGNMENT: usize = 256 * 1024;
-const MAX_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+pub const RESUMABLE_UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ANCESTRY_DEPTH: usize = 128;
 const MAX_RETRY_AFTER_SECONDS: u64 = 60 * 60;
 const TRANSFER_FILE_FIELDS: &str =
     "id,name,mimeType,parents,trashed,version,size,sha256Checksum,appProperties";
+
+/// One exact request body range for a guarded resumable upload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UploadChunkPlan {
+    offset: u64,
+    byte_len: usize,
+    end_offset: u64,
+}
+
+impl UploadChunkPlan {
+    #[must_use]
+    pub const fn offset(self) -> u64 {
+        self.offset
+    }
+
+    #[must_use]
+    pub const fn byte_len(self) -> usize {
+        self.byte_len
+    }
+
+    #[must_use]
+    pub const fn end_offset(self) -> u64 {
+        self.end_offset
+    }
+}
+
+/// Plans the next request using the same 8 MiB boundary enforced by the
+/// protocol adapter. A zero-byte object emits one empty final request.
+///
+/// # Errors
+/// Rejects offsets beyond the object or a completed non-empty session.
+pub fn plan_resumable_upload_chunk(total_size: u64, next_offset: u64) -> Result<UploadChunkPlan> {
+    if next_offset > total_size || (total_size != 0 && next_offset == total_size) {
+        return Err(Error::new(ErrorCode::InvalidInput));
+    }
+    let remaining = total_size - next_offset;
+    let byte_len = usize::try_from(remaining.min(RESUMABLE_UPLOAD_CHUNK_BYTES as u64))
+        .map_err(|_| Error::new(ErrorCode::InvalidInput))?;
+    let end_offset = next_offset
+        .checked_add(u64::try_from(byte_len).map_err(|_| Error::new(ErrorCode::InvalidInput))?)
+        .ok_or_else(|| Error::new(ErrorCode::InvalidInput))?;
+    Ok(UploadChunkPlan {
+        offset: next_offset,
+        byte_len,
+        end_offset,
+    })
+}
 
 #[derive(Deserialize)]
 struct TransferFile {
@@ -651,7 +698,7 @@ impl TransferDrive {
         session: &mut UploadSession,
         bytes: &[u8],
     ) -> Result<UploadProgress> {
-        if bytes.len() > MAX_CHUNK_BYTES {
+        if bytes.len() > RESUMABLE_UPLOAD_CHUNK_BYTES {
             return Err(Error::new(ErrorCode::InvalidInput));
         }
         let length = u64::try_from(bytes.len()).map_err(|_| Error::new(ErrorCode::InvalidInput))?;
@@ -1383,6 +1430,227 @@ mod tests {
         format!(
             r#"{{"id":"file_1","name":"note.md","mimeType":"text/markdown","parents":["root_1"],"trashed":false,"version":"2","size":"3","sha256Checksum":"{SHA}","appProperties":{{"myvaultOperation":"operation_1","myvaultSha256":"{SHA}","myvaultSize":"3"}}}}"#
         )
+    }
+
+    fn complete_file_json_for_size(size: u64) -> String {
+        complete_file_json()
+            .replace("\"size\":\"3\"", &format!("\"size\":\"{size}\""))
+            .replace(
+                "\"myvaultSize\":\"3\"",
+                &format!("\"myvaultSize\":\"{size}\""),
+            )
+    }
+
+    fn intent_for_size(size: u64) -> CreateIntent {
+        CreateIntent::new(
+            "root_1",
+            "note.md",
+            "text/markdown",
+            "operation_1",
+            SHA,
+            size,
+        )
+        .unwrap()
+    }
+
+    fn chunk_plans(total_size: u64) -> Vec<UploadChunkPlan> {
+        let mut plans = Vec::new();
+        let mut next_offset = 0;
+        loop {
+            let plan = plan_resumable_upload_chunk(total_size, next_offset).unwrap();
+            plans.push(plan);
+            if plan.end_offset() == total_size {
+                return plans;
+            }
+            next_offset = plan.end_offset();
+        }
+    }
+
+    fn chunk_matrix_sizes() -> [u64; 5] {
+        let chunk = RESUMABLE_UPLOAD_CHUNK_BYTES as u64;
+        [0, 1, chunk, chunk + 1, chunk * 2]
+    }
+
+    #[test]
+    fn eight_mib_chunk_planner_covers_zero_single_multi_and_exact_boundaries() {
+        let chunk = RESUMABLE_UPLOAD_CHUNK_BYTES as u64;
+        let cases = [
+            (0, vec![(0, 0, 0)]),
+            (1, vec![(0, 1, 1)]),
+            (chunk, vec![(0, chunk, chunk)]),
+            (chunk + 1, vec![(0, chunk, chunk), (chunk, 1, chunk + 1)]),
+            (
+                chunk * 2,
+                vec![(0, chunk, chunk), (chunk, chunk, chunk * 2)],
+            ),
+        ];
+
+        for (total_size, expected) in cases {
+            let actual = chunk_plans(total_size)
+                .into_iter()
+                .map(|plan| (plan.offset(), plan.byte_len() as u64, plan.end_offset()))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "total size: {total_size}");
+            for pair in actual.windows(2) {
+                assert_eq!(pair[0].2, pair[1].0, "total size: {total_size}");
+                assert!(pair[1].0 > pair[0].0, "total size: {total_size}");
+            }
+        }
+
+        assert_eq!(
+            plan_resumable_upload_chunk(1, 1).unwrap_err().code(),
+            ErrorCode::InvalidInput
+        );
+        assert_eq!(
+            plan_resumable_upload_chunk(1, 2).unwrap_err().code(),
+            ErrorCode::InvalidInput
+        );
+    }
+
+    #[test]
+    fn upload_protocol_emits_every_planned_range_monotonically_without_create() {
+        for total_size in chunk_matrix_sizes() {
+            let plans = chunk_plans(total_size);
+            let mut server = Server::new();
+            binding_mocks(&mut server, plans.len() + 1);
+            let blind_create = server
+                .mock("POST", "/upload/drive/v3/files")
+                .expect(0)
+                .create();
+            let final_body = complete_file_json_for_size(total_size);
+            let metadata = server
+                .mock("GET", "/drive/v3/files/file_1")
+                .match_query(Matcher::Regex("fields".into()))
+                .with_body(final_body.clone())
+                .create();
+            let mut uploads = Vec::new();
+            for plan in &plans {
+                let content_range = if total_size == 0 {
+                    "bytes */0".to_owned()
+                } else {
+                    format!(
+                        "bytes {}-{}/{}",
+                        plan.offset(),
+                        plan.end_offset() - 1,
+                        total_size
+                    )
+                };
+                let mut upload = server
+                    .mock("PUT", "/upload/drive/v3/files")
+                    .match_query(Matcher::Any)
+                    .match_header("content-range", Matcher::Exact(content_range))
+                    .match_body(Matcher::Any);
+                if plan.end_offset() == total_size {
+                    upload = upload.with_status(200).with_body(final_body.clone());
+                } else {
+                    upload = upload
+                        .with_status(308)
+                        .with_header("range", &format!("bytes=0-{}", plan.end_offset() - 1));
+                }
+                uploads.push(upload.create());
+            }
+
+            let drive = TransferDrive::for_test(&server, total_size.max(1));
+            let mut session = UploadSession {
+                uri: SecretString::from(format!(
+                    "{}/upload/drive/v3/files?upload_id=session",
+                    server.url()
+                )),
+                intent: intent_for_size(total_size),
+                next_offset: 0,
+            };
+            for plan in &plans {
+                assert_eq!(session.next_offset(), plan.offset());
+                let body = vec![b'x'; plan.byte_len()];
+                let progress = drive.upload_chunk(&mut session, &body).unwrap();
+                assert_eq!(session.next_offset(), plan.end_offset());
+                if plan.end_offset() == total_size {
+                    assert!(matches!(progress, UploadProgress::Complete(_)));
+                } else {
+                    assert_eq!(
+                        progress,
+                        UploadProgress::InProgress {
+                            next_offset: plan.end_offset()
+                        }
+                    );
+                }
+            }
+            for upload in uploads {
+                upload.assert();
+            }
+            blind_create.assert();
+            metadata.assert();
+        }
+    }
+
+    #[test]
+    fn lost_response_status_recovery_covers_every_emitted_boundary_without_create() {
+        for total_size in chunk_matrix_sizes() {
+            for plan in chunk_plans(total_size) {
+                let final_boundary = plan.end_offset() == total_size;
+                let mut server = Server::new();
+                binding_mocks(&mut server, if final_boundary { 2 } else { 1 });
+                let blind_create = server
+                    .mock("POST", "/upload/drive/v3/files")
+                    .expect(0)
+                    .create();
+                let final_body = complete_file_json_for_size(total_size);
+                let metadata = final_boundary.then(|| {
+                    server
+                        .mock("GET", "/drive/v3/files/file_1")
+                        .match_query(Matcher::Regex("fields".into()))
+                        .with_body(final_body.clone())
+                        .create()
+                });
+                let mut status = server
+                    .mock("PUT", "/upload/drive/v3/files")
+                    .match_query(Matcher::Any)
+                    .match_header(
+                        "content-range",
+                        Matcher::Exact(format!("bytes */{total_size}")),
+                    )
+                    .match_body("");
+                if final_boundary {
+                    status = status.with_status(200).with_body(final_body);
+                } else {
+                    status = status
+                        .with_status(308)
+                        .with_header("range", &format!("bytes=0-{}", plan.end_offset() - 1));
+                }
+                let status = status.create();
+                let drive = TransferDrive::for_test(&server, total_size.max(1));
+                let mut session = UploadSession {
+                    uri: SecretString::from(format!(
+                        "{}/upload/drive/v3/files?upload_id=session",
+                        server.url()
+                    )),
+                    intent: intent_for_size(total_size),
+                    next_offset: plan.offset(),
+                };
+
+                let progress = drive.query_upload_status(&mut session).unwrap();
+                assert_eq!(session.next_offset(), plan.end_offset());
+                if final_boundary {
+                    assert!(matches!(progress, UploadProgress::Complete(_)));
+                } else {
+                    assert_eq!(
+                        progress,
+                        UploadProgress::InProgress {
+                            next_offset: plan.end_offset()
+                        }
+                    );
+                    let retry =
+                        plan_resumable_upload_chunk(total_size, session.next_offset()).unwrap();
+                    assert_eq!(retry.offset(), plan.end_offset());
+                    assert!(retry.offset() > plan.offset());
+                }
+                status.assert();
+                blind_create.assert();
+                if let Some(metadata) = metadata {
+                    metadata.assert();
+                }
+            }
+        }
     }
 
     #[test]

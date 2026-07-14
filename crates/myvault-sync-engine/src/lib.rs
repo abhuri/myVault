@@ -571,6 +571,13 @@ pub(crate) fn validate_content_path(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Returns whether a portable path is eligible for ordinary sync content.
+/// Protected metadata/trash roots and non-canonical paths are rejected.
+#[must_use]
+pub fn is_valid_sync_content_path(value: &str) -> bool {
+    validate_content_path(value).is_ok()
+}
+
 pub(crate) fn validate_revision(value: &str) -> Result<()> {
     if is_lower_hex_hash(value) {
         Ok(())
