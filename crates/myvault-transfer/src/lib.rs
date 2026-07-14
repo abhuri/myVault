@@ -481,6 +481,18 @@ impl TransferStore for SyncStore {
     }
 
     fn begin_local_publish(&mut self, operation_id: Uuid, now_unix_ms: u64) -> Result<()> {
+        let Some(batch) = self.active_change_batch().map_err(|_| Error::Store)? else {
+            return Ok(());
+        };
+        let mutation_id = operation_id.to_string();
+        if !self
+            .local_mutations(batch.batch_id)
+            .map_err(|_| Error::Store)?
+            .iter()
+            .any(|mutation| mutation.mutation_id == mutation_id)
+        {
+            return Ok(());
+        }
         self.begin_transfer_local_publish(operation_id, now_unix_ms)
             .map_err(|_| Error::Store)
     }

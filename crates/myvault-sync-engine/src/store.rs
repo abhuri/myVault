@@ -2258,6 +2258,12 @@ impl SyncStore {
         )?;
         if changed != 1 {
             return match load_local_mutation_state(&transaction, active.batch_id, &mutation_id)? {
+                Some(LocalMutationState::Applying)
+                    if transfer.last_error_code.as_deref() == Some("reconcile_requested") =>
+                {
+                    transaction.commit()?;
+                    Ok(())
+                }
                 Some(LocalMutationState::Applying) => Err(Error::MutationNeedsReconcile),
                 Some(LocalMutationState::Committed) => Err(Error::InvalidStateTransition),
                 Some(LocalMutationState::Pending) | None => Err(Error::UnknownMutation),

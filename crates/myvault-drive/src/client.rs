@@ -115,6 +115,26 @@ impl ReadOnlyDrive {
         Self::build(token, api_base, max_response_bytes, REQUEST_TIMEOUT, false)
     }
 
+    /// Constructs a GET-only client for cross-crate integration tests.
+    /// This constructor is deliberately absent from production builds.
+    ///
+    /// # Errors
+    /// Rejects malformed origins, bounds, tokens, or client setup.
+    #[cfg(feature = "test-support")]
+    pub fn for_test_origin(api_base: &str, max_response_bytes: usize) -> Result<Self> {
+        let mut api_base = Url::parse(api_base).map_err(|_| Error::new(ErrorCode::InvalidInput))?;
+        if !api_base.path().ends_with('/') {
+            api_base.set_path(&format!("{}/", api_base.path()));
+        }
+        Self::build(
+            AccessToken::new("integration-test-token"),
+            api_base,
+            max_response_bytes,
+            REQUEST_TIMEOUT,
+            false,
+        )
+    }
+
     #[cfg(test)]
     fn for_test_with_timeout(
         base: &str,

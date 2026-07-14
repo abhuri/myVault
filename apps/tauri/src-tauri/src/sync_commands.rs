@@ -366,11 +366,11 @@ mod platform {
         DesktopOAuth, GoogleClientSecret, GoogleTokenClient, NativeTokenProvider, OsKeyringStore,
         SecretStore,
     };
-    use myvault_drive::{AccessToken, ReadOnlyDrive, TransferDrive};
+    use myvault_drive::{AccessToken, ReadOnlyDrive, ResolvedDriveChange, TransferDrive};
     use myvault_sync_engine::{
-        advance_initial_sync, BindOutcome, RemotePreviewEntry, SyncStore, TransferDirection,
-        TransferMimeClass, TransferPhase, TransferRecord, TransferRegistrationOutcome,
-        VaultSyncState,
+        advance_initial_sync, BindOutcome, RemoteChange, RemotePreviewEntry, SyncStore,
+        TransferDirection, TransferMimeClass, TransferPhase, TransferRecord,
+        TransferRegistrationOutcome, VaultSyncState,
     };
     use myvault_transfer::{WorkOutcome, Worker, MAX_TRANSFER_BYTES};
     use std::{
@@ -391,6 +391,7 @@ mod platform {
     const CALLBACK_TIMEOUT: Duration = Duration::from_secs(180);
     const TRANSFER_PAGE_SIZE: usize = 200;
     const MAX_GUARDED_OPERATIONS: usize = 1_000;
+    const MAX_INCREMENTAL_PAGES: usize = 100;
     const TRANSFER_NAMESPACE: Uuid = Uuid::from_u128(0xa9c0_4bb5_7db8_5a83_8e1c_d67a_a646_a4f2);
 
     #[derive(Default)]
@@ -426,6 +427,25 @@ mod platform {
 
         fn restore(mut self) -> Result<(), SyncCommandError> {
             self.restore_inner()
+        }
+
+        fn discard_store(&mut self) -> Result<(), SyncCommandError> {
+            let session_id = self
+                .active
+                .as_ref()
+                .map(|active| active.session_id)
+                .ok_or_else(SyncCommandError::internal)?;
+            drop(self.active.take());
+            let mut inner = self
+                .runtime
+                .inner
+                .lock()
+                .map_err(|_| SyncCommandError::internal())?;
+            if inner.active.is_some() || inner.transfer_running_session != Some(session_id) {
+                return Err(SyncCommandError::internal());
+            }
+            inner.transfer_running_session = None;
+            Ok(())
         }
 
         fn restore_inner(&mut self) -> Result<(), SyncCommandError> {
@@ -977,6 +997,195 @@ mod platform {
         Ok(registered)
     }
 
+    struct IncrementalBatch {
+        batch_id: Uuid,
+        final_page: bool,
+    }
+
+    fn prepare_incremental_change_batch(
+        service: &AppService,
+        session_id: VaultSessionId,
+        store: &mut SyncStore,
+        read_only: &ReadOnlyDrive,
+        transfer_drive: &TransferDrive,
+        root_id: &str,
+    ) -> Result<IncrementalBatch, SyncCommandError> {
+        let state = store
+            .vault_state()
+            .map_err(map_sync_error)?
+            .ok_or_else(SyncCommandError::internal)?;
+        let account_id = state.account_id.as_deref().ok_or_else(|| {
+            SyncCommandError::new(
+                SyncCommandCode::BindingMismatch,
+                "an exact Drive account must be bound before transfer",
+            )
+        })?;
+        let binding = read_only
+            .verify_binding(account_id, root_id)
+            .map_err(map_drive_error)?;
+        store
+            .verify_remote_binding(&binding)
+            .map_err(map_sync_error)?;
+        let cursor = state.durable_cursor.as_deref().ok_or_else(|| {
+            SyncCommandError::new(
+                SyncCommandCode::RescanRequired,
+                "Drive metadata must have a durable cursor before transfer",
+            )
+        })?;
+        let page = read_only.changes_page(cursor).map_err(map_drive_error)?;
+        let next_cursor = page
+            .next_page_token
+            .as_deref()
+            .or(page.new_start_page_token.as_deref())
+            .ok_or_else(SyncCommandError::internal)?;
+        let final_page = page.new_start_page_token.is_some();
+        let mut changes = Vec::new();
+        let mut downloads = Vec::new();
+        let mut merged_remote_paths = collect_remote_preview(store)?
+            .into_iter()
+            .map(|entry| (entry.file_id, entry.path))
+            .collect::<BTreeMap<_, _>>();
+
+        for raw in &page.changes {
+            let known = store.remote_entry(&raw.file_id).map_err(map_sync_error)?;
+            match read_only
+                .resolve_change_below_root(root_id, raw)
+                .map_err(map_drive_error)?
+            {
+                ResolvedDriveChange::Removed { .. } | ResolvedDriveChange::OutsideBoundRoot => {
+                    if known.is_some() {
+                        return Err(SyncCommandError::new(
+                            SyncCommandCode::RescanRequired,
+                            "remote move or removal requires explicit reconciliation",
+                        ));
+                    }
+                }
+                ResolvedDriveChange::Inside(entry) => {
+                    if let Some(previous) = known.as_ref() {
+                        if previous.path != entry.path
+                            || previous.parent_id != entry.parent_id
+                            || previous.kind != entry.kind
+                        {
+                            return Err(SyncCommandError::new(
+                                SyncCommandCode::RescanRequired,
+                                "remote move or rename requires explicit reconciliation",
+                            ));
+                        }
+                    }
+                    merged_remote_paths.insert(entry.file_id.clone(), entry.path.clone());
+                    let requires_download = entry.kind == RemoteEntryKind::File
+                        && known.as_ref().is_none_or(|previous| {
+                            previous.remote_revision != entry.remote_revision
+                                || previous.content_hash != entry.content_hash
+                        });
+                    if requires_download {
+                        let name = display_name(&entry.path)?;
+                        let candidate = transfer_drive
+                            .inspect_download_candidate(
+                                &entry.file_id,
+                                &entry.parent_id,
+                                name,
+                                &entry.remote_revision,
+                            )
+                            .map_err(map_drive_error)?;
+                        let operation_id = transfer_operation_id(&[
+                            "download",
+                            &entry.path,
+                            &entry.parent_id,
+                            candidate.file_id(),
+                            candidate.sync_revision(),
+                            candidate.sha256(),
+                            &candidate.size().to_string(),
+                        ]);
+                        downloads.push(
+                            TransferRecord::new(
+                                operation_id,
+                                TransferDirection::Download,
+                                entry.path.clone(),
+                                entry.parent_id.clone(),
+                                Some(entry.file_id.clone()),
+                                None,
+                                Some(candidate.sync_revision().to_owned()),
+                                candidate.sha256(),
+                                candidate.size(),
+                                content_kind(&entry.path, false),
+                                operation_marker(operation_id),
+                                Some(stage_reference(operation_id)),
+                                None,
+                                0,
+                            )
+                            .map_err(map_sync_error)?,
+                        );
+                    }
+                    changes.push(RemoteChange::Upsert(entry));
+                }
+            }
+        }
+
+        let local_entries = collect_local_entries(service, session_id)?;
+        reject_portable_path_collisions(
+            merged_remote_paths
+                .values()
+                .map(String::as_str)
+                .chain(local_entries.iter().map(|entry| entry.path.as_str())),
+        )?;
+        let batch_id = transfer_operation_id(&["changes", cursor, next_cursor]);
+        store
+            .begin_transfer_change_batch(batch_id, cursor, next_cursor, &changes, &downloads)
+            .map_err(map_sync_error)?;
+        Ok(IncrementalBatch {
+            batch_id,
+            final_page,
+        })
+    }
+
+    fn requeue_active_batch_reconciliation(
+        store: &mut SyncStore,
+        batch_id: Uuid,
+        now: u64,
+    ) -> Result<(), SyncCommandError> {
+        for mutation in store.local_mutations(batch_id).map_err(map_sync_error)? {
+            let operation_id =
+                Uuid::parse_str(&mutation.mutation_id).map_err(|_| SyncCommandError::internal())?;
+            let transfer = store
+                .transfer(operation_id)
+                .map_err(map_sync_error)?
+                .ok_or_else(SyncCommandError::internal)?;
+            if transfer.phase == TransferPhase::NeedsReconcile {
+                store
+                    .requeue_transfer_for_reconciliation(
+                        operation_id,
+                        now.max(transfer.updated_at_unix_ms),
+                    )
+                    .map_err(map_sync_error)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn run_guarded_worker(
+        service: &AppService,
+        session_id: VaultSessionId,
+        store: &mut SyncStore,
+        drive: TransferDrive,
+    ) -> Result<(), SyncCommandError> {
+        let executor = NativeTransferExecutor::new(service, session_id, drive);
+        let mut worker = Worker::new(store, executor);
+        for _ in 0..MAX_GUARDED_OPERATIONS {
+            match worker
+                .run_once(now_unix_ms()?)
+                .map_err(|_| SyncCommandError::internal())?
+            {
+                WorkOutcome::Idle => break,
+                WorkOutcome::Completed(_)
+                | WorkOutcome::RetryScheduled(_)
+                | WorkOutcome::AuthRequired(_)
+                | WorkOutcome::NeedsReconcile(_) => {}
+            }
+        }
+        Ok(())
+    }
+
     fn require_connected_account(
         connected_account_id: Option<&str>,
         requested_account_id: &str,
@@ -1358,39 +1567,85 @@ mod platform {
             };
 
             let run_result = (|| {
-                let drive = fresh_transfer_drive(&account_id, &bound.remote_root_id)?;
                 let store = detached.store_mut()?;
                 store
                     .resume_auth_required_transfers(now_unix_ms()?)
                     .map_err(map_sync_error)?;
-                prepare_guarded_transfers(
-                    &service,
-                    session_id,
-                    store,
-                    &drive,
-                    &bound.remote_root_id,
-                )?;
-                let executor = NativeTransferExecutor::new(&service, session_id, drive);
-                let mut worker = Worker::new(store, executor);
-                for _ in 0..MAX_GUARDED_OPERATIONS {
-                    match worker
-                        .run_once(now_unix_ms()?)
-                        .map_err(|_| SyncCommandError::internal())?
+
+                let mut metadata_fresh = false;
+                for page_index in 0..MAX_INCREMENTAL_PAGES {
+                    let active = store.active_change_batch().map_err(map_sync_error)?;
+                    let (batch_id, final_page, drive) = if let Some(active) = active {
+                        requeue_active_batch_reconciliation(
+                            store,
+                            active.batch_id,
+                            now_unix_ms()?,
+                        )?;
+                        (
+                            active.batch_id,
+                            false,
+                            fresh_transfer_drive(&account_id, &bound.remote_root_id)?,
+                        )
+                    } else {
+                        let read_only = fresh_drive(&account_id)?;
+                        let drive = fresh_transfer_drive(&account_id, &bound.remote_root_id)?;
+                        let batch = prepare_incremental_change_batch(
+                            &service,
+                            session_id,
+                            store,
+                            &read_only,
+                            &drive,
+                            &bound.remote_root_id,
+                        )?;
+                        (batch.batch_id, batch.final_page, drive)
+                    };
+
+                    run_guarded_worker(&service, session_id, store, drive)?;
+                    let active = store
+                        .active_change_batch()
+                        .map_err(map_sync_error)?
+                        .ok_or_else(SyncCommandError::internal)?;
+                    if active.applying_mutations == 0
+                        && active.committed_mutations == active.declared_mutations
                     {
-                        WorkOutcome::Idle => break,
-                        WorkOutcome::Completed(_)
-                        | WorkOutcome::RetryScheduled(_)
-                        | WorkOutcome::AuthRequired(_)
-                        | WorkOutcome::NeedsReconcile(_) => {}
+                        store
+                            .commit_transfer_change_batch(batch_id, now_unix_ms()?)
+                            .map_err(map_sync_error)?;
+                        if final_page {
+                            metadata_fresh = true;
+                            break;
+                        }
+                    } else {
+                        break;
                     }
+                    if page_index + 1 == MAX_INCREMENTAL_PAGES {
+                        return Err(SyncCommandError::new(
+                            SyncCommandCode::RescanRequired,
+                            "the bounded Drive changes drain did not finish",
+                        ));
+                    }
+                }
+
+                if metadata_fresh {
+                    let drive = fresh_transfer_drive(&account_id, &bound.remote_root_id)?;
+                    prepare_guarded_transfers(
+                        &service,
+                        session_id,
+                        store,
+                        &drive,
+                        &bound.remote_root_id,
+                    )?;
+                    run_guarded_worker(&service, session_id, store, drive)?;
                 }
                 service
                     .confirm_active_session(session_id)
                     .map_err(map_app_error)
             })();
-            let restore_result = detached.restore();
-            run_result?;
-            restore_result?;
+            if let Err(error) = run_result {
+                detached.discard_store()?;
+                return Err(error);
+            }
+            detached.restore()?;
             status_impl(&service, &runtime, session_id)
         })
         .await
@@ -1450,6 +1705,41 @@ mod platform {
     mod tests {
         use super::*;
         use myvault_core::Vault;
+
+        struct EmptyInitialDrive;
+
+        impl myvault_sync_engine::DriveClient for EmptyInitialDrive {
+            fn get_start_page_token(
+                &mut self,
+            ) -> std::result::Result<String, myvault_sync_engine::RemoteError> {
+                Ok("cursor_1".to_owned())
+            }
+
+            fn scan_folder_page(
+                &mut self,
+                _request: &myvault_sync_engine::ScanRequest,
+            ) -> std::result::Result<myvault_sync_engine::ScanPage, myvault_sync_engine::RemoteError>
+            {
+                Ok(myvault_sync_engine::ScanPage {
+                    entries: Vec::new(),
+                    next_page_token: None,
+                })
+            }
+
+            fn changes_page(
+                &mut self,
+                _page_token: &str,
+            ) -> std::result::Result<
+                myvault_sync_engine::ChangesPage,
+                myvault_sync_engine::RemoteError,
+            > {
+                Ok(myvault_sync_engine::ChangesPage {
+                    changes: Vec::new(),
+                    next_page_token: None,
+                    new_start_page_token: Some("cursor_1".to_owned()),
+                })
+            }
+        }
 
         #[test]
         fn desktop_client_id_and_exact_connected_account_are_fail_closed() {
@@ -1656,6 +1946,119 @@ mod platform {
             assert_eq!(busy.code, SyncCommandCode::Busy);
             drop(detached);
             status_impl(&service, &runtime, session_id).expect("restored sync state");
+        }
+
+        #[test]
+        fn incremental_page_keeps_old_cursor_until_transfer_batch_commit() {
+            let temporary = tempfile::tempdir().expect("temporary roots");
+            let base = temporary.path().canonicalize().expect("canonical root");
+            let app_data = base.join("app-data");
+            let vault_root = base.join("vault");
+            std::fs::create_dir(&app_data).expect("app data root");
+            std::fs::create_dir(&vault_root).expect("vault root");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&app_data, std::fs::Permissions::from_mode(0o700))
+                    .expect("private app data permissions");
+            }
+            let service = AppService::with_app_data_root(&app_data);
+            let session_id = service
+                .activate_trusted_vault(
+                    Vault::open(vault_root.canonicalize().expect("canonical vault"))
+                        .expect("open vault"),
+                )
+                .expect("activate vault")
+                .session_id
+                .expect("session");
+            let context = service.native_vault_context(session_id).expect("context");
+            let mut store = SyncStore::open(
+                context.app_data_root().expect("app data"),
+                context.vault_root(),
+                context.vault_id(),
+            )
+            .expect("sync store");
+            let binding = myvault_sync_engine::VerifiedRemoteBinding::new(
+                "account_1",
+                "root_1",
+                "account_1",
+                "root_1",
+            )
+            .expect("binding");
+            store.bind_remote_root(&binding, 1).expect("bind");
+            let mut initial = EmptyInitialDrive;
+            for now in 2..=4 {
+                advance_initial_sync(&mut store, &mut initial, now).expect("initial step");
+            }
+            assert_eq!(
+                store
+                    .vault_state()
+                    .unwrap()
+                    .unwrap()
+                    .durable_cursor
+                    .as_deref(),
+                Some("cursor_1")
+            );
+
+            let mut server = mockito::Server::new();
+            let about = server
+                .mock("GET", "/drive/v3/about")
+                .match_query(mockito::Matcher::Any)
+                .with_body(r#"{"user":{"permissionId":"account_1"}}"#)
+                .create();
+            let root = server
+                .mock("GET", "/drive/v3/files/root_1")
+                .match_query(mockito::Matcher::Any)
+                .with_body(
+                    r#"{"id":"root_1","name":"Fixture","mimeType":"application/vnd.google-apps.folder","parents":[],"trashed":false,"version":"1"}"#,
+                )
+                .create();
+            let changes = server
+                .mock("GET", "/drive/v3/changes")
+                .match_query(mockito::Matcher::Any)
+                .with_body(r#"{"changes":[],"newStartPageToken":"cursor_2"}"#)
+                .create();
+            let origin = server.url();
+            let read_only = ReadOnlyDrive::for_test_origin(&format!("{origin}/drive/v3/"), 4096)
+                .expect("read-only test Drive");
+            let transfer = TransferDrive::for_test_origins(
+                &format!("{origin}/drive/v3/"),
+                &format!("{origin}/upload/drive/v3/"),
+                "account_1",
+                "root_1",
+                myvault_transfer::MAX_TRANSFER_BYTES,
+            )
+            .expect("transfer test Drive");
+
+            let batch = prepare_incremental_change_batch(
+                &service, session_id, &mut store, &read_only, &transfer, "root_1",
+            )
+            .expect("prepare incremental page");
+            assert!(batch.final_page);
+            assert_eq!(
+                store
+                    .vault_state()
+                    .unwrap()
+                    .unwrap()
+                    .durable_cursor
+                    .as_deref(),
+                Some("cursor_1")
+            );
+            store
+                .commit_transfer_change_batch(batch.batch_id, 5)
+                .expect("commit zero-mutation page");
+            assert_eq!(
+                store
+                    .vault_state()
+                    .unwrap()
+                    .unwrap()
+                    .durable_cursor
+                    .as_deref(),
+                Some("cursor_2")
+            );
+            about.assert();
+            root.assert();
+            changes.assert();
         }
     }
 }

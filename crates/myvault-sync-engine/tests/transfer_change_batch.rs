@@ -198,6 +198,16 @@ fn transfer_batch_survives_restart_and_advances_only_after_verified_completion()
         reopened.local_mutations(batch_id).unwrap()[0].state,
         LocalMutationState::Applying
     );
+    reopened
+        .requeue_transfer_for_reconciliation(operation_id, 11)
+        .expect("request exact reconciliation");
+    reopened
+        .claim_next_transfer(11)
+        .expect("claim reconciliation")
+        .expect("due reconciliation");
+    reopened
+        .begin_transfer_local_publish(operation_id, 11)
+        .expect("explicit reconciliation may repeat create-no-replace publication");
     assert_eq!(
         reopened
             .complete_verified_transfer(operation_id, &completion(&entry, 20))
