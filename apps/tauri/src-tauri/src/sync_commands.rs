@@ -5,6 +5,7 @@ use myvault_app_service::{AppError, AppErrorCode, VaultSessionId};
 use myvault_drive::{ErrorCode as DriveErrorCode, FilePage};
 use myvault_sync_engine::{
     InitialSyncProgress, RemoteEntryKind, RemotePreviewCursor, RemotePreviewPage, SyncPhase,
+    TransferSummary,
 };
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -69,6 +70,12 @@ pub struct SyncStatusDto {
     pub root_name: Option<String>,
     pub phase: &'static str,
     pub rescan_required: bool,
+    pub active: u64,
+    pub pending: u64,
+    pub retry_scheduled: u64,
+    pub auth_required: u64,
+    pub needs_reconcile: u64,
+    pub completed: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -507,6 +514,7 @@ mod platform {
         session_id: VaultSessionId,
         inner: &RuntimeInner,
         state: Option<&VaultSyncState>,
+        transfers: TransferSummary,
     ) -> SyncStatusDto {
         SyncStatusDto {
             session_id,
@@ -523,6 +531,12 @@ mod platform {
             root_name: inner.root_name.clone(),
             phase: state.map_or("unbound", |value| phase_name(value.phase)),
             rescan_required: state.is_some_and(|value| value.rescan_required),
+            active: transfers.active(),
+            pending: transfers.pending,
+            retry_scheduled: transfers.retry_scheduled,
+            auth_required: transfers.auth_required,
+            needs_reconcile: transfers.needs_reconcile,
+            completed: transfers.completed,
         }
     }
 
@@ -601,11 +615,15 @@ mod platform {
                     .inner
                     .lock()
                     .map_err(|_| SyncCommandError::internal())?;
-                let state = ensure_store(&mut inner, &context)?
-                    .vault_state()
-                    .map_err(map_sync_error)?;
+                let (state, transfers) = {
+                    let store = ensure_store(&mut inner, &context)?;
+                    (
+                        store.vault_state().map_err(map_sync_error)?,
+                        store.transfer_summary().map_err(map_sync_error)?,
+                    )
+                };
                 refresh_connected_state(&mut inner, state.as_ref())?;
-                Ok(status_from(session_id, &inner, state.as_ref()))
+                Ok(status_from(session_id, &inner, state.as_ref(), transfers))
             })
             .map_err(map_app_error)?
     }
@@ -690,10 +708,14 @@ mod platform {
                             )
                         })?;
                     inner.connected_account_id = Some(account.permission_id);
-                    let state = ensure_store(&mut inner, &context)?
-                        .vault_state()
-                        .map_err(map_sync_error)?;
-                    Ok(status_from(session_id, &inner, state.as_ref()))
+                    let (state, transfers) = {
+                        let store = ensure_store(&mut inner, &context)?;
+                        (
+                            store.vault_state().map_err(map_sync_error)?,
+                            store.transfer_summary().map_err(map_sync_error)?,
+                        )
+                    };
+                    Ok(status_from(session_id, &inner, state.as_ref(), transfers))
                 })
                 .map_err(map_app_error)?
         })
@@ -770,13 +792,14 @@ mod platform {
                     let binding = drive
                         .verify_binding(&account_id, &root_id)
                         .map_err(map_drive_error)?;
-                    let (outcome, state) = {
+                    let (outcome, state, transfers) = {
                         let store = ensure_store(&mut inner, &context)?;
                         let outcome = store
                             .bind_remote_root(&binding, now_unix_ms()?)
                             .map_err(map_sync_error)?;
                         let state = store.vault_state().map_err(map_sync_error)?;
-                        (outcome, state)
+                        let transfers = store.transfer_summary().map_err(map_sync_error)?;
+                        (outcome, state, transfers)
                     };
                     inner.root_name = Some(root.name);
                     Ok(BindRootDto {
@@ -786,7 +809,7 @@ mod platform {
                             BindOutcome::AlreadyBound => "alreadyBound",
                             BindOutcome::LegacyBindingConfirmed => "legacyBindingConfirmed",
                         },
-                        status: status_from(session_id, &inner, state.as_ref()),
+                        status: status_from(session_id, &inner, state.as_ref(), transfers),
                     })
                 })
                 .map_err(map_app_error)?
@@ -837,10 +860,11 @@ mod platform {
                     let progress = advance_initial_sync(store, &mut drive, now_unix_ms()?)
                         .map_err(map_sync_error)?;
                     let state = store.vault_state().map_err(map_sync_error)?;
+                    let transfers = store.transfer_summary().map_err(map_sync_error)?;
                     Ok(ScanStepDto {
                         session_id,
                         progress: progress_name(progress),
-                        status: status_from(session_id, &inner, state.as_ref()),
+                        status: status_from(session_id, &inner, state.as_ref(), transfers),
                     })
                 })
                 .map_err(map_app_error)?
@@ -914,10 +938,14 @@ mod platform {
                     }
                     inner.connected_account_id = None;
                     inner.root_name = None;
-                    let state = ensure_store(&mut inner, &context)?
-                        .vault_state()
-                        .map_err(map_sync_error)?;
-                    Ok(status_from(session_id, &inner, state.as_ref()))
+                    let (state, transfers) = {
+                        let store = ensure_store(&mut inner, &context)?;
+                        (
+                            store.vault_state().map_err(map_sync_error)?,
+                            store.transfer_summary().map_err(map_sync_error)?,
+                        )
+                    };
+                    Ok(status_from(session_id, &inner, state.as_ref(), transfers))
                 })
                 .map_err(map_app_error)?
         })
@@ -1066,6 +1094,7 @@ mod platform {
     }
 
     fn android_status(session_id: VaultSessionId, state: &AndroidSyncState) -> SyncStatusDto {
+        let transfers = TransferSummary::default();
         SyncStatusDto {
             session_id,
             supported: true,
@@ -1078,6 +1107,12 @@ mod platform {
             root_name: state.root_name.clone(),
             phase: "unbound",
             rescan_required: false,
+            active: transfers.active(),
+            pending: transfers.pending,
+            retry_scheduled: transfers.retry_scheduled,
+            auth_required: transfers.auth_required,
+            needs_reconcile: transfers.needs_reconcile,
+            completed: transfers.completed,
         }
     }
 
@@ -1287,12 +1322,21 @@ mod tests {
             root_name: None,
             phase: "unbound",
             rescan_required: false,
+            active: 7,
+            pending: 2,
+            retry_scheduled: 1,
+            auth_required: 1,
+            needs_reconcile: 1,
+            completed: 3,
         };
         let status_json = serde_json::to_string(&status).expect("serialize status");
         assert_eq!(
             status_json,
-            r#"{"sessionId":"12345678-1234-4abc-8def-1234567890ab","supported":true,"bindingAvailable":true,"configured":false,"connected":false,"bound":false,"accountId":null,"rootId":null,"rootName":null,"phase":"unbound","rescanRequired":false}"#
+            r#"{"sessionId":"12345678-1234-4abc-8def-1234567890ab","supported":true,"bindingAvailable":true,"configured":false,"connected":false,"bound":false,"accountId":null,"rootId":null,"rootName":null,"phase":"unbound","rescanRequired":false,"active":7,"pending":2,"retryScheduled":1,"authRequired":1,"needsReconcile":1,"completed":3}"#
         );
+        for forbidden in ["operationId", "path", "token", "sessionUri", "providerBody"] {
+            assert!(!status_json.contains(forbidden));
+        }
 
         let page = preview_page(
             session_id,

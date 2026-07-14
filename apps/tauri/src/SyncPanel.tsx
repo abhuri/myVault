@@ -180,15 +180,17 @@ export function SyncPanel({ sessionId, onBusyChange }: { sessionId: string; onBu
   const disabled = state.busy !== null;
 
   return (
-    <section className="sync-panel" aria-labelledby="drive-metadata-title">
+    <section className="sync-panel" aria-labelledby="drive-sync-title">
       <header>
         <div>
           <p className="section-label">GOOGLE DRIVE</p>
-          <h2 id="drive-metadata-title">Read-only metadata</h2>
+          <h2 id="drive-sync-title">Guarded sync</h2>
         </div>
         {status?.rescanRequired && <span className="sync-warning">Rescan required</span>}
       </header>
-      <p className="sync-scope">Folder names, paths and IDs only. No file content transfer or remote changes.</p>
+      <p className="sync-scope">
+        Verified uploads may create remote files only. Downloads may create local files only when absent. Metadata browsing stays read-only.
+      </p>
 
       {state.error && (
         <div className="sync-error" role="alert">
@@ -206,6 +208,22 @@ export function SyncPanel({ sessionId, onBusyChange }: { sessionId: string; onBu
         <div><dt>Phase</dt><dd>{status?.phase || (state.busy === "status" ? "Checking…" : "Unavailable")}</dd></div>
         <div><dt>Rescan</dt><dd><StateValue active={status?.rescanRequired === false}>{status?.rescanRequired ? "Required" : "No"}</StateValue></dd></div>
       </dl>
+
+      {status && (
+        <section className="sync-section" aria-labelledby="transfer-status-title">
+          <div className="sync-section-heading">
+            <h3 id="transfer-status-title">Transfer status</h3>
+            <span>{status.active} active</span>
+          </div>
+          <dl className="sync-status" aria-live="polite">
+            <div><dt>Pending</dt><dd>{status.pending}</dd></div>
+            <div><dt>Retry scheduled</dt><dd>{status.retryScheduled}</dd></div>
+            <div><dt>Authorization required</dt><dd>{status.authRequired}</dd></div>
+            <div><dt>Needs reconcile</dt><dd>{status.needsReconcile}</dd></div>
+            <div><dt>Completed</dt><dd>{status.completed}</dd></div>
+          </dl>
+        </section>
+      )}
 
       {status?.accountId && <p className="sync-identity">Account ID <code>{status.accountId}</code></p>}
       {status?.rootId && <p className="sync-identity">Exact root <strong>{status.rootName ?? "Drive folder"}</strong><code>{status.rootId}</code></p>}
@@ -227,7 +245,7 @@ export function SyncPanel({ sessionId, onBusyChange }: { sessionId: string; onBu
           disabled={disabled || !status.configured}
           onClick={() => void runStatusOperation("connect", () => syncApi.connect(sessionId))}
         >
-          {state.busy === "connect" ? "Connecting…" : "Connect for metadata access"}
+          {state.busy === "connect" ? "Connecting…" : "Connect Google Drive"}
         </button>
       )}
 
@@ -339,7 +357,7 @@ export function SyncPanel({ sessionId, onBusyChange }: { sessionId: string; onBu
 
       {status?.supported && status.connected && (
         <button className="sync-disconnect" type="button" disabled={disabled} onClick={() => void disconnect()}>
-          {state.busy === "disconnect" ? "Disconnecting…" : "Disconnect Drive metadata"}
+          {state.busy === "disconnect" ? "Disconnecting…" : "Disconnect Google Drive"}
         </button>
       )}
     </section>
