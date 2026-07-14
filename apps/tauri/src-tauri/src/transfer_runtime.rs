@@ -9,7 +9,7 @@ use myvault_transfer::{
     ContentKind, ExecutionFailure, ExecutionFailureKind, TransferDirection, TransferExecutor,
     TransferIntent, VerifiedTransfer, MAX_TRANSFER_BYTES,
 };
-use std::time::Duration;
+use std::{io::Write, time::Duration};
 
 const UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TRANSFER_BYTES_USIZE: usize = MAX_TRANSFER_BYTES as usize;
@@ -295,7 +295,7 @@ impl<'a> NativeTransferExecutor<'a> {
             Ok(stage) => {
                 self.drive
                     .verify_download(&download)
-                    .map_err(|error| drive_failure(error, false))?;
+                    .map_err(|error| drive_failure(error, true))?;
                 stage
             }
             Err(NativeTransferError::StageUnavailable) => {
@@ -410,9 +410,28 @@ impl<'a> NativeTransferExecutor<'a> {
                 MAX_TRANSFER_BYTES_USIZE,
             )
             .map_err(local_failure)?;
-        self.drive
-            .download_blob_to(download, &mut writer)
-            .map_err(download_stream_failure)?;
+        let (download_result, bytes_written) = {
+            let mut counted = ByteCountingWriter::new(&mut writer);
+            let result = self.drive.download_blob_to(download, &mut counted);
+            (result, counted.bytes_written())
+        };
+        if let Err(error) = download_result {
+            drop(writer);
+            let disposition =
+                classify_download_stream_failure(error.code(), bytes_written, intent.byte_len());
+            if disposition.discard_empty_stage {
+                self.service
+                    .discard_incomplete_transfer_stage(
+                        self.session_id,
+                        intent.operation_id(),
+                        intent.sha256_hex(),
+                        intent.byte_len(),
+                        MAX_TRANSFER_BYTES_USIZE,
+                    )
+                    .map_err(local_failure)?;
+            }
+            return Err(failure(disposition.kind, error.code().as_str(), None));
+        }
         self.service
             .finish_transfer_stage(
                 self.session_id,
@@ -486,6 +505,9 @@ fn classify_drive_failure(
     side_effect_possible: bool,
 ) -> ExecutionFailureKind {
     match code {
+        DriveErrorCode::Unauthorized if side_effect_possible => {
+            ExecutionFailureKind::NeedsReconcile
+        }
         DriveErrorCode::Unauthorized => ExecutionFailureKind::AuthRequired,
         DriveErrorCode::RateLimited => ExecutionFailureKind::RateLimited,
         // A redacted transport failure is the only signal currently available
@@ -519,20 +541,72 @@ fn local_failure(error: NativeTransferError) -> ExecutionFailure {
     failure(ExecutionFailureKind::NeedsReconcile, code, None)
 }
 
-fn download_stream_failure(error: DriveError) -> ExecutionFailure {
-    let kind = classify_download_stream_failure(error.code());
-    failure(kind, error.code().as_str(), None)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DownloadFailureDisposition {
+    kind: ExecutionFailureKind,
+    discard_empty_stage: bool,
 }
 
-fn classify_download_stream_failure(code: DriveErrorCode) -> ExecutionFailureKind {
-    if code == DriveErrorCode::Unauthorized {
-        ExecutionFailureKind::AuthRequired
-    } else {
-        // Once a private stage exists, interrupted or rejected streaming can
-        // leave partial evidence. R2 preserves it for explicit reconciliation
-        // instead of truncating it for an automatic retry, including when the
-        // underlying failure looks like a disconnected network.
-        ExecutionFailureKind::NeedsReconcile
+fn classify_download_stream_failure(
+    code: DriveErrorCode,
+    bytes_written: u64,
+    expected_bytes: u64,
+) -> DownloadFailureDisposition {
+    // Only a non-empty transfer with a proven-empty private stage can be
+    // removed and automatically retried. Any written byte, or an empty-file
+    // stage that cannot be distinguished from complete evidence, is preserved
+    // for reconciliation.
+    if bytes_written == 0 && expected_bytes != 0 {
+        let kind = match code {
+            DriveErrorCode::Unauthorized => Some(ExecutionFailureKind::AuthRequired),
+            DriveErrorCode::Transport => Some(ExecutionFailureKind::Offline),
+            DriveErrorCode::Timeout | DriveErrorCode::TransientProvider => {
+                Some(ExecutionFailureKind::TransientSafe)
+            }
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            return DownloadFailureDisposition {
+                kind,
+                discard_empty_stage: true,
+            };
+        }
+    }
+    DownloadFailureDisposition {
+        kind: ExecutionFailureKind::NeedsReconcile,
+        discard_empty_stage: false,
+    }
+}
+
+struct ByteCountingWriter<W> {
+    inner: W,
+    bytes_written: u64,
+}
+
+impl<W> ByteCountingWriter<W> {
+    const fn new(inner: W) -> Self {
+        Self {
+            inner,
+            bytes_written: 0,
+        }
+    }
+
+    const fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+}
+
+impl<W: Write> Write for ByteCountingWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        self.bytes_written = self
+            .bytes_written
+            .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -591,6 +665,18 @@ mod tests {
     }
 
     #[test]
+    fn upload_disconnect_is_offline_only_before_resumable_side_effects() {
+        assert_eq!(
+            classify_drive_failure(DriveErrorCode::Transport, false),
+            ExecutionFailureKind::Offline
+        );
+        assert_eq!(
+            classify_drive_failure(DriveErrorCode::Transport, true),
+            ExecutionFailureKind::TransientUnknown
+        );
+    }
+
+    #[test]
     fn upload_transport_failures_after_possible_mutation_never_pause_offline() {
         for code in [
             DriveErrorCode::Transport,
@@ -605,21 +691,89 @@ mod tests {
     }
 
     #[test]
+    fn auth_expiry_is_refreshable_only_before_possible_remote_mutation() {
+        assert_eq!(
+            classify_drive_failure(DriveErrorCode::Unauthorized, false),
+            ExecutionFailureKind::AuthRequired
+        );
+        assert_eq!(
+            classify_drive_failure(DriveErrorCode::Unauthorized, true),
+            ExecutionFailureKind::NeedsReconcile
+        );
+    }
+
+    #[test]
     fn partial_download_stage_never_pauses_offline() {
         for code in [
             DriveErrorCode::Transport,
             DriveErrorCode::Timeout,
             DriveErrorCode::TransientProvider,
+            DriveErrorCode::Unauthorized,
         ] {
             assert_eq!(
-                classify_download_stream_failure(code),
-                ExecutionFailureKind::NeedsReconcile
+                classify_download_stream_failure(code, 1, 3),
+                DownloadFailureDisposition {
+                    kind: ExecutionFailureKind::NeedsReconcile,
+                    discard_empty_stage: false,
+                }
             );
         }
         assert_eq!(
-            classify_download_stream_failure(DriveErrorCode::Unauthorized),
-            ExecutionFailureKind::AuthRequired
+            classify_download_stream_failure(DriveErrorCode::Transport, 0, 0),
+            DownloadFailureDisposition {
+                kind: ExecutionFailureKind::NeedsReconcile,
+                discard_empty_stage: false,
+            }
         );
+    }
+
+    #[test]
+    fn empty_new_download_stage_has_exact_safe_auth_and_offline_signals() {
+        assert_eq!(
+            classify_download_stream_failure(DriveErrorCode::Transport, 0, 3),
+            DownloadFailureDisposition {
+                kind: ExecutionFailureKind::Offline,
+                discard_empty_stage: true,
+            }
+        );
+        assert_eq!(
+            classify_download_stream_failure(DriveErrorCode::Unauthorized, 0, 3),
+            DownloadFailureDisposition {
+                kind: ExecutionFailureKind::AuthRequired,
+                discard_empty_stage: true,
+            }
+        );
+        assert_eq!(
+            classify_download_stream_failure(DriveErrorCode::Timeout, 0, 3),
+            DownloadFailureDisposition {
+                kind: ExecutionFailureKind::TransientSafe,
+                discard_empty_stage: true,
+            }
+        );
+    }
+
+    #[test]
+    fn existing_verified_download_stage_never_uses_offline_or_refresh_signal() {
+        assert_eq!(
+            classify_drive_failure(DriveErrorCode::Transport, true),
+            ExecutionFailureKind::TransientUnknown
+        );
+        assert_eq!(
+            classify_drive_failure(DriveErrorCode::Unauthorized, true),
+            ExecutionFailureKind::NeedsReconcile
+        );
+    }
+
+    #[test]
+    fn byte_counter_proves_when_download_staging_became_partial() {
+        let mut destination = Vec::new();
+        {
+            let mut writer = ByteCountingWriter::new(&mut destination);
+            writer.write_all(b"partial").unwrap();
+            writer.flush().unwrap();
+            assert_eq!(writer.bytes_written(), 7);
+        }
+        assert_eq!(destination, b"partial");
     }
 
     #[test]

@@ -578,6 +578,9 @@ pub enum WorkOutcome {
     Idle,
     Completed(Uuid),
     RetryScheduled(Uuid),
+    /// The exact operation stopped before a side effect because its credential
+    /// expired. The guarded-run integrator may refresh once, then explicitly
+    /// resume auth-paused transfers; ambiguous auth failures never use this signal.
     AuthRequired(Uuid),
     NeedsReconcile(Uuid),
 }
@@ -585,6 +588,7 @@ pub enum WorkOutcome {
 pub struct Worker<S, E> {
     store: S,
     executor: E,
+    auth_refresh_required: Option<Uuid>,
 }
 
 impl<S, E> Worker<S, E>
@@ -594,7 +598,11 @@ where
 {
     #[must_use]
     pub const fn new(store: S, executor: E) -> Self {
-        Self { store, executor }
+        Self {
+            store,
+            executor,
+            auth_refresh_required: None,
+        }
     }
 
     /// Claims and advances at most one durable transfer operation.
@@ -603,6 +611,13 @@ where
     /// Returns a store or timestamp error without discarding the claimed
     /// operation's durable evidence.
     pub fn run_once(&mut self, now_unix_ms: u64) -> Result<WorkOutcome> {
+        if self.auth_refresh_required.is_some() {
+            // A single executor owns one immutable access token. Do not claim
+            // another operation after that token is proven expired. Returning
+            // Idle makes existing guarded loops stop; the exact refresh signal
+            // remains available through `auth_refresh_required`.
+            return Ok(WorkOutcome::Idle);
+        }
         let Some(intent) = self.store.claim_due(now_unix_ms)? else {
             return Ok(WorkOutcome::Idle);
         };
@@ -652,6 +667,7 @@ where
             ExecutionFailureKind::AuthRequired => {
                 self.store
                     .mark_auth_required(operation_id, failure.code(), now_unix_ms)?;
+                self.auth_refresh_required = Some(operation_id);
                 Ok(WorkOutcome::AuthRequired(operation_id))
             }
             ExecutionFailureKind::Offline => {
@@ -686,6 +702,11 @@ where
                 Ok(WorkOutcome::NeedsReconcile(operation_id))
             }
         }
+    }
+
+    #[must_use]
+    pub const fn auth_refresh_required(&self) -> Option<Uuid> {
+        self.auth_refresh_required
     }
 
     #[must_use]
@@ -1142,6 +1163,41 @@ mod tests {
         let (store, _) = worker.into_parts();
         assert_eq!(store.auth, [id]);
         assert!(store.retries.is_empty());
+    }
+
+    #[test]
+    fn auth_expiry_latches_exact_refresh_signal_and_stops_claiming() {
+        let expired_id = Uuid::new_v4();
+        let unclaimed_id = Uuid::new_v4();
+        let store = MemoryStore {
+            jobs: VecDeque::from([intent(expired_id), intent(unclaimed_id)]),
+            ..MemoryStore::default()
+        };
+        let expired = ExecutionFailure::new(
+            ExecutionFailureKind::AuthRequired,
+            "drive_auth_required",
+            None,
+        )
+        .unwrap();
+        let executor = ScriptedExecutor {
+            results: VecDeque::from([Err(expired), Ok(verified(unclaimed_id, HASH_A))]),
+        };
+        let mut worker = Worker::new(store, executor);
+
+        assert_eq!(
+            worker.run_once(1_000).unwrap(),
+            WorkOutcome::AuthRequired(expired_id)
+        );
+        assert_eq!(worker.auth_refresh_required(), Some(expired_id));
+        assert_eq!(worker.run_once(1_001).unwrap(), WorkOutcome::Idle);
+
+        let (store, executor) = worker.into_parts();
+        assert_eq!(store.auth, [expired_id]);
+        assert_eq!(store.jobs.len(), 1);
+        assert_eq!(store.jobs.front().unwrap().operation_id(), unclaimed_id);
+        assert_eq!(executor.results.len(), 1);
+        assert!(store.retries.is_empty());
+        assert!(store.reconcile.is_empty());
     }
 
     #[test]
