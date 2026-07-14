@@ -50,6 +50,7 @@ pub struct TransferIntent {
     operation_marker: String,
     stage_ref: Option<String>,
     base_ref: Option<String>,
+    attempt_count: u32,
 }
 
 impl TransferIntent {
@@ -74,6 +75,7 @@ impl TransferIntent {
         operation_marker: impl Into<String>,
         stage_ref: Option<String>,
         base_ref: Option<String>,
+        attempt_count: u32,
     ) -> Result<Self> {
         let value = Self {
             operation_id,
@@ -89,6 +91,7 @@ impl TransferIntent {
             operation_marker: operation_marker.into(),
             stage_ref,
             base_ref,
+            attempt_count,
         };
         value.validate()?;
         Ok(value)
@@ -189,6 +192,11 @@ impl TransferIntent {
     #[must_use]
     pub fn base_ref(&self) -> Option<&str> {
         self.base_ref.as_deref()
+    }
+
+    #[must_use]
+    pub const fn attempt_count(&self) -> u32 {
+        self.attempt_count
     }
 }
 
@@ -405,6 +413,7 @@ impl TransferStore for SyncStore {
             record.operation_marker,
             record.stage_reference,
             record.base_reference,
+            record.attempt_count,
         )
         .map(Some)
     }
@@ -513,7 +522,7 @@ where
     /// # Errors
     /// Returns a store or timestamp error without discarding the claimed
     /// operation's durable evidence.
-    pub fn run_once(&mut self, now_unix_ms: u64, attempt: u32) -> Result<WorkOutcome> {
+    pub fn run_once(&mut self, now_unix_ms: u64) -> Result<WorkOutcome> {
         let Some(intent) = self.store.claim_due(now_unix_ms)? else {
             return Ok(WorkOutcome::Idle);
         };
@@ -531,7 +540,9 @@ where
                 self.store.complete_verified(&verified, now_unix_ms)?;
                 Ok(WorkOutcome::Completed(operation_id))
             }
-            Err(failure) => self.handle_failure(operation_id, now_unix_ms, attempt, &failure),
+            Err(failure) => {
+                self.handle_failure(operation_id, now_unix_ms, intent.attempt_count(), &failure)
+            }
         }
     }
 
@@ -702,6 +713,7 @@ mod tests {
             "operation1",
             Some("stage-operation1".into()),
             None,
+            0,
         )
         .unwrap()
     }
@@ -811,7 +823,7 @@ mod tests {
             results: VecDeque::from([Ok(verified(id, HASH_A))]),
         };
         let mut worker = Worker::new(store, executor);
-        assert_eq!(worker.run_once(10, 0).unwrap(), WorkOutcome::Completed(id));
+        assert_eq!(worker.run_once(10).unwrap(), WorkOutcome::Completed(id));
         let (store, _) = worker.into_parts();
         assert_eq!(store.completed, [id]);
         assert!(store.reconcile.is_empty());
@@ -829,7 +841,7 @@ mod tests {
         };
         let mut worker = Worker::new(store, executor);
         assert_eq!(
-            worker.run_once(10, 0).unwrap(),
+            worker.run_once(10).unwrap(),
             WorkOutcome::NeedsReconcile(id)
         );
         let (store, _) = worker.into_parts();
@@ -855,7 +867,7 @@ mod tests {
         };
         let mut worker = Worker::new(store, executor);
         assert_eq!(
-            worker.run_once(10, 0).unwrap(),
+            worker.run_once(10).unwrap(),
             WorkOutcome::NeedsReconcile(id)
         );
         let (store, _) = worker.into_parts();
@@ -881,11 +893,41 @@ mod tests {
         };
         let mut worker = Worker::new(store, executor);
         assert_eq!(
-            worker.run_once(1_000, 4).unwrap(),
+            worker.run_once(1_000).unwrap(),
             WorkOutcome::RetryScheduled(id)
         );
         let (store, _) = worker.into_parts();
         assert_eq!(store.retries, [(id, 121_000, "drive_rate_limited")]);
+    }
+
+    #[test]
+    fn retry_backoff_uses_the_durable_attempt_count() {
+        let id = Uuid::new_v4();
+        let mut due = intent(id);
+        due.attempt_count = 4;
+        let store = MemoryStore {
+            jobs: VecDeque::from([due]),
+            ..MemoryStore::default()
+        };
+        let failure = ExecutionFailure::new(
+            ExecutionFailureKind::RateLimited,
+            "drive_rate_limited",
+            None,
+        )
+        .unwrap();
+        let executor = ScriptedExecutor {
+            results: VecDeque::from([Err(failure)]),
+        };
+        let mut worker = Worker::new(store, executor);
+        assert_eq!(
+            worker.run_once(1_000).unwrap(),
+            WorkOutcome::RetryScheduled(id)
+        );
+        let (store, _) = worker.into_parts();
+        assert_eq!(
+            store.retries,
+            [(id, 1_000 + retry_delay_ms(id, 4), "drive_rate_limited")]
+        );
     }
 
     #[test]
@@ -906,7 +948,7 @@ mod tests {
         };
         let mut worker = Worker::new(store, executor);
         assert_eq!(
-            worker.run_once(1_000, 0).unwrap(),
+            worker.run_once(1_000).unwrap(),
             WorkOutcome::AuthRequired(id)
         );
         let (store, _) = worker.into_parts();
@@ -928,7 +970,7 @@ mod tests {
         };
         let mut worker = Worker::new(store, executor);
         assert_eq!(
-            worker.run_once(2_000, 7).unwrap(),
+            worker.run_once(2_000).unwrap(),
             WorkOutcome::RetryScheduled(id)
         );
         let (store, _) = worker.into_parts();
@@ -960,6 +1002,7 @@ mod tests {
                 "marker",
                 None,
                 None,
+                0,
             )
             .is_err());
         }
@@ -977,6 +1020,7 @@ mod tests {
             "marker",
             None,
             None,
+            0,
         )
         .is_err());
     }
@@ -995,6 +1039,6 @@ mod tests {
             results: VecDeque::new(),
         };
         let mut worker = Worker::new(MemoryStore::default(), executor);
-        assert_eq!(worker.run_once(5, 0).unwrap(), WorkOutcome::Idle);
+        assert_eq!(worker.run_once(5).unwrap(), WorkOutcome::Idle);
     }
 }
