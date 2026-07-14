@@ -682,12 +682,20 @@ mod platform {
         access: &mut FreshAccessToken,
         refresh_attempted: &mut bool,
     ) -> Result<bool, SyncCommandError> {
-        if *refresh_attempted {
+        if !claim_auth_refresh(refresh_attempted) {
             return Ok(false);
         }
-        *refresh_attempted = true;
         *access = fresh_access(account_id)?;
         Ok(true)
+    }
+
+    fn claim_auth_refresh(refresh_attempted: &mut bool) -> bool {
+        if *refresh_attempted {
+            false
+        } else {
+            *refresh_attempted = true;
+            true
+        }
     }
 
     fn transfer_operation_id(parts: &[&str]) -> Uuid {
@@ -1880,6 +1888,14 @@ mod platform {
                     .code,
                 SyncCommandCode::BindingMismatch
             );
+        }
+
+        #[test]
+        fn guarded_run_claims_exactly_one_serialized_auth_refresh() {
+            let mut attempted = false;
+            assert!(claim_auth_refresh(&mut attempted));
+            assert!(attempted);
+            assert!(!claim_auth_refresh(&mut attempted));
         }
 
         #[test]
