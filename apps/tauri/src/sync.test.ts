@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   canOpenAnotherVault,
+  canRunLocalObservation,
   initialSyncState,
   mapFolderPage,
   mapPreviewPage,
@@ -118,6 +119,16 @@ describe("sync reducer", () => {
   it("blocks Vault switching while a native Drive operation is active", () => {
     expect(canOpenAnotherVault(true)).toBe(false);
     expect(canOpenAnotherVault(false)).toBe(true);
+  });
+
+  it("runs local observation only from a pending hint against a fresh ready binding", () => {
+    const ready = { ...STATUS, bound: true, phase: "ready" };
+    expect(canRunLocalObservation(ready, null, true)).toBe(true);
+    expect(canRunLocalObservation(ready, "transfer", true)).toBe(false);
+    expect(canRunLocalObservation(ready, null, false)).toBe(false);
+    expect(canRunLocalObservation({ ...ready, connected: false }, null, true)).toBe(false);
+    expect(canRunLocalObservation({ ...ready, rescanRequired: true }, null, true)).toBe(false);
+    expect(canRunLocalObservation({ ...ready, phase: "changes" }, null, true)).toBe(false);
   });
 
   it("ignores late actions from a previous Vault session", () => {

@@ -1,6 +1,9 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import {
+  canRunLocalObservation,
   initialSyncState,
+  isLocalSyncHintForSession,
+  LOCAL_SYNC_HINT_EVENT,
   safeSyncFailure,
   scanCanContinue,
   syncApi,
@@ -27,6 +30,8 @@ export function SyncPanel({ sessionId, onBusyChange }: { sessionId: string; onBu
   const [bindTarget, setBindTarget] = useState<BindTarget | null>(null);
   const generation = useRef(0);
   const cancelScan = useRef(false);
+  const localObservationPending = useRef(true);
+  const [localHintGeneration, setLocalHintGeneration] = useState(0);
 
   const isCurrent = (expectedGeneration: number) =>
     generation.current === expectedGeneration && state.sessionId === sessionId;
@@ -36,6 +41,16 @@ export function SyncPanel({ sessionId, onBusyChange }: { sessionId: string; onBu
   }, [onBusyChange, state.busy]);
 
   useEffect(() => () => onBusyChange(false), [onBusyChange]);
+
+  useEffect(() => {
+    const receiveHint = (event: Event) => {
+      if (!isLocalSyncHintForSession(event, sessionId)) return;
+      localObservationPending.current = true;
+      setLocalHintGeneration((value) => value + 1);
+    };
+    window.addEventListener(LOCAL_SYNC_HINT_EVENT, receiveHint);
+    return () => window.removeEventListener(LOCAL_SYNC_HINT_EVENT, receiveHint);
+  }, [sessionId]);
 
   useEffect(() => {
     const requestGeneration = ++generation.current;
@@ -69,6 +84,22 @@ export function SyncPanel({ sessionId, onBusyChange }: { sessionId: string; onBu
       if (isCurrent(requestGeneration)) dispatch({ type: "failure", sessionId, message: safeSyncFailure(reason) });
     }
   };
+
+  useEffect(() => {
+    if (!canRunLocalObservation(state.status, state.busy, localObservationPending.current)) return;
+    localObservationPending.current = false;
+    const requestGeneration = generation.current;
+    dispatch({ type: "busy", sessionId, busy: "transfer" });
+    void syncApi.runGuarded(sessionId)
+      .then((status) => {
+        if (isCurrent(requestGeneration)) dispatch({ type: "status", sessionId, status });
+      })
+      .catch((reason) => {
+        if (isCurrent(requestGeneration)) {
+          dispatch({ type: "failure", sessionId, message: safeSyncFailure(reason) });
+        }
+      });
+  }, [localHintGeneration, sessionId, state.busy, state.status]);
 
   const loadFolders = async (
     parentId: string | null,

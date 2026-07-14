@@ -29,7 +29,7 @@ import {
   VAULT_CHANGE_DEBOUNCE_MS,
 } from "./reader";
 import { SyncPanel } from "./SyncPanel";
-import { canOpenAnotherVault, SYNC_BUSY_VAULT_MESSAGE } from "./sync";
+import { canOpenAnotherVault, requestLocalSyncHint, SYNC_BUSY_VAULT_MESSAGE } from "./sync";
 import "./App.css";
 
 type VaultStatus = { active: boolean; sessionId: string | null };
@@ -316,6 +316,7 @@ function App() {
           { sessionId: statusRef.current?.sessionId, activePath: activePathRef.current, savePhase: saveRef.current.phase },
         );
         if (latestPlan.type === "ignore") return;
+        requestLocalSyncHint(latestPlan.sessionId);
         void loadExplorer(latestPlan.sessionId).catch(() => setError("Could not refresh the Vault after an external change."));
         if (latestPlan.activePath) {
           void refreshActiveNote(latestPlan.sessionId, latestPlan.activePath)
@@ -420,6 +421,7 @@ function App() {
       const stillCurrent = textRef.current === submittedText;
       setSave((state) => saveReducer(state, { type: "saved", revisionHex: result.revisionHex, byteLen: result.byteLen, stillCurrent }));
       setNotes((cache) => ({ ...cache, [path]: textRef.current }));
+      requestLocalSyncHint(sessionId);
     } catch (reason) {
       const failure = failureOf(reason);
       setSave((state) => saveReducer(state, { type: "failed", code: failure.code ?? "error", message: failure.message }));

@@ -78,9 +78,34 @@ const MAX_TEXT = 4096;
 export const MAX_ACCUMULATED_FOLDERS = 2000;
 export const MAX_ACCUMULATED_PREVIEW_ENTRIES = 1000;
 export const SYNC_BUSY_VAULT_MESSAGE = "Finish or cancel the active Google Drive operation before opening another Vault.";
+export const LOCAL_SYNC_HINT_EVENT = "myvault-local-sync-hint";
 
 export function canOpenAnotherVault(syncBusy: boolean): boolean {
   return !syncBusy;
+}
+
+export function requestLocalSyncHint(sessionId: string): void {
+  window.dispatchEvent(new CustomEvent(LOCAL_SYNC_HINT_EVENT, { detail: { sessionId } }));
+}
+
+export function isLocalSyncHintForSession(event: Event, sessionId: string): boolean {
+  if (!(event instanceof CustomEvent) || typeof event.detail !== "object" || event.detail === null) return false;
+  return (event.detail as Record<string, unknown>).sessionId === sessionId;
+}
+
+export function canRunLocalObservation(
+  status: SyncStatus | null,
+  busy: SyncBusy,
+  pending: boolean,
+): boolean {
+  return pending
+    && busy === null
+    && status?.supported === true
+    && status.bindingAvailable
+    && status.connected
+    && status.bound
+    && !status.rescanRequired
+    && status.phase.toLocaleLowerCase("en-US") === "ready";
 }
 
 function recordOf(value: unknown, label: string): Record<string, unknown> {
