@@ -434,20 +434,33 @@ fn is_unknown_transport(code: DriveErrorCode) -> bool {
 }
 
 fn drive_failure(error: DriveError, side_effect_possible: bool) -> ExecutionFailure {
-    let kind = match error.code() {
-        DriveErrorCode::Unauthorized => ExecutionFailureKind::AuthRequired,
-        DriveErrorCode::RateLimited => ExecutionFailureKind::RateLimited,
-        code if is_unknown_transport(code) && side_effect_possible => {
-            ExecutionFailureKind::TransientUnknown
-        }
-        code if is_unknown_transport(code) => ExecutionFailureKind::TransientSafe,
-        _ => ExecutionFailureKind::NeedsReconcile,
-    };
+    let kind = classify_drive_failure(error.code(), side_effect_possible);
     let retry_after = error
         .retry_after_seconds()
         .map(Duration::from_secs)
         .filter(|_| kind == ExecutionFailureKind::RateLimited);
     failure(kind, error.code().as_str(), retry_after)
+}
+
+fn classify_drive_failure(
+    code: DriveErrorCode,
+    side_effect_possible: bool,
+) -> ExecutionFailureKind {
+    match code {
+        DriveErrorCode::Unauthorized => ExecutionFailureKind::AuthRequired,
+        DriveErrorCode::RateLimited => ExecutionFailureKind::RateLimited,
+        // A redacted transport failure is the only signal currently available
+        // for a disconnected network. Treat it as Offline only while replaying
+        // the exact durable intent is proven side-effect-free. Timeouts and 5xx
+        // responses may also be transient, but do not prove that the device is
+        // offline and therefore use the ordinary safe retry schedule.
+        DriveErrorCode::Transport if !side_effect_possible => ExecutionFailureKind::Offline,
+        code if is_unknown_transport(code) && side_effect_possible => {
+            ExecutionFailureKind::TransientUnknown
+        }
+        code if is_unknown_transport(code) => ExecutionFailureKind::TransientSafe,
+        _ => ExecutionFailureKind::NeedsReconcile,
+    }
 }
 
 fn local_failure(error: NativeTransferError) -> ExecutionFailure {
@@ -468,15 +481,20 @@ fn local_failure(error: NativeTransferError) -> ExecutionFailure {
 }
 
 fn download_stream_failure(error: DriveError) -> ExecutionFailure {
-    let kind = if error.code() == DriveErrorCode::Unauthorized {
+    let kind = classify_download_stream_failure(error.code());
+    failure(kind, error.code().as_str(), None)
+}
+
+fn classify_download_stream_failure(code: DriveErrorCode) -> ExecutionFailureKind {
+    if code == DriveErrorCode::Unauthorized {
         ExecutionFailureKind::AuthRequired
     } else {
         // Once a private stage exists, interrupted or rejected streaming can
         // leave partial evidence. R2 preserves it for explicit reconciliation
-        // instead of truncating it for an automatic retry.
+        // instead of truncating it for an automatic retry, including when the
+        // underlying failure looks like a disconnected network.
         ExecutionFailureKind::NeedsReconcile
-    };
-    failure(kind, error.code().as_str(), None)
+    }
 }
 
 fn failure(
@@ -515,6 +533,54 @@ mod tests {
             assert!(!mapped.code().contains('/'));
             assert!(!mapped.code().contains("Bearer"));
         }
+    }
+
+    #[test]
+    fn offline_is_reserved_for_pre_side_effect_transport_failure() {
+        assert_eq!(
+            classify_drive_failure(DriveErrorCode::Transport, false),
+            ExecutionFailureKind::Offline
+        );
+        assert_eq!(
+            classify_drive_failure(DriveErrorCode::Timeout, false),
+            ExecutionFailureKind::TransientSafe
+        );
+        assert_eq!(
+            classify_drive_failure(DriveErrorCode::TransientProvider, false),
+            ExecutionFailureKind::TransientSafe
+        );
+    }
+
+    #[test]
+    fn upload_transport_failures_after_possible_mutation_never_pause_offline() {
+        for code in [
+            DriveErrorCode::Transport,
+            DriveErrorCode::Timeout,
+            DriveErrorCode::TransientProvider,
+        ] {
+            assert_eq!(
+                classify_drive_failure(code, true),
+                ExecutionFailureKind::TransientUnknown
+            );
+        }
+    }
+
+    #[test]
+    fn partial_download_stage_never_pauses_offline() {
+        for code in [
+            DriveErrorCode::Transport,
+            DriveErrorCode::Timeout,
+            DriveErrorCode::TransientProvider,
+        ] {
+            assert_eq!(
+                classify_download_stream_failure(code),
+                ExecutionFailureKind::NeedsReconcile
+            );
+        }
+        assert_eq!(
+            classify_download_stream_failure(DriveErrorCode::Unauthorized),
+            ExecutionFailureKind::AuthRequired
+        );
     }
 
     #[test]
