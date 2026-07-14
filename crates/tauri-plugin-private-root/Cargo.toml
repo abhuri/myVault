@@ -10,14 +10,21 @@ links = "tauri-plugin-private-root"
 cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
 myvault-private-fs = { path = "../myvault-private-fs" }
+myvault-platform-fs = { path = "../myvault-platform-fs" }
 myvault-sync-engine = { path = "../myvault-sync-engine" }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 tauri = "2.11.3"
 uuid = { version = "=1.20.0" }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=1.1.4", features = ["process"] }
+
 [build-dependencies]
 tauri-plugin = { version = "2.6.3", features = ["build"] }
+
+[dev-dependencies]
+tempfile = "=3.23.0"
 
 [lints.rust]
 unsafe_code = "forbid"

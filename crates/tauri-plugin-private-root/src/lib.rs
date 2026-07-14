@@ -13,28 +13,16 @@ use tauri::{
 use uuid::Uuid;
 
 mod mobile;
+mod transfer_store;
+
+pub use transfer_store::{
+    AndroidStageWriter, AndroidTransferStore, NativeBaseObjectRef, TransferStoreError,
+    VerifiedAndroidStage, MAX_ANDROID_TRANSFER_BYTES,
+};
 
 /// Opaque native-provenance capability for Android's no-backup directory.
 pub struct NativeNoBackupRoot {
     inspected: myvault_private_fs::InspectedAndroidPrivateRoot,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NativeBaseObjectRef {
-    opaque_ref: String,
-    byte_len: u64,
-}
-
-impl NativeBaseObjectRef {
-    #[must_use]
-    pub fn opaque_ref(&self) -> &str {
-        &self.opaque_ref
-    }
-
-    #[must_use]
-    pub const fn byte_len(&self) -> u64 {
-        self.byte_len
-    }
 }
 
 impl NativeNoBackupRoot {
@@ -66,6 +54,21 @@ impl NativeNoBackupRoot {
         self.inspected
             .revalidate()
             .map_err(PrivateRootError::Validation)?;
+        Ok(store)
+    }
+
+    /// Opens isolated bounded transfer storage for one stable Vault UUID.
+    ///
+    /// # Errors
+    /// Revalidates native no-backup provenance and rejects unsafe descendants,
+    /// nil IDs, topology replacement, or durability failures.
+    pub fn open_transfer_store(
+        &self,
+        vault_id: Uuid,
+    ) -> transfer_store::Result<AndroidTransferStore> {
+        self.inspected.revalidate()?;
+        let store = AndroidTransferStore::open(self.inspected.try_clone_directory()?, vault_id)?;
+        self.inspected.revalidate()?;
         Ok(store)
     }
 
