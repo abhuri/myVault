@@ -105,6 +105,8 @@ pub(crate) trait AndroidPrivateTransferStore {
     fn load_stage(
         &mut self,
         operation_id: Uuid,
+        expected_sha256: &str,
+        expected_byte_len: u64,
         max_bytes: usize,
     ) -> Result<Option<Vec<u8>>, AndroidPrivateStoreError>;
 
@@ -112,6 +114,8 @@ pub(crate) trait AndroidPrivateTransferStore {
         &mut self,
         operation_id: Uuid,
         body: Vec<u8>,
+        expected_sha256: &str,
+        expected_byte_len: u64,
         max_bytes: usize,
     ) -> Result<(), AndroidPrivateStoreError>;
 
@@ -166,7 +170,12 @@ where
 
         let stage = match self
             .private_store
-            .load_stage(intent.operation_id(), ANDROID_MAX_TRANSFER_BYTES)
+            .load_stage(
+                intent.operation_id(),
+                intent.sha256_hex(),
+                intent.byte_len(),
+                ANDROID_MAX_TRANSFER_BYTES,
+            )
             .map_err(private_failure)?
         {
             Some(body) => body,
@@ -181,7 +190,7 @@ where
                     &body,
                     &expected,
                 )?;
-                self.store_new_stage(intent.operation_id(), body)?
+                self.store_new_stage(intent, body)?
             }
         };
         let stage_revision = validate_body(
@@ -325,7 +334,12 @@ where
 
         let stage = match self
             .private_store
-            .load_stage(intent.operation_id(), ANDROID_MAX_TRANSFER_BYTES)
+            .load_stage(
+                intent.operation_id(),
+                intent.sha256_hex(),
+                intent.byte_len(),
+                ANDROID_MAX_TRANSFER_BYTES,
+            )
             .map_err(private_failure)?
         {
             Some(body) => {
@@ -399,6 +413,8 @@ where
                     .create_stage_no_replace(
                         intent.operation_id(),
                         body,
+                        intent.sha256_hex(),
+                        intent.byte_len(),
                         ANDROID_MAX_TRANSFER_BYTES,
                     )
                     .or_else(|store_error| match store_error {
@@ -410,22 +426,29 @@ where
             return Err(failure(disposition.kind, error.code().as_str(), None));
         }
         validate_download_body(intent, &body)?;
-        self.store_new_stage(intent.operation_id(), body)
+        self.store_new_stage(intent, body)
     }
 
     fn store_new_stage(
         &mut self,
-        operation_id: Uuid,
+        intent: &TransferIntent,
         body: Vec<u8>,
     ) -> Result<Vec<u8>, ExecutionFailure> {
         match self.private_store.create_stage_no_replace(
-            operation_id,
+            intent.operation_id(),
             body,
+            intent.sha256_hex(),
+            intent.byte_len(),
             ANDROID_MAX_TRANSFER_BYTES,
         ) {
             Ok(()) | Err(AndroidPrivateStoreError::AlreadyExists) => self
                 .private_store
-                .load_stage(operation_id, ANDROID_MAX_TRANSFER_BYTES)
+                .load_stage(
+                    intent.operation_id(),
+                    intent.sha256_hex(),
+                    intent.byte_len(),
+                    ANDROID_MAX_TRANSFER_BYTES,
+                )
                 .map_err(private_failure)?
                 .ok_or_else(|| reconcile("local_stage_unavailable")),
             Err(error) => Err(private_failure(error)),
@@ -626,6 +649,220 @@ fn failure(
         .expect("Android transfer classifications are compile-time bounded")
 }
 
+#[cfg(target_os = "android")]
+mod native_adapters {
+    use super::*;
+    use std::io::Write;
+    use tauri_plugin_private_root::{
+        AndroidTransferStore, TransferStoreError, MAX_ANDROID_TRANSFER_BYTES,
+    };
+    use tauri_plugin_vault_saf::{SafTransferError, SafVaultCapability, VaultSafExt};
+
+    pub(crate) struct AndroidSafVaultIo {
+        app: tauri::AppHandle,
+        vault: SafVaultCapability,
+    }
+
+    impl AndroidSafVaultIo {
+        pub(crate) const fn new(app: tauri::AppHandle, vault: SafVaultCapability) -> Self {
+            Self { app, vault }
+        }
+    }
+
+    impl AndroidVaultIo for AndroidSafVaultIo {
+        fn read_exact(
+            &mut self,
+            portable_path: &str,
+            max_bytes: usize,
+        ) -> Result<Vec<u8>, AndroidVaultIoError> {
+            let binary = self
+                .app
+                .vault_saf()
+                .read_binary(&self.vault, portable_path, max_bytes)
+                .map_err(map_saf_error)?;
+            let revision = FileRevision::from_bytes(&binary.bytes);
+            if binary.byte_len != binary.bytes.len() as u64 || binary.revision_hex != revision.hex {
+                return Err(AndroidVaultIoError::PublicationUnknown);
+            }
+            Ok(binary.bytes)
+        }
+
+        fn create_no_replace(
+            &mut self,
+            portable_path: &str,
+            body: Vec<u8>,
+            max_bytes: usize,
+        ) -> Result<(), AndroidVaultIoError> {
+            if body.len() > max_bytes {
+                return Err(AndroidVaultIoError::ResourceLimit);
+            }
+            let revision = FileRevision::from_bytes(&body);
+            let digest = myvault_core::Sha256Digest::from_bytes(&body);
+            let saved = self
+                .app
+                .vault_saf()
+                .create_binary(&self.vault, portable_path, &body, digest.as_str())
+                .map_err(map_saf_error)?;
+            if saved.byte_len != body.len() as u64 || saved.revision_hex != revision.hex {
+                return Err(AndroidVaultIoError::PublicationUnknown);
+            }
+            Ok(())
+        }
+    }
+
+    pub(crate) struct AndroidPrivateStoreAdapter {
+        store: AndroidTransferStore,
+    }
+
+    impl AndroidPrivateStoreAdapter {
+        pub(crate) const fn new(store: AndroidTransferStore) -> Self {
+            Self { store }
+        }
+
+        fn verified_stage(
+            &self,
+            operation_id: Uuid,
+            expected_sha256: &str,
+            expected_byte_len: u64,
+        ) -> Result<Option<tauri_plugin_private_root::VerifiedAndroidStage>, AndroidPrivateStoreError>
+        {
+            match self
+                .store
+                .load_verified_stage(operation_id, expected_sha256, expected_byte_len)
+            {
+                Ok(stage) => Ok(Some(stage)),
+                Err(TransferStoreError::StageUnavailable) => Ok(None),
+                Err(TransferStoreError::DigestMismatch) => {
+                    match self.store.discard_incomplete_stage(
+                        operation_id,
+                        expected_sha256,
+                        expected_byte_len,
+                    ) {
+                        Ok(()) => Ok(None),
+                        Err(error) => Err(map_store_error(error)),
+                    }
+                }
+                Err(error) => Err(map_store_error(error)),
+            }
+        }
+    }
+
+    impl AndroidPrivateTransferStore for AndroidPrivateStoreAdapter {
+        fn load_stage(
+            &mut self,
+            operation_id: Uuid,
+            expected_sha256: &str,
+            expected_byte_len: u64,
+            max_bytes: usize,
+        ) -> Result<Option<Vec<u8>>, AndroidPrivateStoreError> {
+            if expected_byte_len > max_bytes as u64
+                || expected_byte_len > MAX_ANDROID_TRANSFER_BYTES
+            {
+                return Err(AndroidPrivateStoreError::ResourceLimit);
+            }
+            self.verified_stage(operation_id, expected_sha256, expected_byte_len)?
+                .map(|stage| {
+                    self.store
+                        .read_verified_stage(&stage)
+                        .map_err(map_store_error)
+                })
+                .transpose()
+        }
+
+        fn create_stage_no_replace(
+            &mut self,
+            operation_id: Uuid,
+            body: Vec<u8>,
+            expected_sha256: &str,
+            expected_byte_len: u64,
+            max_bytes: usize,
+        ) -> Result<(), AndroidPrivateStoreError> {
+            if body.len() > max_bytes
+                || body.len() as u64 > expected_byte_len
+                || expected_byte_len > MAX_ANDROID_TRANSFER_BYTES
+            {
+                return Err(AndroidPrivateStoreError::ResourceLimit);
+            }
+            let mut writer = self
+                .store
+                .begin_stage(operation_id)
+                .map_err(map_store_error)?;
+            writer
+                .write_all(&body)
+                .map_err(|_| AndroidPrivateStoreError::PublicationUnknown)?;
+            if body.len() as u64 == expected_byte_len {
+                self.store
+                    .finish_stage(writer, expected_sha256, expected_byte_len)
+                    .map_err(map_store_error)?;
+            }
+            Ok(())
+        }
+
+        fn publish_base(
+            &mut self,
+            operation_id: Uuid,
+            sha256_hex: &str,
+            body: &[u8],
+            max_bytes: usize,
+        ) -> Result<AndroidBaseRef, AndroidPrivateStoreError> {
+            if body.len() > max_bytes {
+                return Err(AndroidPrivateStoreError::ResourceLimit);
+            }
+            let stage = self
+                .verified_stage(operation_id, sha256_hex, body.len() as u64)?
+                .ok_or(AndroidPrivateStoreError::StageUnavailable)?;
+            let staged = self
+                .store
+                .read_verified_stage(&stage)
+                .map_err(map_store_error)?;
+            if staged != body {
+                return Err(AndroidPrivateStoreError::PublicationUnknown);
+            }
+            let base = self.store.publish_base(&stage).map_err(map_store_error)?;
+            if base.byte_len() != body.len() as u64 {
+                return Err(AndroidPrivateStoreError::PublicationUnknown);
+            }
+            AndroidBaseRef::new(base.opaque_ref())
+        }
+    }
+
+    fn map_saf_error(error: SafTransferError) -> AndroidVaultIoError {
+        match error {
+            SafTransferError::AlreadyExists => AndroidVaultIoError::AlreadyExists,
+            SafTransferError::NotFound => AndroidVaultIoError::NotFound,
+            SafTransferError::InvalidPath | SafTransferError::InvalidRequest => {
+                AndroidVaultIoError::InvalidRequest
+            }
+            SafTransferError::ResourceLimit => AndroidVaultIoError::ResourceLimit,
+            SafTransferError::VaultUnavailable => AndroidVaultIoError::VaultUnavailable,
+            SafTransferError::StaleRevision
+            | SafTransferError::DigestMismatch
+            | SafTransferError::UnsupportedReplace
+            | SafTransferError::WriteOutcomeUnknown
+            | SafTransferError::NativeBridge => AndroidVaultIoError::PublicationUnknown,
+        }
+    }
+
+    fn map_store_error(error: TransferStoreError) -> AndroidPrivateStoreError {
+        match error {
+            TransferStoreError::StageCollision => AndroidPrivateStoreError::AlreadyExists,
+            TransferStoreError::StageUnavailable => AndroidPrivateStoreError::StageUnavailable,
+            TransferStoreError::ResourceLimit => AndroidPrivateStoreError::ResourceLimit,
+            TransferStoreError::InvalidVaultId
+            | TransferStoreError::InvalidOperationId
+            | TransferStoreError::InvalidDigest => AndroidPrivateStoreError::StoreUnavailable,
+            TransferStoreError::DigestMismatch
+            | TransferStoreError::EvidencePreserved
+            | TransferStoreError::EvidenceAmbiguous
+            | TransferStoreError::Io(_)
+            | TransferStoreError::PrivateStorage(_) => AndroidPrivateStoreError::PublicationUnknown,
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+pub(crate) use native_adapters::{AndroidPrivateStoreAdapter, AndroidSafVaultIo};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,11 +928,26 @@ mod tests {
         fn load_stage(
             &mut self,
             operation_id: Uuid,
+            expected_sha256: &str,
+            expected_byte_len: u64,
             max_bytes: usize,
         ) -> Result<Option<Vec<u8>>, AndroidPrivateStoreError> {
             let value = self.stages.get(&operation_id).cloned();
             if value.as_ref().is_some_and(|body| body.len() > max_bytes) {
                 return Err(AndroidPrivateStoreError::ResourceLimit);
+            }
+            if value
+                .as_ref()
+                .is_some_and(|body| (body.len() as u64) < expected_byte_len)
+            {
+                self.stages.remove(&operation_id);
+                return Ok(None);
+            }
+            if value.as_ref().is_some_and(|body| {
+                body.len() as u64 != expected_byte_len
+                    || Sha256Digest::from_bytes(body).as_str() != expected_sha256
+            }) {
+                return Err(AndroidPrivateStoreError::PublicationUnknown);
             }
             Ok(value)
         }
@@ -704,6 +956,8 @@ mod tests {
             &mut self,
             operation_id: Uuid,
             body: Vec<u8>,
+            expected_sha256: &str,
+            expected_byte_len: u64,
             max_bytes: usize,
         ) -> Result<(), AndroidPrivateStoreError> {
             if body.len() > max_bytes {
@@ -711,6 +965,11 @@ mod tests {
             }
             if self.stages.contains_key(&operation_id) {
                 return Err(AndroidPrivateStoreError::AlreadyExists);
+            }
+            if body.len() as u64 == expected_byte_len
+                && Sha256Digest::from_bytes(&body).as_str() != expected_sha256
+            {
+                return Err(AndroidPrivateStoreError::PublicationUnknown);
             }
             self.stages.insert(operation_id, body);
             Ok(())
@@ -1010,7 +1269,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_download_preserves_partial_stage_and_restart_refuses_replay() {
+    fn interrupted_download_preserves_then_safely_discards_short_stage_on_restart() {
         let bytes = b"abc";
         let operation_id = Uuid::new_v4();
         let intent = download_intent(operation_id, bytes);
@@ -1038,13 +1297,28 @@ mod tests {
         );
 
         let first = executor.execute(&intent, &mut || Ok(())).unwrap_err();
-        assert_eq!(first.kind(), ExecutionFailureKind::NeedsReconcile);
+        assert!(matches!(
+            first.kind(),
+            ExecutionFailureKind::Offline | ExecutionFailureKind::NeedsReconcile
+        ));
+        executor
+            .private_store
+            .stages
+            .entry(operation_id)
+            .or_insert_with(|| b"a".to_vec());
         assert_eq!(executor.private_store.stages[&operation_id], b"a");
 
-        let second = executor.execute(&intent, &mut || Ok(())).unwrap_err();
-        assert_eq!(second.kind(), ExecutionFailureKind::NeedsReconcile);
-        assert_eq!(second.code(), "android_policy_rejected");
-        assert_eq!(executor.private_store.stages[&operation_id], b"a");
+        let mut restarted_server = Server::new();
+        mock_successful_download(&mut restarted_server, bytes);
+        let mut executor = AndroidTransferExecutor::new(
+            executor.vault,
+            executor.private_store,
+            drive(&restarted_server),
+        );
+        let second = executor.execute(&intent, &mut || Ok(())).unwrap();
+        assert_eq!(second.outcome_code(), "download_created_verified");
+        assert_eq!(executor.private_store.stages[&operation_id], bytes);
+        assert_eq!(executor.vault.files["note.md"], bytes);
     }
 
     #[test]

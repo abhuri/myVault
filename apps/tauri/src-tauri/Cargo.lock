@@ -4428,11 +4428,15 @@ version = "0.1.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
+ "myvault-platform-fs",
  "myvault-private-fs",
+ "myvault-sync-engine",
+ "rustix",
  "serde",
  "sha2",
  "tauri",
  "tauri-plugin",
+ "uuid",
 ]
 
 [[package]]
@@ -4442,6 +4446,7 @@ dependencies = [
  "serde",
  "tauri",
  "tauri-plugin",
+ "uuid",
 ]
 
 [[package]]
