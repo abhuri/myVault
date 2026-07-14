@@ -626,6 +626,17 @@ impl TransferDrive {
         self.decode_upload_response(session, response, None)
     }
 
+    /// Rechecks the exact bound account, root ancestry, parent, file id,
+    /// canonical revision, SHA-256, and byte length using metadata GETs only.
+    /// This lets restart recovery validate an already-complete private stage
+    /// without downloading the blob again.
+    ///
+    /// # Errors
+    /// Returns only a stable redacted mismatch or provider classification.
+    pub fn verify_download(&self, intent: &DownloadIntent) -> Result<RemoteObject> {
+        self.exact_download_metadata(intent)
+    }
+
     /// Streams an exact blob into caller-owned private staging, then validates
     /// byte length, SHA-256, and a second metadata read before returning.
     /// Google Workspace native MIME types are rejected.
@@ -1619,6 +1630,86 @@ mod tests {
             drive.query_upload_status(&mut session).unwrap_err().code(),
             ErrorCode::RangeRejected
         );
+    }
+
+    #[test]
+    fn metadata_only_download_verification_returns_current_evidence_without_media_get() {
+        let mut server = Server::new();
+        binding_mocks(&mut server, 1);
+        let metadata = server
+            .mock("GET", "/drive/v3/files/file_1")
+            .match_query(Matcher::Regex("fields".into()))
+            .with_body(format!(
+                r#"{{"id":"file_1","name":"note.md","mimeType":"text/markdown","parents":["root_1"],"trashed":false,"version":"2","size":"3","sha256Checksum":"{SHA}"}}"#
+            ))
+            .create();
+        let media = server
+            .mock("GET", "/drive/v3/files/file_1")
+            .match_query(Matcher::UrlEncoded("alt".into(), "media".into()))
+            .expect(0)
+            .create();
+
+        let verified = TransferDrive::for_test(&server, 1024)
+            .verify_download(
+                &DownloadIntent::from_sync_revision("file_1", "root_1", SYNC_REVISION_2, SHA, 3)
+                    .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(verified.file_id(), "file_1");
+        assert_eq!(verified.sync_revision(), SYNC_REVISION_2);
+        assert_eq!(verified.sha256(), SHA);
+        assert_eq!(verified.size(), 3);
+        metadata.assert();
+        media.assert();
+    }
+
+    #[test]
+    fn metadata_only_download_verification_rejects_wrong_revision_and_parent() {
+        for (metadata, expected) in [
+            (
+                format!(
+                    r#"{{"id":"file_1","name":"note.md","mimeType":"text/markdown","parents":["root_1"],"trashed":false,"version":"3","size":"3","sha256Checksum":"{SHA}"}}"#
+                ),
+                ErrorCode::RevisionMismatch,
+            ),
+            (
+                format!(
+                    r#"{{"id":"file_1","name":"note.md","mimeType":"text/markdown","parents":["other_parent"],"trashed":false,"version":"2","size":"3","sha256Checksum":"{SHA}"}}"#
+                ),
+                ErrorCode::MalformedResponse,
+            ),
+        ] {
+            let mut server = Server::new();
+            binding_mocks(&mut server, 1);
+            let metadata_request = server
+                .mock("GET", "/drive/v3/files/file_1")
+                .match_query(Matcher::Regex("fields".into()))
+                .with_body(metadata)
+                .create();
+            let media = server
+                .mock("GET", "/drive/v3/files/file_1")
+                .match_query(Matcher::UrlEncoded("alt".into(), "media".into()))
+                .expect(0)
+                .create();
+
+            let error = TransferDrive::for_test(&server, 1024)
+                .verify_download(
+                    &DownloadIntent::from_sync_revision(
+                        "file_1",
+                        "root_1",
+                        SYNC_REVISION_2,
+                        SHA,
+                        3,
+                    )
+                    .unwrap(),
+                )
+                .unwrap_err();
+
+            assert_eq!(error.code(), expected);
+            metadata_request.assert();
+            media.assert();
+        }
     }
 
     #[test]
