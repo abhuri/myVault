@@ -247,6 +247,34 @@ fn transfer_registration_is_exactly_idempotent_and_rejects_unsafe_references() {
 }
 
 #[test]
+fn offline_pause_preserves_attempt_count_and_resumes_only_when_due() {
+    let fixture = Fixture::new();
+    let mut store = bound_store(&fixture);
+    let operation_id = Uuid::new_v4();
+    store
+        .register_transfer(&upload(operation_id, "marker-offline"))
+        .unwrap();
+    let claimed = store.claim_next_transfer(10).unwrap().unwrap();
+    assert_eq!(claimed.attempt_count, 0);
+
+    store
+        .pause_transfer_offline(operation_id, 30, "network_offline", 20)
+        .unwrap();
+    let paused = store.transfer(operation_id).unwrap().unwrap();
+    assert_eq!(paused.phase, TransferPhase::RetryScheduled);
+    assert_eq!(paused.attempt_count, 0);
+    assert!(store.claim_next_transfer(29).unwrap().is_none());
+    assert_eq!(
+        store
+            .claim_next_transfer(30)
+            .unwrap()
+            .unwrap()
+            .attempt_count,
+        0
+    );
+}
+
+#[test]
 fn transfer_transitions_completion_and_base_publication_are_atomic_and_idempotent() {
     let fixture = Fixture::new();
     let mut store = bound_store(&fixture);

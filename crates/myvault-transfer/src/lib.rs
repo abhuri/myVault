@@ -357,6 +357,12 @@ pub trait TransferStore {
         next_attempt_at_unix_ms: u64,
         code: &'static str,
     ) -> Result<()>;
+    fn pause_offline(
+        &mut self,
+        operation_id: Uuid,
+        next_attempt_at_unix_ms: u64,
+        code: &'static str,
+    ) -> Result<()>;
     fn mark_auth_required(
         &mut self,
         operation_id: Uuid,
@@ -426,6 +432,21 @@ impl TransferStore for SyncStore {
         code: &'static str,
     ) -> Result<()> {
         self.schedule_transfer_retry(
+            operation_id,
+            next_attempt_at_unix_ms,
+            code,
+            next_attempt_at_unix_ms,
+        )
+        .map_err(|_| Error::Store)
+    }
+
+    fn pause_offline(
+        &mut self,
+        operation_id: Uuid,
+        next_attempt_at_unix_ms: u64,
+        code: &'static str,
+    ) -> Result<()> {
+        self.pause_transfer_offline(
             operation_id,
             next_attempt_at_unix_ms,
             code,
@@ -530,7 +551,7 @@ where
             ExecutionFailureKind::Offline => {
                 let next = checked_add_ms(now_unix_ms, BASE_BACKOFF_MS)?;
                 self.store
-                    .schedule_retry(operation_id, next, failure.code())?;
+                    .pause_offline(operation_id, next, failure.code())?;
                 Ok(WorkOutcome::RetryScheduled(operation_id))
             }
             ExecutionFailureKind::RateLimited => {
@@ -704,6 +725,7 @@ mod tests {
         jobs: VecDeque<TransferIntent>,
         completed: Vec<Uuid>,
         retries: Vec<(Uuid, u64, &'static str)>,
+        offline_pauses: Vec<(Uuid, u64, &'static str)>,
         auth: Vec<Uuid>,
         reconcile: Vec<Uuid>,
     }
@@ -729,6 +751,17 @@ mod tests {
             code: &'static str,
         ) -> Result<()> {
             self.retries
+                .push((operation_id, next_attempt_at_unix_ms, code));
+            Ok(())
+        }
+
+        fn pause_offline(
+            &mut self,
+            operation_id: Uuid,
+            next_attempt_at_unix_ms: u64,
+            code: &'static str,
+        ) -> Result<()> {
+            self.offline_pauses
                 .push((operation_id, next_attempt_at_unix_ms, code));
             Ok(())
         }
@@ -878,6 +911,28 @@ mod tests {
         );
         let (store, _) = worker.into_parts();
         assert_eq!(store.auth, [id]);
+        assert!(store.retries.is_empty());
+    }
+
+    #[test]
+    fn offline_pause_does_not_consume_a_retry_attempt() {
+        let id = Uuid::new_v4();
+        let store = MemoryStore {
+            jobs: VecDeque::from([intent(id)]),
+            ..MemoryStore::default()
+        };
+        let failure =
+            ExecutionFailure::new(ExecutionFailureKind::Offline, "network_offline", None).unwrap();
+        let executor = ScriptedExecutor {
+            results: VecDeque::from([Err(failure)]),
+        };
+        let mut worker = Worker::new(store, executor);
+        assert_eq!(
+            worker.run_once(2_000, 7).unwrap(),
+            WorkOutcome::RetryScheduled(id)
+        );
+        let (store, _) = worker.into_parts();
+        assert_eq!(store.offline_pauses, [(id, 3_000, "network_offline")]);
         assert!(store.retries.is_empty());
     }
 

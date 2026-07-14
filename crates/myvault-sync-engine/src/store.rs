@@ -1613,6 +1613,53 @@ impl SyncStore {
         Ok(())
     }
 
+    /// Pauses a running transfer while offline without consuming a retry attempt.
+    ///
+    /// # Errors
+    /// Rejects missing transfers, invalid codes/timestamps, or invalid transitions.
+    pub fn pause_transfer_offline(
+        &mut self,
+        operation_id: Uuid,
+        next_attempt_at_unix_ms: u64,
+        error_code: &str,
+        updated_at_unix_ms: u64,
+    ) -> Result<()> {
+        if operation_id.is_nil() {
+            return Err(Error::TransferNotFound);
+        }
+        validate_redacted_code(error_code)?;
+        let next = u64_to_i64(next_attempt_at_unix_ms)?;
+        let updated = u64_to_i64(updated_at_unix_ms)?;
+        let existing =
+            load_transfer(&self.connection, operation_id)?.ok_or(Error::TransferNotFound)?;
+        if existing.phase == TransferPhase::RetryScheduled
+            && existing.next_attempt_at_unix_ms == next_attempt_at_unix_ms
+            && existing.last_error_code.as_deref() == Some(error_code)
+        {
+            return Ok(());
+        }
+        if updated_at_unix_ms < existing.updated_at_unix_ms {
+            return Err(Error::InvalidStateTransition);
+        }
+        let changed = self.connection.execute(
+            "UPDATE transfers
+             SET phase = ?1, next_attempt_at_unix_ms = ?2,
+                 updated_at_unix_ms = ?3, last_error_code = ?4
+             WHERE operation_id = ?5 AND phase = 'running'",
+            params![
+                TransferPhase::RetryScheduled.as_str(),
+                next,
+                updated,
+                error_code,
+                operation_id.to_string()
+            ],
+        )?;
+        if changed != 1 {
+            return Err(Error::InvalidStateTransition);
+        }
+        Ok(())
+    }
+
     /// Pauses a running transfer without persisting provider errors or credentials.
     ///
     /// # Errors
