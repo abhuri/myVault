@@ -626,6 +626,48 @@ impl TransferDrive {
         self.decode_upload_response(session, response, None)
     }
 
+    /// Inspects one exact remote download candidate using metadata GETs only.
+    /// The result proves the bound account/root ancestry, exact parent, live
+    /// blob MIME policy, canonical revision, SHA-256, and bounded byte length.
+    ///
+    /// # Errors
+    /// Fails closed for unbound ancestry, wrong parents, trashed or Google
+    /// Workspace-native objects, missing metadata, and oversized blobs.
+    pub fn inspect_download_candidate(
+        &self,
+        file_id: &str,
+        parent_id: &str,
+    ) -> Result<RemoteObject> {
+        self.ensure_folder_below_root(parent_id)?;
+        let file = self.transfer_file_metadata(file_id)?;
+        if file.trashed
+            || file.parents.as_slice() != [parent_id]
+            || file.mime_type.starts_with("application/vnd.google-apps.")
+        {
+            return Err(Error::new(ErrorCode::MalformedResponse));
+        }
+        let version = file
+            .version
+            .as_deref()
+            .ok_or_else(|| Error::new(ErrorCode::MalformedResponse))?;
+        let sha256 = file
+            .sha256_checksum
+            .as_deref()
+            .ok_or_else(|| Error::new(ErrorCode::MalformedResponse))?
+            .to_owned();
+        let size = parse_size(file.size.as_deref())?;
+        if size > self.max_blob_bytes {
+            return Err(Error::new(ErrorCode::ResponseTooLarge));
+        }
+        Ok(RemoteObject {
+            file_id: file.id,
+            provider_version: version.to_owned(),
+            sync_revision: sync_revision_from_provider_version(version)?,
+            sha256,
+            size,
+        })
+    }
+
     /// Rechecks the exact bound account, root ancestry, parent, file id,
     /// canonical revision, SHA-256, and byte length using metadata GETs only.
     /// This lets restart recovery validate an already-complete private stage
@@ -864,33 +906,14 @@ impl TransferDrive {
     }
 
     fn exact_download_metadata(&self, intent: &DownloadIntent) -> Result<RemoteObject> {
-        self.ensure_folder_below_root(&intent.parent_id)?;
-        let file = self.transfer_file_metadata(&intent.file_id)?;
-        if file.trashed
-            || file.parents.as_slice() != [intent.parent_id.as_str()]
-            || file.mime_type.starts_with("application/vnd.google-apps.")
-        {
-            return Err(Error::new(ErrorCode::MalformedResponse));
-        }
-        let version = file
-            .version
-            .as_deref()
-            .ok_or_else(|| Error::new(ErrorCode::MalformedResponse))?;
-        if version != intent.provider_version {
+        let observed = self.inspect_download_candidate(&intent.file_id, &intent.parent_id)?;
+        if observed.provider_version != intent.provider_version {
             return Err(Error::new(ErrorCode::RevisionMismatch));
         }
-        if file.sha256_checksum.as_deref() != Some(intent.sha256.as_str())
-            || parse_size(file.size.as_deref())? != intent.size
-        {
+        if observed.sha256 != intent.sha256 || observed.size != intent.size {
             return Err(Error::new(ErrorCode::HashMismatch));
         }
-        Ok(RemoteObject {
-            file_id: file.id,
-            provider_version: version.to_owned(),
-            sync_revision: sync_revision_from_provider_version(version)?,
-            sha256: intent.sha256.clone(),
-            size: intent.size,
-        })
+        Ok(observed)
     }
 
     fn authorization(&self) -> String {
@@ -1630,6 +1653,97 @@ mod tests {
             drive.query_upload_status(&mut session).unwrap_err().code(),
             ErrorCode::RangeRejected
         );
+    }
+
+    #[test]
+    fn inspect_download_candidate_returns_bounded_blob_metadata_without_content_read() {
+        let mut server = Server::new();
+        binding_mocks(&mut server, 1);
+        let metadata = server
+            .mock("GET", "/drive/v3/files/file_1")
+            .match_query(Matcher::Regex("fields".into()))
+            .with_body(format!(
+                r#"{{"id":"file_1","name":"note.md","mimeType":"text/markdown","parents":["root_1"],"trashed":false,"version":"2","size":"3","sha256Checksum":"{SHA}"}}"#
+            ))
+            .create();
+        let media = server
+            .mock("GET", "/drive/v3/files/file_1")
+            .match_query(Matcher::UrlEncoded("alt".into(), "media".into()))
+            .expect(0)
+            .create();
+
+        let candidate = TransferDrive::for_test(&server, 1024)
+            .inspect_download_candidate("file_1", "root_1")
+            .unwrap();
+
+        assert_eq!(candidate.file_id(), "file_1");
+        assert_eq!(candidate.sync_revision(), SYNC_REVISION_2);
+        assert_eq!(candidate.sha256(), SHA);
+        assert_eq!(candidate.size(), 3);
+        metadata.assert();
+        media.assert();
+    }
+
+    #[test]
+    fn inspect_download_candidate_fails_closed_for_unsafe_metadata() {
+        let cases = [
+            (
+                format!(
+                    r#"{{"id":"file_1","name":"note.md","mimeType":"text/markdown","parents":["other_parent"],"trashed":false,"version":"2","size":"3","sha256Checksum":"{SHA}"}}"#
+                ),
+                1024,
+                ErrorCode::MalformedResponse,
+            ),
+            (
+                r#"{"id":"file_1","name":"note.md","mimeType":"text/markdown","parents":["root_1"],"trashed":false,"version":"2","size":"3"}"#.to_owned(),
+                1024,
+                ErrorCode::MalformedResponse,
+            ),
+            (
+                format!(
+                    r#"{{"id":"file_1","name":"note.md","mimeType":"text/markdown","parents":["root_1"],"trashed":false,"version":"2","sha256Checksum":"{SHA}"}}"#
+                ),
+                1024,
+                ErrorCode::MalformedResponse,
+            ),
+            (
+                format!(
+                    r#"{{"id":"file_1","name":"Doc","mimeType":"application/vnd.google-apps.document","parents":["root_1"],"trashed":false,"version":"2","size":"3","sha256Checksum":"{SHA}"}}"#
+                ),
+                1024,
+                ErrorCode::MalformedResponse,
+            ),
+            (
+                format!(
+                    r#"{{"id":"file_1","name":"large.bin","mimeType":"application/octet-stream","parents":["root_1"],"trashed":false,"version":"2","size":"1025","sha256Checksum":"{SHA}"}}"#
+                ),
+                1024,
+                ErrorCode::ResponseTooLarge,
+            ),
+        ];
+
+        for (body, max_blob_bytes, expected) in cases {
+            let mut server = Server::new();
+            binding_mocks(&mut server, 1);
+            let metadata = server
+                .mock("GET", "/drive/v3/files/file_1")
+                .match_query(Matcher::Regex("fields".into()))
+                .with_body(body)
+                .create();
+            let media = server
+                .mock("GET", "/drive/v3/files/file_1")
+                .match_query(Matcher::UrlEncoded("alt".into(), "media".into()))
+                .expect(0)
+                .create();
+
+            let error = TransferDrive::for_test(&server, max_blob_bytes)
+                .inspect_download_candidate("file_1", "root_1")
+                .unwrap_err();
+
+            assert_eq!(error.code(), expected);
+            metadata.assert();
+            media.assert();
+        }
     }
 
     #[test]
