@@ -177,17 +177,74 @@ must never be marked passed by these offline jobsค่ะ
 This gate requires separate approval after Gate 7ค่ะ User actions and external
 configuration should be batched as close to this gate as possibleค่ะ
 
-- [ ] Exact non-trashed disposable or explicitly allowlisted test root is prepared outside the R1 runtimeค่ะ
-- [ ] Native macOS OAuth opens in the system browser with the expected read-only scopeค่ะ
-- [ ] Account discovery and exact root binding passค่ะ
-- [ ] Initial scan, restart/resume, duplicate preview, and Changes drain passค่ะ
-- [ ] Wrong-account and wrong-root attempts fail closedค่ะ
-- [ ] Native credential-store restart and idempotent disconnect passค่ะ
-- [ ] Captured Drive runtime evidence contains no mutation requestค่ะ
-- [ ] No personal Vault or unrelated Drive item is accessedค่ะ
-- [ ] Android compile/emulator evidence passes and remains labeled non-physicalค่ะ
-- [ ] Quality, Android, Ubuntu, and Windows checks pass on the same source HEADค่ะ
-- [ ] Sunday performs final security, diff, documentation, and R1 exit-gate reviewค่ะ
+- [x] Exact non-trashed disposable or explicitly allowlisted test root is prepared outside the R1 runtimeค่ะ
+- [x] Native macOS OAuth opens in the system browser with the expected read-only scopeค่ะ
+- [x] Account discovery and exact root binding passค่ะ
+- [x] Initial scan, restart/resume, duplicate preview, and Changes drain passค่ะ
+- [x] Wrong-account and wrong-root attempts fail closedค่ะ
+- [x] Native credential-store restart and idempotent disconnect passค่ะ
+- [x] Captured Drive runtime evidence contains no mutation requestค่ะ
+- [x] No personal Vault is opened; no unrelated Drive item is bound, recursively scanned, or content-readค่ะ
+- [x] Android compile/emulator evidence passes and remains labeled non-physicalค่ะ
+- [x] Quality, Android, Ubuntu, and Windows checks pass on the same source HEADค่ะ
+- [x] Sunday performs final security, diff, documentation, and R1 exit-gate reviewค่ะ
+
+### Gate 8 evidence — 2026-07-14
+
+- Functional source candidate: `935177cac20176a2c1a0312f05c31026b098cf86`
+  on `codex/r1-readonly-binding`; Draft PR #26 targets `main`ค่ะ
+- Host: macOS 26.5.2 build 25F84 on arm64ค่ะ The final debug application
+  SHA-256 is
+  `030e2a2489aca8f2be726b18f35e4525d5b6749dd1a5c0d1a25200c11af55c37`ค่ะ
+- `pnpm quality:r1:offline` passed on the final candidate: frontend 38,
+  AppService 16, desktop auth 19, Google auth plugin 3, Sync engine 24,
+  Drive adapter 20, and Tauri 15 tests, plus formatting, strict Clippy,
+  documentation tests, typecheck, and production buildค่ะ
+- The live Google project remained External/Testing with the exact scope
+  `https://www.googleapis.com/auth/drive.metadata.readonly` and the allowlisted
+  test accountค่ะ OAuth completed through the system browser, the native
+  credential-store restart restored the connection, and no credential or
+  authorization value was written to tracked files or the debug logค่ะ
+- The disposable root `myVault-r1-20260714-k7m9` was created outside the
+  application and bound by exact Drive ID
+  `1l6-hCRrj0yIRvYKjyphzbd9IBKpeqTLl`ค่ะ Its Unicode child
+  `ชั้นใน-ทดสอบ-Ω` and two Google Docs with the duplicate display name
+  `ข้อมูลซ้ำ-R1` remained distinct by provider ID in the bounded previewค่ะ
+- Initial scan, application restart, connection restoration, preview refresh,
+  and final Changes drain completed with phase `ready`, a durable cursor,
+  an empty scan frontier, an empty pending Changes batch, and zero pending
+  mutationsค่ะ The final metadata database contained three remote entries and
+  no credential or file-content bodyค่ะ
+- A final native runtime method trace captured exactly two Drive requests and
+  both were `GET`ค่ะ The production adapter static scan found no POST, PUT,
+  PATCH, or DELETE construction, and `/tmp/myvault-r1-debug.log` remained
+  exactly zero bytesค่ะ
+- Wrong-account, wrong-root, malformed-ID, missing-parent, multiple-parent,
+  and exact-parent mismatch cases fail closed in deterministic tests on the
+  same candidateค่ะ A live switch to another account or unrelated root was
+  deliberately not performed because it would expose unrelated Drive metadata
+  without improving the already exact fail-closed assertionค่ะ
+- Native credential restoration was exercised liveค่ะ Idempotent disconnect,
+  partial-cleanup typing, and restart-after-cleanup were exercised by the
+  exact-candidate desktop-auth/Tauri tests and by an ignored real OS-keyring
+  ephemeral round-trip testค่ะ The live user credential was deliberately not
+  deleted during acceptanceค่ะ
+- The root chooser necessarily read the minimum root-level folder candidate
+  metadata required for exact selectionค่ะ No personal Vault was opened, no
+  unrelated folder was bound or recursively scanned, and no Drive file content
+  was requestedค่ะ
+- Android API 36 ARM64 emulator compile, install, cold start, and relaunch
+  passedค่ะ The APK passed 16 KB alignment and v2 signature verificationค่ะ
+  This remains emulator evidence; physical-device acceptance is deferred to R7ค่ะ
+- GitHub Actions ran on the same functional source candidateค่ะ Quality run
+  `29337784885` passed both `quality` and `android-compile`; platform run
+  `29337784793` passed Ubuntu 22.04 AppImage and Windows 2022 NSISค่ะ
+- Independent final review found no R1 blockerค่ะ The residual low risk is that
+  the exact-root alias check trusts Google's pinned-HTTPS server-side `root`
+  filter, while all returned parent/ID/cardinality invariants still fail closedค่ะ
+- The only CI annotation is the announced Node.js 20 action-runtime deprecation;
+  GitHub forced those pinned actions onto Node.js 24 and every job passedค่ะ
+  Updating the action pins is non-blocking maintenance outside R1ค่ะ
 
 R2 must not start until every applicable R1 item passes and the milestone
 transition receives explicit approvalค่ะ
