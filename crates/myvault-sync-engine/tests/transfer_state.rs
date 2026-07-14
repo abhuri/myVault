@@ -475,12 +475,80 @@ fn restart_converts_running_transfer_to_reconcile_without_blind_claim() {
     );
     assert_eq!(reopened.claim_next_transfer(i64::MAX as u64).unwrap(), None);
     reopened
-        .schedule_transfer_retry(operation_id, 50, "verified_absent", 40)
+        .requeue_transfer_for_reconciliation(operation_id, 50)
         .unwrap();
+    let queued = reopened.transfer(operation_id).unwrap().unwrap();
+    assert_eq!(queued.phase, TransferPhase::RetryScheduled);
+    assert_eq!(queued.attempt_count, 1);
+    assert_eq!(queued.next_attempt_at_unix_ms, 50);
     assert_eq!(
-        reopened.claim_next_transfer(50).unwrap().unwrap().phase,
-        TransferPhase::Running
+        queued.last_error_code.as_deref(),
+        Some("reconcile_requested")
     );
+    assert_eq!(queued.remote_parent_id, "remote-parent");
+    assert_eq!(queued.expected_local_revision, Some(hash(b'a')));
+    assert_eq!(queued.sha256, hash(b'b'));
+    assert_eq!(queued.stage_reference.as_deref(), Some("stage.abcdef"));
+    assert!(queued.remote_file_id.is_none());
+    assert!(queued.base_reference.is_none());
+    assert!(reopened.claim_next_transfer(49).unwrap().is_none());
+    let claimed = reopened.claim_next_transfer(50).unwrap().unwrap();
+    assert_eq!(claimed.phase, TransferPhase::Running);
+    assert_eq!(
+        claimed.last_error_code.as_deref(),
+        Some("reconcile_requested")
+    );
+}
+
+#[test]
+fn reconciliation_requeue_is_exact_single_phase_and_rejects_stale_time() {
+    let fixture = Fixture::new();
+    let mut store = bound_store(&fixture);
+    let pending_id = Uuid::new_v4();
+    store
+        .register_transfer(&upload(pending_id, "marker-pending-not-reconcile"))
+        .unwrap();
+    assert!(matches!(
+        store.requeue_transfer_for_reconciliation(pending_id, 20),
+        Err(Error::InvalidStateTransition)
+    ));
+    assert_eq!(
+        store.claim_next_transfer(10).unwrap().unwrap().operation_id,
+        pending_id
+    );
+    assert!(matches!(
+        store.requeue_transfer_for_reconciliation(pending_id, 20),
+        Err(Error::InvalidStateTransition)
+    ));
+
+    let reconcile_id = Uuid::new_v4();
+    store
+        .register_transfer(&upload(reconcile_id, "marker-exact-reconcile"))
+        .unwrap();
+    store.claim_next_transfer(10).unwrap().unwrap();
+    store
+        .mark_transfer_needs_reconcile(reconcile_id, "response_lost", 30)
+        .unwrap();
+    assert!(matches!(
+        store.requeue_transfer_for_reconciliation(reconcile_id, 29),
+        Err(Error::InvalidStateTransition)
+    ));
+    assert_eq!(
+        store.transfer(reconcile_id).unwrap().unwrap().phase,
+        TransferPhase::NeedsReconcile
+    );
+
+    store
+        .requeue_transfer_for_reconciliation(reconcile_id, 30)
+        .unwrap();
+    assert!(matches!(
+        store.requeue_transfer_for_reconciliation(reconcile_id, 30),
+        Err(Error::InvalidStateTransition)
+    ));
+    assert!(matches!(
+        store.requeue_transfer_for_reconciliation(Uuid::new_v4(), 30),
+        Err(Error::TransferNotFound)
+    ));
 }
 
 #[test]

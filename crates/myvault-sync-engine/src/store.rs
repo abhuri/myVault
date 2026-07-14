@@ -1813,6 +1813,55 @@ impl SyncStore {
         )
     }
 
+    /// Releases exactly one stopped transfer for an explicit reconciliation run.
+    ///
+    /// This transition does not claim that an earlier side effect succeeded or was
+    /// absent. It preserves every expected identity and opaque stage/base reference,
+    /// and only changes `NeedsReconcile` to a due `RetryScheduled` row carrying the
+    /// redacted `reconcile_requested` signal. After claiming it, the executor must
+    /// inspect the exact durable local and remote identities before it may complete
+    /// the transfer or perform any replay proven safe by that inspection.
+    ///
+    /// # Errors
+    /// Rejects missing transfers, stale timestamps, or any phase other than
+    /// `NeedsReconcile`. A second request is therefore not a blind replay.
+    pub fn requeue_transfer_for_reconciliation(
+        &mut self,
+        operation_id: Uuid,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        if operation_id.is_nil() {
+            return Err(Error::TransferNotFound);
+        }
+        let now = u64_to_i64(now_unix_ms)?;
+        let transaction = self.connection.transaction()?;
+        let existing = load_transfer(&transaction, operation_id)?.ok_or(Error::TransferNotFound)?;
+        if existing.phase != TransferPhase::NeedsReconcile
+            || now_unix_ms < existing.updated_at_unix_ms
+        {
+            return Err(Error::InvalidStateTransition);
+        }
+        let changed = transaction.execute(
+            "UPDATE transfers
+             SET phase = ?1, attempt_count = attempt_count + 1,
+                 next_attempt_at_unix_ms = ?2, updated_at_unix_ms = ?2,
+                 last_error_code = ?3
+             WHERE operation_id = ?4 AND phase = 'needs_reconcile'
+               AND updated_at_unix_ms <= ?2",
+            params![
+                TransferPhase::RetryScheduled.as_str(),
+                now,
+                "reconcile_requested",
+                operation_id.to_string()
+            ],
+        )?;
+        if changed != 1 {
+            return Err(Error::InvalidStateTransition);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Publishes an opaque private base-object reference without exposing an ambient path.
     ///
     /// The operation is exact-idempotent and may precede the final completion transaction.
