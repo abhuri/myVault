@@ -620,8 +620,8 @@ impl AppService {
         store.load_stage(operation_id, &expected_sha256, expected_byte_len, max_bytes)
     }
 
-    /// Removes only a private stage whose exact operation-scoped bytes fail to
-    /// match the durable transfer digest/length after an interrupted download.
+    /// Removes only a private stage whose exact operation-scoped byte length is
+    /// strictly shorter than the durable download length after interruption.
     ///
     /// The removal is descriptor-relative and identity checked. An exact
     /// verified stage, a hardlinked stage, a missing stage, a stale session,
@@ -630,8 +630,8 @@ impl AppService {
     ///
     /// # Errors
     /// Rejects stale sessions, nil operation IDs, malformed evidence, exact
-    /// verified stages, missing/replaced/hardlinked stages, unsafe private
-    /// storage, and size-limit violations.
+    /// verified stages, complete wrong-digest evidence, missing/replaced/
+    /// hardlinked stages, unsafe private storage, and size-limit violations.
     pub fn discard_incomplete_transfer_stage(
         &self,
         session_id: VaultSessionId,

@@ -298,6 +298,11 @@ impl PrivateTransferStore {
             // Recovery must never turn a verified stage into a fresh download.
             return Err(NativeTransferError::StageAlreadyExists);
         }
+        if snapshot.byte_len >= expected_byte_len {
+            // A full-length wrong digest (or oversized evidence) is corruption,
+            // not a known-interrupted stream. Preserve it for reconciliation.
+            return Err(NativeTransferError::DigestMismatch);
+        }
         self.verify_root()?;
         private_fs::remove_private_file_if_identity(&self.staging, name, &file, &identity)
             .map_err(|error| match error {

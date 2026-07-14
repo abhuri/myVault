@@ -373,6 +373,32 @@ fn incomplete_stage_recovery_refuses_verified_stage_and_preserves_vault() {
         fs::read(fixture.vault.join("existing.bin")).unwrap(),
         b"vault bytes"
     );
+
+    let corrupt_operation_id = Uuid::new_v4();
+    let mut corrupt = service
+        .begin_transfer_stage(session, corrupt_operation_id, 64)
+        .unwrap();
+    corrupt.write_all(b"wrong private evidence").unwrap();
+    drop(corrupt);
+    assert_eq!(b"wrong private evidence".len(), bytes.len());
+    assert!(matches!(
+        service.discard_incomplete_transfer_stage(
+            session,
+            corrupt_operation_id,
+            digest.as_str(),
+            bytes.len() as u64,
+            64,
+        ),
+        Err(NativeTransferError::DigestMismatch)
+    ));
+    assert!(matches!(
+        service.begin_transfer_stage(session, corrupt_operation_id, 64),
+        Err(NativeTransferError::StageAlreadyExists)
+    ));
+    assert_eq!(
+        fs::read(fixture.vault.join("existing.bin")).unwrap(),
+        b"vault bytes"
+    );
 }
 
 #[cfg(unix)]

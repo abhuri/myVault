@@ -298,26 +298,22 @@ impl<'a> NativeTransferExecutor<'a> {
                 stage
             }
             Err(NativeTransferError::StageUnavailable) => {
-                let mut writer = self
-                    .service
-                    .begin_transfer_stage(
+                self.download_into_new_stage(intent, &download)?
+            }
+            Err(NativeTransferError::DigestMismatch) => {
+                // The durable operation identity authorizes removal of only
+                // its own proven-incomplete private stage. Exact verified or
+                // hardlinked evidence is refused by the app-service boundary.
+                self.service
+                    .discard_incomplete_transfer_stage(
                         self.session_id,
                         intent.operation_id(),
-                        MAX_TRANSFER_BYTES_USIZE,
-                    )
-                    .map_err(local_failure)?;
-                self.drive
-                    .download_blob_to(&download, &mut writer)
-                    .map_err(download_stream_failure)?;
-                self.service
-                    .finish_transfer_stage(
-                        self.session_id,
-                        writer,
                         intent.sha256_hex(),
                         intent.byte_len(),
                         MAX_TRANSFER_BYTES_USIZE,
                     )
-                    .map_err(local_failure)?
+                    .map_err(local_failure)?;
+                self.download_into_new_stage(intent, &download)?
             }
             Err(error) => return Err(local_failure(error)),
         };
@@ -390,6 +386,33 @@ impl<'a> NativeTransferExecutor<'a> {
             }
             Err(error) => Err(local_failure(error)),
         }
+    }
+
+    fn download_into_new_stage(
+        &mut self,
+        intent: &TransferIntent,
+        download: &DownloadIntent,
+    ) -> Result<TransferStageRef, ExecutionFailure> {
+        let mut writer = self
+            .service
+            .begin_transfer_stage(
+                self.session_id,
+                intent.operation_id(),
+                MAX_TRANSFER_BYTES_USIZE,
+            )
+            .map_err(local_failure)?;
+        self.drive
+            .download_blob_to(download, &mut writer)
+            .map_err(download_stream_failure)?;
+        self.service
+            .finish_transfer_stage(
+                self.session_id,
+                writer,
+                intent.sha256_hex(),
+                intent.byte_len(),
+                MAX_TRANSFER_BYTES_USIZE,
+            )
+            .map_err(local_failure)
     }
 }
 
@@ -514,7 +537,7 @@ mod tests {
     use super::*;
     use mockito::{Matcher, Server};
     use myvault_core::Vault;
-    use std::fs;
+    use std::{fs, io::Write};
     use uuid::Uuid;
 
     #[test]
@@ -925,6 +948,113 @@ mod tests {
         let verified = executor.execute(&intent).expect("verified download");
 
         assert_eq!(fs::read(vault_root.join("ภาษาไทย.md")).unwrap(), b"abc");
+        assert_eq!(verified.remote_file_id(), "file_1");
+        assert_eq!(verified.remote_revision(), revision);
+        assert_eq!(verified.base_ref(), format!("sha256-{sha256}"));
+        assert_eq!(verified.outcome_code(), "download_created_verified");
+        media.assert();
+    }
+
+    #[test]
+    fn restarted_download_discards_partial_stage_before_safe_replay() {
+        let temporary = tempfile::tempdir().expect("temporary roots");
+        let base = temporary
+            .path()
+            .canonicalize()
+            .expect("canonical temporary root");
+        let app_data = base.join("app-data");
+        let vault_root = base.join("vault");
+        fs::create_dir(&app_data).expect("app data");
+        fs::create_dir(&vault_root).expect("vault root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&app_data, fs::Permissions::from_mode(0o700))
+                .expect("private app data");
+        }
+        let operation_id = Uuid::new_v4();
+        let interrupted = AppService::with_app_data_root(&app_data);
+        let interrupted_session = interrupted
+            .activate_trusted_vault(Vault::open(&vault_root).expect("open vault"))
+            .expect("activate")
+            .session_id
+            .expect("session");
+        let mut partial = interrupted
+            .begin_transfer_stage(interrupted_session, operation_id, MAX_TRANSFER_BYTES_USIZE)
+            .expect("partial stage");
+        partial.write_all(b"a").expect("partial byte");
+        drop(partial);
+        drop(interrupted);
+
+        let service = AppService::with_app_data_root(&app_data);
+        let session_id = service
+            .activate_trusted_vault(Vault::open(&vault_root).expect("reopen vault"))
+            .expect("reactivate")
+            .session_id
+            .expect("new session");
+        let sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let revision = "0000000000000000000000000000000000000000000000000000000000000002";
+        let intent = TransferIntent::new(
+            operation_id,
+            TransferDirection::Download,
+            "recovered.bin",
+            "root_1",
+            Some("file_1".to_owned()),
+            None,
+            Some(revision.to_owned()),
+            sha256,
+            3,
+            ContentKind::Blob,
+            format!("r2-{}", operation_id.simple()),
+            Some(format!("stage-{operation_id}")),
+            None,
+            1,
+        )
+        .expect("intent");
+
+        let mut server = Server::new();
+        server
+            .mock("GET", "/drive/v3/about")
+            .match_query(Matcher::Any)
+            .with_body(r#"{"user":{"permissionId":"account_1"}}"#)
+            .expect(2)
+            .create();
+        server
+            .mock("GET", "/drive/v3/files/root_1")
+            .match_query(Matcher::Any)
+            .with_body(r#"{"id":"root_1","name":"Root","mimeType":"application/vnd.google-apps.folder","parents":[],"trashed":false,"version":"1"}"#)
+            .expect(2)
+            .create();
+        let remote = format!(
+            r#"{{"id":"file_1","name":"recovered.bin","mimeType":"application/octet-stream","parents":["root_1"],"trashed":false,"version":"2","size":"3","sha256Checksum":"{sha256}"}}"#,
+        );
+        server
+            .mock("GET", "/drive/v3/files/file_1")
+            .match_query(Matcher::Regex("fields".into()))
+            .with_body(remote)
+            .expect(2)
+            .create();
+        let media = server
+            .mock("GET", "/drive/v3/files/file_1")
+            .match_query(Matcher::Regex("alt=media".into()))
+            .with_header("content-length", "3")
+            .with_body("abc")
+            .expect(1)
+            .create();
+        let origin = server.url();
+        let drive = TransferDrive::for_test_origins(
+            &format!("{origin}/drive/v3/"),
+            &format!("{origin}/upload/drive/v3/"),
+            "account_1",
+            "root_1",
+            MAX_TRANSFER_BYTES,
+        )
+        .expect("test Drive");
+        let mut executor = NativeTransferExecutor::new(&service, session_id, drive);
+
+        let verified = executor.execute(&intent).expect("recovered download");
+
+        assert_eq!(fs::read(vault_root.join("recovered.bin")).unwrap(), b"abc");
         assert_eq!(verified.remote_file_id(), "file_1");
         assert_eq!(verified.remote_revision(), revision);
         assert_eq!(verified.base_ref(), format!("sha256-{sha256}"));
