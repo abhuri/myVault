@@ -238,7 +238,16 @@ impl ReadOnlyDrive {
         validate_optional_page_token(page.next_page_token.as_deref())?;
         for file in &page.files {
             validate_file(file)?;
-            if !file.parents.iter().any(|parent| parent == parent_id) {
+            // Google accepts the literal `root` as a request alias but returns
+            // the root folder's opaque id in each child's `parents` field.
+            // Keep the response fail-closed by requiring exactly one valid
+            // provider-returned parent; exact ids must still match.
+            let parent_matches = if parent_id == "root" {
+                file.parents.len() == 1
+            } else {
+                file.parents.iter().any(|parent| parent == parent_id)
+            };
+            if !parent_matches {
                 return Err(Error::new(ErrorCode::MalformedResponse));
             }
         }
@@ -622,6 +631,80 @@ mod tests {
             .is_empty());
         first.assert();
         second.assert();
+    }
+
+    #[test]
+    fn root_alias_accepts_the_opaque_parent_id_returned_by_google() {
+        let mut server = Server::new();
+        let page = server
+            .mock("GET", "/drive/v3/files")
+            .match_query(Matcher::UrlEncoded(
+                "q".into(),
+                "'root' in parents and trashed = false".into(),
+            ))
+            .with_body(
+                r#"{
+                    "files":[{
+                        "id":"folder_1","name":"Fixture","mimeType":"application/vnd.google-apps.folder",
+                        "parents":["opaque_google_root_id"],"trashed":false,"version":"1"
+                    }]
+                }"#,
+            )
+            .create();
+
+        let result = client(&server).list_children_page("root", None).unwrap();
+
+        page.assert();
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].parents, ["opaque_google_root_id"]);
+    }
+
+    #[test]
+    fn child_page_still_rejects_a_mismatched_exact_parent() {
+        let mut server = Server::new();
+        let page = server
+            .mock("GET", "/drive/v3/files")
+            .match_query(Matcher::Any)
+            .with_body(
+                r#"{
+                    "files":[{
+                        "id":"file_1","name":"note.md","mimeType":"text/markdown",
+                        "parents":["other_parent"],"trashed":false,"version":"1"
+                    }]
+                }"#,
+            )
+            .create();
+
+        let error = client(&server)
+            .list_children_page("expected_parent", None)
+            .expect_err("an exact parent mismatch must fail closed");
+
+        page.assert();
+        assert_eq!(error.code(), ErrorCode::MalformedResponse);
+    }
+
+    #[test]
+    fn root_alias_rejects_a_child_without_a_parent() {
+        let mut server = Server::new();
+        let page = server
+            .mock("GET", "/drive/v3/files")
+            .match_query(Matcher::Any)
+            .with_body(
+                r#"{
+                    "files":[{
+                        "id":"file_1","name":"orphan.md","mimeType":"text/markdown",
+                        "parents":[],"trashed":false,"version":"1"
+                    }]
+                }"#,
+            )
+            .create();
+
+        let error = client(&server)
+            .list_children_page("root", None)
+            .expect_err("a root-alias child without a parent must fail closed");
+
+        page.assert();
+        assert_eq!(error.code(), ErrorCode::MalformedResponse);
     }
 
     #[test]

@@ -91,6 +91,33 @@ impl fmt::Debug for AuthorizationCode {
     }
 }
 
+/// OAuth client credential used only inside the native token endpoint client.
+/// Desktop applications are public clients, but this value must still stay out
+/// of repository history, UI DTOs, and diagnostics.
+pub struct GoogleClientSecret(SecretString);
+
+impl GoogleClientSecret {
+    pub fn parse(value: String) -> Result<Self, AuthError> {
+        if value.is_empty()
+            || value.len() > 512
+            || !value.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(AuthError::InvalidRequest("client_secret is invalid"));
+        }
+        Ok(Self(SecretString::from(value)))
+    }
+
+    fn expose(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
+
+impl fmt::Debug for GoogleClientSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("GoogleClientSecret([REDACTED])")
+    }
+}
+
 /// Request data needed by a native token endpoint client.
 pub struct TokenExchangeRequest {
     pub client_id: String,
@@ -193,6 +220,7 @@ pub trait TokenRefresher {
 pub struct GoogleTokenClient {
     client: Client,
     endpoint: Url,
+    client_secret: GoogleClientSecret,
 }
 
 impl fmt::Debug for GoogleTokenClient {
@@ -200,21 +228,28 @@ impl fmt::Debug for GoogleTokenClient {
         formatter
             .debug_struct("GoogleTokenClient")
             .field("endpoint", &self.endpoint)
+            .field("client_secret", &"[REDACTED]")
             .finish_non_exhaustive()
     }
 }
 
 impl GoogleTokenClient {
-    pub fn new() -> Result<Self, AuthError> {
-        Self::with_endpoint(Url::parse(GOOGLE_TOKEN_ENDPOINT)?)
+    pub fn new(client_secret: GoogleClientSecret) -> Result<Self, AuthError> {
+        Self::with_endpoint(Url::parse(GOOGLE_TOKEN_ENDPOINT)?, client_secret)
     }
 
-    fn with_endpoint(endpoint: Url) -> Result<Self, AuthError> {
-        Self::with_endpoint_and_timeouts(endpoint, Duration::from_secs(10), Duration::from_secs(30))
+    fn with_endpoint(endpoint: Url, client_secret: GoogleClientSecret) -> Result<Self, AuthError> {
+        Self::with_endpoint_and_timeouts(
+            endpoint,
+            client_secret,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+        )
     }
 
     fn with_endpoint_and_timeouts(
         endpoint: Url,
+        client_secret: GoogleClientSecret,
         connect_timeout: Duration,
         request_timeout: Duration,
     ) -> Result<Self, AuthError> {
@@ -224,15 +259,21 @@ impl GoogleTokenClient {
             .redirect(Policy::none())
             .build()
             .map_err(|_| AuthError::ExchangeFailed("HTTP client initialization failed"))?;
-        Ok(Self { client, endpoint })
+        Ok(Self {
+            client,
+            endpoint,
+            client_secret,
+        })
     }
 
     fn send_form(&self, form: &[(&str, &str)]) -> Result<TokenSet, AuthError> {
+        let mut form = form.to_vec();
+        form.push(("client_secret", self.client_secret.expose()));
         let response = self
             .client
             .post(self.endpoint.clone())
             .header(reqwest::header::ACCEPT, "application/json")
-            .form(form)
+            .form(&form)
             .send()
             .map_err(|error| {
                 if error.is_timeout() {
@@ -887,6 +928,7 @@ mod tests {
         assert!(query
             .get("code_challenge")
             .is_some_and(|value| value.len() == 43));
+        assert!(!query.contains_key("client_secret"));
     }
 
     #[test]
@@ -1071,8 +1113,12 @@ mod tests {
         }
     }
 
+    fn test_client_secret() -> GoogleClientSecret {
+        GoogleClientSecret::parse("desktop-client-secret".to_owned()).unwrap()
+    }
+
     #[test]
-    fn google_exchange_posts_installed_app_fields_without_client_secret() {
+    fn google_exchange_posts_installed_app_fields_with_client_secret() {
         let mut server = Server::new();
         let request = exchange_request();
         let exchange = server
@@ -1080,6 +1126,7 @@ mod tests {
             .match_header("accept", "application/json")
             .match_body(Matcher::AllOf(vec![
                 Matcher::UrlEncoded("client_id".into(), "desktop-client".into()),
+                Matcher::UrlEncoded("client_secret".into(), "desktop-client-secret".into()),
                 Matcher::UrlEncoded("code".into(), "one-time-secret-code".into()),
                 Matcher::UrlEncoded("code_verifier".into(), "pkce-secret-verifier".into()),
                 Matcher::UrlEncoded("grant_type".into(), "authorization_code".into()),
@@ -1094,7 +1141,7 @@ mod tests {
             ))
             .create();
         let endpoint = Url::parse(&format!("{}/token", server.url())).unwrap();
-        let client = GoogleTokenClient::with_endpoint(endpoint).unwrap();
+        let client = GoogleTokenClient::with_endpoint(endpoint, test_client_secret()).unwrap();
 
         let tokens = client.exchange(&request).unwrap();
 
@@ -1108,12 +1155,13 @@ mod tests {
     }
 
     #[test]
-    fn google_refresh_posts_only_refresh_grant_fields() {
+    fn google_refresh_posts_client_secret_and_refresh_grant_fields() {
         let mut server = Server::new();
         let refresh = server
             .mock("POST", "/token")
             .match_body(Matcher::AllOf(vec![
                 Matcher::UrlEncoded("client_id".into(), "desktop-client".into()),
+                Matcher::UrlEncoded("client_secret".into(), "desktop-client-secret".into()),
                 Matcher::UrlEncoded("grant_type".into(), "refresh_token".into()),
                 Matcher::UrlEncoded("refresh_token".into(), "refresh-secret".into()),
             ]))
@@ -1121,7 +1169,7 @@ mod tests {
             .with_body(r#"{"access_token":"fresh-access","expires_in":1200,"token_type":"bearer"}"#)
             .create();
         let endpoint = Url::parse(&format!("{}/token", server.url())).unwrap();
-        let client = GoogleTokenClient::with_endpoint(endpoint).unwrap();
+        let client = GoogleTokenClient::with_endpoint(endpoint, test_client_secret()).unwrap();
         let request = TokenRefreshRequest::new(
             "desktop-client",
             SecretString::from("refresh-secret".to_owned()),
@@ -1144,7 +1192,7 @@ mod tests {
             .with_body("provider-secret-body")
             .create();
         let endpoint = Url::parse(&format!("{}/token", server.url())).unwrap();
-        let client = GoogleTokenClient::with_endpoint(endpoint).unwrap();
+        let client = GoogleTokenClient::with_endpoint(endpoint, test_client_secret()).unwrap();
 
         let error = client.exchange(&exchange_request()).unwrap_err();
 
@@ -1168,6 +1216,7 @@ mod tests {
         let endpoint = Url::parse(&format!("{}/token", server.url())).unwrap();
         let client = GoogleTokenClient::with_endpoint_and_timeouts(
             endpoint,
+            test_client_secret(),
             Duration::from_millis(20),
             Duration::from_millis(20),
         )
@@ -1189,6 +1238,7 @@ mod tests {
             .create();
         let oversized_client = GoogleTokenClient::with_endpoint(
             Url::parse(&format!("{}/token", oversized_server.url())).unwrap(),
+            test_client_secret(),
         )
         .unwrap();
         assert!(matches!(
@@ -1208,6 +1258,7 @@ mod tests {
             .create();
         let scope_client = GoogleTokenClient::with_endpoint(
             Url::parse(&format!("{}/token", scope_server.url())).unwrap(),
+            test_client_secret(),
         )
         .unwrap();
         assert!(matches!(
@@ -1301,6 +1352,8 @@ mod tests {
     #[test]
     fn secret_bearing_types_are_not_serializable_and_debug_is_redacted() {
         static_assertions::assert_not_impl_any!(AuthorizationCode: serde::Serialize);
+        static_assertions::assert_not_impl_any!(GoogleClientSecret: serde::Serialize);
+        static_assertions::assert_not_impl_any!(GoogleTokenClient: serde::Serialize);
         static_assertions::assert_not_impl_any!(TokenExchangeRequest: serde::Serialize);
         static_assertions::assert_not_impl_any!(TokenRefreshRequest: serde::Serialize);
         static_assertions::assert_not_impl_any!(TokenSet: serde::Serialize);
@@ -1314,6 +1367,16 @@ mod tests {
         assert!(!debug.contains("refresh-secret"));
         assert!(debug.contains("[REDACTED]"));
 
+        let secret_value = "desktop-client-secret-that-must-stay-native";
+        let client = GoogleTokenClient::with_endpoint(
+            Url::parse("https://oauth2.googleapis.com/token").unwrap(),
+            GoogleClientSecret::parse(secret_value.to_owned()).unwrap(),
+        )
+        .unwrap();
+        let debug = format!("{client:?}");
+        assert!(!debug.contains(secret_value));
+        assert!(debug.contains("[REDACTED]"));
+
         let fresh = FreshAccessToken {
             value: SecretString::from("access-secret".to_owned()),
             expires_in: None,
@@ -1321,5 +1384,22 @@ mod tests {
         let debug = format!("{fresh:?}");
         assert!(!debug.contains("access-secret"));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn google_client_secret_validation_is_fail_closed_and_redacted() {
+        let valid = GoogleClientSecret::parse("desktop-client-secret_123".to_owned()).unwrap();
+        assert_eq!(format!("{valid:?}"), "GoogleClientSecret([REDACTED])");
+
+        for invalid in ["", "secret value", "secret\nvalue", "บัญชี"] {
+            assert!(matches!(
+                GoogleClientSecret::parse(invalid.to_owned()),
+                Err(AuthError::InvalidRequest("client_secret is invalid"))
+            ));
+        }
+        assert!(matches!(
+            GoogleClientSecret::parse("a".repeat(513)),
+            Err(AuthError::InvalidRequest("client_secret is invalid"))
+        ));
     }
 }

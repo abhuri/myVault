@@ -354,7 +354,8 @@ mod platform {
     use super::*;
     use myvault_app_service::{AppService, NativeVaultContext};
     use myvault_desktop_auth::{
-        DesktopOAuth, GoogleTokenClient, NativeTokenProvider, OsKeyringStore, SecretStore,
+        DesktopOAuth, GoogleClientSecret, GoogleTokenClient, NativeTokenProvider, OsKeyringStore,
+        SecretStore,
     };
     use myvault_drive::{AccessToken, ReadOnlyDrive};
     use myvault_sync_engine::{advance_initial_sync, BindOutcome, SyncStore, VaultSyncState};
@@ -365,6 +366,7 @@ mod platform {
     };
 
     const CLIENT_ID_ENV: &str = "MYVAULT_GOOGLE_DESKTOP_CLIENT_ID";
+    const CLIENT_SECRET_ENV: &str = "MYVAULT_GOOGLE_DESKTOP_CLIENT_SECRET";
     const KEYRING_SERVICE: &str = "com.abhuri.myvault.google-drive";
     const CALLBACK_TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -396,6 +398,21 @@ mod platform {
         Ok(value)
     }
 
+    fn desktop_client_secret() -> Result<GoogleClientSecret, SyncCommandError> {
+        let value = std::env::var(CLIENT_SECRET_ENV).map_err(|_| {
+            SyncCommandError::new(
+                SyncCommandCode::Unconfigured,
+                "desktop Google OAuth is not configured",
+            )
+        })?;
+        GoogleClientSecret::parse(value).map_err(|_| {
+            SyncCommandError::new(
+                SyncCommandCode::Unconfigured,
+                "desktop Google OAuth is not configured",
+            )
+        })
+    }
+
     fn validate_client_id(value: &str) -> Result<(), SyncCommandError> {
         if value.is_empty()
             || value.len() > 512
@@ -412,13 +429,14 @@ mod platform {
     }
 
     fn is_configured() -> bool {
-        desktop_client_id().is_ok()
+        desktop_client_id().is_ok() && desktop_client_secret().is_ok()
     }
 
     fn provider(
         client_id: &str,
     ) -> Result<NativeTokenProvider<GoogleTokenClient, OsKeyringStore>, SyncCommandError> {
-        let endpoint = GoogleTokenClient::new().map_err(|_| SyncCommandError::internal())?;
+        let endpoint = GoogleTokenClient::new(desktop_client_secret()?)
+            .map_err(|_| SyncCommandError::internal())?;
         NativeTokenProvider::new(client_id, endpoint, OsKeyringStore::new(KEYRING_SERVICE))
             .map_err(|_| SyncCommandError::internal())
     }
@@ -616,6 +634,7 @@ mod platform {
             service
                 .with_native_session_lease(session_id, |context| {
                     let client_id = desktop_client_id()?;
+                    let provider = provider(&client_id)?;
                     let mut inner = runtime
                         .inner
                         .lock()
@@ -639,7 +658,6 @@ mod platform {
                             "Google authorization was not completed",
                         )
                     })?;
-                    let provider = provider(&client_id)?;
                     let tokens = provider.exchange(&request).map_err(|_| {
                         SyncCommandError::new(
                             SyncCommandCode::AuthRequired,
