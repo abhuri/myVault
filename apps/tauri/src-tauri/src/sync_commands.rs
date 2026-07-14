@@ -2073,6 +2073,194 @@ mod platform {
             root.assert();
             changes.assert();
         }
+
+        #[test]
+        fn incremental_download_publishes_exact_base_before_advancing_cursor() {
+            const SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+            const REMOTE_REVISION: &str =
+                "0000000000000000000000000000000000000000000000000000000000000002";
+            const PATH: &str = "ภาษาไทย.md";
+
+            let temporary = tempfile::tempdir().expect("temporary roots");
+            let base = temporary.path().canonicalize().expect("canonical root");
+            let app_data = base.join("app-data");
+            let vault_root = base.join("vault");
+            std::fs::create_dir(&app_data).expect("app data root");
+            std::fs::create_dir(&vault_root).expect("vault root");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&app_data, std::fs::Permissions::from_mode(0o700))
+                    .expect("private app data permissions");
+            }
+            let service = AppService::with_app_data_root(&app_data);
+            let session_id = service
+                .activate_trusted_vault(
+                    Vault::open(vault_root.canonicalize().expect("canonical vault"))
+                        .expect("open vault"),
+                )
+                .expect("activate vault")
+                .session_id
+                .expect("session");
+            let context = service.native_vault_context(session_id).expect("context");
+            let mut store = SyncStore::open(
+                context.app_data_root().expect("app data"),
+                context.vault_root(),
+                context.vault_id(),
+            )
+            .expect("sync store");
+            let binding = myvault_sync_engine::VerifiedRemoteBinding::new(
+                "account_1",
+                "root_1",
+                "account_1",
+                "root_1",
+            )
+            .expect("binding");
+            store.bind_remote_root(&binding, 1).expect("bind");
+            let mut initial = EmptyInitialDrive;
+            for now in 2..=4 {
+                advance_initial_sync(&mut store, &mut initial, now).expect("initial step");
+            }
+
+            let mut server = mockito::Server::new();
+            let about = server
+                .mock("GET", "/drive/v3/about")
+                .match_query(mockito::Matcher::Any)
+                .with_body(r#"{"user":{"permissionId":"account_1"}}"#)
+                .expect(4)
+                .create();
+            let root = server
+                .mock("GET", "/drive/v3/files/root_1")
+                .match_query(mockito::Matcher::Any)
+                .with_body(
+                    r#"{"id":"root_1","name":"Fixture","mimeType":"application/vnd.google-apps.folder","parents":[],"trashed":false,"version":"1"}"#,
+                )
+                .expect(4)
+                .create();
+            let changes = server
+                .mock("GET", "/drive/v3/changes")
+                .match_query(mockito::Matcher::Any)
+                .with_body(format!(
+                    r#"{{"changes":[{{"fileId":"file_1","removed":false,"file":{{"id":"file_1","name":"{PATH}","mimeType":"text/markdown","parents":["root_1"],"trashed":false,"version":"2","sha256Checksum":"{SHA256}"}}}}],"newStartPageToken":"cursor_2"}}"#,
+                ))
+                .create();
+            let remote = format!(
+                r#"{{"id":"file_1","name":"{PATH}","mimeType":"text/markdown","parents":["root_1"],"trashed":false,"version":"2","size":"3","sha256Checksum":"{SHA256}"}}"#,
+            );
+            let metadata = server
+                .mock("GET", "/drive/v3/files/file_1")
+                .match_query(mockito::Matcher::Regex("fields".into()))
+                .with_body(remote)
+                .expect(3)
+                .create();
+            let media = server
+                .mock("GET", "/drive/v3/files/file_1")
+                .match_query(mockito::Matcher::Regex("alt=media".into()))
+                .with_header("content-length", "3")
+                .with_body("abc")
+                .create();
+            let origin = server.url();
+            let read_only = ReadOnlyDrive::for_test_origin(&format!("{origin}/drive/v3/"), 4096)
+                .expect("read-only test Drive");
+            let transfer = TransferDrive::for_test_origins(
+                &format!("{origin}/drive/v3/"),
+                &format!("{origin}/upload/drive/v3/"),
+                "account_1",
+                "root_1",
+                myvault_transfer::MAX_TRANSFER_BYTES,
+            )
+            .expect("transfer test Drive");
+
+            let batch = prepare_incremental_change_batch(
+                &service, session_id, &mut store, &read_only, &transfer, "root_1",
+            )
+            .expect("prepare incremental download");
+            let mutations = store
+                .local_mutations(batch.batch_id)
+                .expect("durable local mutation");
+            assert_eq!(mutations.len(), 1);
+            assert_eq!(
+                mutations[0].state,
+                myvault_sync_engine::LocalMutationState::Pending
+            );
+            let operation_id = Uuid::parse_str(&mutations[0].mutation_id).expect("operation id");
+            assert_eq!(
+                store.transfer(operation_id).unwrap().unwrap().phase,
+                TransferPhase::Pending
+            );
+            assert!(store
+                .commit_transfer_change_batch(batch.batch_id, 5)
+                .is_err());
+            assert_eq!(
+                store
+                    .vault_state()
+                    .unwrap()
+                    .unwrap()
+                    .durable_cursor
+                    .as_deref(),
+                Some("cursor_1")
+            );
+            assert!(!vault_root.join(PATH).exists());
+
+            run_guarded_worker(&service, session_id, &mut store, transfer)
+                .expect("run guarded download");
+
+            assert_eq!(std::fs::read(vault_root.join(PATH)).unwrap(), b"abc");
+            let completed = store.transfer(operation_id).unwrap().unwrap();
+            let expected_base = format!("sha256-{SHA256}");
+            assert_eq!(completed.phase, TransferPhase::Completed);
+            assert_eq!(
+                completed.base_reference.as_deref(),
+                Some(expected_base.as_str())
+            );
+            assert_eq!(
+                store.local_mutations(batch.batch_id).unwrap()[0].state,
+                myvault_sync_engine::LocalMutationState::Committed
+            );
+            let mut sink = std::io::sink();
+            let local = service
+                .stream_transfer_source(
+                    session_id,
+                    PATH,
+                    &mut sink,
+                    usize::try_from(MAX_TRANSFER_BYTES).expect("transfer size fits usize"),
+                )
+                .expect("read back local bytes");
+            let remote_base = store
+                .remote_base("file_1")
+                .unwrap()
+                .expect("verified remote base");
+            assert_eq!(remote_base.local_revision, local.revision.hex);
+            assert_eq!(remote_base.remote_revision, REMOTE_REVISION);
+            assert_eq!(remote_base.content_hash, SHA256);
+            assert_eq!(
+                store
+                    .vault_state()
+                    .unwrap()
+                    .unwrap()
+                    .durable_cursor
+                    .as_deref(),
+                Some("cursor_1")
+            );
+
+            store
+                .commit_transfer_change_batch(batch.batch_id, now_unix_ms().unwrap())
+                .expect("advance cursor after verified completion");
+            assert_eq!(
+                store
+                    .vault_state()
+                    .unwrap()
+                    .unwrap()
+                    .durable_cursor
+                    .as_deref(),
+                Some("cursor_2")
+            );
+            about.assert();
+            root.assert();
+            changes.assert();
+            metadata.assert();
+            media.assert();
+        }
     }
 }
 
