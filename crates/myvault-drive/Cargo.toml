@@ -7,6 +7,9 @@ license = "MIT"
 description = "Guarded Google Drive metadata and transfer adapter for myVault"
 publish = false
 
+[features]
+test-support = []
+
 [dependencies]
 myvault-sync-engine = { path = "../myvault-sync-engine" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }

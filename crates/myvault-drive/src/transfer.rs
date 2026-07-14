@@ -449,6 +449,31 @@ impl TransferDrive {
         .unwrap()
     }
 
+    /// Constructs an HTTP capability for cross-crate integration tests.
+    /// This constructor is deliberately absent from production builds.
+    ///
+    /// # Errors
+    /// Rejects malformed origins, bindings, limits, or client setup.
+    #[cfg(feature = "test-support")]
+    pub fn for_test_origins(
+        api_base: &str,
+        upload_base: &str,
+        account_id: impl Into<String>,
+        root_id: impl Into<String>,
+        max_blob_bytes: u64,
+    ) -> Result<Self> {
+        Self::build(
+            AccessToken::new("integration-test-token"),
+            Url::parse(api_base).map_err(|_| Error::new(ErrorCode::InvalidInput))?,
+            Url::parse(upload_base).map_err(|_| Error::new(ErrorCode::InvalidInput))?,
+            account_id.into(),
+            root_id.into(),
+            max_blob_bytes,
+            Duration::from_secs(2),
+            false,
+        )
+    }
+
     /// Re-establishes account/root/parent ancestry and reconciles both the
     /// operation marker and exact name before a create can be initiated.
     ///

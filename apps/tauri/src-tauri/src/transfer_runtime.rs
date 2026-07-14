@@ -250,6 +250,14 @@ impl<'a> NativeTransferExecutor<'a> {
         &mut self,
         intent: &TransferIntent,
     ) -> Result<VerifiedTransfer, ExecutionFailure> {
+        let expected_stage = format!("stage-{}", intent.operation_id());
+        if intent.stage_ref() != Some(expected_stage.as_str()) {
+            return Err(failure(
+                ExecutionFailureKind::NeedsReconcile,
+                "stage_reference_mismatch",
+                None,
+            ));
+        }
         let remote_file_id = intent.remote_file_id().ok_or_else(|| {
             failure(
                 ExecutionFailureKind::NeedsReconcile,
@@ -483,6 +491,9 @@ fn failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mockito::{Matcher, Server};
+    use myvault_core::Vault;
+    use std::fs;
     use uuid::Uuid;
 
     #[test]
@@ -504,5 +515,205 @@ mod tests {
             assert!(!mapped.code().contains('/'));
             assert!(!mapped.code().contains("Bearer"));
         }
+    }
+
+    #[test]
+    fn upload_existing_exact_bytes_completes_without_remote_mutation() {
+        let temporary = tempfile::tempdir().expect("temporary roots");
+        let base = temporary
+            .path()
+            .canonicalize()
+            .expect("canonical temporary root");
+        let app_data = base.join("app-data");
+        let vault_root = base.join("vault");
+        fs::create_dir(&app_data).expect("app data");
+        fs::create_dir(&vault_root).expect("vault root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&app_data, fs::Permissions::from_mode(0o700))
+                .expect("private app data");
+        }
+        fs::write(vault_root.join("note.md"), b"abc").expect("source");
+        let service = AppService::with_app_data_root(&app_data);
+        let session_id = service
+            .activate_trusted_vault(Vault::open(&vault_root).expect("open vault"))
+            .expect("activate")
+            .session_id
+            .expect("session");
+        let operation_id = Uuid::new_v4();
+        let mut sink = std::io::sink();
+        let snapshot = service
+            .stream_transfer_source(session_id, "note.md", &mut sink, MAX_TRANSFER_BYTES_USIZE)
+            .expect("snapshot");
+        let marker = format!("r2-{}", operation_id.simple());
+        let intent = TransferIntent::new(
+            operation_id,
+            TransferDirection::Upload,
+            "note.md",
+            "root_1",
+            None,
+            Some(snapshot.revision.hex.clone()),
+            None,
+            snapshot.sha256.as_str(),
+            snapshot.byte_len,
+            ContentKind::Markdown,
+            marker.clone(),
+            Some(format!("stage-{operation_id}")),
+            None,
+            0,
+        )
+        .expect("intent");
+
+        let mut server = Server::new();
+        server
+            .mock("GET", "/drive/v3/about")
+            .match_query(Matcher::Any)
+            .with_body(r#"{"user":{"permissionId":"account_1"}}"#)
+            .expect(2)
+            .create();
+        server
+            .mock("GET", "/drive/v3/files/root_1")
+            .match_query(Matcher::Any)
+            .with_body(r#"{"id":"root_1","name":"Root","mimeType":"application/vnd.google-apps.folder","parents":[],"trashed":false,"version":"1"}"#)
+            .expect(2)
+            .create();
+        let remote = format!(
+            r#"{{"id":"file_1","name":"note.md","mimeType":"text/markdown","parents":["root_1"],"trashed":false,"version":"2","size":"3","sha256Checksum":"{}","appProperties":{{"myvaultOperation":"{marker}","myvaultSha256":"{}","myvaultSize":"3"}}}}"#,
+            snapshot.sha256.as_str(),
+            snapshot.sha256.as_str(),
+        );
+        server
+            .mock("GET", "/drive/v3/files")
+            .match_query(Matcher::Any)
+            .with_body(format!(r#"{{"files":[{remote}]}}"#))
+            .expect(1)
+            .create();
+        server
+            .mock("GET", "/drive/v3/files/file_1")
+            .match_query(Matcher::Any)
+            .with_body(remote)
+            .expect(1)
+            .create();
+        let post = server
+            .mock("POST", "/upload/drive/v3/files")
+            .match_query(Matcher::Any)
+            .expect(0)
+            .create();
+        let origin = server.url();
+        let drive = TransferDrive::for_test_origins(
+            &format!("{origin}/drive/v3/"),
+            &format!("{origin}/upload/drive/v3/"),
+            "account_1",
+            "root_1",
+            MAX_TRANSFER_BYTES,
+        )
+        .expect("test Drive");
+        let mut executor = NativeTransferExecutor::new(&service, session_id, drive);
+
+        let verified = executor.execute(&intent).expect("verified no-op");
+
+        assert_eq!(verified.remote_file_id(), "file_1");
+        assert_eq!(verified.sha256_hex(), snapshot.sha256.as_str());
+        assert_eq!(
+            verified.local_revision(),
+            Some(snapshot.revision.hex.as_str())
+        );
+        assert_eq!(verified.outcome_code(), "upload_verified");
+        post.assert();
+    }
+
+    #[test]
+    fn download_exact_blob_creates_local_file_and_private_base() {
+        let temporary = tempfile::tempdir().expect("temporary roots");
+        let base = temporary
+            .path()
+            .canonicalize()
+            .expect("canonical temporary root");
+        let app_data = base.join("app-data");
+        let vault_root = base.join("vault");
+        fs::create_dir(&app_data).expect("app data");
+        fs::create_dir(&vault_root).expect("vault root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&app_data, fs::Permissions::from_mode(0o700))
+                .expect("private app data");
+        }
+        let service = AppService::with_app_data_root(&app_data);
+        let session_id = service
+            .activate_trusted_vault(Vault::open(&vault_root).expect("open vault"))
+            .expect("activate")
+            .session_id
+            .expect("session");
+        let operation_id = Uuid::new_v4();
+        let sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let revision = "0000000000000000000000000000000000000000000000000000000000000002";
+        let intent = TransferIntent::new(
+            operation_id,
+            TransferDirection::Download,
+            "ภาษาไทย.md",
+            "root_1",
+            Some("file_1".to_owned()),
+            None,
+            Some(revision.to_owned()),
+            sha256,
+            3,
+            ContentKind::Markdown,
+            format!("r2-{}", operation_id.simple()),
+            Some(format!("stage-{operation_id}")),
+            None,
+            0,
+        )
+        .expect("intent");
+
+        let mut server = Server::new();
+        server
+            .mock("GET", "/drive/v3/about")
+            .match_query(Matcher::Any)
+            .with_body(r#"{"user":{"permissionId":"account_1"}}"#)
+            .expect(2)
+            .create();
+        server
+            .mock("GET", "/drive/v3/files/root_1")
+            .match_query(Matcher::Any)
+            .with_body(r#"{"id":"root_1","name":"Root","mimeType":"application/vnd.google-apps.folder","parents":[],"trashed":false,"version":"1"}"#)
+            .expect(2)
+            .create();
+        let remote = format!(
+            r#"{{"id":"file_1","name":"ภาษาไทย.md","mimeType":"text/markdown","parents":["root_1"],"trashed":false,"version":"2","size":"3","sha256Checksum":"{sha256}"}}"#,
+        );
+        server
+            .mock("GET", "/drive/v3/files/file_1")
+            .match_query(Matcher::Regex("fields".into()))
+            .with_body(remote)
+            .expect(2)
+            .create();
+        let media = server
+            .mock("GET", "/drive/v3/files/file_1")
+            .match_query(Matcher::Regex("alt=media".into()))
+            .with_header("content-length", "3")
+            .with_body("abc")
+            .expect(1)
+            .create();
+        let origin = server.url();
+        let drive = TransferDrive::for_test_origins(
+            &format!("{origin}/drive/v3/"),
+            &format!("{origin}/upload/drive/v3/"),
+            "account_1",
+            "root_1",
+            MAX_TRANSFER_BYTES,
+        )
+        .expect("test Drive");
+        let mut executor = NativeTransferExecutor::new(&service, session_id, drive);
+
+        let verified = executor.execute(&intent).expect("verified download");
+
+        assert_eq!(fs::read(vault_root.join("ภาษาไทย.md")).unwrap(), b"abc");
+        assert_eq!(verified.remote_file_id(), "file_1");
+        assert_eq!(verified.remote_revision(), revision);
+        assert_eq!(verified.base_ref(), format!("sha256-{sha256}"));
+        assert_eq!(verified.outcome_code(), "download_created_verified");
+        media.assert();
     }
 }

@@ -42,3 +42,5 @@ tauri-plugin-vault-saf = { path = "../../../crates/tauri-plugin-vault-saf" }
 
 [dev-dependencies]
 tempfile = "3.23.0"
+mockito = "=1.7.0"
+myvault-drive = { path = "../../../crates/myvault-drive", features = ["test-support"] }
