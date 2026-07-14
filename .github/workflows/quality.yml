@@ -206,6 +206,7 @@ jobs:
         with:
           toolchain: 1.96.0
           targets: aarch64-linux-android
+          components: clippy
 
       - name: Install Android SDK and NDK
         run: |
