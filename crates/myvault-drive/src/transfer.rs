@@ -627,8 +627,9 @@ impl TransferDrive {
     }
 
     /// Inspects one exact remote download candidate using metadata GETs only.
-    /// The result proves the bound account/root ancestry, exact parent, live
-    /// blob MIME policy, canonical revision, SHA-256, and bounded byte length.
+    /// The result proves the bound account/root ancestry, exact parent and
+    /// display name, expected canonical revision, live blob MIME policy,
+    /// SHA-256, and bounded byte length.
     ///
     /// # Errors
     /// Fails closed for unbound ancestry, wrong parents, trashed or Google
@@ -637,7 +638,26 @@ impl TransferDrive {
         &self,
         file_id: &str,
         parent_id: &str,
+        expected_name: &str,
+        expected_sync_revision: &str,
     ) -> Result<RemoteObject> {
+        validate_name(expected_name)?;
+        let expected_provider_version =
+            provider_version_from_sync_revision(expected_sync_revision)?;
+        let (candidate, current_name) =
+            self.inspect_download_candidate_metadata(file_id, parent_id)?;
+        if current_name != expected_name || candidate.provider_version != expected_provider_version
+        {
+            return Err(Error::new(ErrorCode::RevisionMismatch));
+        }
+        Ok(candidate)
+    }
+
+    fn inspect_download_candidate_metadata(
+        &self,
+        file_id: &str,
+        parent_id: &str,
+    ) -> Result<(RemoteObject, String)> {
         self.ensure_folder_below_root(parent_id)?;
         let file = self.transfer_file_metadata(file_id)?;
         if file.trashed
@@ -659,13 +679,16 @@ impl TransferDrive {
         if size > self.max_blob_bytes {
             return Err(Error::new(ErrorCode::ResponseTooLarge));
         }
-        Ok(RemoteObject {
-            file_id: file.id,
-            provider_version: version.to_owned(),
-            sync_revision: sync_revision_from_provider_version(version)?,
-            sha256,
-            size,
-        })
+        Ok((
+            RemoteObject {
+                file_id: file.id,
+                provider_version: version.to_owned(),
+                sync_revision: sync_revision_from_provider_version(version)?,
+                sha256,
+                size,
+            },
+            file.name,
+        ))
     }
 
     /// Rechecks the exact bound account, root ancestry, parent, file id,
@@ -906,7 +929,8 @@ impl TransferDrive {
     }
 
     fn exact_download_metadata(&self, intent: &DownloadIntent) -> Result<RemoteObject> {
-        let observed = self.inspect_download_candidate(&intent.file_id, &intent.parent_id)?;
+        let (observed, _) =
+            self.inspect_download_candidate_metadata(&intent.file_id, &intent.parent_id)?;
         if observed.provider_version != intent.provider_version {
             return Err(Error::new(ErrorCode::RevisionMismatch));
         }
@@ -1673,7 +1697,7 @@ mod tests {
             .create();
 
         let candidate = TransferDrive::for_test(&server, 1024)
-            .inspect_download_candidate("file_1", "root_1")
+            .inspect_download_candidate("file_1", "root_1", "note.md", SYNC_REVISION_2)
             .unwrap();
 
         assert_eq!(candidate.file_id(), "file_1");
@@ -1737,12 +1761,65 @@ mod tests {
                 .create();
 
             let error = TransferDrive::for_test(&server, max_blob_bytes)
-                .inspect_download_candidate("file_1", "root_1")
+                .inspect_download_candidate("file_1", "root_1", "note.md", SYNC_REVISION_2)
                 .unwrap_err();
 
             assert_eq!(error.code(), expected);
             metadata.assert();
             media.assert();
+        }
+    }
+
+    #[test]
+    fn inspect_download_candidate_rejects_name_and_revision_mismatch_without_media_get() {
+        let revision_3 = "0000000000000000000000000000000000000000000000000000000000000003";
+        for (expected_name, expected_revision) in
+            [("renamed.md", SYNC_REVISION_2), ("note.md", revision_3)]
+        {
+            let mut server = Server::new();
+            binding_mocks(&mut server, 1);
+            let metadata = server
+                .mock("GET", "/drive/v3/files/file_1")
+                .match_query(Matcher::Regex("fields".into()))
+                .with_body(format!(
+                    r#"{{"id":"file_1","name":"note.md","mimeType":"text/markdown","parents":["root_1"],"trashed":false,"version":"2","size":"3","sha256Checksum":"{SHA}"}}"#
+                ))
+                .create();
+            let media = server
+                .mock("GET", "/drive/v3/files/file_1")
+                .match_query(Matcher::UrlEncoded("alt".into(), "media".into()))
+                .expect(0)
+                .create();
+
+            let error = TransferDrive::for_test(&server, 1024)
+                .inspect_download_candidate("file_1", "root_1", expected_name, expected_revision)
+                .unwrap_err();
+
+            assert_eq!(error.code(), ErrorCode::RevisionMismatch);
+            metadata.assert();
+            media.assert();
+        }
+    }
+
+    #[test]
+    fn inspect_download_candidate_rejects_malformed_expected_identity_before_network() {
+        let server = Server::new();
+        let drive = TransferDrive::for_test(&server, 1024);
+        for (name, revision) in [
+            ("../note.md", SYNC_REVISION_2),
+            ("note.md", "2"),
+            (
+                "note.md",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ),
+        ] {
+            assert_eq!(
+                drive
+                    .inspect_download_candidate("file_1", "root_1", name, revision)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::InvalidInput
+            );
         }
     }
 
