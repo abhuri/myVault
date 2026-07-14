@@ -369,6 +369,30 @@ fn incomplete_stage_recovery_refuses_verified_stage_and_preserves_vault() {
             .unwrap(),
         stage
     );
+    let base = service
+        .publish_verified_stage_as_base(session, &stage, 64)
+        .unwrap();
+    assert_eq!(base.opaque_ref(), format!("sha256-{}", digest.as_str()));
+    assert!(matches!(
+        service.discard_incomplete_transfer_stage(
+            session,
+            operation_id,
+            digest.as_str(),
+            bytes.len() as u64,
+            64,
+        ),
+        Err(NativeTransferError::StageUnavailable)
+    ));
+    let vault_store = single_child(&fixture.app_data.join("guarded-transfer/v1"));
+    assert_eq!(
+        fs::read(
+            vault_store
+                .join("objects")
+                .join(format!("{}.blob", digest.as_str()))
+        )
+        .unwrap(),
+        bytes
+    );
     assert_eq!(
         fs::read(fixture.vault.join("existing.bin")).unwrap(),
         b"vault bytes"
