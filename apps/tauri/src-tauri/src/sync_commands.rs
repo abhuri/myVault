@@ -363,8 +363,8 @@ mod platform {
     use crate::transfer_runtime::NativeTransferExecutor;
     use myvault_app_service::{AppService, ExplorerKindDto, NativeVaultContext};
     use myvault_desktop_auth::{
-        DesktopOAuth, GoogleClientSecret, GoogleTokenClient, NativeTokenProvider, OsKeyringStore,
-        SecretStore,
+        DesktopOAuth, FreshAccessToken, GoogleClientSecret, GoogleTokenClient, NativeTokenProvider,
+        OsKeyringStore, SecretStore,
     };
     use myvault_drive::{AccessToken, ReadOnlyDrive, ResolvedDriveChange, TransferDrive};
     use myvault_sync_engine::{
@@ -643,39 +643,51 @@ mod platform {
         Ok(())
     }
 
-    fn fresh_drive(account_id: &str) -> Result<ReadOnlyDrive, SyncCommandError> {
+    fn fresh_access(account_id: &str) -> Result<FreshAccessToken, SyncCommandError> {
         let client_id = desktop_client_id()?;
-        let access = provider(&client_id)?
+        provider(&client_id)?
             .fresh_access_token(account_id)
             .map_err(|_| {
                 SyncCommandError::new(
                     SyncCommandCode::AuthRequired,
                     "Google authorization is required",
                 )
-            })?;
+            })
+    }
+
+    fn read_only_drive(access: &FreshAccessToken) -> Result<ReadOnlyDrive, SyncCommandError> {
         ReadOnlyDrive::google(AccessToken::new(access.expose_to_native().to_owned()))
             .map_err(map_drive_error)
     }
 
-    fn fresh_transfer_drive(
+    fn transfer_drive(
+        access: &FreshAccessToken,
         account_id: &str,
         root_id: &str,
     ) -> Result<TransferDrive, SyncCommandError> {
-        let client_id = desktop_client_id()?;
-        let access = provider(&client_id)?
-            .fresh_access_token(account_id)
-            .map_err(|_| {
-                SyncCommandError::new(
-                    SyncCommandCode::AuthRequired,
-                    "Google authorization is required",
-                )
-            })?;
         TransferDrive::google(
             AccessToken::new(access.expose_to_native().to_owned()),
             account_id,
             root_id,
         )
         .map_err(map_drive_error)
+    }
+
+    fn fresh_drive(account_id: &str) -> Result<ReadOnlyDrive, SyncCommandError> {
+        read_only_drive(&fresh_access(account_id)?)
+    }
+
+    fn refresh_run_access_once(
+        account_id: &str,
+        access: &mut FreshAccessToken,
+        refresh_attempted: &mut bool,
+    ) -> Result<bool, SyncCommandError> {
+        if *refresh_attempted {
+            return Ok(false);
+        }
+        *refresh_attempted = true;
+        *access = fresh_access(account_id)?;
+        Ok(true)
     }
 
     fn transfer_operation_id(parts: &[&str]) -> Uuid {
@@ -1176,12 +1188,18 @@ mod platform {
         Ok(())
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum GuardedWorkerOutcome {
+        Drained,
+        AuthRequired,
+    }
+
     fn run_guarded_worker(
         service: &AppService,
         session_id: VaultSessionId,
         store: &mut SyncStore,
         drive: TransferDrive,
-    ) -> Result<(), SyncCommandError> {
+    ) -> Result<GuardedWorkerOutcome, SyncCommandError> {
         let executor = NativeTransferExecutor::new(service, session_id, drive);
         let mut worker = Worker::new(store, executor);
         for _ in 0..MAX_GUARDED_OPERATIONS {
@@ -1189,14 +1207,45 @@ mod platform {
                 .run_once(now_unix_ms()?)
                 .map_err(|_| SyncCommandError::internal())?
             {
-                WorkOutcome::Idle => break,
+                WorkOutcome::Idle => return Ok(GuardedWorkerOutcome::Drained),
                 WorkOutcome::Completed(_)
                 | WorkOutcome::RetryScheduled(_)
-                | WorkOutcome::AuthRequired(_)
                 | WorkOutcome::NeedsReconcile(_) => {}
+                WorkOutcome::AuthRequired(_) => return Ok(GuardedWorkerOutcome::AuthRequired),
             }
         }
-        Ok(())
+        Ok(GuardedWorkerOutcome::Drained)
+    }
+
+    fn run_guarded_worker_with_auth_refresh(
+        service: &AppService,
+        session_id: VaultSessionId,
+        store: &mut SyncStore,
+        account_id: &str,
+        root_id: &str,
+        access: &mut FreshAccessToken,
+        refresh_attempted: &mut bool,
+    ) -> Result<GuardedWorkerOutcome, SyncCommandError> {
+        let first = run_guarded_worker(
+            service,
+            session_id,
+            store,
+            transfer_drive(access, account_id, root_id)?,
+        )?;
+        if first != GuardedWorkerOutcome::AuthRequired
+            || !refresh_run_access_once(account_id, access, refresh_attempted)?
+        {
+            return Ok(first);
+        }
+        store
+            .resume_auth_required_transfers(now_unix_ms()?)
+            .map_err(map_sync_error)?;
+        run_guarded_worker(
+            service,
+            session_id,
+            store,
+            transfer_drive(access, account_id, root_id)?,
+        )
     }
 
     fn require_connected_account(
@@ -1585,35 +1634,58 @@ mod platform {
                     .resume_auth_required_transfers(now_unix_ms()?)
                     .map_err(map_sync_error)?;
 
+                let mut access = fresh_access(&account_id)?;
+                let mut refresh_attempted = false;
                 let mut metadata_fresh = false;
+                let mut auth_blocked = false;
                 for page_index in 0..MAX_INCREMENTAL_PAGES {
                     let active = store.active_change_batch().map_err(map_sync_error)?;
-                    let (batch_id, final_page, drive) = if let Some(active) = active {
+                    let (batch_id, final_page) = if let Some(active) = active {
                         requeue_active_batch_reconciliation(
                             store,
                             active.batch_id,
                             now_unix_ms()?,
                         )?;
-                        (
-                            active.batch_id,
-                            false,
-                            fresh_transfer_drive(&account_id, &bound.remote_root_id)?,
-                        )
+                        (active.batch_id, false)
                     } else {
-                        let read_only = fresh_drive(&account_id)?;
-                        let drive = fresh_transfer_drive(&account_id, &bound.remote_root_id)?;
-                        let batch = prepare_incremental_change_batch(
-                            &service,
-                            session_id,
-                            store,
-                            &read_only,
-                            &drive,
-                            &bound.remote_root_id,
-                        )?;
-                        (batch.batch_id, batch.final_page, drive)
+                        let batch = loop {
+                            let read_only = read_only_drive(&access)?;
+                            let drive =
+                                transfer_drive(&access, &account_id, &bound.remote_root_id)?;
+                            match prepare_incremental_change_batch(
+                                &service,
+                                session_id,
+                                store,
+                                &read_only,
+                                &drive,
+                                &bound.remote_root_id,
+                            ) {
+                                Err(error)
+                                    if error.code == SyncCommandCode::AuthRequired
+                                        && refresh_run_access_once(
+                                            &account_id,
+                                            &mut access,
+                                            &mut refresh_attempted,
+                                        )? => {}
+                                result => break result?,
+                            }
+                        };
+                        (batch.batch_id, batch.final_page)
                     };
 
-                    run_guarded_worker(&service, session_id, store, drive)?;
+                    if run_guarded_worker_with_auth_refresh(
+                        &service,
+                        session_id,
+                        store,
+                        &account_id,
+                        &bound.remote_root_id,
+                        &mut access,
+                        &mut refresh_attempted,
+                    )? == GuardedWorkerOutcome::AuthRequired
+                    {
+                        auth_blocked = true;
+                        break;
+                    }
                     let active = store
                         .active_change_batch()
                         .map_err(map_sync_error)?
@@ -1639,16 +1711,38 @@ mod platform {
                     }
                 }
 
-                if metadata_fresh {
-                    let drive = fresh_transfer_drive(&account_id, &bound.remote_root_id)?;
-                    prepare_guarded_transfers(
+                if metadata_fresh && !auth_blocked {
+                    loop {
+                        let drive = transfer_drive(&access, &account_id, &bound.remote_root_id)?;
+                        match prepare_guarded_transfers(
+                            &service,
+                            session_id,
+                            store,
+                            &drive,
+                            &bound.remote_root_id,
+                        ) {
+                            Err(error)
+                                if error.code == SyncCommandCode::AuthRequired
+                                    && refresh_run_access_once(
+                                        &account_id,
+                                        &mut access,
+                                        &mut refresh_attempted,
+                                    )? => {}
+                            result => {
+                                result?;
+                                break;
+                            }
+                        }
+                    }
+                    let _ = run_guarded_worker_with_auth_refresh(
                         &service,
                         session_id,
                         store,
-                        &drive,
+                        &account_id,
                         &bound.remote_root_id,
+                        &mut access,
+                        &mut refresh_attempted,
                     )?;
-                    run_guarded_worker(&service, session_id, store, drive)?;
                 }
                 service
                     .confirm_active_session(session_id)
