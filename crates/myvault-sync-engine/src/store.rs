@@ -1,8 +1,8 @@
 use crate::{
-    parse_uuid, u64_to_i64, validate_content_path, validate_redacted_code, validate_remote_id,
-    validate_remote_token, validate_revision, ChangesPage, Error, RemoteChange, RemoteEntry,
-    RemoteEntryKind, Result, ScanPage, ScanRequest, SyncPhase, VerifiedRemoteBinding,
-    MAX_SCAN_FRONTIER_FOLDERS,
+    parse_uuid, u64_to_i64, validate_content_path, validate_private_reference,
+    validate_redacted_code, validate_remote_id, validate_remote_token, validate_revision,
+    ChangesPage, Error, RemoteChange, RemoteEntry, RemoteEntryKind, Result, ScanPage, ScanRequest,
+    SyncPhase, VerifiedRemoteBinding, MAX_SCAN_FRONTIER_FOLDERS,
 };
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
@@ -99,6 +99,39 @@ const CHANGE_BATCH_MUTATIONS_SCHEMA: &str = "CREATE TABLE change_batch_mutations
     PRIMARY KEY (batch_id, mutation_id),
     FOREIGN KEY (batch_id) REFERENCES change_batch(batch_id) ON DELETE CASCADE
 )";
+const TRANSFERS_SCHEMA: &str = "CREATE TABLE transfers (
+    operation_id TEXT PRIMARY KEY NOT NULL,
+    direction TEXT NOT NULL CHECK (direction IN ('upload', 'download')),
+    portable_path TEXT NOT NULL,
+    remote_parent_id TEXT NOT NULL,
+    remote_file_id TEXT,
+    display_name TEXT NOT NULL,
+    expected_local_revision TEXT,
+    expected_remote_revision TEXT,
+    sha256 TEXT NOT NULL,
+    byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+    mime_class TEXT NOT NULL CHECK (mime_class IN ('markdown', 'blob')),
+    operation_marker TEXT NOT NULL UNIQUE,
+    stage_reference TEXT,
+    base_reference TEXT,
+    phase TEXT NOT NULL CHECK (phase IN ('pending', 'running', 'retry_scheduled', 'auth_required', 'needs_reconcile', 'completed')),
+    attempt_count INTEGER NOT NULL CHECK (attempt_count >= 0),
+    next_attempt_at_unix_ms INTEGER NOT NULL CHECK (next_attempt_at_unix_ms >= 0),
+    created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+    updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= 0),
+    last_error_code TEXT,
+    verified_local_revision TEXT,
+    verified_remote_revision TEXT
+)";
+const TRANSFERS_DUE_INDEX_SCHEMA: &str = "CREATE INDEX transfers_due_idx
+    ON transfers(phase, next_attempt_at_unix_ms, created_at_unix_ms, operation_id)";
+const TRANSFER_HISTORY_SCHEMA: &str = "CREATE TABLE transfer_history (
+    event_id INTEGER PRIMARY KEY NOT NULL,
+    operation_id TEXT NOT NULL UNIQUE,
+    outcome_code TEXT NOT NULL,
+    occurred_at_unix_ms INTEGER NOT NULL CHECK (occurred_at_unix_ms >= 0),
+    FOREIGN KEY (operation_id) REFERENCES transfers(operation_id)
+)";
 
 const SCHEMA_OBJECTS_V1: [(&str, &str, &str); 8] = [
     ("table", "vault_state", VAULT_STATE_SCHEMA_V1),
@@ -119,7 +152,7 @@ const SCHEMA_OBJECTS_V1: [(&str, &str, &str); 8] = [
     ),
 ];
 
-const SCHEMA_OBJECTS: [(&str, &str, &str); 10] = [
+const SCHEMA_OBJECTS_V2: [(&str, &str, &str); 10] = [
     ("table", "vault_state", VAULT_STATE_SCHEMA),
     ("table", "remote_entries", REMOTE_ENTRIES_SCHEMA),
     (
@@ -144,7 +177,35 @@ const SCHEMA_OBJECTS: [(&str, &str, &str); 10] = [
     ),
 ];
 
-pub const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_OBJECTS: [(&str, &str, &str); 13] = [
+    ("table", "vault_state", VAULT_STATE_SCHEMA),
+    ("table", "remote_entries", REMOTE_ENTRIES_SCHEMA),
+    (
+        "index",
+        "remote_entries_path_idx",
+        REMOTE_ENTRIES_INDEX_SCHEMA,
+    ),
+    (
+        "index",
+        "remote_entries_preview_idx",
+        REMOTE_ENTRIES_PREVIEW_INDEX_SCHEMA,
+    ),
+    ("table", "scan_frontier", SCAN_FRONTIER_SCHEMA),
+    ("table", "sync_jobs", SYNC_JOBS_SCHEMA),
+    ("index", "sync_jobs_due_idx", SYNC_JOBS_INDEX_SCHEMA),
+    ("table", "sync_history", SYNC_HISTORY_SCHEMA),
+    ("table", "change_batch", CHANGE_BATCH_SCHEMA),
+    (
+        "table",
+        "change_batch_mutations",
+        CHANGE_BATCH_MUTATIONS_SCHEMA,
+    ),
+    ("table", "transfers", TRANSFERS_SCHEMA),
+    ("index", "transfers_due_idx", TRANSFERS_DUE_INDEX_SCHEMA),
+    ("table", "transfer_history", TRANSFER_HISTORY_SCHEMA),
+];
+
+pub const SCHEMA_VERSION: i64 = 3;
 pub const MAX_REMOTE_PREVIEW_PAGE_SIZE: usize = 200;
 
 /// Exact residual risk inherited from bundled `SQLite`'s ambient-path VFS.
@@ -404,6 +465,315 @@ impl QueueJob {
 pub enum EnqueueOutcome {
     Enqueued,
     AlreadyPresent,
+    AlreadyCompleted,
+}
+
+/// Direction of one content-bearing R2 transfer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransferDirection {
+    Upload,
+    Download,
+}
+
+impl TransferDirection {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Upload => "upload",
+            Self::Download => "download",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "upload" => Ok(Self::Upload),
+            "download" => Ok(Self::Download),
+            _ => Err(Error::InvalidSchema),
+        }
+    }
+}
+
+/// Bounded content classification; raw provider MIME strings are not durable evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransferMimeClass {
+    Markdown,
+    Blob,
+}
+
+impl TransferMimeClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Markdown => "markdown",
+            Self::Blob => "blob",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "markdown" => Ok(Self::Markdown),
+            "blob" => Ok(Self::Blob),
+            _ => Err(Error::InvalidSchema),
+        }
+    }
+}
+
+/// Durable transfer phase. `Running` is always recovered to `NeedsReconcile` after restart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransferPhase {
+    Pending,
+    Running,
+    RetryScheduled,
+    AuthRequired,
+    NeedsReconcile,
+    Completed,
+}
+
+impl TransferPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::RetryScheduled => "retry_scheduled",
+            Self::AuthRequired => "auth_required",
+            Self::NeedsReconcile => "needs_reconcile",
+            Self::Completed => "completed",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "retry_scheduled" => Ok(Self::RetryScheduled),
+            "auth_required" => Ok(Self::AuthRequired),
+            "needs_reconcile" => Ok(Self::NeedsReconcile),
+            "completed" => Ok(Self::Completed),
+            _ => Err(Error::InvalidSchema),
+        }
+    }
+}
+
+/// Complete non-secret evidence required before a transfer side effect may start.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransferRecord {
+    pub operation_id: Uuid,
+    pub direction: TransferDirection,
+    pub portable_path: String,
+    pub remote_parent_id: String,
+    pub remote_file_id: Option<String>,
+    pub display_name: String,
+    pub expected_local_revision: Option<String>,
+    pub expected_remote_revision: Option<String>,
+    pub sha256: String,
+    pub byte_length: u64,
+    pub mime_class: TransferMimeClass,
+    pub operation_marker: String,
+    pub stage_reference: Option<String>,
+    pub base_reference: Option<String>,
+    pub phase: TransferPhase,
+    pub attempt_count: u32,
+    pub next_attempt_at_unix_ms: u64,
+    pub created_at_unix_ms: u64,
+    pub updated_at_unix_ms: u64,
+    pub last_error_code: Option<String>,
+    pub verified_local_revision: Option<String>,
+    pub verified_remote_revision: Option<String>,
+}
+
+impl TransferRecord {
+    /// Creates validated pending evidence without credentials, bodies, URLs, or ambient paths.
+    ///
+    /// # Errors
+    /// Rejects malformed identities, revisions, digest, timestamps, or opaque references.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        operation_id: Uuid,
+        direction: TransferDirection,
+        portable_path: impl Into<String>,
+        remote_parent_id: impl Into<String>,
+        remote_file_id: Option<String>,
+        expected_local_revision: Option<String>,
+        expected_remote_revision: Option<String>,
+        sha256: impl Into<String>,
+        byte_length: u64,
+        mime_class: TransferMimeClass,
+        operation_marker: impl Into<String>,
+        stage_reference: Option<String>,
+        base_reference: Option<String>,
+        created_at_unix_ms: u64,
+    ) -> Result<Self> {
+        let portable_path = portable_path.into();
+        let display_name = portable_path
+            .rsplit('/')
+            .next()
+            .ok_or(Error::InvalidTransferEvidence)?
+            .to_owned();
+        let record = Self {
+            operation_id,
+            direction,
+            portable_path,
+            remote_parent_id: remote_parent_id.into(),
+            remote_file_id,
+            display_name,
+            expected_local_revision,
+            expected_remote_revision,
+            sha256: sha256.into(),
+            byte_length,
+            mime_class,
+            operation_marker: operation_marker.into(),
+            stage_reference,
+            base_reference,
+            phase: TransferPhase::Pending,
+            attempt_count: 0,
+            next_attempt_at_unix_ms: created_at_unix_ms,
+            created_at_unix_ms,
+            updated_at_unix_ms: created_at_unix_ms,
+            last_error_code: None,
+            verified_local_revision: None,
+            verified_remote_revision: None,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.operation_id.is_nil() {
+            return Err(Error::InvalidTransferEvidence);
+        }
+        validate_content_path(&self.portable_path)?;
+        if self.display_name
+            != self
+                .portable_path
+                .rsplit('/')
+                .next()
+                .ok_or(Error::InvalidTransferEvidence)?
+        {
+            return Err(Error::InvalidTransferEvidence);
+        }
+        validate_remote_id(&self.remote_parent_id)?;
+        if let Some(value) = &self.remote_file_id {
+            validate_remote_id(value)?;
+        }
+        if self.direction == TransferDirection::Download && self.remote_file_id.is_none() {
+            return Err(Error::InvalidTransferEvidence);
+        }
+        if let Some(value) = &self.expected_local_revision {
+            validate_revision(value)?;
+        }
+        if let Some(value) = &self.expected_remote_revision {
+            validate_remote_id(value)?;
+        }
+        validate_revision(&self.sha256)?;
+        validate_remote_id(&self.operation_marker)?;
+        for reference in [
+            self.stage_reference.as_deref(),
+            self.base_reference.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            validate_private_reference(reference)?;
+        }
+        if let Some(value) = &self.last_error_code {
+            validate_redacted_code(value)?;
+        }
+        if let Some(value) = &self.verified_local_revision {
+            validate_revision(value)?;
+        }
+        if let Some(value) = &self.verified_remote_revision {
+            validate_remote_id(value)?;
+        }
+        u64_to_i64(self.byte_length)?;
+        u64_to_i64(self.next_attempt_at_unix_ms)?;
+        u64_to_i64(self.created_at_unix_ms)?;
+        u64_to_i64(self.updated_at_unix_ms)?;
+        if self.updated_at_unix_ms < self.created_at_unix_ms
+            || (self.phase == TransferPhase::Completed
+                && (self.remote_file_id.is_none()
+                    || self.base_reference.is_none()
+                    || self.verified_local_revision.is_none()
+                    || self.verified_remote_revision.is_none()))
+        {
+            return Err(Error::InvalidTransferEvidence);
+        }
+        Ok(())
+    }
+
+    fn same_registration(&self, other: &Self) -> bool {
+        self.operation_id == other.operation_id
+            && self.direction == other.direction
+            && self.portable_path == other.portable_path
+            && self.remote_parent_id == other.remote_parent_id
+            && (other.remote_file_id.is_none() || self.remote_file_id == other.remote_file_id)
+            && self.display_name == other.display_name
+            && self.expected_local_revision == other.expected_local_revision
+            && self.expected_remote_revision == other.expected_remote_revision
+            && self.sha256 == other.sha256
+            && self.byte_length == other.byte_length
+            && self.mime_class == other.mime_class
+            && self.operation_marker == other.operation_marker
+            && self.stage_reference == other.stage_reference
+            && (other.base_reference.is_none() || self.base_reference == other.base_reference)
+            && self.created_at_unix_ms == other.created_at_unix_ms
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransferRegistrationOutcome {
+    Registered,
+    AlreadyPresent,
+    AlreadyCompleted,
+}
+
+/// Exact identities proven after content transfer and byte verification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransferCompletion {
+    pub remote_file_id: String,
+    pub remote_revision: String,
+    pub local_revision: String,
+    pub base_reference: String,
+    pub outcome_code: String,
+    pub occurred_at_unix_ms: u64,
+}
+
+impl TransferCompletion {
+    /// Creates exact verified completion evidence.
+    ///
+    /// # Errors
+    /// Rejects malformed identities, revisions, references, codes, or timestamps.
+    pub fn new(
+        remote_file_id: impl Into<String>,
+        remote_revision: impl Into<String>,
+        local_revision: impl Into<String>,
+        base_reference: impl Into<String>,
+        outcome_code: impl Into<String>,
+        occurred_at_unix_ms: u64,
+    ) -> Result<Self> {
+        let completion = Self {
+            remote_file_id: remote_file_id.into(),
+            remote_revision: remote_revision.into(),
+            local_revision: local_revision.into(),
+            base_reference: base_reference.into(),
+            outcome_code: outcome_code.into(),
+            occurred_at_unix_ms,
+        };
+        completion.validate()?;
+        Ok(completion)
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_remote_id(&self.remote_file_id)?;
+        validate_remote_id(&self.remote_revision)?;
+        validate_revision(&self.local_revision)?;
+        validate_private_reference(&self.base_reference)?;
+        validate_redacted_code(&self.outcome_code)?;
+        u64_to_i64(self.occurred_at_unix_ms)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransferCompletionOutcome {
+    Completed,
     AlreadyCompleted,
 }
 
@@ -1100,6 +1470,376 @@ impl SyncStore {
         query_count(&self.connection, "SELECT COUNT(*) FROM sync_history")
     }
 
+    /// Registers complete durable transfer evidence before any side effect.
+    ///
+    /// # Errors
+    /// Rejects unbound state, malformed evidence, marker reuse, or conflicting operation IDs.
+    pub fn register_transfer(
+        &mut self,
+        transfer: &TransferRecord,
+    ) -> Result<TransferRegistrationOutcome> {
+        transfer.validate()?;
+        if transfer.phase != TransferPhase::Pending
+            || transfer.attempt_count != 0
+            || transfer.last_error_code.is_some()
+            || transfer.verified_local_revision.is_some()
+            || transfer.verified_remote_revision.is_some()
+        {
+            return Err(Error::InvalidTransferEvidence);
+        }
+        let transaction = self.connection.transaction()?;
+        require_state(&transaction, self.vault_id)?;
+        if let Some(existing) = load_transfer(&transaction, transfer.operation_id)? {
+            if !existing.same_registration(transfer) {
+                return Err(Error::TransferCollision);
+            }
+            let outcome = if existing.phase == TransferPhase::Completed {
+                TransferRegistrationOutcome::AlreadyCompleted
+            } else {
+                TransferRegistrationOutcome::AlreadyPresent
+            };
+            transaction.commit()?;
+            return Ok(outcome);
+        }
+        let marker_owner: Option<String> = transaction
+            .query_row(
+                "SELECT operation_id FROM transfers WHERE operation_marker = ?1",
+                [&transfer.operation_marker],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if marker_owner.is_some() {
+            return Err(Error::TransferCollision);
+        }
+        insert_transfer(&transaction, transfer)?;
+        transaction.commit()?;
+        Ok(TransferRegistrationOutcome::Registered)
+    }
+
+    /// Claims the oldest due transfer in one transaction.
+    ///
+    /// Reconciliation and authentication pauses are never claimed implicitly.
+    ///
+    /// # Errors
+    /// Returns invalid persisted evidence, timestamp, or database errors.
+    pub fn claim_next_transfer(&mut self, now_unix_ms: u64) -> Result<Option<TransferRecord>> {
+        let now = u64_to_i64(now_unix_ms)?;
+        let transaction = self.connection.transaction()?;
+        let candidate = {
+            let mut statement = transaction.prepare(
+                "SELECT operation_id, direction, portable_path, remote_parent_id,
+                        remote_file_id, display_name, expected_local_revision,
+                        expected_remote_revision, sha256, byte_length, mime_class,
+                        operation_marker, stage_reference, base_reference, phase,
+                        attempt_count, next_attempt_at_unix_ms, created_at_unix_ms,
+                        updated_at_unix_ms, last_error_code, verified_local_revision,
+                        verified_remote_revision
+                 FROM transfers
+                 WHERE phase IN ('pending', 'retry_scheduled')
+                   AND next_attempt_at_unix_ms <= ?1
+                 ORDER BY created_at_unix_ms, operation_id
+                 LIMIT 1",
+            )?;
+            statement.query_row([now], row_to_transfer).optional()?
+        };
+        let Some(mut transfer) = candidate.transpose()? else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let changed = transaction.execute(
+            "UPDATE transfers SET phase = ?1, updated_at_unix_ms = ?2
+             WHERE operation_id = ?3 AND phase IN ('pending', 'retry_scheduled')",
+            params![
+                TransferPhase::Running.as_str(),
+                now,
+                transfer.operation_id.to_string()
+            ],
+        )?;
+        if changed != 1 {
+            return Err(Error::InvalidStateTransition);
+        }
+        transfer.phase = TransferPhase::Running;
+        transfer.updated_at_unix_ms = now_unix_ms;
+        transaction.commit()?;
+        Ok(Some(transfer))
+    }
+
+    /// Schedules a retry only after the caller has established that replay is safe.
+    ///
+    /// # Errors
+    /// Rejects missing transfers, invalid codes/timestamps, or invalid transitions.
+    pub fn schedule_transfer_retry(
+        &mut self,
+        operation_id: Uuid,
+        next_attempt_at_unix_ms: u64,
+        error_code: &str,
+        updated_at_unix_ms: u64,
+    ) -> Result<()> {
+        if operation_id.is_nil() {
+            return Err(Error::TransferNotFound);
+        }
+        validate_redacted_code(error_code)?;
+        let next = u64_to_i64(next_attempt_at_unix_ms)?;
+        let updated = u64_to_i64(updated_at_unix_ms)?;
+        let existing =
+            load_transfer(&self.connection, operation_id)?.ok_or(Error::TransferNotFound)?;
+        if existing.phase == TransferPhase::RetryScheduled
+            && existing.next_attempt_at_unix_ms == next_attempt_at_unix_ms
+            && existing.last_error_code.as_deref() == Some(error_code)
+        {
+            return Ok(());
+        }
+        if updated_at_unix_ms < existing.updated_at_unix_ms {
+            return Err(Error::InvalidStateTransition);
+        }
+        let changed = self.connection.execute(
+            "UPDATE transfers
+             SET phase = ?1, attempt_count = attempt_count + 1,
+                 next_attempt_at_unix_ms = ?2, updated_at_unix_ms = ?3,
+                 last_error_code = ?4
+             WHERE operation_id = ?5
+               AND phase IN ('running', 'auth_required', 'needs_reconcile')",
+            params![
+                TransferPhase::RetryScheduled.as_str(),
+                next,
+                updated,
+                error_code,
+                operation_id.to_string()
+            ],
+        )?;
+        if changed != 1 {
+            return Err(Error::InvalidStateTransition);
+        }
+        Ok(())
+    }
+
+    /// Pauses a running transfer without persisting provider errors or credentials.
+    ///
+    /// # Errors
+    /// Rejects missing transfers, malformed redacted codes, or invalid transitions.
+    pub fn mark_transfer_auth_required(
+        &mut self,
+        operation_id: Uuid,
+        error_code: &str,
+        updated_at_unix_ms: u64,
+    ) -> Result<()> {
+        self.mark_transfer_stopped(
+            operation_id,
+            TransferPhase::AuthRequired,
+            error_code,
+            updated_at_unix_ms,
+        )
+    }
+
+    /// Stops a transfer whose side-effect outcome or revision is ambiguous.
+    ///
+    /// # Errors
+    /// Rejects missing transfers, malformed redacted codes, or invalid transitions.
+    pub fn mark_transfer_needs_reconcile(
+        &mut self,
+        operation_id: Uuid,
+        error_code: &str,
+        updated_at_unix_ms: u64,
+    ) -> Result<()> {
+        self.mark_transfer_stopped(
+            operation_id,
+            TransferPhase::NeedsReconcile,
+            error_code,
+            updated_at_unix_ms,
+        )
+    }
+
+    /// Publishes an opaque private base-object reference without exposing an ambient path.
+    ///
+    /// The operation is exact-idempotent and may precede the final completion transaction.
+    ///
+    /// # Errors
+    /// Rejects mismatched references, missing transfers, or invalid transitions.
+    pub fn publish_transfer_base_reference(
+        &mut self,
+        operation_id: Uuid,
+        base_reference: &str,
+        updated_at_unix_ms: u64,
+    ) -> Result<()> {
+        validate_private_reference(base_reference)?;
+        let updated = u64_to_i64(updated_at_unix_ms)?;
+        let existing =
+            load_transfer(&self.connection, operation_id)?.ok_or(Error::TransferNotFound)?;
+        if existing.base_reference.as_deref() == Some(base_reference) {
+            return Ok(());
+        }
+        if existing.base_reference.is_some() || updated_at_unix_ms < existing.updated_at_unix_ms {
+            return Err(Error::TransferCollision);
+        }
+        let changed = self.connection.execute(
+            "UPDATE transfers SET base_reference = ?1, updated_at_unix_ms = ?2
+             WHERE operation_id = ?3
+               AND phase IN ('running', 'needs_reconcile')
+               AND base_reference IS NULL",
+            params![base_reference, updated, operation_id.to_string()],
+        )?;
+        if changed != 1 {
+            return Err(Error::InvalidStateTransition);
+        }
+        Ok(())
+    }
+
+    /// Commits verified exact identities, a base reference, a completed tombstone, and
+    /// redacted history atomically.
+    ///
+    /// # Errors
+    /// Rejects stale expected identities, conflicting completion, or invalid transitions.
+    pub fn complete_verified_transfer(
+        &mut self,
+        operation_id: Uuid,
+        completion: &TransferCompletion,
+    ) -> Result<TransferCompletionOutcome> {
+        if operation_id.is_nil() {
+            return Err(Error::TransferNotFound);
+        }
+        completion.validate()?;
+        let transaction = self.connection.transaction()?;
+        let existing = load_transfer(&transaction, operation_id)?.ok_or(Error::TransferNotFound)?;
+        if existing.phase == TransferPhase::Completed {
+            let history: Option<(String, i64)> = transaction
+                .query_row(
+                    "SELECT outcome_code, occurred_at_unix_ms FROM transfer_history
+                     WHERE operation_id = ?1",
+                    [operation_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let same = existing.remote_file_id.as_deref() == Some(&completion.remote_file_id)
+                && existing.verified_remote_revision.as_deref()
+                    == Some(&completion.remote_revision)
+                && existing.verified_local_revision.as_deref() == Some(&completion.local_revision)
+                && existing.base_reference.as_deref() == Some(&completion.base_reference)
+                && history
+                    == Some((
+                        completion.outcome_code.clone(),
+                        u64_to_i64(completion.occurred_at_unix_ms)?,
+                    ));
+            if same {
+                transaction.commit()?;
+                return Ok(TransferCompletionOutcome::AlreadyCompleted);
+            }
+            return Err(Error::TransferCollision);
+        }
+        if !matches!(
+            existing.phase,
+            TransferPhase::Running | TransferPhase::NeedsReconcile
+        ) || existing.updated_at_unix_ms > completion.occurred_at_unix_ms
+            || existing
+                .remote_file_id
+                .as_ref()
+                .is_some_and(|value| value != &completion.remote_file_id)
+            || existing
+                .expected_remote_revision
+                .as_ref()
+                .is_some_and(|value| value != &completion.remote_revision)
+            || (existing.direction == TransferDirection::Upload
+                && existing
+                    .expected_local_revision
+                    .as_ref()
+                    .is_some_and(|value| value != &completion.local_revision))
+            || existing
+                .base_reference
+                .as_ref()
+                .is_some_and(|value| value != &completion.base_reference)
+        {
+            return Err(Error::InvalidStateTransition);
+        }
+        let occurred = u64_to_i64(completion.occurred_at_unix_ms)?;
+        transaction.execute(
+            "INSERT INTO transfer_history(operation_id, outcome_code, occurred_at_unix_ms)
+             VALUES (?1, ?2, ?3)",
+            params![operation_id.to_string(), completion.outcome_code, occurred],
+        )?;
+        let changed = transaction.execute(
+            "UPDATE transfers
+             SET remote_file_id = ?1, base_reference = ?2, phase = ?3,
+                 next_attempt_at_unix_ms = ?4, updated_at_unix_ms = ?4,
+                 last_error_code = NULL, verified_local_revision = ?5,
+                 verified_remote_revision = ?6
+             WHERE operation_id = ?7 AND phase IN ('running', 'needs_reconcile')",
+            params![
+                completion.remote_file_id,
+                completion.base_reference,
+                TransferPhase::Completed.as_str(),
+                occurred,
+                completion.local_revision,
+                completion.remote_revision,
+                operation_id.to_string()
+            ],
+        )?;
+        if changed != 1 {
+            return Err(Error::InvalidStateTransition);
+        }
+        transaction.commit()?;
+        Ok(TransferCompletionOutcome::Completed)
+    }
+
+    /// Reads one durable transfer by operation ID.
+    ///
+    /// # Errors
+    /// Returns invalid persisted evidence or database errors.
+    pub fn transfer(&self, operation_id: Uuid) -> Result<Option<TransferRecord>> {
+        load_transfer(&self.connection, operation_id)
+    }
+
+    /// Returns active, non-completed transfer count.
+    ///
+    /// # Errors
+    /// Returns invalid count or database errors.
+    pub fn transfer_count(&self) -> Result<u64> {
+        query_count(
+            &self.connection,
+            "SELECT COUNT(*) FROM transfers WHERE phase != 'completed'",
+        )
+    }
+
+    fn mark_transfer_stopped(
+        &mut self,
+        operation_id: Uuid,
+        target: TransferPhase,
+        error_code: &str,
+        updated_at_unix_ms: u64,
+    ) -> Result<()> {
+        if operation_id.is_nil() {
+            return Err(Error::TransferNotFound);
+        }
+        if !matches!(
+            target,
+            TransferPhase::AuthRequired | TransferPhase::NeedsReconcile
+        ) {
+            return Err(Error::InvalidStateTransition);
+        }
+        validate_redacted_code(error_code)?;
+        let updated = u64_to_i64(updated_at_unix_ms)?;
+        let existing =
+            load_transfer(&self.connection, operation_id)?.ok_or(Error::TransferNotFound)?;
+        if existing.phase == target && existing.last_error_code.as_deref() == Some(error_code) {
+            return Ok(());
+        }
+        if updated_at_unix_ms < existing.updated_at_unix_ms {
+            return Err(Error::InvalidStateTransition);
+        }
+        let changed = self.connection.execute(
+            "UPDATE transfers SET phase = ?1, updated_at_unix_ms = ?2, last_error_code = ?3
+             WHERE operation_id = ?4 AND phase = 'running'",
+            params![
+                target.as_str(),
+                updated,
+                error_code,
+                operation_id.to_string()
+            ],
+        )?;
+        if changed != 1 {
+            return Err(Error::InvalidStateTransition);
+        }
+        Ok(())
+    }
+
     /// Starts one durable incremental cursor batch.
     ///
     /// # Errors
@@ -1351,6 +2091,15 @@ impl SyncStore {
                 JobState::Running.as_str()
             ],
         )?;
+        self.connection.execute(
+            "UPDATE transfers
+             SET phase = ?1, last_error_code = 'interrupted_unknown_outcome'
+             WHERE phase = ?2",
+            params![
+                TransferPhase::NeedsReconcile.as_str(),
+                TransferPhase::Running.as_str()
+            ],
+        )?;
         Ok(())
     }
 }
@@ -1420,7 +2169,14 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         }
         migrate_v1_to_v2(&transaction)?;
     }
-    if !schema_v2_is_valid(&transaction)? {
+    let after_v1: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if after_v1 == 2 {
+        if !schema_v2_is_valid(&transaction)? {
+            return Err(Error::InvalidSchema);
+        }
+        migrate_v2_to_v3(&transaction)?;
+    }
+    if !schema_v3_is_valid(&transaction)? {
         return Err(Error::InvalidSchema);
     }
     transaction.commit()?;
@@ -1431,6 +2187,14 @@ fn create_schema(transaction: &Transaction<'_>) -> Result<()> {
     for (_, _, statement) in SCHEMA_OBJECTS {
         transaction.execute_batch(statement)?;
     }
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+fn migrate_v2_to_v3(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(TRANSFERS_SCHEMA)?;
+    transaction.execute_batch(TRANSFERS_DUE_INDEX_SCHEMA)?;
+    transaction.execute_batch(TRANSFER_HISTORY_SCHEMA)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -1463,7 +2227,7 @@ fn migrate_v1_to_v2(transaction: &Transaction<'_>) -> Result<()> {
     )?;
     transaction.execute_batch(REMOTE_ENTRIES_PREVIEW_INDEX_SCHEMA)?;
     transaction.execute_batch(SCAN_FRONTIER_SCHEMA)?;
-    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.pragma_update(None, "user_version", 2)?;
     Ok(())
 }
 
@@ -1514,7 +2278,7 @@ fn schema_v1_is_valid(connection: &Connection) -> Result<bool> {
 }
 
 fn schema_v2_is_valid(connection: &Connection) -> Result<bool> {
-    if !schema_definitions_are_exact(connection, &SCHEMA_OBJECTS)? {
+    if !schema_definitions_are_exact(connection, &SCHEMA_OBJECTS_V2)? {
         return Ok(false);
     }
     let mut statement = connection.prepare(
@@ -1563,6 +2327,111 @@ fn schema_v2_is_valid(connection: &Connection) -> Result<bool> {
             row.get(0)
         })?;
     Ok(foreign_key_errors == 0)
+}
+
+fn schema_v3_is_valid(connection: &Connection) -> Result<bool> {
+    if !schema_definitions_are_exact(connection, &SCHEMA_OBJECTS)? {
+        return Ok(false);
+    }
+    let mut statement = connection.prepare(
+        "SELECT name FROM sqlite_master
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+         ORDER BY name",
+    )?;
+    let tables = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let expected = [
+        "change_batch",
+        "change_batch_mutations",
+        "remote_entries",
+        "scan_frontier",
+        "sync_history",
+        "sync_jobs",
+        "transfer_history",
+        "transfers",
+        "vault_state",
+    ];
+    if tables.iter().map(String::as_str).ne(expected) {
+        return Ok(false);
+    }
+    if !primary_schema_columns_are_valid_v2(connection)?
+        || !transfer_schema_columns_are_valid(connection)?
+        || !auxiliary_schema_columns_are_valid(connection)?
+        || !index_has_columns(connection, "remote_entries_path_idx", &["portable_path"])?
+        || !index_has_columns(
+            connection,
+            "remote_entries_preview_idx",
+            &["portable_path", "file_id"],
+        )?
+        || !index_has_columns(
+            connection,
+            "sync_jobs_due_idx",
+            &[
+                "state",
+                "next_attempt_at_unix_ms",
+                "created_at_unix_ms",
+                "operation_id",
+            ],
+        )?
+        || !index_has_columns(
+            connection,
+            "transfers_due_idx",
+            &[
+                "phase",
+                "next_attempt_at_unix_ms",
+                "created_at_unix_ms",
+                "operation_id",
+            ],
+        )?
+    {
+        return Ok(false);
+    }
+    let foreign_key_errors: i64 =
+        connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    Ok(foreign_key_errors == 0)
+}
+
+fn transfer_schema_columns_are_valid(connection: &Connection) -> Result<bool> {
+    Ok(table_has_columns(
+        connection,
+        "transfers",
+        &[
+            ("operation_id", "TEXT", true, 1),
+            ("direction", "TEXT", true, 0),
+            ("portable_path", "TEXT", true, 0),
+            ("remote_parent_id", "TEXT", true, 0),
+            ("remote_file_id", "TEXT", false, 0),
+            ("display_name", "TEXT", true, 0),
+            ("expected_local_revision", "TEXT", false, 0),
+            ("expected_remote_revision", "TEXT", false, 0),
+            ("sha256", "TEXT", true, 0),
+            ("byte_length", "INTEGER", true, 0),
+            ("mime_class", "TEXT", true, 0),
+            ("operation_marker", "TEXT", true, 0),
+            ("stage_reference", "TEXT", false, 0),
+            ("base_reference", "TEXT", false, 0),
+            ("phase", "TEXT", true, 0),
+            ("attempt_count", "INTEGER", true, 0),
+            ("next_attempt_at_unix_ms", "INTEGER", true, 0),
+            ("created_at_unix_ms", "INTEGER", true, 0),
+            ("updated_at_unix_ms", "INTEGER", true, 0),
+            ("last_error_code", "TEXT", false, 0),
+            ("verified_local_revision", "TEXT", false, 0),
+            ("verified_remote_revision", "TEXT", false, 0),
+        ],
+    )? && table_has_columns(
+        connection,
+        "transfer_history",
+        &[
+            ("event_id", "INTEGER", true, 1),
+            ("operation_id", "TEXT", true, 0),
+            ("outcome_code", "TEXT", true, 0),
+            ("occurred_at_unix_ms", "INTEGER", true, 0),
+        ],
+    )?)
 }
 
 fn primary_schema_columns_are_valid(connection: &Connection) -> Result<bool> {
@@ -2056,6 +2925,121 @@ fn insert_job(transaction: &Transaction<'_>, job: &QueueJob) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+fn insert_transfer(transaction: &Transaction<'_>, transfer: &TransferRecord) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO transfers(
+            operation_id, direction, portable_path, remote_parent_id, remote_file_id,
+            display_name, expected_local_revision, expected_remote_revision, sha256,
+            byte_length, mime_class, operation_marker, stage_reference, base_reference,
+            phase, attempt_count, next_attempt_at_unix_ms, created_at_unix_ms,
+            updated_at_unix_ms, last_error_code, verified_local_revision,
+            verified_remote_revision
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+            ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
+         )",
+        params![
+            transfer.operation_id.to_string(),
+            transfer.direction.as_str(),
+            transfer.portable_path,
+            transfer.remote_parent_id,
+            transfer.remote_file_id,
+            transfer.display_name,
+            transfer.expected_local_revision,
+            transfer.expected_remote_revision,
+            transfer.sha256,
+            u64_to_i64(transfer.byte_length)?,
+            transfer.mime_class.as_str(),
+            transfer.operation_marker,
+            transfer.stage_reference,
+            transfer.base_reference,
+            transfer.phase.as_str(),
+            i64::from(transfer.attempt_count),
+            u64_to_i64(transfer.next_attempt_at_unix_ms)?,
+            u64_to_i64(transfer.created_at_unix_ms)?,
+            u64_to_i64(transfer.updated_at_unix_ms)?,
+            transfer.last_error_code,
+            transfer.verified_local_revision,
+            transfer.verified_remote_revision,
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_transfer(connection: &Connection, operation_id: Uuid) -> Result<Option<TransferRecord>> {
+    connection
+        .query_row(
+            "SELECT operation_id, direction, portable_path, remote_parent_id,
+                    remote_file_id, display_name, expected_local_revision,
+                    expected_remote_revision, sha256, byte_length, mime_class,
+                    operation_marker, stage_reference, base_reference, phase,
+                    attempt_count, next_attempt_at_unix_ms, created_at_unix_ms,
+                    updated_at_unix_ms, last_error_code, verified_local_revision,
+                    verified_remote_revision
+             FROM transfers WHERE operation_id = ?1",
+            [operation_id.to_string()],
+            row_to_transfer,
+        )
+        .optional()?
+        .map_or(Ok(None), |transfer| Ok(Some(transfer?)))
+}
+
+fn row_to_transfer(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<TransferRecord>> {
+    let operation_id = row.get::<_, String>(0)?;
+    let direction = row.get::<_, String>(1)?;
+    let portable_path = row.get::<_, String>(2)?;
+    let remote_parent_id = row.get::<_, String>(3)?;
+    let remote_file_id = row.get::<_, Option<String>>(4)?;
+    let display_name = row.get::<_, String>(5)?;
+    let expected_local_revision = row.get::<_, Option<String>>(6)?;
+    let expected_remote_revision = row.get::<_, Option<String>>(7)?;
+    let sha256 = row.get::<_, String>(8)?;
+    let byte_length = row.get::<_, i64>(9)?;
+    let mime_class = row.get::<_, String>(10)?;
+    let operation_marker = row.get::<_, String>(11)?;
+    let stage_reference = row.get::<_, Option<String>>(12)?;
+    let base_reference = row.get::<_, Option<String>>(13)?;
+    let phase = row.get::<_, String>(14)?;
+    let attempt_count = row.get::<_, i64>(15)?;
+    let next_attempt_at_unix_ms = row.get::<_, i64>(16)?;
+    let created_at_unix_ms = row.get::<_, i64>(17)?;
+    let updated_at_unix_ms = row.get::<_, i64>(18)?;
+    let last_error_code = row.get::<_, Option<String>>(19)?;
+    let verified_local_revision = row.get::<_, Option<String>>(20)?;
+    let verified_remote_revision = row.get::<_, Option<String>>(21)?;
+    Ok((|| {
+        let transfer = TransferRecord {
+            operation_id: parse_uuid(&operation_id)?,
+            direction: TransferDirection::parse(&direction)?,
+            portable_path,
+            remote_parent_id,
+            remote_file_id,
+            display_name,
+            expected_local_revision,
+            expected_remote_revision,
+            sha256,
+            byte_length: u64::try_from(byte_length).map_err(|_| Error::InvalidSchema)?,
+            mime_class: TransferMimeClass::parse(&mime_class)?,
+            operation_marker,
+            stage_reference,
+            base_reference,
+            phase: TransferPhase::parse(&phase)?,
+            attempt_count: u32::try_from(attempt_count).map_err(|_| Error::InvalidSchema)?,
+            next_attempt_at_unix_ms: u64::try_from(next_attempt_at_unix_ms)
+                .map_err(|_| Error::InvalidSchema)?,
+            created_at_unix_ms: u64::try_from(created_at_unix_ms)
+                .map_err(|_| Error::InvalidSchema)?,
+            updated_at_unix_ms: u64::try_from(updated_at_unix_ms)
+                .map_err(|_| Error::InvalidSchema)?,
+            last_error_code,
+            verified_local_revision,
+            verified_remote_revision,
+        };
+        transfer.validate()?;
+        Ok(transfer)
+    })())
 }
 
 fn load_job(connection: &Connection, operation_id: Uuid) -> Result<Option<QueueJob>> {

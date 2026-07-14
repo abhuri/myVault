@@ -16,7 +16,9 @@ mod store;
 pub use store::{
     BindOutcome, ChangeBatch, EnqueueOutcome, JobState, LocalMutationState, LocalMutationStatus,
     QueueJob, QueueJobKind, RemotePreviewCursor, RemotePreviewEntry, RemotePreviewPage, SyncStore,
-    VaultSyncState, MAX_REMOTE_PREVIEW_PAGE_SIZE, SCHEMA_VERSION, SQLITE_OPEN_RESIDUAL_RISK,
+    TransferCompletion, TransferCompletionOutcome, TransferDirection, TransferMimeClass,
+    TransferPhase, TransferRecord, TransferRegistrationOutcome, VaultSyncState,
+    MAX_REMOTE_PREVIEW_PAGE_SIZE, SCHEMA_VERSION, SQLITE_OPEN_RESIDUAL_RISK,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -46,6 +48,9 @@ pub enum Error {
     UnsupportedSchema(i64),
     QueueCollision,
     JobNotFound,
+    InvalidTransferEvidence,
+    TransferCollision,
+    TransferNotFound,
     CursorMismatch,
     RescanRequired,
     InvalidPreviewCursor,
@@ -96,6 +101,13 @@ impl fmt::Display for Error {
                 formatter.write_str("the queue operation identifier has conflicting content")
             }
             Self::JobNotFound => formatter.write_str("the sync queue job was not found"),
+            Self::InvalidTransferEvidence => {
+                formatter.write_str("the durable transfer evidence is invalid")
+            }
+            Self::TransferCollision => {
+                formatter.write_str("the transfer operation identifier has conflicting evidence")
+            }
+            Self::TransferNotFound => formatter.write_str("the durable transfer was not found"),
             Self::CursorMismatch => formatter.write_str("the durable cursor changed unexpectedly"),
             Self::RescanRequired => formatter.write_str("the remote cursor requires a full rescan"),
             Self::InvalidPreviewCursor => {
@@ -569,6 +581,19 @@ pub(crate) fn validate_redacted_code(value: &str) -> Result<()> {
         Ok(())
     } else {
         Err(Error::InvalidErrorCode)
+    }
+}
+
+pub(crate) fn validate_private_reference(value: &str) -> Result<()> {
+    if (1..=256).contains(&value.len())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        })
+        && !matches!(value, "." | "..")
+    {
+        Ok(())
+    } else {
+        Err(Error::InvalidTransferEvidence)
     }
 }
 

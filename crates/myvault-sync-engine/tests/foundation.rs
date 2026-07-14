@@ -118,7 +118,10 @@ fn downgrade_database_to_v1(database_path: &Path) {
     let connection = rusqlite::Connection::open(database_path).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE scan_frontier;
+            "DROP TABLE transfer_history;
+             DROP INDEX transfers_due_idx;
+             DROP TABLE transfers;
+             DROP TABLE scan_frontier;
              DROP INDEX remote_entries_preview_idx;
              ALTER TABLE vault_state RENAME TO vault_state_v2;
              CREATE TABLE vault_state (
