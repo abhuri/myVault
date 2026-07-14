@@ -8,6 +8,7 @@ description = "Tauri-free guarded transfer orchestration for myVault"
 publish = false
 
 [dependencies]
+myvault-sync-engine = { path = "../myvault-sync-engine" }
 uuid = { version = "=1.20.0", features = ["v4"] }
 
 [dev-dependencies]

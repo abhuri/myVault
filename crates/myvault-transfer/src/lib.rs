@@ -7,6 +7,9 @@
 //! the worker validates their typed evidence and drives durable state through a
 //! narrow store trait.
 
+use myvault_sync_engine::{
+    SyncStore, TransferCompletion, TransferDirection as StoreDirection, TransferMimeClass,
+};
 use std::{fmt, time::Duration};
 use uuid::Uuid;
 
@@ -344,6 +347,88 @@ pub trait TransferStore {
         code: &'static str,
         now_unix_ms: u64,
     ) -> Result<()>;
+}
+
+impl TransferStore for SyncStore {
+    fn claim_due(&mut self, now_unix_ms: u64) -> Result<Option<TransferIntent>> {
+        let Some(record) = self
+            .claim_next_transfer(now_unix_ms)
+            .map_err(|_| Error::Store)?
+        else {
+            return Ok(None);
+        };
+        TransferIntent::new(
+            record.operation_id,
+            match record.direction {
+                StoreDirection::Upload => TransferDirection::Upload,
+                StoreDirection::Download => TransferDirection::Download,
+            },
+            record.portable_path,
+            record.remote_parent_id,
+            record.remote_file_id,
+            record.expected_local_revision,
+            record.expected_remote_revision,
+            record.sha256,
+            record.byte_length,
+            match record.mime_class {
+                TransferMimeClass::Markdown => ContentKind::Markdown,
+                TransferMimeClass::Blob => ContentKind::Blob,
+            },
+            record.operation_marker,
+        )
+        .map(Some)
+    }
+
+    fn complete_verified(&mut self, verified: &VerifiedTransfer, now_unix_ms: u64) -> Result<()> {
+        let local_revision = verified.local_revision().ok_or(Error::InvalidEvidence)?;
+        let completion = TransferCompletion::new(
+            verified.remote_file_id(),
+            verified.remote_revision(),
+            local_revision,
+            verified.base_ref(),
+            verified.outcome_code(),
+            now_unix_ms,
+        )
+        .map_err(|_| Error::InvalidEvidence)?;
+        self.complete_verified_transfer(verified.operation_id(), &completion)
+            .map(|_| ())
+            .map_err(|_| Error::Store)
+    }
+
+    fn schedule_retry(
+        &mut self,
+        operation_id: Uuid,
+        next_attempt_at_unix_ms: u64,
+        code: &'static str,
+    ) -> Result<()> {
+        self.schedule_transfer_retry(
+            operation_id,
+            next_attempt_at_unix_ms,
+            code,
+            next_attempt_at_unix_ms,
+        )
+        .map_err(|_| Error::Store)
+    }
+
+    fn mark_auth_required(
+        &mut self,
+        operation_id: Uuid,
+        code: &'static str,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        self.mark_transfer_auth_required(operation_id, code, now_unix_ms)
+            .map_err(|_| Error::Store)
+    }
+
+    fn mark_needs_reconcile(
+        &mut self,
+        operation_id: Uuid,
+        code: &'static str,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        self.mark_transfer_needs_reconcile(operation_id, code, now_unix_ms)
+            .map_err(|_| Error::Store)
+    }
 }
 
 #[allow(clippy::missing_errors_doc)]
