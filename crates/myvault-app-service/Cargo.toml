@@ -10,6 +10,7 @@ description = "Tauri-free safe application service boundary for myVault"
 cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
 myvault-core = { path = "../myvault-core" }
+myvault-platform-fs = { path = "../myvault-platform-fs" }
 myvault-private-fs = { path = "../myvault-private-fs" }
 myvault-snapshots = { path = "../myvault-snapshots" }
 serde = { version = "=1.0.228", features = ["derive"] }

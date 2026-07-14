@@ -471,23 +471,12 @@ fn verify_file_snapshot(
     }
 }
 
-#[cfg(unix)]
 fn same_file_identity(left: &File, right: &File) -> Result<bool, NativeTransferError> {
-    use std::os::unix::fs::MetadataExt;
-    let left = left
-        .try_clone()
-        .and_then(|file| file.into_std().metadata())
+    let left = myvault_platform_fs::file_identity(left)
         .map_err(|_| NativeTransferError::PrivateStoreUnavailable)?;
-    let right = right
-        .try_clone()
-        .and_then(|file| file.into_std().metadata())
+    let right = myvault_platform_fs::file_identity(right)
         .map_err(|_| NativeTransferError::PrivateStoreUnavailable)?;
-    Ok(left.dev() == right.dev() && left.ino() == right.ino())
-}
-
-#[cfg(not(unix))]
-fn same_file_identity(_left: &File, _right: &File) -> Result<bool, NativeTransferError> {
-    Ok(false)
+    Ok(left == right)
 }
 
 #[cfg(unix)]
@@ -531,5 +520,34 @@ pub(crate) fn map_core_error(error: CoreError) -> NativeTransferError {
         | CoreError::PublishedCleanupPending { .. }
         | CoreError::ReplaceContentOutcomeUnknown { .. } => NativeTransferError::PublicationUnknown,
         _ => NativeTransferError::VaultUnavailable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use cap_std::{ambient_authority, fs::Dir};
+
+    use super::same_file_identity;
+
+    #[test]
+    fn handle_identity_matches_hard_link_but_not_equal_bytes() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let original = temporary.path().join("original");
+        let hard_link = temporary.path().join("hard-link");
+        let equal_copy = temporary.path().join("equal-copy");
+        fs::write(&original, b"same bytes").expect("write original");
+        fs::hard_link(&original, &hard_link).expect("create hard link");
+        fs::write(&equal_copy, b"same bytes").expect("write equal copy");
+
+        let directory =
+            Dir::open_ambient_dir(temporary.path(), ambient_authority()).expect("open directory");
+        let original = directory.open("original").expect("open original");
+        let hard_link = directory.open("hard-link").expect("open hard link");
+        let equal_copy = directory.open("equal-copy").expect("open equal copy");
+
+        assert!(same_file_identity(&original, &hard_link).expect("compare hard link"));
+        assert!(!same_file_identity(&original, &equal_copy).expect("compare equal copy"));
     }
 }
