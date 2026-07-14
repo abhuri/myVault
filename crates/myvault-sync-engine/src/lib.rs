@@ -60,6 +60,8 @@ pub enum Error {
     UnknownMutation,
     LocalMutationIncomplete,
     MutationNeedsReconcile,
+    UnsupportedTransferChange,
+    TransferChangeMismatch,
     Remote(RemoteError),
 }
 
@@ -128,6 +130,11 @@ impl fmt::Display for Error {
             }
             Self::MutationNeedsReconcile => formatter
                 .write_str("a local mutation has an unknown outcome and needs reconciliation"),
+            Self::UnsupportedTransferChange => {
+                formatter.write_str("the remote change requires an unsupported local mutation")
+            }
+            Self::TransferChangeMismatch => formatter
+                .write_str("the transfer does not exactly match its resolved remote change"),
             Self::Remote(error) => error.fmt(formatter),
         }
     }

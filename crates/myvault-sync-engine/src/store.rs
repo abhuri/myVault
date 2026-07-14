@@ -1577,15 +1577,7 @@ impl SyncStore {
         &mut self,
         transfer: &TransferRecord,
     ) -> Result<TransferRegistrationOutcome> {
-        transfer.validate()?;
-        if transfer.phase != TransferPhase::Pending
-            || transfer.attempt_count != 0
-            || transfer.last_error_code.is_some()
-            || transfer.verified_local_revision.is_some()
-            || transfer.verified_remote_revision.is_some()
-        {
-            return Err(Error::InvalidTransferEvidence);
-        }
+        validate_new_transfer(transfer)?;
         let transaction = self.connection.transaction()?;
         require_state(&transaction, self.vault_id)?;
         if let Some(existing) = load_transfer(&transaction, transfer.operation_id)? {
@@ -1913,6 +1905,8 @@ impl SyncStore {
         completion.validate()?;
         let transaction = self.connection.transaction()?;
         let existing = load_transfer(&transaction, operation_id)?.ok_or(Error::TransferNotFound)?;
+        let mutation_id = transfer_mutation_id(operation_id);
+        let mutation_state = active_transfer_mutation_state(&transaction, &mutation_id)?;
         if existing.phase == TransferPhase::Completed {
             let history: Option<(String, i64)> = transaction
                 .query_row(
@@ -1932,7 +1926,9 @@ impl SyncStore {
                         completion.outcome_code.clone(),
                         u64_to_i64(completion.occurred_at_unix_ms)?,
                     ));
-            if same {
+            let mutation_consistent =
+                mutation_state.is_none_or(|state| state == LocalMutationState::Committed);
+            if same && mutation_consistent {
                 transaction.commit()?;
                 return Ok(TransferCompletionOutcome::AlreadyCompleted);
             }
@@ -1962,6 +1958,12 @@ impl SyncStore {
         {
             return Err(Error::InvalidStateTransition);
         }
+        if mutation_state.is_some() && existing.direction != TransferDirection::Download {
+            return Err(Error::TransferChangeMismatch);
+        }
+        if mutation_state.is_some_and(|state| state != LocalMutationState::Applying) {
+            return Err(Error::InvalidStateTransition);
+        }
         let occurred = u64_to_i64(completion.occurred_at_unix_ms)?;
         transaction.execute(
             "INSERT INTO transfer_history(operation_id, outcome_code, occurred_at_unix_ms)
@@ -1987,6 +1989,9 @@ impl SyncStore {
         )?;
         if changed != 1 {
             return Err(Error::InvalidStateTransition);
+        }
+        if mutation_state == Some(LocalMutationState::Applying) {
+            commit_transfer_mutation(&transaction, &existing, completion, &mutation_id)?;
         }
         transaction.commit()?;
         Ok(TransferCompletionOutcome::Completed)
@@ -2138,6 +2143,139 @@ impl SyncStore {
         Ok(())
     }
 
+    /// Starts a transfer-coupled incremental page in one transaction.
+    ///
+    /// The resolved metadata, exact download registrations, and one declared local
+    /// mutation per download become durable together. Known removals, moves, kind
+    /// changes, and file revisions without a corresponding download fail closed.
+    ///
+    /// # Errors
+    /// Rejects stale cursors, active batches, unsupported changes, mismatched
+    /// downloads, duplicate identities, or malformed durable evidence.
+    pub fn begin_transfer_change_batch(
+        &mut self,
+        batch_id: Uuid,
+        expected_cursor: &str,
+        next_cursor: &str,
+        changes: &[RemoteChange],
+        downloads: &[TransferRecord],
+    ) -> Result<()> {
+        if batch_id.is_nil() {
+            return Err(Error::InvalidStateTransition);
+        }
+        validate_remote_token(expected_cursor)?;
+        validate_remote_token(next_cursor)?;
+        if changes.len() > crate::MAX_SCAN_PAGE_ENTRIES {
+            return Err(Error::InvalidRemoteEntry);
+        }
+        for change in changes {
+            change.validate()?;
+        }
+        for transfer in downloads {
+            validate_new_transfer(transfer)?;
+            if transfer.direction != TransferDirection::Download
+                || transfer.expected_remote_revision.is_none()
+            {
+                return Err(Error::TransferChangeMismatch);
+            }
+        }
+
+        let transaction = self.connection.transaction()?;
+        let state = require_state(&transaction, self.vault_id)?;
+        if state.phase != SyncPhase::Ready
+            || state.durable_cursor.as_deref() != Some(expected_cursor)
+        {
+            return Err(Error::CursorMismatch);
+        }
+        if load_change_batch(&transaction)?.is_some() {
+            return Err(Error::BatchAlreadyActive);
+        }
+
+        validate_resolved_transfer_changes(&transaction, changes, downloads)?;
+
+        transaction.execute(
+            "INSERT INTO change_batch(singleton, batch_id, expected_cursor, next_cursor)
+             VALUES (1, ?1, ?2, ?3)",
+            params![batch_id.to_string(), expected_cursor, next_cursor],
+        )?;
+        for change in changes {
+            if let RemoteChange::Upsert(entry) = change {
+                upsert_remote_entry(&transaction, entry)?;
+            }
+        }
+        for transfer in downloads {
+            register_transfer_in_transaction(&transaction, transfer)?;
+            transaction.execute(
+                "INSERT INTO change_batch_mutations(batch_id, mutation_id, state)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    batch_id.to_string(),
+                    transfer_mutation_id(transfer.operation_id),
+                    LocalMutationState::Pending.as_str()
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Durably marks the local publication belonging to one download as applying.
+    ///
+    /// # Errors
+    /// Rejects transfers outside the active batch, non-downloads, unclaimed
+    /// transfers, or mutations already applying/committed.
+    pub fn begin_transfer_local_publish(
+        &mut self,
+        operation_id: Uuid,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        if operation_id.is_nil() {
+            return Err(Error::TransferNotFound);
+        }
+        let now = u64_to_i64(now_unix_ms)?;
+        let transaction = self.connection.transaction()?;
+        let active = load_change_batch(&transaction)?.ok_or(Error::NoActiveBatch)?;
+        let transfer = load_transfer(&transaction, operation_id)?.ok_or(Error::TransferNotFound)?;
+        if transfer.direction != TransferDirection::Download
+            || !matches!(
+                transfer.phase,
+                TransferPhase::Running | TransferPhase::NeedsReconcile
+            )
+            || transfer.updated_at_unix_ms > now_unix_ms
+        {
+            return Err(Error::InvalidStateTransition);
+        }
+        let mutation_id = transfer_mutation_id(operation_id);
+        let changed = transaction.execute(
+            "UPDATE change_batch_mutations SET state = ?1
+             WHERE batch_id = ?2 AND mutation_id = ?3 AND state = ?4",
+            params![
+                LocalMutationState::Applying.as_str(),
+                active.batch_id.to_string(),
+                mutation_id,
+                LocalMutationState::Pending.as_str()
+            ],
+        )?;
+        if changed != 1 {
+            return match load_local_mutation_state(&transaction, active.batch_id, &mutation_id)? {
+                Some(LocalMutationState::Applying) => Err(Error::MutationNeedsReconcile),
+                Some(LocalMutationState::Committed) => Err(Error::InvalidStateTransition),
+                Some(LocalMutationState::Pending) | None => Err(Error::UnknownMutation),
+            };
+        }
+        let transfer_changed = transaction.execute(
+            "UPDATE transfers SET updated_at_unix_ms = ?1
+             WHERE operation_id = ?2 AND phase IN ('running', 'needs_reconcile')
+               AND updated_at_unix_ms <= ?1",
+            params![now, operation_id.to_string()],
+        )?;
+        if transfer_changed != 1 {
+            return Err(Error::InvalidStateTransition);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Marks one declared local mutation as applying before touching the Vault.
     ///
     /// A process interruption after this durable transition leaves an explicit
@@ -2150,6 +2288,9 @@ impl SyncStore {
         let active = self.active_change_batch()?.ok_or(Error::NoActiveBatch)?;
         if active.batch_id != batch_id {
             return Err(Error::NoActiveBatch);
+        }
+        if is_transfer_backed_mutation(&self.connection, batch_id, mutation_id)? {
+            return Err(Error::InvalidStateTransition);
         }
         let changed = self.connection.execute(
             "UPDATE change_batch_mutations SET state = ?1
@@ -2184,6 +2325,9 @@ impl SyncStore {
         let active = self.active_change_batch()?.ok_or(Error::NoActiveBatch)?;
         if active.batch_id != batch_id {
             return Err(Error::NoActiveBatch);
+        }
+        if is_transfer_backed_mutation(&self.connection, batch_id, mutation_id)? {
+            return Err(Error::InvalidStateTransition);
         }
         let changed = self.connection.execute(
             "UPDATE change_batch_mutations SET state = ?1
@@ -2260,7 +2404,78 @@ impl SyncStore {
         if batch.batch_id != batch_id {
             return Err(Error::NoActiveBatch);
         }
+        if transfer_backed_mutation_count(&transaction, batch_id)? != 0 {
+            return Err(Error::InvalidStateTransition);
+        }
         if batch.applying_mutations != 0 || batch.declared_mutations != batch.committed_mutations {
+            return Err(Error::LocalMutationIncomplete);
+        }
+        let changed = transaction.execute(
+            "UPDATE vault_state SET durable_cursor = ?1, updated_at_unix_ms = ?2
+             WHERE singleton = 1 AND phase = ?3 AND durable_cursor = ?4",
+            params![
+                batch.next_cursor,
+                now,
+                SyncPhase::Ready.as_str(),
+                batch.expected_cursor
+            ],
+        )?;
+        if changed != 1 {
+            return Err(Error::CursorMismatch);
+        }
+        transaction.execute("DELETE FROM change_batch WHERE singleton = 1", [])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Advances a transfer-coupled cursor only after exact completed evidence exists.
+    ///
+    /// A zero-mutation metadata page is valid. Every declared mutation on a non-empty
+    /// page must map to a completed download, committed history, exact remote revision,
+    /// and matching base fields on the resolved remote entry.
+    ///
+    /// # Errors
+    /// Rejects missing/partial evidence, a different batch, or a changed cursor.
+    pub fn commit_transfer_change_batch(&mut self, batch_id: Uuid, now_unix_ms: u64) -> Result<()> {
+        let now = u64_to_i64(now_unix_ms)?;
+        let transaction = self.connection.transaction()?;
+        let batch = load_change_batch(&transaction)?.ok_or(Error::NoActiveBatch)?;
+        if batch.batch_id != batch_id {
+            return Err(Error::NoActiveBatch);
+        }
+        if batch.applying_mutations != 0 || batch.declared_mutations != batch.committed_mutations {
+            return Err(Error::LocalMutationIncomplete);
+        }
+        let incomplete: i64 = transaction.query_row(
+            "SELECT COUNT(*)
+             FROM change_batch_mutations AS mutation
+             LEFT JOIN transfers AS transfer ON transfer.operation_id = mutation.mutation_id
+             LEFT JOIN transfer_history AS history
+               ON history.operation_id = transfer.operation_id
+             LEFT JOIN remote_entries AS remote
+               ON remote.file_id = transfer.remote_file_id
+             WHERE mutation.batch_id = ?1 AND (
+               mutation.state != 'committed' OR transfer.direction != 'download'
+               OR transfer.phase != 'completed' OR history.operation_id IS NULL
+               OR transfer.remote_file_id IS NULL OR transfer.base_reference IS NULL
+               OR transfer.verified_local_revision IS NULL
+               OR transfer.verified_remote_revision IS NULL
+               OR transfer.expected_remote_revision IS NULL
+               OR transfer.expected_remote_revision != transfer.verified_remote_revision
+               OR remote.file_id IS NULL
+               OR remote.parent_id != transfer.remote_parent_id
+               OR remote.portable_path != transfer.portable_path OR remote.kind != 'file'
+               OR remote.remote_revision != transfer.verified_remote_revision
+               OR remote.base_local_revision != transfer.verified_local_revision
+               OR remote.base_remote_revision != transfer.verified_remote_revision
+               OR remote.base_content_hash != transfer.sha256
+               OR (remote.content_hash_algorithm = 'sha256' AND
+                   (remote.content_hash IS NULL OR remote.content_hash != transfer.sha256))
+             )",
+            [batch_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if incomplete != 0 {
             return Err(Error::LocalMutationIncomplete);
         }
         let changed = transaction.execute(
@@ -2290,6 +2505,9 @@ impl SyncStore {
         let active = load_change_batch(&transaction)?.ok_or(Error::NoActiveBatch)?;
         if active.batch_id != batch_id {
             return Err(Error::NoActiveBatch);
+        }
+        if transfer_backed_mutation_count(&transaction, batch_id)? != 0 {
+            return Err(Error::MutationNeedsReconcile);
         }
         if active.applying_mutations != 0 || active.committed_mutations != 0 {
             return Err(Error::MutationNeedsReconcile);
@@ -3137,6 +3355,267 @@ fn upsert_remote_entry(transaction: &Transaction<'_>, entry: &RemoteEntry) -> Re
         ],
     )?;
     Ok(())
+}
+
+fn load_remote_entry(connection: &Connection, file_id: &str) -> Result<Option<RemoteEntry>> {
+    let persisted: Option<PersistedRemoteEntry> = connection
+        .query_row(
+            "SELECT file_id, parent_id, portable_path, kind,
+                    content_hash_algorithm, content_hash, remote_revision
+             FROM remote_entries WHERE file_id = ?1",
+            [file_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    persisted.map_or(Ok(None), |persisted| {
+        let (
+            file_id,
+            parent_id,
+            path,
+            kind,
+            content_hash_algorithm,
+            content_hash,
+            remote_revision,
+        ) = persisted;
+        let content_hash = match (content_hash_algorithm.as_deref(), content_hash) {
+            (None, None) => None,
+            (Some(algorithm), Some(hex)) => Some(RemoteContentHash::new(
+                match algorithm {
+                    "md5" => RemoteHashAlgorithm::Md5,
+                    "sha1" => RemoteHashAlgorithm::Sha1,
+                    "sha256" => RemoteHashAlgorithm::Sha256,
+                    _ => return Err(Error::InvalidSchema),
+                },
+                hex,
+            )?),
+            _ => return Err(Error::InvalidSchema),
+        };
+        let entry = RemoteEntry {
+            file_id,
+            parent_id,
+            path,
+            kind: match kind.as_str() {
+                "file" => RemoteEntryKind::File,
+                "folder" => RemoteEntryKind::Folder,
+                _ => return Err(Error::InvalidSchema),
+            },
+            content_hash,
+            remote_revision,
+        };
+        entry.validate()?;
+        Ok(Some(entry))
+    })
+}
+
+fn validate_new_transfer(transfer: &TransferRecord) -> Result<()> {
+    transfer.validate()?;
+    if transfer.phase != TransferPhase::Pending
+        || transfer.attempt_count != 0
+        || transfer.last_error_code.is_some()
+        || transfer.verified_local_revision.is_some()
+        || transfer.verified_remote_revision.is_some()
+    {
+        return Err(Error::InvalidTransferEvidence);
+    }
+    Ok(())
+}
+
+fn validate_resolved_transfer_changes(
+    connection: &Connection,
+    changes: &[RemoteChange],
+    downloads: &[TransferRecord],
+) -> Result<()> {
+    let mut changed_ids = BTreeSet::new();
+    let mut required_downloads = BTreeSet::new();
+    for change in changes {
+        match change {
+            RemoteChange::Removed { .. } => return Err(Error::UnsupportedTransferChange),
+            RemoteChange::Upsert(entry) => {
+                if !changed_ids.insert(entry.file_id.as_str()) {
+                    return Err(Error::InvalidRemoteEntry);
+                }
+                let existing = load_remote_entry(connection, &entry.file_id)?;
+                if existing.as_ref().is_some_and(|previous| {
+                    previous.path != entry.path
+                        || previous.parent_id != entry.parent_id
+                        || previous.kind != entry.kind
+                }) {
+                    return Err(Error::UnsupportedTransferChange);
+                }
+                let path_owner: Option<String> = connection
+                    .query_row(
+                        "SELECT file_id FROM remote_entries
+                         WHERE portable_path = ?1 AND file_id != ?2 LIMIT 1",
+                        params![entry.path, entry.file_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if path_owner.is_some() {
+                    return Err(Error::UnsupportedTransferChange);
+                }
+                if entry.kind == RemoteEntryKind::File
+                    && existing.as_ref().is_none_or(|previous| {
+                        previous.remote_revision != entry.remote_revision
+                            || previous.content_hash != entry.content_hash
+                    })
+                {
+                    required_downloads.insert(entry.file_id.as_str());
+                }
+            }
+        }
+    }
+
+    let mut supplied_downloads = BTreeSet::new();
+    for transfer in downloads {
+        let file_id = transfer
+            .remote_file_id
+            .as_deref()
+            .ok_or(Error::TransferChangeMismatch)?;
+        if !supplied_downloads.insert(file_id) {
+            return Err(Error::TransferChangeMismatch);
+        }
+        let entry = changes
+            .iter()
+            .find_map(|change| match change {
+                RemoteChange::Upsert(entry) if entry.file_id == file_id => Some(entry),
+                _ => None,
+            })
+            .ok_or(Error::TransferChangeMismatch)?;
+        if entry.kind != RemoteEntryKind::File
+            || transfer.portable_path != entry.path
+            || transfer.remote_parent_id != entry.parent_id
+            || transfer.expected_remote_revision.as_deref() != Some(entry.remote_revision.as_str())
+            || entry.content_hash.as_ref().is_some_and(|hash| {
+                hash.algorithm == RemoteHashAlgorithm::Sha256 && hash.hex != transfer.sha256
+            })
+        {
+            return Err(Error::TransferChangeMismatch);
+        }
+    }
+    if supplied_downloads != required_downloads {
+        return Err(Error::TransferChangeMismatch);
+    }
+    Ok(())
+}
+
+fn commit_transfer_mutation(
+    transaction: &Transaction<'_>,
+    transfer: &TransferRecord,
+    completion: &TransferCompletion,
+    mutation_id: &str,
+) -> Result<()> {
+    let metadata_changed = transaction.execute(
+        "UPDATE remote_entries
+         SET base_local_revision = ?1, base_remote_revision = ?2,
+             base_content_hash = ?3
+         WHERE file_id = ?4 AND parent_id = ?5 AND portable_path = ?6
+           AND kind = 'file' AND remote_revision = ?2
+           AND (content_hash_algorithm IS NULL OR content_hash_algorithm != 'sha256'
+                OR content_hash = ?3)",
+        params![
+            completion.local_revision,
+            completion.remote_revision,
+            transfer.sha256,
+            completion.remote_file_id,
+            transfer.remote_parent_id,
+            transfer.portable_path
+        ],
+    )?;
+    if metadata_changed != 1 {
+        return Err(Error::TransferChangeMismatch);
+    }
+    let mutation_changed = transaction.execute(
+        "UPDATE change_batch_mutations SET state = ?1
+         WHERE mutation_id = ?2 AND state = ?3
+           AND batch_id = (SELECT batch_id FROM change_batch WHERE singleton = 1)",
+        params![
+            LocalMutationState::Committed.as_str(),
+            mutation_id,
+            LocalMutationState::Applying.as_str()
+        ],
+    )?;
+    if mutation_changed != 1 {
+        return Err(Error::InvalidStateTransition);
+    }
+    Ok(())
+}
+
+fn register_transfer_in_transaction(
+    transaction: &Transaction<'_>,
+    transfer: &TransferRecord,
+) -> Result<()> {
+    if let Some(existing) = load_transfer(transaction, transfer.operation_id)? {
+        if !existing.same_registration(transfer) || existing.phase == TransferPhase::Completed {
+            return Err(Error::TransferCollision);
+        }
+        return Ok(());
+    }
+    let marker_owner: Option<String> = transaction
+        .query_row(
+            "SELECT operation_id FROM transfers WHERE operation_marker = ?1",
+            [&transfer.operation_marker],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if marker_owner.is_some() {
+        return Err(Error::TransferCollision);
+    }
+    insert_transfer(transaction, transfer)
+}
+
+fn transfer_mutation_id(operation_id: Uuid) -> String {
+    operation_id.to_string()
+}
+
+fn active_transfer_mutation_state(
+    connection: &Connection,
+    mutation_id: &str,
+) -> Result<Option<LocalMutationState>> {
+    let Some(batch) = load_change_batch(connection)? else {
+        return Ok(None);
+    };
+    load_local_mutation_state(connection, batch.batch_id, mutation_id)
+}
+
+fn is_transfer_backed_mutation(
+    connection: &Connection,
+    batch_id: Uuid,
+    mutation_id: &str,
+) -> Result<bool> {
+    let found = connection
+        .query_row(
+            "SELECT 1
+             FROM change_batch_mutations AS mutation
+             JOIN transfers AS transfer ON transfer.operation_id = mutation.mutation_id
+             WHERE mutation.batch_id = ?1 AND mutation.mutation_id = ?2",
+            params![batch_id.to_string(), mutation_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(found)
+}
+
+fn transfer_backed_mutation_count(connection: &Connection, batch_id: Uuid) -> Result<u64> {
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*)
+         FROM change_batch_mutations AS mutation
+         JOIN transfers AS transfer ON transfer.operation_id = mutation.mutation_id
+         WHERE mutation.batch_id = ?1",
+        [batch_id.to_string()],
+        |row| row.get(0),
+    )?;
+    u64::try_from(count).map_err(|_| Error::InvalidSchema)
 }
 
 fn insert_job(transaction: &Transaction<'_>, job: &QueueJob) -> Result<()> {
