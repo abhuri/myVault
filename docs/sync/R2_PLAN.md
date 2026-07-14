@@ -146,6 +146,27 @@ lockfilesค่ะ The main integrator applies dependency and lockfile changes a
 lane contracts passค่ะ Final integration and every release gate run on one exact
 source HEADค่ะ
 
+## Codex execution profile
+
+Official Codex guidance was reviewed on 2026-07-14 before splitting the R2
+workค่ะ The main Sunday agent uses Sol High because R2 crosses OAuth, Drive,
+durable state, filesystem/SAF, platform, and data-loss boundaries that require
+open-ended reasoning and final integration judgmentค่ะ Terra Medium is the
+default recommendation for bounded read-heavy investigation, test execution,
+and narrow review lanes; Terra High is appropriate when a bounded security
+audit needs deeper reasoningค่ะ
+
+Subagents are used only for independent, clearly owned work because parallel
+agents consume more aggregate tokens and shared-file writes increase integration
+riskค่ะ The current spawn surface did not expose a per-call model selector, so
+the evidence must not claim that a particular child model was pinned when it was
+not observableค่ะ A future Codex setup may pin model and reasoning in custom
+agent configuration when that control is availableค่ะ
+
+References: [Codex subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents.md),
+[Codex models](https://learn.chatgpt.com/docs/models.md), and
+[long-running work](https://learn.chatgpt.com/docs/long-running-work.md)ค่ะ
+
 ## Integration order
 
 1. Freeze types, schema v3, state transitions, retry taxonomy, and fault pointsค่ะ
