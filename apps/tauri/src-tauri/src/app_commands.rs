@@ -12,7 +12,7 @@ use std::sync::Arc;
 #[cfg(target_os = "android")]
 use std::sync::Mutex;
 #[cfg(target_os = "android")]
-use tauri_plugin_vault_saf::{SafError, VaultSafExt};
+use tauri_plugin_vault_saf::{SafError, SafVaultCapability, VaultSafExt};
 
 #[cfg(not(target_os = "android"))]
 use myvault_core::Vault;
@@ -71,16 +71,34 @@ impl DesktopVaultWatcher {
 }
 
 #[cfg(target_os = "android")]
+struct ActiveAndroidVault {
+    session_id: VaultSessionId,
+    vault: SafVaultCapability,
+}
+
+#[cfg(target_os = "android")]
 #[derive(Default)]
-pub struct AndroidVaultSession(Mutex<Option<VaultSessionId>>);
+pub struct AndroidVaultSession(Mutex<Option<ActiveAndroidVault>>);
 
 #[cfg(target_os = "android")]
 pub(crate) fn android_session_id(
     session: &AndroidVaultSession,
     requested: VaultSessionId,
 ) -> Result<VaultSessionId, AppError> {
-    let active = *session.0.lock().map_err(|_| AppError::internal())?;
-    validate_android_session(active, requested)
+    android_vault_capability(session, requested).map(|_| requested)
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn android_vault_capability(
+    session: &AndroidVaultSession,
+    requested: VaultSessionId,
+) -> Result<SafVaultCapability, AppError> {
+    let active = session.0.lock().map_err(|_| AppError::internal())?;
+    validate_android_session(active.as_ref().map(|value| value.session_id), requested)?;
+    active
+        .as_ref()
+        .map(|value| value.vault.clone())
+        .ok_or_else(AppError::no_active_session)
 }
 
 #[cfg(target_os = "android")]
@@ -90,9 +108,26 @@ pub(crate) fn with_android_session_lease<T>(
     operation: impl FnOnce() -> T,
 ) -> Result<T, AppError> {
     let active = session.0.lock().map_err(|_| AppError::internal())?;
-    validate_android_session(*active, requested)?;
+    validate_android_session(active.as_ref().map(|value| value.session_id), requested)?;
     // `active` deliberately stays in scope while the native operation runs.
     Ok(operation())
+}
+
+#[cfg(target_os = "android")]
+fn with_android_vault_lease<T>(
+    session: &AndroidVaultSession,
+    requested: VaultSessionId,
+    operation: impl FnOnce(&SafVaultCapability) -> T,
+) -> Result<T, AppError> {
+    let active = session.0.lock().map_err(|_| AppError::internal())?;
+    validate_android_session(active.as_ref().map(|value| value.session_id), requested)?;
+    let vault = active
+        .as_ref()
+        .map(|value| &value.vault)
+        .ok_or_else(AppError::no_active_session)?;
+    // The Rust session cannot be replaced while the exact native root proof is
+    // used. Kotlin independently rejects a switched persisted SAF root.
+    Ok(operation(vault))
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -200,16 +235,25 @@ pub fn vault_status(
     app: tauri::AppHandle,
     session: tauri::State<'_, AndroidVaultSession>,
 ) -> Result<VaultStatusDto, AppError> {
-    let native_active = app.vault_saf().has_root().map_err(map_android_saf_error)?;
+    let native = app
+        .vault_saf()
+        .active_root()
+        .map_err(map_android_saf_error)?;
     let mut current = session.0.lock().map_err(|_| AppError::internal())?;
-    if native_active && current.is_none() {
-        *current = Some(VaultSessionId::new());
-    } else if !native_active {
-        *current = None;
+    match native {
+        Some(vault) if current.as_ref().is_none_or(|active| active.vault != vault) => {
+            *current = Some(ActiveAndroidVault {
+                session_id: VaultSessionId::new(),
+                vault,
+            });
+        }
+        Some(_) => {}
+        None => *current = None,
     }
+    let session_id = current.as_ref().map(|active| active.session_id);
     Ok(VaultStatusDto {
-        active: native_active,
-        session_id: *current,
+        active: session_id.is_some(),
+        session_id,
     })
 }
 
@@ -236,12 +280,10 @@ pub async fn vault_read_note(
     path: String,
 ) -> Result<NoteDto, AppError> {
     let requested = parse_session_id(&session_id)?;
-    android_session_id(&session, requested)?;
-    let note = app
-        .vault_saf()
-        .read_note(&path)
-        .map_err(map_android_saf_error)?;
-    android_session_id(&session, requested)?;
+    let note = with_android_vault_lease(&session, requested, |vault| {
+        app.vault_saf().read_note(vault, &path)
+    })?
+    .map_err(map_android_saf_error)?;
     Ok(NoteDto {
         session_id: requested,
         path,
@@ -288,26 +330,29 @@ pub async fn vault_save_note(
     expected_byte_len: u64,
 ) -> Result<SaveNoteDto, AppError> {
     let requested = parse_session_id(&session_id)?;
-    android_session_id(&session, requested)?;
-    let saved = app
-        .vault_saf()
-        .save_note(&path, &text, &expected_revision_hex, expected_byte_len)
-        .map_err(|error| match error {
-            tauri_plugin_vault_saf::SafSaveError::StaleRevision => AppError::stale_revision(),
-            tauri_plugin_vault_saf::SafSaveError::NoteNotFound => AppError::note_not_found(),
-            tauri_plugin_vault_saf::SafSaveError::InvalidPath => AppError {
-                code: myvault_app_service::AppErrorCode::InvalidPath,
-                message: "the note path is invalid",
-            },
-            tauri_plugin_vault_saf::SafSaveError::InvalidRequest => {
-                AppError::invalid_revision_or_path()
-            }
-            tauri_plugin_vault_saf::SafSaveError::WriteOutcomeUnknown
-            | tauri_plugin_vault_saf::SafSaveError::NativeBridge => {
-                AppError::write_outcome_unknown()
-            }
-        })?;
-    android_session_id(&session, requested)?;
+    let saved = with_android_vault_lease(&session, requested, |vault| {
+        app.vault_saf().save_note(
+            vault,
+            &path,
+            &text,
+            &expected_revision_hex,
+            expected_byte_len,
+        )
+    })?
+    .map_err(|error| match error {
+        tauri_plugin_vault_saf::SafSaveError::StaleRevision => AppError::stale_revision(),
+        tauri_plugin_vault_saf::SafSaveError::NoteNotFound => AppError::note_not_found(),
+        tauri_plugin_vault_saf::SafSaveError::InvalidPath => AppError {
+            code: myvault_app_service::AppErrorCode::InvalidPath,
+            message: "the note path is invalid",
+        },
+        tauri_plugin_vault_saf::SafSaveError::InvalidRequest => {
+            AppError::invalid_revision_or_path()
+        }
+        tauri_plugin_vault_saf::SafSaveError::VaultUnavailable => AppError::vault_unavailable(),
+        tauri_plugin_vault_saf::SafSaveError::WriteOutcomeUnknown
+        | tauri_plugin_vault_saf::SafSaveError::NativeBridge => AppError::write_outcome_unknown(),
+    })?;
     Ok(SaveNoteDto {
         session_id: requested,
         path,
@@ -400,8 +445,10 @@ pub async fn vault_list_explorer(
             message: "the explorer cursor is invalid",
         });
     }
-    let mut inventory = app.vault_saf().inventory().map_err(map_android_saf_error)?;
-    android_session_id(&session, requested)?;
+    let mut inventory = with_android_vault_lease(&session, requested, |vault| {
+        app.vault_saf().inventory(vault)
+    })?
+    .map_err(map_android_saf_error)?;
     inventory.normalize_portable_order();
     let start = after.as_ref().map_or(0, |cursor| {
         inventory
@@ -471,15 +518,18 @@ pub async fn vault_choose_folder(
     app: tauri::AppHandle,
     session: tauri::State<'_, AndroidVaultSession>,
 ) -> Result<VaultChooseFolderDto, AppError> {
-    let activated = app
+    let Some(vault) = app
         .vault_saf()
         .choose_root()
-        .map_err(|_| AppError::vault_selection_failed())?;
-    if !activated {
+        .map_err(|_| AppError::vault_selection_failed())?
+    else {
         return Ok(VaultChooseFolderDto::Cancelled);
-    }
+    };
     let id = VaultSessionId::new();
-    *session.0.lock().map_err(|_| AppError::internal())? = Some(id);
+    *session.0.lock().map_err(|_| AppError::internal())? = Some(ActiveAndroidVault {
+        session_id: id,
+        vault,
+    });
     Ok(VaultChooseFolderDto::Activated {
         status: VaultStatusDto {
             active: true,
