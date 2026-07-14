@@ -875,6 +875,13 @@ pub struct SyncStore {
     _vault_directory: Dir,
 }
 
+#[derive(Clone, Copy)]
+enum PrivateStoragePolicy {
+    Standard,
+    #[cfg(target_os = "android")]
+    NativeAndroidNoBackup,
+}
+
 impl SyncStore {
     /// Opens one private, vault-specific operational sync database.
     ///
@@ -884,17 +891,76 @@ impl SyncStore {
     /// # Errors
     /// Fails closed for unsafe storage, invalid IDs, corrupt evidence, or migration failures.
     pub fn open(app_data_root: &Path, vault_root: &Path, vault_id: Uuid) -> Result<Self> {
+        let root = private_fs::open_private_disjoint_held_root(app_data_root, vault_root)?;
+        Self::open_from_held_private_root(&root, vault_id)
+    }
+
+    /// Opens from an already validated held private-root capability.
+    ///
+    /// This native-only integration API accepts no arbitrary path and
+    /// revalidates the retained canonical/held identity before and after the
+    /// SQLite ambient-path open.
+    ///
+    /// # Errors
+    /// Fails closed for stale capabilities, unsafe storage, invalid IDs,
+    /// corrupt evidence, lease contention, or migration failures.
+    #[doc(hidden)]
+    pub fn open_from_held_private_root(
+        root: &private_fs::HeldPrivateRoot,
+        vault_id: Uuid,
+    ) -> Result<Self> {
+        root.revalidate()?;
+        let store = Self::open_in_private_root(
+            root.try_clone_directory()?,
+            root.canonical_path(),
+            vault_id,
+            PrivateStoragePolicy::Standard,
+        )?;
+        root.revalidate()?;
+        Ok(store)
+    }
+
+    /// Opens per-Vault sync state below a native-proven Android no-backup root.
+    ///
+    /// The caller must retain native `getNoBackupFilesDir()` provenance; the
+    /// inspected capability itself exposes no constructor from an ambient path.
+    /// Android owner/mode/link checks remain exact while an unsupported ACL
+    /// query is accepted only in this dedicated native lane.
+    ///
+    /// # Errors
+    /// Fails closed before or after open if root identity/privacy changes, or
+    /// for invalid IDs, unsafe descendants, lease contention, and bad schema.
+    #[cfg(target_os = "android")]
+    #[doc(hidden)]
+    pub fn open_from_android_no_backup_root(
+        root: &private_fs::InspectedAndroidPrivateRoot,
+        vault_id: Uuid,
+    ) -> Result<Self> {
+        root.revalidate()?;
+        let store = Self::open_in_private_root(
+            root.try_clone_directory()?,
+            root.canonical_path(),
+            vault_id,
+            PrivateStoragePolicy::NativeAndroidNoBackup,
+        )?;
+        root.revalidate()?;
+        Ok(store)
+    }
+
+    fn open_in_private_root(
+        private_root: Dir,
+        canonical_app_root: &Path,
+        vault_id: Uuid,
+        policy: PrivateStoragePolicy,
+    ) -> Result<Self> {
         if vault_id.is_nil() {
             return Err(Error::InvalidVaultId);
         }
-        let canonical_app_root = app_data_root.canonicalize()?;
-        let private_root = private_fs::open_private_disjoint_root(app_data_root, vault_root)?;
-        let sync_root = private_fs::create_or_open_private_dir(&private_root, ROOT_DIRECTORY)?;
-        let version = private_fs::create_or_open_private_dir(&sync_root, VERSION_DIRECTORY)?;
-        let vaults = private_fs::create_or_open_private_dir(&version, VAULTS_DIRECTORY)?;
-        let vault_directory =
-            private_fs::create_or_open_private_dir(&vaults, vault_id.to_string())?;
-        let lease_file = acquire_sync_lease(&vault_directory)?;
+        let sync_root = create_or_open_storage_dir(&private_root, ROOT_DIRECTORY, policy)?;
+        let version = create_or_open_storage_dir(&sync_root, VERSION_DIRECTORY, policy)?;
+        let vaults = create_or_open_storage_dir(&version, VAULTS_DIRECTORY, policy)?;
+        let vault_directory = create_or_open_storage_dir(&vaults, vault_id.to_string(), policy)?;
+        let lease_file = acquire_sync_lease(&vault_directory, policy)?;
         let database_path = canonical_app_root
             .join(ROOT_DIRECTORY)
             .join(VERSION_DIRECTORY)
@@ -911,9 +977,9 @@ impl SyncStore {
             .follow(FollowSymlinks::No);
         let file = vault_directory.open_with(DATABASE_NAME, &options)?;
         if !existed {
-            private_fs::set_private_file_permissions(&file)?;
+            harden_new_storage_file(&file, policy)?;
         }
-        private_fs::verify_private_file(&file, 1)?;
+        verify_storage_file(&file, policy)?;
         file.sync_all()?;
         if !existed {
             private_fs::sync_directory(&vault_directory)?;
@@ -926,7 +992,7 @@ impl SyncStore {
         migrate(&mut connection)?;
         connection.pragma_update(None, "journal_mode", "DELETE")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
-        private_fs::open_private_file(&vault_directory, DATABASE_NAME, 1)?;
+        open_storage_file(&vault_directory, DATABASE_NAME, policy)?;
 
         let mut store = Self {
             connection,
@@ -2605,7 +2671,63 @@ impl SyncStore {
     }
 }
 
-fn acquire_sync_lease(vault_directory: &Dir) -> Result<std::fs::File> {
+fn create_or_open_storage_dir(
+    parent: &Dir,
+    name: impl AsRef<Path>,
+    policy: PrivateStoragePolicy,
+) -> Result<Dir> {
+    match policy {
+        PrivateStoragePolicy::Standard => Ok(private_fs::create_or_open_private_dir(parent, name)?),
+        #[cfg(target_os = "android")]
+        PrivateStoragePolicy::NativeAndroidNoBackup => Ok(
+            private_fs::create_or_open_android_private_dir(parent, name)?,
+        ),
+    }
+}
+
+fn harden_new_storage_file(file: &cap_std::fs::File, policy: PrivateStoragePolicy) -> Result<()> {
+    match policy {
+        PrivateStoragePolicy::Standard => private_fs::set_private_file_permissions(file)?,
+        #[cfg(target_os = "android")]
+        PrivateStoragePolicy::NativeAndroidNoBackup => {
+            private_fs::harden_android_new_file(file)?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_storage_file(file: &cap_std::fs::File, policy: PrivateStoragePolicy) -> Result<()> {
+    match policy {
+        PrivateStoragePolicy::Standard => private_fs::verify_private_file(file, 1)?,
+        #[cfg(target_os = "android")]
+        PrivateStoragePolicy::NativeAndroidNoBackup => {
+            private_fs::inspect_android_held_file(file)?;
+        }
+    }
+    Ok(())
+}
+
+fn open_storage_file(
+    parent: &Dir,
+    name: impl AsRef<Path>,
+    policy: PrivateStoragePolicy,
+) -> Result<()> {
+    match policy {
+        PrivateStoragePolicy::Standard => {
+            private_fs::open_private_file(parent, name, 1)?;
+        }
+        #[cfg(target_os = "android")]
+        PrivateStoragePolicy::NativeAndroidNoBackup => {
+            private_fs::open_android_private_file(parent, name)?;
+        }
+    }
+    Ok(())
+}
+
+fn acquire_sync_lease(
+    vault_directory: &Dir,
+    policy: PrivateStoragePolicy,
+) -> Result<std::fs::File> {
     let mut create = OpenOptions::new();
     create
         .read(true)
@@ -2622,9 +2744,9 @@ fn acquire_sync_lease(vault_directory: &Dir) -> Result<std::fs::File> {
         Err(error) => return Err(error.into()),
     };
     if created {
-        private_fs::set_private_file_permissions(&lease)?;
+        harden_new_storage_file(&lease, policy)?;
     }
-    private_fs::verify_private_file(&lease, 1)?;
+    verify_storage_file(&lease, policy)?;
     if created {
         lease.sync_all()?;
         private_fs::sync_directory(vault_directory)?;
