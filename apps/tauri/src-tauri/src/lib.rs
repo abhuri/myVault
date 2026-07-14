@@ -1,6 +1,8 @@
 use serde::Serialize;
 use std::sync::Arc;
 
+#[allow(dead_code)]
+mod android_transfer_policy;
 mod app_commands;
 mod sync_commands;
 #[cfg(not(target_os = "android"))]
