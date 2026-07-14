@@ -16,11 +16,11 @@ Updated 2026-07-14 Asia/Bangkok ค่ะ
 ## 2. Repository Checkpoint
 
 - Physical path คือ `/Volumes/AWB-Apps/My Apps/myVault` และ compatibility path คือ `/Users/awb/My Apps/myVault` ค่ะ
-- Branch คือ `codex/phase-3a-merge-handoff` ซึ่งสร้างจาก `origin/main` ที่ `db85177` ค่ะ
-- Phase 3A source head `7f5b8d6` ถูก merge ผ่าน PR #23 ที่ `db85177` เมื่อ 2026-07-14 ค่ะ
-- Post-merge Quality run `29270038450` ผ่านทั้ง `quality` และ `android-compile` ค่ะ
-- Working tree รอบนี้เป็น documentation-only alignment และยังไม่ได้ stage, commit หรือ push ค่ะ
-- Expected changed files คือ `PROJECT_PLAN.md`, `SESSION_HANDOFF.md`, `README.md`, `CHANGELOG.md`, `apps/tauri/DESIGN.md`, `docs/demo/RESULTS.md`, `docs/demo/PHASE1_HARDENING_ACCEPTANCE.md`, `docs/phase-0/DEVICE_TEST.md`, `docs/phase-0/ENVIRONMENT.md`, `docs/phase-0/RESULTS.md` และ `docs/sync/RESULTS.md` ค่ะ
+- Canonical branch คือ `main` และ canonical checkpoint คือ merge commit `5160882` จาก PR #24 ค่ะ
+- Phase 3A source head `7f5b8d6` ถูก merge ผ่าน PR #23 ที่ `db85177` และ locked roadmap commit `f5fba4d` ถูก merge ผ่าน PR #24 ที่ `5160882` ค่ะ
+- PR #24 ผ่าน Final Merge Review, Quality, Android compile, Ubuntu AppImage และ Windows NSIS ก่อน merge ค่ะ
+- Post-merge Quality run `29295471872` บน `5160882` ผ่านทั้ง `quality` และ `android-compile` ค่ะ
+- Active implementation milestone คือ R1 ค่ะ Shared workspace ล่าสุดอยู่บน `codex/r1-readonly-binding` ซึ่งแตกจาก `5160882` และมีงานที่ต้องรักษาไว้ค่ะ Session ใหม่ต้องตรวจ Git state จริงเพราะ active branch อาจเดินหน้าจาก checkpoint นี้แล้วค่ะ
 
 ## 3. Current Truth
 
@@ -71,7 +71,7 @@ Ignored-by-default tests คือ live Drive fixture และ OS keyring mutat
 - R6 ปิด Persistent Knowledge Core ค่ะ
 - R7 บังคับ native runtime acceptance บน macOS, Windows, Ubuntu และ physical Android ค่ะ
 - R8 ทำ recovery drill, release verification และ Personal First Release ค่ะ
-- Active implementation milestone ยังไม่มีค่ะ Milestone ถัดไปคือ R1 — Native Auth + Read-only Existing Drive Binding ค่ะ
+- Active implementation milestone คือ R1 — Native Auth + Read-only Existing Drive Binding ค่ะ
 - เปิด implementation milestone ได้ครั้งละหนึ่ง milestone และต้องผ่าน exit gate พร้อม approval ก่อน transition ค่ะ
 - Planning range ที่เหลือจากผลรวม milestone คือ 10–19 focused engineering weeks โดยไม่รวมเวลารอ environment, device, external review หรือ account approval ค่ะ
 - Scope, order และ exit gates ถูกล็อกค่ะ Planning range ไม่ใช่ deadline lock ค่ะ
@@ -99,18 +99,18 @@ Ignored-by-default tests คือ live Drive fixture และ OS keyring mutat
 
 ## 8. Next Actions
 
-1. ตรวจ locked-roadmap diff ให้ไม่มี stale milestone, duplicate ownership, broken links หรือ gate ที่ขัดกับ evidence ค่ะ
-2. ขออนุมัติ stage/commit/push documentation-only scope แยกตาม workflow ค่ะ
-3. เสนอ R1 implementation plan เพียง milestone เดียว โดยระบุ read-only fixture/root, native credential boundary, production adapter boundary, rollback/cleanup และ acceptance ค่ะ
-4. หลัง R1 approval จึงต่อ Desktop OAuth และ production read-only Drive adapter เข้ากับ Tauri/Sync engine ค่ะ
+1. รักษา active R1 branch และ uncommitted work ทั้งหมดก่อนแก้ไฟล์ค่ะ
+2. ตรวจว่า R1 implementation plan และ approval state ใน active session ครอบคลุม read-only fixture/root, native credential boundary, production adapter boundary, rollback/cleanup และ acceptance ค่ะ
+3. เดิน R1 ตาม locked scope โดยแยก approval ก่อนเปิด OAuth browser หรือใช้ live Google Drive fixture ค่ะ
+4. ปิด R1 ด้วย exit-gate evidence บน source head เดียวกันและขอ approval ก่อน transition ค่ะ
 5. ห้ามเริ่ม R2 upload/download, remote mutation หรือแตะ personal Existing Vault ก่อน R1 exit gate ผ่านค่ะ
 
 ## 9. Approval State
 
-- Documentation audit, alignment และ roadmap lock รอบนี้ได้รับอนุมัติแล้วค่ะ
-- Locked scope/order/gates ได้รับ approval ด้วยข้อความ `Approve lock roadmap` เมื่อ 2026-07-14 ค่ะ
-- การแก้ source code, stage, commit และ push ยังไม่ได้รับ approval ในรอบนี้ค่ะ
-- R1 implementation และ live OAuth/Google Drive access ยังไม่ได้รับ approval ค่ะ
+- Documentation audit, alignment, roadmap lock, PR review และ merge เข้า `main` ได้รับอนุมัติและดำเนินการแล้วค่ะ
+- Locked scope/order/gates ได้รับ approval ด้วยข้อความ `Approve lock roadmap` เมื่อ 2026-07-14 และอยู่บน `main` ที่ `5160882` ค่ะ
+- Active R1 branch มี implementation work แล้วค่ะ Session ที่ทำ R1 ต้องถือ approval state ของตัวเองเป็น source of truth และห้ามตีความ roadmap merge ว่าอนุมัติ live external access ค่ะ
+- OAuth browser และ live Google Drive access ยังต้องมี explicit approval ตาม R1 plan ค่ะ
 - ไม่มี approval ด้าน User Data Policy ค้างอยู่ค่ะ OAuth credential และ token ต้องอยู่ภายนอก repository และห้ามแสดงใน log ค่ะ
 - งาน implementation ใหม่ต้องเสนอแผนและขออนุมัติคุณโอก่อนลงมือค่ะ
 

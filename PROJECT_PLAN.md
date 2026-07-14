@@ -395,7 +395,7 @@ Milestone จะถือว่า complete เมื่อครบทุกข
 
 ## 15. Current Transition
 
-- Roadmap lock documentation round ได้รับ approval และกำลังรอ review/stage/commit/push ค่ะ
-- Active implementation milestone ยังไม่มีค่ะ
-- Milestone ถัดไปคือ R1 — Native Auth + Read-only Existing Drive Binding ค่ะ
-- ก่อนเริ่ม R1 ต้องเสนอ implementation plan ที่ระบุ exact fixture/root, credential boundary, production adapter boundary, rollback/cleanup, acceptance commands และจุดที่ต้องขอ approval ก่อนเปิด browser หรือแตะ Google Drive จริงค่ะ
+- Locked roadmap ถูก merge เข้า `main` ผ่าน PR #24 ที่ merge commit `5160882` แล้วค่ะ Post-merge Quality run `29295471872` ผ่านทั้ง `quality` และ `android-compile` ค่ะ
+- Canonical roadmap checkpoint อยู่บน `origin/main` ที่ `5160882` ค่ะ Session ใหม่ต้องเริ่มจาก commit นี้หรือ descendant ของ commit นี้ค่ะ
+- Active implementation milestone คือ R1 — Native Auth + Read-only Existing Drive Binding ค่ะ Shared workspace มี branch `codex/r1-readonly-binding` ที่แตกจาก `5160882` และมีงานอยู่ จึงต้องตรวจ Git state และรักษางานเดิมก่อนแก้ไฟล์ค่ะ
+- R1 implementation plan ต้องคง exact fixture/root, credential boundary, production adapter boundary, rollback/cleanup, acceptance commands และแยก approval สำหรับ browser/live Google Drive access ตาม handoff ของ active session ค่ะ
