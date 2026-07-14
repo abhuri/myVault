@@ -90,6 +90,11 @@ jobs:
           cargo test --manifest-path crates/myvault-snapshots/Cargo.toml
           cargo test --manifest-path crates/myvault-app-service/Cargo.toml
 
+      - name: Test native R1 auth and read-only Drive contracts
+        run: |
+          cargo test --manifest-path crates/desktop-auth/Cargo.toml
+          cargo test --manifest-path crates/myvault-drive/Cargo.toml
+
       - name: Test sync foundation on native Linux
         if: runner.os == 'Linux'
         run: cargo test --manifest-path crates/myvault-sync-engine/Cargo.toml

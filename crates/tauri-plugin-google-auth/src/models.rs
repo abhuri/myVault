@@ -1,3 +1,5 @@
+#![cfg_attr(not(target_os = "android"), allow(dead_code))]
+
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -6,8 +8,8 @@ use zeroize::Zeroizing;
 pub struct AccessToken(Zeroizing<String>);
 
 impl AccessToken {
-    pub(crate) fn new(value: String) -> Self {
-        Self(Zeroizing::new(value))
+    pub(crate) fn new(value: Zeroizing<String>) -> Self {
+        Self(value)
     }
 
     pub(crate) fn expose_to_native(&self) -> &str {
@@ -18,6 +20,14 @@ impl AccessToken {
 pub struct Authorization {
     pub access_token: AccessToken,
     pub granted_scope_count: usize,
+}
+
+impl Authorization {
+    /// Gives native Rust integration a scoped borrow of the bearer token.
+    /// The token remains non-serializable and cannot cross a Tauri command DTO.
+    pub fn with_native_access_token<T>(&self, operation: impl FnOnce(&str) -> T) -> T {
+        operation(self.access_token.expose_to_native())
+    }
 }
 
 #[derive(Serialize)]
@@ -32,7 +42,7 @@ pub(crate) struct AuthorizeRequest<'a> {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NativeAuthorization {
-    pub access_token: String,
+    pub access_token: Zeroizing<String>,
     pub granted_scopes: Vec<String>,
 }
 
@@ -46,4 +56,28 @@ pub(crate) struct DisconnectRequest<'a> {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NativeDisconnectResult {
     pub revoked: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_bearing_native_types_are_not_debuggable_or_serializable() {
+        static_assertions::assert_not_impl_any!(AccessToken: std::fmt::Debug, std::fmt::Display, serde::Serialize);
+        static_assertions::assert_not_impl_any!(Authorization: std::fmt::Debug, serde::Serialize);
+        static_assertions::assert_not_impl_any!(NativeAuthorization: std::fmt::Debug, serde::Serialize);
+    }
+
+    #[test]
+    fn authorization_request_serializes_only_the_scope() {
+        let request = AuthorizeRequest {
+            scopes: &[crate::GOOGLE_DRIVE_SCOPE],
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "scopes": [crate::GOOGLE_DRIVE_SCOPE] })
+        );
+    }
 }

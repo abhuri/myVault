@@ -15,10 +15,14 @@ mod store;
 
 pub use store::{
     BindOutcome, ChangeBatch, EnqueueOutcome, JobState, LocalMutationState, LocalMutationStatus,
-    QueueJob, QueueJobKind, SyncStore, VaultSyncState, SCHEMA_VERSION, SQLITE_OPEN_RESIDUAL_RISK,
+    QueueJob, QueueJobKind, RemotePreviewCursor, RemotePreviewEntry, RemotePreviewPage, SyncStore,
+    VaultSyncState, MAX_REMOTE_PREVIEW_PAGE_SIZE, SCHEMA_VERSION, SQLITE_OPEN_RESIDUAL_RISK,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+pub const MAX_SCAN_PAGE_ENTRIES: usize = 1_000;
+pub const MAX_SCAN_FRONTIER_FOLDERS: usize = 5_000;
 
 #[derive(Debug)]
 pub enum Error {
@@ -35,12 +39,17 @@ pub enum Error {
     InvalidErrorCode,
     SyncLeaseHeld,
     BindingCollision,
+    BindingIdentityMismatch,
+    BindingRequiresAccount,
     InvalidStateTransition,
     InvalidSchema,
     UnsupportedSchema(i64),
     QueueCollision,
     JobNotFound,
     CursorMismatch,
+    RescanRequired,
+    InvalidPreviewCursor,
+    InvalidPreviewLimit,
     BatchAlreadyActive,
     NoActiveBatch,
     UnknownMutation,
@@ -69,6 +78,10 @@ impl fmt::Display for Error {
             Self::BindingCollision => {
                 formatter.write_str("the vault is already bound to a different remote root")
             }
+            Self::BindingIdentityMismatch => formatter
+                .write_str("the requested account and root do not match verified remote identity"),
+            Self::BindingRequiresAccount => formatter
+                .write_str("the migrated remote binding requires verified account identity"),
             Self::InvalidStateTransition => {
                 formatter.write_str("the requested sync state transition is invalid")
             }
@@ -84,6 +97,13 @@ impl fmt::Display for Error {
             }
             Self::JobNotFound => formatter.write_str("the sync queue job was not found"),
             Self::CursorMismatch => formatter.write_str("the durable cursor changed unexpectedly"),
+            Self::RescanRequired => formatter.write_str("the remote cursor requires a full rescan"),
+            Self::InvalidPreviewCursor => {
+                formatter.write_str("the remote preview cursor is invalid")
+            }
+            Self::InvalidPreviewLimit => {
+                formatter.write_str("the remote preview page size is invalid")
+            }
             Self::BatchAlreadyActive => {
                 formatter.write_str("an incremental change batch is already active")
             }
@@ -267,6 +287,9 @@ pub struct ScanPage {
 
 impl ScanPage {
     pub(crate) fn validate(&self) -> Result<()> {
+        if self.entries.len() > MAX_SCAN_PAGE_ENTRIES {
+            return Err(Error::InvalidRemoteEntry);
+        }
         validate_entries(&self.entries)?;
         if let Some(token) = &self.next_page_token {
             validate_remote_token(token)?;
@@ -297,6 +320,66 @@ pub struct ChangesPage {
     pub new_start_page_token: Option<String>,
 }
 
+/// Exact account/root identity proven by a native provider before persistence.
+///
+/// The requested values and the values observed from the provider must match,
+/// which makes a folder name alone insufficient to create a binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedRemoteBinding {
+    account_id: String,
+    remote_root_id: String,
+}
+
+impl VerifiedRemoteBinding {
+    /// Creates one exact verified binding.
+    ///
+    /// # Errors
+    /// Rejects malformed IDs or any requested/observed identity mismatch.
+    pub fn new(
+        requested_account_id: impl Into<String>,
+        requested_remote_root_id: impl Into<String>,
+        observed_account_id: impl Into<String>,
+        observed_remote_root_id: impl Into<String>,
+    ) -> Result<Self> {
+        let requested_account_id = requested_account_id.into();
+        let requested_remote_root_id = requested_remote_root_id.into();
+        let observed_account_id = observed_account_id.into();
+        let observed_remote_root_id = observed_remote_root_id.into();
+        validate_remote_id(&requested_account_id)?;
+        validate_remote_id(&requested_remote_root_id)?;
+        validate_remote_id(&observed_account_id)?;
+        validate_remote_id(&observed_remote_root_id)?;
+        if requested_account_id != observed_account_id
+            || requested_remote_root_id != observed_remote_root_id
+        {
+            return Err(Error::BindingIdentityMismatch);
+        }
+        Ok(Self {
+            account_id: requested_account_id,
+            remote_root_id: requested_remote_root_id,
+        })
+    }
+
+    #[must_use]
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    #[must_use]
+    pub fn remote_root_id(&self) -> &str {
+        &self.remote_root_id
+    }
+}
+
+/// One durable, bounded request for a direct-child page of a remote folder.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScanRequest {
+    pub folder_id: String,
+    /// Empty only for the bound root; descendants use canonical portable paths.
+    pub folder_path: String,
+    pub page_token: Option<String>,
+}
+
 impl ChangesPage {
     pub(crate) fn validate(&self) -> Result<()> {
         for change in &self.changes {
@@ -318,14 +401,13 @@ pub trait DriveClient {
     /// Returns only a redacted remote error.
     fn get_start_page_token(&mut self) -> std::result::Result<String, RemoteError>;
 
-    /// Fetches one recursive remote metadata page for the bound root.
+    /// Fetches one direct-child metadata page for the durable folder frontier.
     ///
     /// # Errors
     /// Returns only a redacted remote error.
-    fn scan_page(
+    fn scan_folder_page(
         &mut self,
-        remote_root_id: &str,
-        page_token: Option<&str>,
+        request: &ScanRequest,
     ) -> std::result::Result<ScanPage, RemoteError>;
 
     /// Fetches one Changes page from the exact supplied cursor.
@@ -357,6 +439,9 @@ pub fn advance_initial_sync<C: DriveClient>(
     now_unix_ms: u64,
 ) -> Result<InitialSyncProgress> {
     let state = store.vault_state()?.ok_or(Error::InvalidStateTransition)?;
+    if state.account_id.is_none() {
+        return Err(Error::BindingRequiresAccount);
+    }
     match state.phase {
         SyncPhase::NeedStartToken => {
             let token = client.get_start_page_token().map_err(Error::Remote)?;
@@ -365,14 +450,14 @@ pub fn advance_initial_sync<C: DriveClient>(
             Ok(InitialSyncProgress::StartTokenCaptured)
         }
         SyncPhase::Scanning => {
-            let expected_page_token = state.scan_page_token.as_deref();
-            let page = client
-                .scan_page(&state.remote_root_id, expected_page_token)
-                .map_err(Error::Remote)?;
+            let request = store.scan_request()?.ok_or(Error::InvalidStateTransition)?;
+            let page = client.scan_folder_page(&request).map_err(Error::Remote)?;
             page.validate()?;
-            let complete = page.next_page_token.is_none();
-            store.apply_scan_page(expected_page_token, &page, now_unix_ms)?;
-            Ok(if complete {
+            store.apply_scan_page(request.page_token.as_deref(), &page, now_unix_ms)?;
+            let scan_complete = store
+                .vault_state()?
+                .is_some_and(|current| current.phase == SyncPhase::Draining);
+            Ok(if scan_complete {
                 InitialSyncProgress::ScanComplete
             } else {
                 InitialSyncProgress::ScanPageCommitted
@@ -383,7 +468,14 @@ pub fn advance_initial_sync<C: DriveClient>(
                 .changes_page_token
                 .as_deref()
                 .ok_or(Error::InvalidStateTransition)?;
-            let page = client.changes_page(cursor).map_err(Error::Remote)?;
+            let page = match client.changes_page(cursor) {
+                Ok(page) => page,
+                Err(error) if matches!(error.code(), "cursor_expired" | "cursor_ambiguous") => {
+                    store.mark_rescan_required(now_unix_ms)?;
+                    return Err(Error::RescanRequired);
+                }
+                Err(error) => return Err(Error::Remote(error)),
+            };
             page.validate()?;
             let complete = page.new_start_page_token.is_some();
             store.apply_changes_page(cursor, &page, now_unix_ms)?;

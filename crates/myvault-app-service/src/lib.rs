@@ -292,8 +292,42 @@ impl std::error::Error for AppError {}
 
 struct VaultSession {
     id: VaultSessionId,
+    vault_id: Uuid,
     vault: Vault,
     snapshots: Option<SnapshotRuntime>,
+}
+
+/// Native-only capability context for opening private per-Vault services.
+///
+/// This type deliberately does not implement `Serialize` or `Debug` because it
+/// contains ambient filesystem paths that must stay behind the Tauri boundary.
+pub struct NativeVaultContext {
+    session_id: VaultSessionId,
+    vault_id: Uuid,
+    vault_root: PathBuf,
+    app_data_root: Option<PathBuf>,
+}
+
+impl NativeVaultContext {
+    #[must_use]
+    pub const fn session_id(&self) -> VaultSessionId {
+        self.session_id
+    }
+
+    #[must_use]
+    pub const fn vault_id(&self) -> Uuid {
+        self.vault_id
+    }
+
+    #[must_use]
+    pub fn vault_root(&self) -> &Path {
+        &self.vault_root
+    }
+
+    #[must_use]
+    pub fn app_data_root(&self) -> Option<&Path> {
+        self.app_data_root.as_deref()
+    }
 }
 
 struct SnapshotRuntime {
@@ -328,13 +362,15 @@ impl AppService {
     /// Returns a safe internal error if the session lock is unavailable.
     pub fn activate_trusted_vault(&self, vault: Vault) -> Result<VaultStatusDto, AppError> {
         let id = VaultSessionId(Uuid::new_v4());
+        let vault_id = vault_id_for(&vault);
         let snapshots = self
             .app_data_root
             .as_ref()
-            .map(|root| open_snapshot_runtime(root, &vault))
+            .map(|root| open_snapshot_runtime(root, &vault, vault_id))
             .transpose()?;
         let session = Arc::new(VaultSession {
             id,
+            vault_id,
             vault,
             snapshots,
         });
@@ -372,6 +408,66 @@ impl AppService {
             active: current.is_some(),
             session_id: current.as_ref().map(|session| session.id),
         })
+    }
+
+    /// Returns an owned native-only capability snapshot for the exact active session.
+    ///
+    /// The context is intentionally not frontend-serializable. Native callers
+    /// must still validate the session again before publishing a result after a
+    /// long-running operation.
+    ///
+    /// # Errors
+    /// Rejects absent or stale session identifiers and unavailable session state.
+    pub fn native_vault_context(
+        &self,
+        session_id: VaultSessionId,
+    ) -> Result<NativeVaultContext, AppError> {
+        self.with_session(session_id, |session| {
+            Ok(NativeVaultContext {
+                session_id,
+                vault_id: session.vault_id,
+                vault_root: session.vault.root().to_path_buf(),
+                app_data_root: self.app_data_root.clone(),
+            })
+        })
+    }
+
+    /// Confirms that an opaque session remains the active native capability.
+    ///
+    /// # Errors
+    /// Rejects absent or stale session identifiers.
+    pub fn confirm_active_session(&self, session_id: VaultSessionId) -> Result<(), AppError> {
+        self.with_session(session_id, |_| Ok(()))
+    }
+
+    /// Runs one native operation while preventing the active Vault capability
+    /// from being replaced until the operation returns.
+    ///
+    /// The callback result is intentionally generic so a native integration can
+    /// preserve its own typed error boundary. The session read lease remains
+    /// held for the complete callback, making a final credential or durable
+    /// state commit atomic with respect to Vault activation.
+    ///
+    /// # Errors
+    /// Rejects absent or stale session identifiers before invoking the callback.
+    pub fn with_native_session_lease<T>(
+        &self,
+        session_id: VaultSessionId,
+        operation: impl FnOnce(NativeVaultContext) -> T,
+    ) -> Result<T, AppError> {
+        let current = self.session.read().map_err(|_| internal_error())?;
+        let active = current.as_ref().ok_or_else(no_session_error)?;
+        if active.id != session_id {
+            return Err(stale_session_error());
+        }
+        let context = NativeVaultContext {
+            session_id,
+            vault_id: active.vault_id,
+            vault_root: active.vault.root().to_path_buf(),
+            app_data_root: self.app_data_root.clone(),
+        };
+        // `current` deliberately stays in scope while the callback runs.
+        Ok(operation(context))
     }
 
     /// Reads one Markdown note as strict UTF-8 with its exact byte revision.
@@ -638,11 +734,18 @@ impl AppService {
     }
 }
 
-fn open_snapshot_runtime(app_data_root: &Path, vault: &Vault) -> Result<SnapshotRuntime, AppError> {
-    let vault_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, &vault_identity_bytes(vault.root()));
+fn open_snapshot_runtime(
+    app_data_root: &Path,
+    vault: &Vault,
+    vault_id: Uuid,
+) -> Result<SnapshotRuntime, AppError> {
     let store = SnapshotStore::open(app_data_root, vault.root(), vault_id)
         .map_err(|_| AppError::recovery_unavailable())?;
     Ok(SnapshotRuntime { vault_id, store })
+}
+
+fn vault_id_for(vault: &Vault) -> Uuid {
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, &vault_identity_bytes(vault.root()))
 }
 
 fn vault_identity_bytes(root: &Path) -> Vec<u8> {
@@ -779,6 +882,113 @@ mod tests {
     use super::*;
     use std::fs;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn native_context_is_stable_per_vault_and_rejects_stale_sessions() {
+        let temporary = tempfile::tempdir().expect("temporary");
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        fs::create_dir(&first).expect("first");
+        fs::create_dir(&second).expect("second");
+        let first = first.canonicalize().expect("canonical first");
+        let second = second.canonicalize().expect("canonical second");
+        let service = AppService::new();
+
+        let first_session = service
+            .activate_trusted_vault(Vault::open(&first).expect("first vault"))
+            .expect("activate first")
+            .session_id
+            .expect("first session");
+        let first_context = service
+            .native_vault_context(first_session)
+            .expect("first native context");
+        assert_eq!(first_context.session_id(), first_session);
+        assert_eq!(first_context.vault_root(), first);
+        assert_eq!(first_context.app_data_root(), None);
+        assert!(!first_context.vault_id().is_nil());
+
+        let replacement_session = service
+            .activate_trusted_vault(Vault::open(&first).expect("same first vault"))
+            .expect("reactivate first")
+            .session_id
+            .expect("replacement session");
+        let replacement_context = service
+            .native_vault_context(replacement_session)
+            .expect("replacement native context");
+        assert_eq!(replacement_context.vault_id(), first_context.vault_id());
+        let Err(stale_error) = service.native_vault_context(first_session) else {
+            panic!("old session should be rejected");
+        };
+        assert_eq!(stale_error.code, AppErrorCode::StaleSession);
+
+        let second_session = service
+            .activate_trusted_vault(Vault::open(&second).expect("second vault"))
+            .expect("activate second")
+            .session_id
+            .expect("second session");
+        let second_context = service
+            .native_vault_context(second_session)
+            .expect("second native context");
+        assert_ne!(second_context.vault_id(), first_context.vault_id());
+        service
+            .confirm_active_session(second_session)
+            .expect("second remains active");
+    }
+
+    #[test]
+    fn native_session_lease_linearizes_before_vault_activation() {
+        let temporary = tempfile::tempdir().expect("temporary");
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        fs::create_dir(&first).expect("first");
+        fs::create_dir(&second).expect("second");
+        let first = first.canonicalize().expect("canonical first");
+        let second = second.canonicalize().expect("canonical second");
+        let service = AppService::new();
+        let first_id = service
+            .activate_trusted_vault(Vault::open(&first).expect("first vault"))
+            .expect("activate first")
+            .session_id
+            .expect("first id");
+        let locked = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let locked_worker = Arc::clone(&locked);
+            let resume_worker = Arc::clone(&resume);
+            let service_ref = &service;
+            let lease = scope.spawn(move || {
+                service_ref.with_native_session_lease(first_id, |context| {
+                    assert_eq!(context.session_id(), first_id);
+                    locked_worker.wait();
+                    resume_worker.wait();
+                })
+            });
+            locked.wait();
+            assert!(matches!(
+                service.session.try_write(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let service_ref = &service;
+            let switch = scope.spawn(move || {
+                let status = service_ref
+                    .activate_trusted_vault(Vault::open(&second).expect("second vault"))
+                    .expect("switch session");
+                done_tx.send(status).expect("send switched status");
+            });
+            assert!(done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err());
+            resume.wait();
+            lease.join().expect("lease worker").expect("native lease");
+            let switched = done_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("activation should complete after lease");
+            assert_ne!(switched.session_id, Some(first_id));
+            switch.join().expect("switch worker");
+        });
+    }
 
     #[test]
     fn in_flight_old_session_result_is_suppressed_after_switch_or_close() {

@@ -1,8 +1,9 @@
 use myvault_sync_engine::{
     advance_initial_sync, BindOutcome, ChangesPage, DriveClient, EnqueueOutcome, Error,
     InitialSyncProgress, JobState, LocalMutationState, QueueJob, QueueJobKind, RemoteChange,
-    RemoteContentHash, RemoteEntry, RemoteEntryKind, RemoteError, RemoteHashAlgorithm, ScanPage,
-    SyncPhase, SyncStore,
+    RemoteContentHash, RemoteEntry, RemoteEntryKind, RemoteError, RemoteHashAlgorithm,
+    RemotePreviewCursor, ScanPage, ScanRequest, SyncPhase, SyncStore, VerifiedRemoteBinding,
+    SCHEMA_VERSION,
 };
 use std::collections::VecDeque;
 use std::fs;
@@ -64,20 +65,17 @@ impl DriveClient for MockDrive {
             .ok_or_else(|| remote_error("missing_start"))
     }
 
-    fn scan_page(
-        &mut self,
-        remote_root_id: &str,
-        page_token: Option<&str>,
-    ) -> Result<ScanPage, RemoteError> {
+    fn scan_folder_page(&mut self, request: &ScanRequest) -> Result<ScanPage, RemoteError> {
         self.calls.push(format!(
-            "scan:{remote_root_id}:{}",
-            page_token.unwrap_or("first")
+            "scan:{}:{}",
+            request.folder_id,
+            request.page_token.as_deref().unwrap_or("first")
         ));
         let (expected, page) = self
             .scans
             .pop_front()
             .ok_or_else(|| remote_error("missing_scan_page"))?;
-        if expected.as_deref() != page_token {
+        if expected != request.page_token {
             return Err(remote_error("unexpected_scan_cursor"));
         }
         Ok(page)
@@ -94,6 +92,57 @@ impl DriveClient for MockDrive {
         }
         Ok(page)
     }
+}
+
+struct ExpiredCursorDrive;
+
+impl DriveClient for ExpiredCursorDrive {
+    fn get_start_page_token(&mut self) -> Result<String, RemoteError> {
+        unreachable!()
+    }
+
+    fn scan_folder_page(&mut self, _: &ScanRequest) -> Result<ScanPage, RemoteError> {
+        unreachable!()
+    }
+
+    fn changes_page(&mut self, _: &str) -> Result<ChangesPage, RemoteError> {
+        Err(remote_error("cursor_expired"))
+    }
+}
+
+fn binding(account_id: &str, root_id: &str) -> VerifiedRemoteBinding {
+    VerifiedRemoteBinding::new(account_id, root_id, account_id, root_id).unwrap()
+}
+
+fn downgrade_database_to_v1(database_path: &Path) {
+    let connection = rusqlite::Connection::open(database_path).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE scan_frontier;
+             DROP INDEX remote_entries_preview_idx;
+             ALTER TABLE vault_state RENAME TO vault_state_v2;
+             CREATE TABLE vault_state (
+                singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+                vault_id TEXT NOT NULL UNIQUE,
+                remote_root_id TEXT NOT NULL,
+                phase TEXT NOT NULL CHECK (phase IN ('need_start_token', 'scanning', 'draining', 'ready')),
+                start_token TEXT,
+                scan_page_token TEXT,
+                changes_page_token TEXT,
+                durable_cursor TEXT,
+                updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= 0)
+             );
+             INSERT INTO vault_state(
+                singleton, vault_id, remote_root_id, phase, start_token,
+                scan_page_token, changes_page_token, durable_cursor, updated_at_unix_ms
+             )
+             SELECT singleton, vault_id, remote_root_id, phase, start_token,
+                    scan_page_token, changes_page_token, durable_cursor, updated_at_unix_ms
+             FROM vault_state_v2;
+             DROP TABLE vault_state_v2;
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
 }
 
 fn remote_error(code: &str) -> RemoteError {
@@ -117,10 +166,35 @@ fn file(file_id: &str, path: &str, revision: &str, hash_byte: u8) -> RemoteEntry
     }
 }
 
+fn folder(file_id: &str, parent_id: &str, path: &str, revision: &str) -> RemoteEntry {
+    RemoteEntry {
+        file_id: file_id.into(),
+        parent_id: parent_id.into(),
+        path: path.into(),
+        kind: RemoteEntryKind::Folder,
+        content_hash: None,
+        remote_revision: revision.into(),
+    }
+}
+
+fn child_file(
+    file_id: &str,
+    parent_id: &str,
+    path: &str,
+    revision: &str,
+    hash_byte: u8,
+) -> RemoteEntry {
+    let mut entry = file(file_id, path, revision, hash_byte);
+    entry.parent_id = parent_id.into();
+    entry
+}
+
 fn ready_store(fixture: &Fixture) -> SyncStore {
     let mut store = fixture.open();
     assert_eq!(
-        store.bind_remote_root("remote-root", 1).unwrap(),
+        store
+            .bind_remote_root(&binding("account-a", "remote-root"), 1)
+            .unwrap(),
         BindOutcome::Created
     );
     store.begin_initial_scan("start-1", 2).unwrap();
@@ -152,7 +226,9 @@ fn ready_store(fixture: &Fixture) -> SyncStore {
 fn initial_sync_orders_token_scan_and_changes_then_reaches_ready() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
-    store.bind_remote_root("remote-root", 1).unwrap();
+    store
+        .bind_remote_root(&binding("account-a", "remote-root"), 1)
+        .unwrap();
     let mut drive = MockDrive {
         start_token: Some("start-1".into()),
         scans: VecDeque::from([
@@ -160,8 +236,8 @@ fn initial_sync_orders_token_scan_and_changes_then_reaches_ready() {
                 None,
                 ScanPage {
                     entries: vec![
-                        file("file-a", "Notes/A.md", "rev-a1", b'a'),
-                        file("file-b", "Notes/ไทย.md", "rev-b1", b'b'),
+                        file("file-a", "A.md", "rev-a1", b'a'),
+                        file("file-b", "ไทย.md", "rev-b1", b'b'),
                     ],
                     next_page_token: Some("scan-2".into()),
                 },
@@ -169,7 +245,7 @@ fn initial_sync_orders_token_scan_and_changes_then_reaches_ready() {
             (
                 Some("scan-2".into()),
                 ScanPage {
-                    entries: vec![file("file-c", "Assets/image.png", "rev-c1", b'c')],
+                    entries: vec![file("file-c", "image.png", "rev-c1", b'c')],
                     next_page_token: None,
                 },
             ),
@@ -190,7 +266,7 @@ fn initial_sync_orders_token_scan_and_changes_then_reaches_ready() {
                 ChangesPage {
                     changes: vec![RemoteChange::Upsert(file(
                         "file-b",
-                        "Notes/ไทย.md",
+                        "ไทย.md",
                         "rev-b2",
                         b'd',
                     ))],
@@ -240,11 +316,308 @@ fn initial_sync_orders_token_scan_and_changes_then_reaches_ready() {
 }
 
 #[test]
+fn token_capture_and_recursive_frontier_are_restart_safe() {
+    let fixture = Fixture::new();
+    {
+        let mut store = fixture.open();
+        store
+            .bind_remote_root(&binding("account-a", "remote-root"), 1)
+            .unwrap();
+        store.begin_initial_scan("start-1", 2).unwrap();
+        let request = store.scan_request().unwrap().unwrap();
+        assert_eq!(request.folder_id, "remote-root");
+        assert_eq!(request.folder_path, "");
+        assert_eq!(request.page_token, None);
+    }
+
+    let mut store = fixture.open();
+    let state = store.vault_state().unwrap().unwrap();
+    assert_eq!(state.phase, SyncPhase::Scanning);
+    assert_eq!(state.start_token.as_deref(), Some("start-1"));
+    store
+        .apply_scan_page(
+            None,
+            &ScanPage {
+                entries: vec![folder("folder-a", "remote-root", "Notes", "folder-rev")],
+                next_page_token: Some("root-page-2".into()),
+            },
+            3,
+        )
+        .unwrap();
+    assert_eq!(
+        store.scan_request().unwrap().unwrap().page_token.as_deref(),
+        Some("root-page-2")
+    );
+    store
+        .apply_scan_page(
+            Some("root-page-2"),
+            &ScanPage {
+                entries: Vec::new(),
+                next_page_token: None,
+            },
+            4,
+        )
+        .unwrap();
+    let child = store.scan_request().unwrap().unwrap();
+    assert_eq!(child.folder_id, "folder-a");
+    assert_eq!(child.folder_path, "Notes");
+    store
+        .apply_scan_page(
+            None,
+            &ScanPage {
+                entries: vec![child_file(
+                    "nested-note",
+                    "folder-a",
+                    "Notes/A.md",
+                    "note-rev",
+                    b'a',
+                )],
+                next_page_token: Some("folder-page-2".into()),
+            },
+            5,
+        )
+        .unwrap();
+    drop(store);
+
+    let store = fixture.open();
+    assert_eq!(
+        store.scan_request().unwrap().unwrap(),
+        ScanRequest {
+            folder_id: "folder-a".into(),
+            folder_path: "Notes".into(),
+            page_token: Some("folder-page-2".into()),
+        }
+    );
+    assert_eq!(store.remote_entry_count().unwrap(), 2);
+}
+
+#[test]
+fn recursive_frontier_rejects_root_and_seen_folder_cycles_atomically() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store
+        .bind_remote_root(&binding("account-a", "remote-root"), 1)
+        .unwrap();
+    store.begin_initial_scan("start-1", 2).unwrap();
+
+    assert!(matches!(
+        store.apply_scan_page(
+            None,
+            &ScanPage {
+                entries: vec![folder("remote-root", "remote-root", "Loop", "rev-loop")],
+                next_page_token: None,
+            },
+            3,
+        ),
+        Err(Error::InvalidRemoteEntry)
+    ));
+    assert_eq!(store.remote_entry_count().unwrap(), 0);
+    assert_eq!(
+        store.scan_request().unwrap().unwrap().folder_id,
+        "remote-root"
+    );
+
+    store
+        .apply_scan_page(
+            None,
+            &ScanPage {
+                entries: vec![folder("folder-a", "remote-root", "Notes", "rev-a")],
+                next_page_token: None,
+            },
+            4,
+        )
+        .unwrap();
+    assert_eq!(store.scan_request().unwrap().unwrap().folder_id, "folder-a");
+    store
+        .apply_scan_page(
+            None,
+            &ScanPage {
+                entries: vec![folder("folder-b", "folder-a", "Notes/Child", "rev-b")],
+                next_page_token: None,
+            },
+            5,
+        )
+        .unwrap();
+    assert_eq!(store.scan_request().unwrap().unwrap().folder_id, "folder-b");
+    assert!(matches!(
+        store.apply_scan_page(
+            None,
+            &ScanPage {
+                entries: vec![folder(
+                    "folder-a",
+                    "folder-b",
+                    "Notes/Child/Loop",
+                    "rev-loop",
+                )],
+                next_page_token: None,
+            },
+            6,
+        ),
+        Err(Error::InvalidRemoteEntry)
+    ));
+    assert_eq!(store.remote_entry_count().unwrap(), 2);
+    assert_eq!(store.scan_request().unwrap().unwrap().folder_id, "folder-b");
+}
+
+#[test]
+fn restart_after_scan_before_changes_resumes_drain() {
+    let fixture = Fixture::new();
+    {
+        let mut store = fixture.open();
+        store
+            .bind_remote_root(&binding("account-a", "remote-root"), 1)
+            .unwrap();
+        store.begin_initial_scan("start-1", 2).unwrap();
+        store
+            .apply_scan_page(
+                None,
+                &ScanPage {
+                    entries: vec![file("file-a", "A.md", "rev-a", b'a')],
+                    next_page_token: None,
+                },
+                3,
+            )
+            .unwrap();
+        assert_eq!(
+            store.vault_state().unwrap().unwrap().phase,
+            SyncPhase::Draining
+        );
+    }
+
+    let mut store = fixture.open();
+    let mut drive = MockDrive {
+        changes: VecDeque::from([(
+            "start-1".into(),
+            ChangesPage {
+                changes: Vec::new(),
+                next_page_token: None,
+                new_start_page_token: Some("durable-1".into()),
+            },
+        )]),
+        ..MockDrive::default()
+    };
+    assert_eq!(
+        advance_initial_sync(&mut store, &mut drive, 4).unwrap(),
+        InitialSyncProgress::Ready
+    );
+    assert_eq!(
+        store
+            .vault_state()
+            .unwrap()
+            .unwrap()
+            .durable_cursor
+            .as_deref(),
+        Some("durable-1")
+    );
+}
+
+#[test]
+fn mid_changes_restart_and_rejected_page_do_not_advance_cursor() {
+    let fixture = Fixture::new();
+    {
+        let mut store = fixture.open();
+        store
+            .bind_remote_root(&binding("account-a", "remote-root"), 1)
+            .unwrap();
+        store.begin_initial_scan("start-1", 2).unwrap();
+        store
+            .apply_scan_page(
+                None,
+                &ScanPage {
+                    entries: Vec::new(),
+                    next_page_token: None,
+                },
+                3,
+            )
+            .unwrap();
+        store
+            .apply_changes_page(
+                "start-1",
+                &ChangesPage {
+                    changes: Vec::new(),
+                    next_page_token: Some("changes-2".into()),
+                    new_start_page_token: None,
+                },
+                4,
+            )
+            .unwrap();
+    }
+
+    let mut store = fixture.open();
+    assert_eq!(
+        store
+            .vault_state()
+            .unwrap()
+            .unwrap()
+            .changes_page_token
+            .as_deref(),
+        Some("changes-2")
+    );
+    assert!(matches!(
+        store.apply_changes_page(
+            "changes-2",
+            &ChangesPage {
+                changes: Vec::new(),
+                next_page_token: Some("next".into()),
+                new_start_page_token: Some("ambiguous".into()),
+            },
+            5,
+        ),
+        Err(Error::InvalidRemoteEntry)
+    ));
+    assert_eq!(
+        store
+            .vault_state()
+            .unwrap()
+            .unwrap()
+            .changes_page_token
+            .as_deref(),
+        Some("changes-2")
+    );
+}
+
+#[test]
+fn expired_changes_cursor_marks_rescan_required_without_remote_mutation() {
+    let fixture = Fixture::new();
+    let mut store = ready_store(&fixture);
+    // Return to a draining state through a fresh, read-only initial scan.
+    store.mark_rescan_required(10).unwrap();
+    store.begin_initial_scan("start-2", 11).unwrap();
+    store
+        .apply_scan_page(
+            None,
+            &ScanPage {
+                entries: Vec::new(),
+                next_page_token: None,
+            },
+            12,
+        )
+        .unwrap();
+    let mut drive = MockDrive::default();
+    assert!(matches!(
+        advance_initial_sync(&mut store, &mut drive, 13),
+        Err(Error::Remote(_))
+    ));
+    // A provider's explicit expired-cursor code gets a dedicated disposition.
+    let mut expired = ExpiredCursorDrive;
+    assert!(matches!(
+        advance_initial_sync(&mut store, &mut expired, 14),
+        Err(Error::RescanRequired)
+    ));
+    let state = store.vault_state().unwrap().unwrap();
+    assert_eq!(state.phase, SyncPhase::NeedStartToken);
+    assert!(state.rescan_required);
+    assert!(state.durable_cursor.is_none());
+}
+
+#[test]
 fn restart_resumes_from_last_committed_scan_page() {
     let fixture = Fixture::new();
     {
         let mut store = fixture.open();
-        store.bind_remote_root("remote-root", 1).unwrap();
+        store
+            .bind_remote_root(&binding("account-a", "remote-root"), 1)
+            .unwrap();
         store.begin_initial_scan("start-1", 2).unwrap();
         store
             .apply_scan_page(
@@ -295,7 +668,9 @@ fn restart_resumes_from_last_committed_scan_page() {
 fn rejected_page_does_not_advance_and_same_page_can_be_requested_again() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
-    store.bind_remote_root("remote-root", 1).unwrap();
+    store
+        .bind_remote_root(&binding("account-a", "remote-root"), 1)
+        .unwrap();
     store.begin_initial_scan("start-1", 2).unwrap();
     let mut invalid = MockDrive {
         scans: VecDeque::from([(
@@ -333,23 +708,52 @@ fn rejected_page_does_not_advance_and_same_page_can_be_requested_again() {
 #[test]
 fn duplicate_remote_paths_remain_visible_as_separate_candidates() {
     let fixture = Fixture::new();
-    let mut store = fixture.open();
-    store.bind_remote_root("remote-root", 1).unwrap();
-    store.begin_initial_scan("start-1", 2).unwrap();
-    store
-        .apply_scan_page(
-            None,
-            &ScanPage {
-                entries: vec![
-                    file("duplicate-a", "duplicate.md", "rev-a", b'a'),
-                    file("duplicate-b", "duplicate.md", "rev-b", b'b'),
-                ],
-                next_page_token: None,
-            },
-            3,
-        )
-        .unwrap();
-    assert_eq!(store.remote_entry_count().unwrap(), 2);
+    {
+        let mut store = fixture.open();
+        store
+            .bind_remote_root(&binding("account-a", "remote-root"), 1)
+            .unwrap();
+        store.begin_initial_scan("start-1", 2).unwrap();
+        store
+            .apply_scan_page(
+                None,
+                &ScanPage {
+                    entries: vec![
+                        file("duplicate-a", "duplicate.md", "rev-a", b'a'),
+                        file("duplicate-b", "duplicate.md", "rev-b", b'b'),
+                        file("unique", "unique.md", "rev-c", b'c'),
+                    ],
+                    next_page_token: None,
+                },
+                3,
+            )
+            .unwrap();
+    }
+    let store = fixture.open();
+    let first = store.remote_preview(None, 1).unwrap();
+    assert!(first.has_more);
+    assert_eq!(first.total_entries, 3);
+    assert_eq!(first.colliding_entries, 2);
+    assert_eq!(first.entries[0].file_id, "duplicate-a");
+    assert!(first.entries[0].path_collision);
+    let second = store.remote_preview(first.next_after.as_ref(), 1).unwrap();
+    assert_eq!(second.entries[0].file_id, "duplicate-b");
+    assert!(second.entries[0].path_collision);
+    let final_page = store.remote_preview(second.next_after.as_ref(), 1).unwrap();
+    assert_eq!(final_page.entries[0].file_id, "unique");
+    assert!(!final_page.entries[0].path_collision);
+    assert!(!final_page.has_more);
+    assert_eq!(store.remote_entry_count().unwrap(), 3);
+    assert!(matches!(
+        store.remote_preview(
+            Some(&RemotePreviewCursor {
+                path: "../escape".into(),
+                file_id: "duplicate-a".into(),
+            }),
+            1,
+        ),
+        Err(Error::InvalidPreviewCursor)
+    ));
 }
 
 #[test]
@@ -697,24 +1101,138 @@ fn applying_local_mutation_survives_restart_and_requires_reconciliation() {
 
 #[test]
 fn different_remote_binding_is_rejected_without_mutation() {
+    assert!(matches!(
+        VerifiedRemoteBinding::new("account-a", "remote-a", "account-b", "remote-a"),
+        Err(Error::BindingIdentityMismatch)
+    ));
+    assert!(matches!(
+        VerifiedRemoteBinding::new("account-a", "Vault", "account-a", "remote-a"),
+        Err(Error::BindingIdentityMismatch)
+    ));
     let fixture = Fixture::new();
     let mut store = fixture.open();
     assert_eq!(
-        store.bind_remote_root("remote-a", 1).unwrap(),
+        store
+            .bind_remote_root(&binding("account-a", "remote-a"), 1)
+            .unwrap(),
         BindOutcome::Created
     );
     assert_eq!(
-        store.bind_remote_root("remote-a", 2).unwrap(),
+        store
+            .bind_remote_root(&binding("account-a", "remote-a"), 2)
+            .unwrap(),
         BindOutcome::AlreadyBound
     );
     assert!(matches!(
-        store.bind_remote_root("remote-b", 3),
+        store.bind_remote_root(&binding("account-a", "remote-b"), 3),
+        Err(Error::BindingCollision)
+    ));
+    assert!(matches!(
+        store.verify_remote_binding(&binding("account-b", "remote-a")),
         Err(Error::BindingCollision)
     ));
     assert_eq!(
         store.vault_state().unwrap().unwrap().remote_root_id,
         "remote-a"
     );
+}
+
+#[test]
+fn v1_migration_preserves_evidence_and_requires_verified_account_then_rescan() {
+    let fixture = Fixture::new();
+    let database_path = {
+        let mut store = fixture.open();
+        store
+            .bind_remote_root(&binding("account-before-migration", "remote-root"), 1)
+            .unwrap();
+        store.begin_initial_scan("legacy-start", 2).unwrap();
+        store
+            .apply_scan_page(
+                None,
+                &ScanPage {
+                    entries: vec![file("legacy-file", "legacy.md", "legacy-rev", b'a')],
+                    next_page_token: None,
+                },
+                3,
+            )
+            .unwrap();
+        store.database_path().to_path_buf()
+    };
+    downgrade_database_to_v1(&database_path);
+
+    let mut store = fixture.open();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    let migrated = store.vault_state().unwrap().unwrap();
+    assert_eq!(migrated.account_id, None);
+    assert_eq!(migrated.remote_root_id, "remote-root");
+    assert_eq!(migrated.phase, SyncPhase::NeedStartToken);
+    assert!(migrated.rescan_required);
+    assert_eq!(store.remote_entry_count().unwrap(), 1);
+    let mut drive = MockDrive {
+        start_token: Some("must-not-be-fetched".into()),
+        ..MockDrive::default()
+    };
+    assert!(matches!(
+        advance_initial_sync(&mut store, &mut drive, 4),
+        Err(Error::BindingRequiresAccount)
+    ));
+    assert!(drive.calls.is_empty());
+    assert!(matches!(
+        store.bind_remote_root(&binding("account-a", "different-root"), 5),
+        Err(Error::BindingCollision)
+    ));
+    assert_eq!(
+        store
+            .bind_remote_root(&binding("account-a", "remote-root"), 6)
+            .unwrap(),
+        BindOutcome::LegacyBindingConfirmed
+    );
+    assert_eq!(
+        store.vault_state().unwrap().unwrap().account_id.as_deref(),
+        Some("account-a")
+    );
+    store.begin_initial_scan("fresh-start", 7).unwrap();
+    assert_eq!(store.remote_entry_count().unwrap(), 0);
+    assert!(!store.vault_state().unwrap().unwrap().rescan_required);
+}
+
+#[test]
+fn malformed_v1_schema_is_preserved_and_not_partially_migrated() {
+    let fixture = Fixture::new();
+    let database_path = {
+        let store = fixture.open();
+        store.database_path().to_path_buf()
+    };
+    downgrade_database_to_v1(&database_path);
+    let connection = rusqlite::Connection::open(&database_path).unwrap();
+    connection
+        .execute_batch(
+            "DROP INDEX remote_entries_path_idx;
+             CREATE INDEX remote_entries_path_idx ON remote_entries(parent_id);",
+        )
+        .unwrap();
+    drop(connection);
+    let before = fs::read(&database_path).unwrap();
+
+    assert!(matches!(
+        SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+        Err(Error::InvalidSchema)
+    ));
+    assert_eq!(fs::read(&database_path).unwrap(), before);
+    let connection = rusqlite::Connection::open(&database_path).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 1);
+    let new_table_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'scan_frontier'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(new_table_count, 0);
 }
 
 #[test]

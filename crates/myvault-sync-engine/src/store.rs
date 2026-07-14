@@ -1,7 +1,8 @@
 use crate::{
     parse_uuid, u64_to_i64, validate_content_path, validate_redacted_code, validate_remote_id,
     validate_remote_token, validate_revision, ChangesPage, Error, RemoteChange, RemoteEntry,
-    RemoteEntryKind, Result, ScanPage, SyncPhase,
+    RemoteEntryKind, Result, ScanPage, ScanRequest, SyncPhase, VerifiedRemoteBinding,
+    MAX_SCAN_FRONTIER_FOLDERS,
 };
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
@@ -18,7 +19,7 @@ const VAULTS_DIRECTORY: &str = "vaults";
 const LEASE_NAME: &str = "sync-operation.lock";
 const DATABASE_NAME: &str = "myvault-sync.sqlite3";
 
-const VAULT_STATE_SCHEMA: &str = "CREATE TABLE vault_state (
+const VAULT_STATE_SCHEMA_V1: &str = "CREATE TABLE vault_state (
     singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
     vault_id TEXT NOT NULL UNIQUE,
     remote_root_id TEXT NOT NULL,
@@ -28,6 +29,19 @@ const VAULT_STATE_SCHEMA: &str = "CREATE TABLE vault_state (
     changes_page_token TEXT,
     durable_cursor TEXT,
     updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= 0)
+)";
+const VAULT_STATE_SCHEMA: &str = "CREATE TABLE vault_state (
+    singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+    vault_id TEXT NOT NULL UNIQUE,
+    remote_root_id TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK (phase IN ('need_start_token', 'scanning', 'draining', 'ready')),
+    start_token TEXT,
+    scan_page_token TEXT,
+    changes_page_token TEXT,
+    durable_cursor TEXT,
+    updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= 0),
+    account_id TEXT,
+    rescan_required INTEGER NOT NULL CHECK (rescan_required IN (0, 1))
 )";
 const REMOTE_ENTRIES_SCHEMA: &str = "CREATE TABLE remote_entries (
     file_id TEXT PRIMARY KEY NOT NULL,
@@ -43,6 +57,14 @@ const REMOTE_ENTRIES_SCHEMA: &str = "CREATE TABLE remote_entries (
 )";
 const REMOTE_ENTRIES_INDEX_SCHEMA: &str =
     "CREATE INDEX remote_entries_path_idx ON remote_entries(portable_path COLLATE BINARY)";
+const REMOTE_ENTRIES_PREVIEW_INDEX_SCHEMA: &str = "CREATE INDEX remote_entries_preview_idx
+    ON remote_entries(portable_path COLLATE BINARY, file_id COLLATE BINARY)";
+const SCAN_FRONTIER_SCHEMA: &str = "CREATE TABLE scan_frontier (
+    sequence INTEGER PRIMARY KEY NOT NULL,
+    folder_id TEXT NOT NULL UNIQUE,
+    portable_path TEXT NOT NULL,
+    page_token TEXT
+)";
 const SYNC_JOBS_SCHEMA: &str = "CREATE TABLE sync_jobs (
     operation_id TEXT PRIMARY KEY NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('upload', 'download', 'move', 'trash')),
@@ -78,8 +100,8 @@ const CHANGE_BATCH_MUTATIONS_SCHEMA: &str = "CREATE TABLE change_batch_mutations
     FOREIGN KEY (batch_id) REFERENCES change_batch(batch_id) ON DELETE CASCADE
 )";
 
-const SCHEMA_OBJECTS: [(&str, &str, &str); 8] = [
-    ("table", "vault_state", VAULT_STATE_SCHEMA),
+const SCHEMA_OBJECTS_V1: [(&str, &str, &str); 8] = [
+    ("table", "vault_state", VAULT_STATE_SCHEMA_V1),
     ("table", "remote_entries", REMOTE_ENTRIES_SCHEMA),
     (
         "index",
@@ -97,7 +119,33 @@ const SCHEMA_OBJECTS: [(&str, &str, &str); 8] = [
     ),
 ];
 
-pub const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_OBJECTS: [(&str, &str, &str); 10] = [
+    ("table", "vault_state", VAULT_STATE_SCHEMA),
+    ("table", "remote_entries", REMOTE_ENTRIES_SCHEMA),
+    (
+        "index",
+        "remote_entries_path_idx",
+        REMOTE_ENTRIES_INDEX_SCHEMA,
+    ),
+    (
+        "index",
+        "remote_entries_preview_idx",
+        REMOTE_ENTRIES_PREVIEW_INDEX_SCHEMA,
+    ),
+    ("table", "scan_frontier", SCAN_FRONTIER_SCHEMA),
+    ("table", "sync_jobs", SYNC_JOBS_SCHEMA),
+    ("index", "sync_jobs_due_idx", SYNC_JOBS_INDEX_SCHEMA),
+    ("table", "sync_history", SYNC_HISTORY_SCHEMA),
+    ("table", "change_batch", CHANGE_BATCH_SCHEMA),
+    (
+        "table",
+        "change_batch_mutations",
+        CHANGE_BATCH_MUTATIONS_SCHEMA,
+    ),
+];
+
+pub const SCHEMA_VERSION: i64 = 2;
+pub const MAX_REMOTE_PREVIEW_PAGE_SIZE: usize = 200;
 
 /// Exact residual risk inherited from bundled `SQLite`'s ambient-path VFS.
 pub const SQLITE_OPEN_RESIDUAL_RISK: &str = "bundled SQLite opens ambient paths; a custom descriptor-relative VFS is required to resist a hostile same-user directory rename during sqlite3_open_v2";
@@ -106,18 +154,46 @@ pub const SQLITE_OPEN_RESIDUAL_RISK: &str = "bundled SQLite opens ambient paths;
 pub enum BindOutcome {
     Created,
     AlreadyBound,
+    LegacyBindingConfirmed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VaultSyncState {
     pub vault_id: Uuid,
+    pub account_id: Option<String>,
     pub remote_root_id: String,
     pub phase: SyncPhase,
     pub start_token: Option<String>,
     pub scan_page_token: Option<String>,
     pub changes_page_token: Option<String>,
     pub durable_cursor: Option<String>,
+    pub rescan_required: bool,
     pub updated_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemotePreviewCursor {
+    pub path: String,
+    pub file_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemotePreviewEntry {
+    pub file_id: String,
+    pub parent_id: String,
+    pub path: String,
+    pub kind: RemoteEntryKind,
+    pub path_collision: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemotePreviewPage {
+    pub entries: Vec<RemotePreviewEntry>,
+    pub next_after: Option<RemotePreviewCursor>,
+    pub has_more: bool,
+    pub total_entries: u64,
+    pub colliding_entries: u64,
+    pub rescan_required: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -469,29 +545,52 @@ impl SyncStore {
     /// Rejects invalid IDs or a different existing remote binding.
     pub fn bind_remote_root(
         &mut self,
-        remote_root_id: &str,
+        binding: &VerifiedRemoteBinding,
         now_unix_ms: u64,
     ) -> Result<BindOutcome> {
-        validate_remote_id(remote_root_id)?;
         let now = u64_to_i64(now_unix_ms)?;
         let transaction = self.connection.transaction()?;
         if let Some(state) = load_state(&transaction, self.vault_id)? {
-            if state.remote_root_id == remote_root_id {
+            if state.remote_root_id != binding.remote_root_id() {
+                return Err(Error::BindingCollision);
+            }
+            if let Some(account_id) = state.account_id {
+                if account_id != binding.account_id() {
+                    return Err(Error::BindingCollision);
+                }
                 transaction.commit()?;
                 return Ok(BindOutcome::AlreadyBound);
             }
-            return Err(Error::BindingCollision);
+            transaction.execute(
+                "UPDATE vault_state
+                 SET account_id = ?1, phase = ?2, start_token = NULL,
+                     scan_page_token = NULL, changes_page_token = NULL,
+                     durable_cursor = NULL, rescan_required = 1,
+                     updated_at_unix_ms = ?3
+                 WHERE singleton = 1 AND remote_root_id = ?4 AND account_id IS NULL",
+                params![
+                    binding.account_id(),
+                    SyncPhase::NeedStartToken.as_str(),
+                    now,
+                    binding.remote_root_id()
+                ],
+            )?;
+            transaction.execute("DELETE FROM scan_frontier", [])?;
+            transaction.commit()?;
+            return Ok(BindOutcome::LegacyBindingConfirmed);
         }
         transaction.execute(
             "INSERT INTO vault_state(
                 singleton, vault_id, remote_root_id, phase, start_token,
-                scan_page_token, changes_page_token, durable_cursor, updated_at_unix_ms
-             ) VALUES (1, ?1, ?2, ?3, NULL, NULL, NULL, NULL, ?4)",
+                scan_page_token, changes_page_token, durable_cursor, updated_at_unix_ms,
+                account_id, rescan_required
+             ) VALUES (1, ?1, ?2, ?3, NULL, NULL, NULL, NULL, ?4, ?5, 0)",
             params![
                 self.vault_id.to_string(),
-                remote_root_id,
+                binding.remote_root_id(),
                 SyncPhase::NeedStartToken.as_str(),
-                now
+                now,
+                binding.account_id()
             ],
         )?;
         transaction.commit()?;
@@ -506,6 +605,19 @@ impl SyncStore {
         load_state(&self.connection, self.vault_id)
     }
 
+    /// Verifies that the active durable binding matches the provider identity.
+    ///
+    /// # Errors
+    /// Rejects an absent, unverified, or different account/root binding.
+    pub fn verify_remote_binding(&self, binding: &VerifiedRemoteBinding) -> Result<()> {
+        let state = self.vault_state()?.ok_or(Error::InvalidStateTransition)?;
+        let account_id = state.account_id.ok_or(Error::BindingRequiresAccount)?;
+        if account_id != binding.account_id() || state.remote_root_id != binding.remote_root_id() {
+            return Err(Error::BindingCollision);
+        }
+        Ok(())
+    }
+
     /// Persists the pre-scan Changes token and enters `Scanning`.
     ///
     /// # Errors
@@ -518,11 +630,21 @@ impl SyncStore {
         if state.phase != SyncPhase::NeedStartToken {
             return Err(Error::InvalidStateTransition);
         }
+        if state.account_id.is_none() {
+            return Err(Error::BindingRequiresAccount);
+        }
         transaction.execute("DELETE FROM remote_entries", [])?;
+        transaction.execute("DELETE FROM scan_frontier", [])?;
+        transaction.execute(
+            "INSERT INTO scan_frontier(sequence, folder_id, portable_path, page_token)
+             VALUES (1, ?1, '', NULL)",
+            [state.remote_root_id.as_str()],
+        )?;
         let changed = transaction.execute(
             "UPDATE vault_state
              SET phase = ?1, start_token = ?2, scan_page_token = NULL,
-                 changes_page_token = NULL, durable_cursor = NULL, updated_at_unix_ms = ?3
+                 changes_page_token = NULL, durable_cursor = NULL, rescan_required = 0,
+                 updated_at_unix_ms = ?3
              WHERE singleton = 1 AND vault_id = ?4 AND phase = ?5",
             params![
                 SyncPhase::Scanning.as_str(),
@@ -537,6 +659,42 @@ impl SyncStore {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Returns the next durable direct-child folder request.
+    ///
+    /// # Errors
+    /// Rejects missing, malformed, or cursor-inconsistent frontier evidence.
+    pub fn scan_request(&self) -> Result<Option<ScanRequest>> {
+        let state = self.vault_state()?.ok_or(Error::InvalidStateTransition)?;
+        if state.phase != SyncPhase::Scanning {
+            return Ok(None);
+        }
+        let request = self
+            .connection
+            .query_row(
+                "SELECT folder_id, portable_path, page_token
+                 FROM scan_frontier ORDER BY sequence LIMIT 1",
+                [],
+                |row| {
+                    Ok(ScanRequest {
+                        folder_id: row.get(0)?,
+                        folder_path: row.get(1)?,
+                        page_token: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(Error::InvalidSchema)?;
+        validate_remote_id(&request.folder_id)?;
+        validate_frontier_path(&request.folder_path)?;
+        if let Some(token) = &request.page_token {
+            validate_remote_token(token)?;
+        }
+        if state.scan_page_token != request.page_token {
+            return Err(Error::CursorMismatch);
+        }
+        Ok(Some(request))
     }
 
     /// Applies one recursive scan page and advances its page token atomically.
@@ -562,24 +720,47 @@ impl SyncStore {
         if state.scan_page_token.as_deref() != expected_page_token {
             return Err(Error::CursorMismatch);
         }
+        let current = load_frontier_head(&transaction)?.ok_or(Error::InvalidSchema)?;
+        if current.page_token.as_deref() != expected_page_token {
+            return Err(Error::CursorMismatch);
+        }
+        validate_scan_page_children(&transaction, &state.remote_root_id, &current, page)?;
         for entry in &page.entries {
             upsert_remote_entry(&transaction, entry)?;
         }
+        enqueue_child_folders(&transaction, &current, &page.entries)?;
         if let Some(next) = &page.next_page_token {
+            transaction.execute(
+                "UPDATE scan_frontier SET page_token = ?1 WHERE sequence = ?2",
+                params![next, current.sequence],
+            )?;
             transaction.execute(
                 "UPDATE vault_state SET scan_page_token = ?1, updated_at_unix_ms = ?2
                  WHERE singleton = 1",
                 params![next, now],
             )?;
         } else {
-            let start = state.start_token.ok_or(Error::InvalidStateTransition)?;
             transaction.execute(
-                "UPDATE vault_state
-                 SET phase = ?1, scan_page_token = NULL, changes_page_token = ?2,
-                     updated_at_unix_ms = ?3
-                 WHERE singleton = 1",
-                params![SyncPhase::Draining.as_str(), start, now],
+                "DELETE FROM scan_frontier WHERE sequence = ?1",
+                [current.sequence],
             )?;
+            let next_frontier = load_frontier_head(&transaction)?;
+            if let Some(next_request) = next_frontier {
+                transaction.execute(
+                    "UPDATE vault_state SET scan_page_token = ?1, updated_at_unix_ms = ?2
+                     WHERE singleton = 1",
+                    params![next_request.page_token, now],
+                )?;
+            } else {
+                let start = state.start_token.ok_or(Error::InvalidStateTransition)?;
+                transaction.execute(
+                    "UPDATE vault_state
+                     SET phase = ?1, scan_page_token = NULL, changes_page_token = ?2,
+                         updated_at_unix_ms = ?3
+                     WHERE singleton = 1",
+                    params![SyncPhase::Draining.as_str(), start, now],
+                )?;
+            }
         }
         transaction.commit()?;
         Ok(())
@@ -644,6 +825,110 @@ impl SyncStore {
     /// Returns a database error or invalid count error.
     pub fn remote_entry_count(&self) -> Result<u64> {
         query_count(&self.connection, "SELECT COUNT(*) FROM remote_entries")
+    }
+
+    /// Returns one bounded, deterministic remote metadata preview page.
+    ///
+    /// # Errors
+    /// Rejects an invalid cursor/page size or malformed persisted evidence.
+    pub fn remote_preview(
+        &self,
+        after: Option<&RemotePreviewCursor>,
+        limit: usize,
+    ) -> Result<RemotePreviewPage> {
+        if !(1..=MAX_REMOTE_PREVIEW_PAGE_SIZE).contains(&limit) {
+            return Err(Error::InvalidPreviewLimit);
+        }
+        if let Some(cursor) = after {
+            validate_content_path(&cursor.path).map_err(|_| Error::InvalidPreviewCursor)?;
+            validate_remote_id(&cursor.file_id).map_err(|_| Error::InvalidPreviewCursor)?;
+        }
+        let state = self.vault_state()?.ok_or(Error::InvalidStateTransition)?;
+        let fetch_limit = i64::try_from(limit + 1).map_err(|_| Error::InvalidPreviewLimit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT entry.file_id, entry.parent_id, entry.portable_path, entry.kind,
+                    EXISTS(
+                        SELECT 1 FROM remote_entries duplicate
+                        WHERE duplicate.portable_path = entry.portable_path
+                          AND duplicate.file_id <> entry.file_id
+                    )
+             FROM remote_entries entry
+             WHERE (?1 IS NULL OR entry.portable_path > ?1
+                    OR (entry.portable_path = ?1 AND entry.file_id > ?2))
+             ORDER BY entry.portable_path COLLATE BINARY, entry.file_id COLLATE BINARY
+             LIMIT ?3",
+        )?;
+        let (after_path, after_id) = after.map_or((None, None), |cursor| {
+            (Some(cursor.path.as_str()), Some(cursor.file_id.as_str()))
+        });
+        let mut entries = statement
+            .query_map(params![after_path, after_id, fetch_limit], |row| {
+                let kind: String = row.get(3)?;
+                Ok(RemotePreviewEntry {
+                    file_id: row.get(0)?,
+                    parent_id: row.get(1)?,
+                    path: row.get(2)?,
+                    kind: if kind == "file" {
+                        RemoteEntryKind::File
+                    } else {
+                        RemoteEntryKind::Folder
+                    },
+                    path_collision: row.get::<_, i64>(4)? != 0,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let has_more = entries.len() > limit;
+        if has_more {
+            entries.pop();
+        }
+        let next_after = if has_more {
+            let last = entries.last().ok_or(Error::InvalidSchema)?;
+            Some(RemotePreviewCursor {
+                path: last.path.clone(),
+                file_id: last.file_id.clone(),
+            })
+        } else {
+            None
+        };
+        let total_entries = self.remote_entry_count()?;
+        let colliding_entries = query_count(
+            &self.connection,
+            "SELECT COUNT(*) FROM remote_entries entry
+             WHERE EXISTS(
+                SELECT 1 FROM remote_entries duplicate
+                WHERE duplicate.portable_path = entry.portable_path
+                  AND duplicate.file_id <> entry.file_id
+             )",
+        )?;
+        Ok(RemotePreviewPage {
+            entries,
+            next_after,
+            has_more,
+            total_entries,
+            colliding_entries,
+            rescan_required: state.rescan_required,
+        })
+    }
+
+    /// Invalidates scan cursors while preserving remote metadata as stale preview evidence.
+    ///
+    /// # Errors
+    /// Rejects missing binding state, invalid timestamps, or storage failures.
+    pub fn mark_rescan_required(&mut self, now_unix_ms: u64) -> Result<()> {
+        let now = u64_to_i64(now_unix_ms)?;
+        let transaction = self.connection.transaction()?;
+        require_state(&transaction, self.vault_id)?;
+        transaction.execute("DELETE FROM scan_frontier", [])?;
+        transaction.execute(
+            "UPDATE vault_state
+             SET phase = ?1, start_token = NULL, scan_page_token = NULL,
+                 changes_page_token = NULL, durable_cursor = NULL,
+                 rescan_required = 1, updated_at_unix_ms = ?2
+             WHERE singleton = 1",
+            params![SyncPhase::NeedStartToken.as_str(), now],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Enqueues a validated operation with exact-idempotent retry semantics.
@@ -1128,16 +1413,21 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         if existing != 0 {
             return Err(Error::InvalidSchema);
         }
-        create_schema_v1(&transaction)?;
+        create_schema(&transaction)?;
+    } else if current == 1 {
+        if !schema_v1_is_valid(&transaction)? {
+            return Err(Error::InvalidSchema);
+        }
+        migrate_v1_to_v2(&transaction)?;
     }
-    if !schema_v1_is_valid(&transaction)? {
+    if !schema_v2_is_valid(&transaction)? {
         return Err(Error::InvalidSchema);
     }
     transaction.commit()?;
     Ok(())
 }
 
-fn create_schema_v1(transaction: &Transaction<'_>) -> Result<()> {
+fn create_schema(transaction: &Transaction<'_>) -> Result<()> {
     for (_, _, statement) in SCHEMA_OBJECTS {
         transaction.execute_batch(statement)?;
     }
@@ -1145,8 +1435,40 @@ fn create_schema_v1(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v1_to_v2(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "ALTER TABLE vault_state RENAME TO vault_state_v1;
+         CREATE TABLE vault_state (
+            singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+            vault_id TEXT NOT NULL UNIQUE,
+            remote_root_id TEXT NOT NULL,
+            phase TEXT NOT NULL CHECK (phase IN ('need_start_token', 'scanning', 'draining', 'ready')),
+            start_token TEXT,
+            scan_page_token TEXT,
+            changes_page_token TEXT,
+            durable_cursor TEXT,
+            updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= 0),
+            account_id TEXT,
+            rescan_required INTEGER NOT NULL CHECK (rescan_required IN (0, 1))
+         );
+         INSERT INTO vault_state(
+            singleton, vault_id, remote_root_id, phase, start_token,
+            scan_page_token, changes_page_token, durable_cursor, updated_at_unix_ms,
+            account_id, rescan_required
+         )
+         SELECT singleton, vault_id, remote_root_id, 'need_start_token', NULL,
+                NULL, NULL, NULL, updated_at_unix_ms, NULL, 1
+         FROM vault_state_v1;
+         DROP TABLE vault_state_v1;",
+    )?;
+    transaction.execute_batch(REMOTE_ENTRIES_PREVIEW_INDEX_SCHEMA)?;
+    transaction.execute_batch(SCAN_FRONTIER_SCHEMA)?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
 fn schema_v1_is_valid(connection: &Connection) -> Result<bool> {
-    if !schema_definitions_are_exact(connection)? {
+    if !schema_definitions_are_exact(connection, &SCHEMA_OBJECTS_V1)? {
         return Ok(false);
     }
     let mut statement = connection.prepare(
@@ -1171,6 +1493,58 @@ fn schema_v1_is_valid(connection: &Connection) -> Result<bool> {
     if !primary_schema_columns_are_valid(connection)?
         || !auxiliary_schema_columns_are_valid(connection)?
         || !index_has_columns(connection, "remote_entries_path_idx", &["portable_path"])?
+        || !index_has_columns(
+            connection,
+            "sync_jobs_due_idx",
+            &[
+                "state",
+                "next_attempt_at_unix_ms",
+                "created_at_unix_ms",
+                "operation_id",
+            ],
+        )?
+    {
+        return Ok(false);
+    }
+    let foreign_key_errors: i64 =
+        connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    Ok(foreign_key_errors == 0)
+}
+
+fn schema_v2_is_valid(connection: &Connection) -> Result<bool> {
+    if !schema_definitions_are_exact(connection, &SCHEMA_OBJECTS)? {
+        return Ok(false);
+    }
+    let mut statement = connection.prepare(
+        "SELECT name FROM sqlite_master
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+         ORDER BY name",
+    )?;
+    let tables = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let expected = [
+        "change_batch",
+        "change_batch_mutations",
+        "remote_entries",
+        "scan_frontier",
+        "sync_history",
+        "sync_jobs",
+        "vault_state",
+    ];
+    if tables.iter().map(String::as_str).ne(expected) {
+        return Ok(false);
+    }
+    if !primary_schema_columns_are_valid_v2(connection)?
+        || !auxiliary_schema_columns_are_valid(connection)?
+        || !index_has_columns(connection, "remote_entries_path_idx", &["portable_path"])?
+        || !index_has_columns(
+            connection,
+            "remote_entries_preview_idx",
+            &["portable_path", "file_id"],
+        )?
         || !index_has_columns(
             connection,
             "sync_jobs_due_idx",
@@ -1240,6 +1614,66 @@ fn primary_schema_columns_are_valid(connection: &Connection) -> Result<bool> {
     )?)
 }
 
+fn primary_schema_columns_are_valid_v2(connection: &Connection) -> Result<bool> {
+    Ok(table_has_columns(
+        connection,
+        "vault_state",
+        &[
+            ("singleton", "INTEGER", true, 1),
+            ("vault_id", "TEXT", true, 0),
+            ("remote_root_id", "TEXT", true, 0),
+            ("phase", "TEXT", true, 0),
+            ("start_token", "TEXT", false, 0),
+            ("scan_page_token", "TEXT", false, 0),
+            ("changes_page_token", "TEXT", false, 0),
+            ("durable_cursor", "TEXT", false, 0),
+            ("updated_at_unix_ms", "INTEGER", true, 0),
+            ("account_id", "TEXT", false, 0),
+            ("rescan_required", "INTEGER", true, 0),
+        ],
+    )? && table_has_columns(
+        connection,
+        "remote_entries",
+        &[
+            ("file_id", "TEXT", true, 1),
+            ("parent_id", "TEXT", true, 0),
+            ("portable_path", "TEXT", true, 0),
+            ("kind", "TEXT", true, 0),
+            ("content_hash_algorithm", "TEXT", false, 0),
+            ("content_hash", "TEXT", false, 0),
+            ("remote_revision", "TEXT", true, 0),
+            ("base_local_revision", "TEXT", false, 0),
+            ("base_remote_revision", "TEXT", false, 0),
+            ("base_content_hash", "TEXT", false, 0),
+        ],
+    )? && table_has_columns(
+        connection,
+        "scan_frontier",
+        &[
+            ("sequence", "INTEGER", true, 1),
+            ("folder_id", "TEXT", true, 0),
+            ("portable_path", "TEXT", true, 0),
+            ("page_token", "TEXT", false, 0),
+        ],
+    )? && table_has_columns(
+        connection,
+        "sync_jobs",
+        &[
+            ("operation_id", "TEXT", true, 1),
+            ("kind", "TEXT", true, 0),
+            ("path", "TEXT", true, 0),
+            ("destination_path", "TEXT", false, 0),
+            ("remote_file_id", "TEXT", false, 0),
+            ("expected_local_revision", "TEXT", false, 0),
+            ("state", "TEXT", true, 0),
+            ("attempt_count", "INTEGER", true, 0),
+            ("next_attempt_at_unix_ms", "INTEGER", true, 0),
+            ("created_at_unix_ms", "INTEGER", true, 0),
+            ("last_error_code", "TEXT", false, 0),
+        ],
+    )?)
+}
+
 fn auxiliary_schema_columns_are_valid(connection: &Connection) -> Result<bool> {
     Ok(table_has_columns(
         connection,
@@ -1270,7 +1704,10 @@ fn auxiliary_schema_columns_are_valid(connection: &Connection) -> Result<bool> {
     )?)
 }
 
-fn schema_definitions_are_exact(connection: &Connection) -> Result<bool> {
+fn schema_definitions_are_exact(
+    connection: &Connection,
+    expected_schema: &[(&str, &str, &str)],
+) -> Result<bool> {
     let actual_objects = {
         let mut statement = connection.prepare(
             "SELECT type, name FROM sqlite_master
@@ -1284,7 +1721,7 @@ fn schema_definitions_are_exact(connection: &Connection) -> Result<bool> {
             .collect::<std::result::Result<BTreeSet<_>, _>>()?;
         objects
     };
-    let expected_objects = SCHEMA_OBJECTS
+    let expected_objects = expected_schema
         .iter()
         .map(|(kind, name, _)| ((*kind).to_owned(), (*name).to_owned()))
         .collect::<BTreeSet<_>>();
@@ -1292,7 +1729,7 @@ fn schema_definitions_are_exact(connection: &Connection) -> Result<bool> {
         return Ok(false);
     }
 
-    for (kind, name, expected_sql) in SCHEMA_OBJECTS {
+    for (kind, name, expected_sql) in expected_schema {
         let actual_sql = connection
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
@@ -1357,7 +1794,8 @@ fn load_state(connection: &Connection, expected_vault_id: Uuid) -> Result<Option
     let row = connection
         .query_row(
             "SELECT vault_id, remote_root_id, phase, start_token, scan_page_token,
-                    changes_page_token, durable_cursor, updated_at_unix_ms
+                    changes_page_token, durable_cursor, updated_at_unix_ms,
+                    account_id, rescan_required
              FROM vault_state WHERE singleton = 1",
             [],
             |row| {
@@ -1370,6 +1808,8 @@ fn load_state(connection: &Connection, expected_vault_id: Uuid) -> Result<Option
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, i64>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, i64>(9)?,
                 ))
             },
         )
@@ -1383,6 +1823,8 @@ fn load_state(connection: &Connection, expected_vault_id: Uuid) -> Result<Option
         changes_page_token,
         durable_cursor,
         updated_at,
+        account_id,
+        rescan_required,
     )) = row
     else {
         return Ok(None);
@@ -1392,6 +1834,9 @@ fn load_state(connection: &Connection, expected_vault_id: Uuid) -> Result<Option
         return Err(Error::BindingCollision);
     }
     validate_remote_id(&remote_root_id)?;
+    if let Some(account_id) = &account_id {
+        validate_remote_id(account_id)?;
+    }
     for token in [
         start_token.as_deref(),
         scan_page_token.as_deref(),
@@ -1404,16 +1849,152 @@ fn load_state(connection: &Connection, expected_vault_id: Uuid) -> Result<Option
         validate_remote_token(token)?;
     }
     let updated_at_unix_ms = u64::try_from(updated_at).map_err(|_| Error::InvalidSchema)?;
+    let rescan_required = match rescan_required {
+        0 => false,
+        1 => true,
+        _ => return Err(Error::InvalidSchema),
+    };
     Ok(Some(VaultSyncState {
         vault_id,
+        account_id,
         remote_root_id,
         phase: SyncPhase::parse(&phase)?,
         start_token,
         scan_page_token,
         changes_page_token,
         durable_cursor,
+        rescan_required,
         updated_at_unix_ms,
     }))
+}
+
+#[derive(Clone)]
+struct FrontierRow {
+    sequence: i64,
+    folder_id: String,
+    portable_path: String,
+    page_token: Option<String>,
+}
+
+fn load_frontier_head(connection: &Connection) -> Result<Option<FrontierRow>> {
+    Ok(connection
+        .query_row(
+            "SELECT sequence, folder_id, portable_path, page_token
+             FROM scan_frontier ORDER BY sequence LIMIT 1",
+            [],
+            |row| {
+                Ok(FrontierRow {
+                    sequence: row.get(0)?,
+                    folder_id: row.get(1)?,
+                    portable_path: row.get(2)?,
+                    page_token: row.get(3)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn validate_frontier_path(path: &str) -> Result<()> {
+    if path.is_empty() {
+        Ok(())
+    } else {
+        validate_content_path(path)
+    }
+}
+
+fn validate_scan_page_children(
+    transaction: &Transaction<'_>,
+    remote_root_id: &str,
+    current: &FrontierRow,
+    page: &ScanPage,
+) -> Result<()> {
+    let mut identities = BTreeSet::new();
+    for entry in &page.entries {
+        entry.validate()?;
+        if entry.parent_id != current.folder_id || !identities.insert(entry.file_id.as_str()) {
+            return Err(Error::InvalidRemoteEntry);
+        }
+        let relative = if current.portable_path.is_empty() {
+            entry.path.as_str()
+        } else {
+            entry
+                .path
+                .strip_prefix(&current.portable_path)
+                .and_then(|value| value.strip_prefix('/'))
+                .ok_or(Error::InvalidRemoteEntry)?
+        };
+        if relative.is_empty() || relative.contains('/') {
+            return Err(Error::InvalidRemoteEntry);
+        }
+        if entry.kind == RemoteEntryKind::Folder {
+            if entry.file_id == remote_root_id {
+                return Err(Error::InvalidRemoteEntry);
+            }
+            let already_seen = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM remote_entries WHERE file_id = ?1)",
+                [entry.file_id.as_str()],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if already_seen {
+                return Err(Error::InvalidRemoteEntry);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn enqueue_child_folders(
+    transaction: &Transaction<'_>,
+    current: &FrontierRow,
+    entries: &[RemoteEntry],
+) -> Result<()> {
+    let mut next_sequence: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(sequence), 0) FROM scan_frontier",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut frontier_count: usize = transaction
+        .query_row("SELECT COUNT(*) FROM scan_frontier", [], |row| {
+            row.get::<_, i64>(0)
+        })?
+        .try_into()
+        .map_err(|_| Error::InvalidRemoteEntry)?;
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.kind == RemoteEntryKind::Folder)
+    {
+        if entry.file_id == current.folder_id {
+            return Err(Error::InvalidRemoteEntry);
+        }
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT portable_path FROM scan_frontier WHERE folder_id = ?1",
+                [entry.file_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(path) = existing {
+            if path != entry.path {
+                return Err(Error::InvalidRemoteEntry);
+            }
+            continue;
+        }
+        next_sequence = next_sequence
+            .checked_add(1)
+            .ok_or(Error::InvalidRemoteEntry)?;
+        frontier_count = frontier_count
+            .checked_add(1)
+            .ok_or(Error::InvalidRemoteEntry)?;
+        if frontier_count > MAX_SCAN_FRONTIER_FOLDERS {
+            return Err(Error::InvalidRemoteEntry);
+        }
+        transaction.execute(
+            "INSERT INTO scan_frontier(sequence, folder_id, portable_path, page_token)
+             VALUES (?1, ?2, ?3, NULL)",
+            params![next_sequence, entry.file_id, entry.path],
+        )?;
+    }
+    Ok(())
 }
 
 fn require_state(connection: &Connection, expected_vault_id: Uuid) -> Result<VaultSyncState> {
