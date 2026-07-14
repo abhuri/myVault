@@ -8,10 +8,53 @@ use tauri::{
     plugin::{Builder, TauriPlugin},
     Manager, Runtime,
 };
+use uuid::Uuid;
 
 #[cfg(target_os = "android")]
 mod mobile;
 mod policy;
+
+#[cfg(any(target_os = "android", test))]
+const SAF_VAULT_NAMESPACE: Uuid = Uuid::from_u128(0xf3d7_7615_8097_5c85_9a33_6b3f_62ae_d477);
+
+/// Native-only proof that one exact persisted SAF tree was active when the
+/// capability was issued. It intentionally has no serialization surface and
+/// redacts its stable root identity from debug output.
+#[derive(Clone, Eq, PartialEq)]
+pub struct SafVaultCapability {
+    root_identity_hex: String,
+    vault_id: Uuid,
+}
+
+impl SafVaultCapability {
+    #[cfg(any(target_os = "android", test))]
+    fn from_root_identity(root_identity_hex: String) -> Result<Self, SafError> {
+        let identity = decode_root_identity(&root_identity_hex).ok_or(SafError::NativeBridge)?;
+        Ok(Self {
+            root_identity_hex,
+            vault_id: Uuid::new_v5(&SAF_VAULT_NAMESPACE, &identity),
+        })
+    }
+
+    #[cfg(target_os = "android")]
+    fn expected_root_identity_hex(&self) -> &str {
+        &self.root_identity_hex
+    }
+
+    /// Returns the stable per-tree UUID used only for native per-Vault state.
+    #[must_use]
+    pub const fn vault_id(&self) -> Uuid {
+        self.vault_id
+    }
+}
+
+impl std::fmt::Debug for SafVaultCapability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SafVaultCapability")
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -89,6 +132,7 @@ pub enum SafSaveError {
     NoteNotFound,
     InvalidPath,
     InvalidRequest,
+    VaultUnavailable,
     WriteOutcomeUnknown,
     NativeBridge,
 }
@@ -102,6 +146,7 @@ pub enum SafTransferError {
     InvalidRequest,
     DigestMismatch,
     ResourceLimit,
+    VaultUnavailable,
     UnsupportedReplace,
     WriteOutcomeUnknown,
     NativeBridge,
@@ -112,6 +157,7 @@ pub enum SafTransferError {
 #[cfg(target_os = "android")]
 struct NativeStatus {
     active: bool,
+    root_identity_hex: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -119,19 +165,29 @@ struct NativeStatus {
 #[cfg(target_os = "android")]
 struct NativeChoice {
     outcome: String,
+    root_identity_hex: Option<String>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg(target_os = "android")]
 struct PathRequest<'a> {
+    expected_root_identity_hex: &'a str,
     path: &'a str,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg(target_os = "android")]
+struct RootRequest<'a> {
+    expected_root_identity_hex: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg(target_os = "android")]
 struct SaveRequest<'a> {
+    expected_root_identity_hex: &'a str,
     path: &'a str,
     text: &'a str,
     expected_revision_hex: &'a str,
@@ -142,6 +198,7 @@ struct SaveRequest<'a> {
 #[serde(rename_all = "camelCase")]
 #[cfg(target_os = "android")]
 struct BinaryWriteRequest<'a> {
+    expected_root_identity_hex: &'a str,
     path: &'a str,
     bytes_base64: String,
     sha256_hex: &'a str,
@@ -209,38 +266,76 @@ fn map_plugin_error(error: tauri::plugin::mobile::PluginInvokeError) -> SafError
 }
 
 #[cfg(target_os = "android")]
+fn map_transfer_plugin_error(error: tauri::plugin::mobile::PluginInvokeError) -> SafTransferError {
+    match map_plugin_error(error) {
+        SafError::InvalidPath => SafTransferError::InvalidPath,
+        SafError::NoteNotFound => SafTransferError::NotFound,
+        SafError::ResourceLimit => SafTransferError::ResourceLimit,
+        SafError::VaultUnavailable => SafTransferError::VaultUnavailable,
+        SafError::NoteNotUtf8
+        | SafError::PickerBusy
+        | SafError::PickerUnavailable
+        | SafError::PickerPermission
+        | SafError::PickerFailed
+        | SafError::NativeBridge => SafTransferError::NativeBridge,
+    }
+}
+
+#[cfg(target_os = "android")]
 pub struct VaultSaf<R: Runtime>(tauri::plugin::PluginHandle<R>);
 
 #[cfg(target_os = "android")]
 impl<R: Runtime> VaultSaf<R> {
-    pub fn has_root(&self) -> Result<bool, SafError> {
+    /// Returns a native-only capability for the exact currently persisted SAF
+    /// root, or `None` when permission/root validation is unavailable.
+    pub fn active_root(&self) -> Result<Option<SafVaultCapability>, SafError> {
         let value: NativeStatus = self
             .0
             .run_mobile_plugin("status", ())
             .map_err(map_plugin_error)?;
-        Ok(value.active)
+        native_capability(value.active, value.root_identity_hex)
     }
 
-    pub fn choose_root(&self) -> Result<bool, SafError> {
+    /// Runs the native picker and returns the exact activated SAF capability.
+    pub fn choose_root(&self) -> Result<Option<SafVaultCapability>, SafError> {
         let value: NativeChoice = self
             .0
             .run_mobile_plugin("chooseRoot", ())
             .map_err(map_plugin_error)?;
-        Ok(value.outcome == "activated")
+        match value.outcome.as_str() {
+            "cancelled" if value.root_identity_hex.is_none() => Ok(None),
+            "activated" => value
+                .root_identity_hex
+                .ok_or(SafError::NativeBridge)
+                .and_then(SafVaultCapability::from_root_identity)
+                .map(Some),
+            _ => Err(SafError::NativeBridge),
+        }
     }
 
-    pub fn inventory(&self) -> Result<SafInventory, SafError> {
+    pub fn inventory(&self, vault: &SafVaultCapability) -> Result<SafInventory, SafError> {
         self.0
-            .run_mobile_plugin("inventory", ())
+            .run_mobile_plugin(
+                "inventory",
+                RootRequest {
+                    expected_root_identity_hex: vault.expected_root_identity_hex(),
+                },
+            )
             .map_err(map_plugin_error)
     }
 
-    pub fn read_note(&self, path: &str) -> Result<SafNote, SafError> {
+    pub fn read_note(&self, vault: &SafVaultCapability, path: &str) -> Result<SafNote, SafError> {
         if !policy::is_valid_note_path(path) {
             return Err(SafError::InvalidPath);
         }
         self.0
-            .run_mobile_plugin("readNote", PathRequest { path })
+            .run_mobile_plugin(
+                "readNote",
+                PathRequest {
+                    expected_root_identity_hex: vault.expected_root_identity_hex(),
+                    path,
+                },
+            )
             .map_err(map_plugin_error)
     }
 
@@ -253,6 +348,7 @@ impl<R: Runtime> VaultSaf<R> {
     /// and any ambiguous failure is reported as `WriteOutcomeUnknown`.
     pub fn save_note(
         &self,
+        vault: &SafVaultCapability,
         path: &str,
         text: &str,
         expected_revision_hex: &str,
@@ -266,6 +362,7 @@ impl<R: Runtime> VaultSaf<R> {
             .run_mobile_plugin(
                 "saveNote",
                 SaveRequest {
+                    expected_root_identity_hex: vault.expected_root_identity_hex(),
                     path,
                     text,
                     expected_revision_hex,
@@ -281,6 +378,7 @@ impl<R: Runtime> VaultSaf<R> {
             "staleRevision" => Err(SafSaveError::StaleRevision),
             "noteNotFound" => Err(SafSaveError::NoteNotFound),
             "invalidRequest" => Err(SafSaveError::InvalidRequest),
+            "vaultUnavailable" => Err(SafSaveError::VaultUnavailable),
             "writeOutcomeUnknown" => Err(SafSaveError::WriteOutcomeUnknown),
             _ => Err(SafSaveError::NativeBridge),
         }
@@ -288,14 +386,25 @@ impl<R: Runtime> VaultSaf<R> {
 
     /// Reads one bounded binary document through the held SAF tree. The body
     /// remains native-only and is decoded only after exact length validation.
-    pub fn read_binary(&self, path: &str, max_bytes: usize) -> Result<SafBinary, SafTransferError> {
+    pub fn read_binary(
+        &self,
+        vault: &SafVaultCapability,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<SafBinary, SafTransferError> {
         if !policy::is_valid_portable_path(path) {
             return Err(SafTransferError::InvalidPath);
         }
         let response: NativeBinary = self
             .0
-            .run_mobile_plugin("readBinary", PathRequest { path })
-            .map_err(|_| SafTransferError::NativeBridge)?;
+            .run_mobile_plugin(
+                "readBinary",
+                PathRequest {
+                    expected_root_identity_hex: vault.expected_root_identity_hex(),
+                    path,
+                },
+            )
+            .map_err(map_transfer_plugin_error)?;
         let bytes = decode_base64_bounded(&response.bytes_base64, max_bytes)?;
         if bytes.len() as u64 != response.byte_len {
             return Err(SafTransferError::NativeBridge);
@@ -311,11 +420,12 @@ impl<R: Runtime> VaultSaf<R> {
     /// portable path and verifies the exact bytes by native readback.
     pub fn create_binary(
         &self,
+        vault: &SafVaultCapability,
         path: &str,
         bytes: &[u8],
         sha256_hex: &str,
     ) -> Result<SafSave, SafTransferError> {
-        self.write_binary(path, bytes, sha256_hex)
+        self.write_binary(vault, path, bytes, sha256_hex)
     }
 
     /// Validates replacement arguments, then fails closed without invoking the
@@ -323,6 +433,7 @@ impl<R: Runtime> VaultSaf<R> {
     /// so R2 does not replace existing transfer targets.
     pub fn replace_binary_if_revision(
         &self,
+        _vault: &SafVaultCapability,
         path: &str,
         bytes: &[u8],
         sha256_hex: &str,
@@ -342,6 +453,7 @@ impl<R: Runtime> VaultSaf<R> {
 
     fn write_binary(
         &self,
+        vault: &SafVaultCapability,
         path: &str,
         bytes: &[u8],
         sha256_hex: &str,
@@ -357,6 +469,7 @@ impl<R: Runtime> VaultSaf<R> {
             .run_mobile_plugin(
                 "createBinary",
                 BinaryWriteRequest {
+                    expected_root_identity_hex: vault.expected_root_identity_hex(),
                     path,
                     bytes_base64: encode_base64(bytes),
                     sha256_hex,
@@ -376,6 +489,7 @@ impl<R: Runtime> VaultSaf<R> {
             "notFound" => Err(SafTransferError::NotFound),
             "digestMismatch" => Err(SafTransferError::DigestMismatch),
             "resourceLimit" => Err(SafTransferError::ResourceLimit),
+            "vaultUnavailable" => Err(SafTransferError::VaultUnavailable),
             "unsupportedReplace" => Err(SafTransferError::UnsupportedReplace),
             "invalidRequest" => Err(SafTransferError::InvalidRequest),
             "writeOutcomeUnknown" => Err(SafTransferError::WriteOutcomeUnknown),
@@ -386,6 +500,41 @@ impl<R: Runtime> VaultSaf<R> {
 
 #[cfg(target_os = "android")]
 const MAX_NATIVE_TRANSFER_BYTES: usize = 16 * 1024 * 1024;
+
+#[cfg(any(target_os = "android", test))]
+fn native_capability(
+    active: bool,
+    root_identity_hex: Option<String>,
+) -> Result<Option<SafVaultCapability>, SafError> {
+    match (active, root_identity_hex) {
+        (false, None) => Ok(None),
+        (true, Some(identity)) => SafVaultCapability::from_root_identity(identity).map(Some),
+        _ => Err(SafError::NativeBridge),
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn decode_root_identity(value: &str) -> Option<[u8; 32]> {
+    if !is_canonical_digest(value) {
+        return None;
+    }
+    let mut output = [0_u8; 32];
+    for (target, pair) in output.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        let high = base16_value(pair[0])?;
+        let low = base16_value(pair[1])?;
+        *target = (high << 4) | low;
+    }
+    Some(output)
+}
+
+#[cfg(any(target_os = "android", test))]
+fn base16_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
 
 #[cfg(any(target_os = "android", test))]
 fn is_canonical_digest(value: &str) -> bool {
@@ -502,6 +651,41 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
 #[cfg(test)]
 mod transfer_tests {
     use super::*;
+
+    #[test]
+    fn root_capability_is_stable_distinct_and_debug_redacted() {
+        let first_identity = "01".repeat(32);
+        let second_identity = "02".repeat(32);
+        let first = SafVaultCapability::from_root_identity(first_identity.clone()).unwrap();
+        let restarted = SafVaultCapability::from_root_identity(first_identity.clone()).unwrap();
+        let second = SafVaultCapability::from_root_identity(second_identity.clone()).unwrap();
+
+        assert_eq!(first, restarted);
+        assert_eq!(first.vault_id(), restarted.vault_id());
+        assert_ne!(first, second);
+        assert_ne!(first.vault_id(), second.vault_id());
+        let debug = format!("{first:?}");
+        assert_eq!(debug, "SafVaultCapability { .. }");
+        assert!(!debug.contains(&first_identity));
+        assert!(!debug.contains(&first.vault_id().to_string()));
+    }
+
+    #[test]
+    fn native_root_evidence_is_exact_and_canonical() {
+        let identity = "ab".repeat(32);
+        assert!(native_capability(false, None).unwrap().is_none());
+        assert!(native_capability(true, Some(identity)).unwrap().is_some());
+        for malformed in [
+            None,
+            Some(String::new()),
+            Some("AB".repeat(32)),
+            Some("ab".repeat(31)),
+            Some("gg".repeat(32)),
+        ] {
+            assert!(native_capability(true, malformed).is_err());
+        }
+        assert!(native_capability(false, Some("ab".repeat(32))).is_err());
+    }
 
     #[test]
     fn native_base64_round_trips_zero_unicode_and_large_binary() {

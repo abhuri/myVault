@@ -24,10 +24,17 @@ import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicBoolean
 
 @InvokeArg
-internal class PathArgs { lateinit var path: String }
+internal class RootArgs { lateinit var expectedRootIdentityHex: String }
+
+@InvokeArg
+internal class PathArgs {
+    lateinit var expectedRootIdentityHex: String
+    lateinit var path: String
+}
 
 @InvokeArg
 internal class SaveArgs {
+    lateinit var expectedRootIdentityHex: String
     lateinit var path: String
     lateinit var text: String
     lateinit var expectedRevisionHex: String
@@ -36,6 +43,7 @@ internal class SaveArgs {
 
 @InvokeArg
 internal class BinaryWriteArgs {
+    lateinit var expectedRootIdentityHex: String
     lateinit var path: String
     lateinit var bytesBase64: String
     lateinit var sha256Hex: String
@@ -60,6 +68,11 @@ internal fun comparePortablePathsUtf8(left: String, right: String): Int {
     return leftBytes.size.compareTo(rightBytes.size)
 }
 
+internal fun stableRootIdentityHex(rootUri: String): String = MessageDigest
+    .getInstance("SHA-256")
+    .digest((ROOT_IDENTITY_DOMAIN + rootUri).toByteArray(StandardCharsets.UTF_8))
+    .joinToString("") { "%02x".format(it) }
+
 @TauriPlugin
 class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
     private val resolver = activity.applicationContext.contentResolver
@@ -69,8 +82,17 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun status(invoke: Invoke) {
-        val response = JSObject()
-        response.put("active", persistedRoot() != null)
+        val response = synchronized(ioLock) {
+            try {
+                val root = persistedRoot() ?: return@synchronized inactiveRootResponse()
+                DocumentsContract.getTreeDocumentId(root)
+                queryChildren(root, DocumentsContract.getTreeDocumentId(root))
+                activeRootResponse(root)
+            } catch (_: Exception) {
+                clearRoot()
+                inactiveRootResponse()
+            }
+        }
         invoke.resolve(response)
     }
 
@@ -115,23 +137,27 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.reject("The selected folder did not grant read and write access", "PICKER_PERMISSION")
             return
         }
-        val previousRoot = persistedRoot()
         val permissionAlreadyPersisted = hasPersistedReadWritePermission(uri)
         var newlyAcquiredPermission = false
         var activationCommitted = false
         try {
             resolver.takePersistableUriPermission(uri, flags)
             newlyAcquiredPermission = !permissionAlreadyPersisted
-            // Validate that the tree root is queryable before replacing the old capability.
-            DocumentsContract.getTreeDocumentId(uri)
-            queryChildren(uri, DocumentsContract.getTreeDocumentId(uri))
-            if (!preferences.edit().putString(ROOT_KEY, uri.toString()).commit()) {
-                throw IllegalStateException("root preference was not persisted")
+            val response = synchronized(ioLock) {
+                val previousRoot = persistedRoot()
+                // Validate that the tree root is queryable before replacing the old capability.
+                DocumentsContract.getTreeDocumentId(uri)
+                queryChildren(uri, DocumentsContract.getTreeDocumentId(uri))
+                if (!preferences.edit().putString(ROOT_KEY, uri.toString()).commit()) {
+                    throw IllegalStateException("root preference was not persisted")
+                }
+                activationCommitted = true
+                if (previousRoot != null && previousRoot != uri) releasePermissionQuietly(previousRoot)
+                JSObject().apply {
+                    put("outcome", "activated")
+                    put("rootIdentityHex", rootIdentity(uri))
+                }
             }
-            activationCommitted = true
-            if (previousRoot != null && previousRoot != uri) releasePermissionQuietly(previousRoot)
-            val response = JSObject()
-            response.put("outcome", "activated")
             invoke.resolve(response)
         } catch (_: Exception) {
             if (newlyAcquiredPermission && !activationCommitted) releasePermissionQuietly(uri)
@@ -141,11 +167,18 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun inventory(invoke: Invoke) {
+        val expectedRootIdentity = try { invoke.parseArgs(RootArgs::class.java).expectedRootIdentityHex }
+        catch (_: Exception) {
+            invoke.reject("Vault capability is invalid", "VAULT_UNAVAILABLE")
+            return
+        }
         try {
-            val response = synchronized(ioLock) { buildInventory(requireRoot()) }
+            val response = synchronized(ioLock) { buildInventory(requireRoot(expectedRootIdentity)) }
             invoke.resolve(response)
+        } catch (_: RootMismatchException) {
+            invoke.reject("Vault capability is stale", "VAULT_UNAVAILABLE")
         } catch (_: SecurityException) {
-            clearRoot()
+            clearRootIfMatches(expectedRootIdentity)
             invoke.reject("Vault permission is unavailable", "VAULT_UNAVAILABLE")
         } catch (_: LimitException) {
             invoke.reject("Vault inventory exceeds the safety limit", "RESOURCE_LIMIT")
@@ -156,19 +189,26 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun readNote(invoke: Invoke) {
-        val path = try { canonicalNotePath(invoke.parseArgs(PathArgs::class.java).path) }
+        val args = try { invoke.parseArgs(PathArgs::class.java) }
+        catch (_: Exception) {
+            invoke.reject("Invalid note path", "INVALID_PATH")
+            return
+        }
+        val path = try { canonicalNotePath(args.path) }
         catch (_: Exception) {
             invoke.reject("Invalid note path", "INVALID_PATH")
             return
         }
         try {
             val response = synchronized(ioLock) {
-                val root = requireRoot()
+                val root = requireRoot(args.expectedRootIdentityHex)
                 val document = resolveDocument(root, path) ?: throw MissingException()
                 if (document.mime == DocumentsContract.Document.MIME_TYPE_DIR) throw MissingException()
                 noteResponse(readBounded(root, document.documentId))
             }
             invoke.resolve(response)
+        } catch (_: RootMismatchException) {
+            invoke.reject("Vault capability is stale", "VAULT_UNAVAILABLE")
         } catch (_: MissingException) {
             invoke.reject("Note was not found", "NOTE_NOT_FOUND")
         } catch (_: CharacterCodingException) {
@@ -176,7 +216,7 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
         } catch (_: LimitException) {
             invoke.reject("Note exceeds the safety limit", "RESOURCE_LIMIT")
         } catch (_: SecurityException) {
-            clearRoot()
+            clearRootIfMatches(args.expectedRootIdentityHex)
             invoke.reject("Vault permission is unavailable", "VAULT_UNAVAILABLE")
         } catch (_: Exception) {
             invoke.reject("Note is unavailable", "VAULT_UNAVAILABLE")
@@ -202,7 +242,7 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
         }
         try {
             val response = synchronized(ioLock) {
-                val root = requireRoot()
+                val root = requireRoot(args.expectedRootIdentityHex)
                 val document = resolveDocument(root, path) ?: throw MissingException()
                 val current = readBounded(root, document.documentId)
                 if (current.size.toLong() != args.expectedByteLen || digest(current) != args.expectedRevisionHex) {
@@ -224,6 +264,8 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
                 noteResponse(verify).apply { put("outcome", "saved") }
             }
             invoke.resolve(response)
+        } catch (_: RootMismatchException) {
+            invoke.resolve(saveOutcome("vaultUnavailable"))
         } catch (_: StaleException) {
             invoke.resolve(saveOutcome("staleRevision"))
         } catch (_: UnknownWriteException) {
@@ -231,7 +273,7 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
         } catch (_: MissingException) {
             invoke.resolve(saveOutcome("noteNotFound"))
         } catch (_: SecurityException) {
-            clearRoot()
+            clearRootIfMatches(args.expectedRootIdentityHex)
             invoke.resolve(saveOutcome("writeOutcomeUnknown"))
         } catch (_: Exception) {
             invoke.resolve(saveOutcome("writeOutcomeUnknown"))
@@ -240,25 +282,32 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun readBinary(invoke: Invoke) {
-        val path = try { canonicalPortablePath(invoke.parseArgs(PathArgs::class.java).path) }
+        val args = try { invoke.parseArgs(PathArgs::class.java) }
+        catch (_: Exception) {
+            invoke.reject("Invalid transfer path", "INVALID_PATH")
+            return
+        }
+        val path = try { canonicalPortablePath(args.path) }
         catch (_: Exception) {
             invoke.reject("Invalid transfer path", "INVALID_PATH")
             return
         }
         try {
             val response = synchronized(ioLock) {
-                val root = requireRoot()
+                val root = requireRoot(args.expectedRootIdentityHex)
                 val document = resolveDocument(root, path) ?: throw MissingException()
                 if (document.mime == DocumentsContract.Document.MIME_TYPE_DIR) throw MissingException()
                 binaryResponse(readBounded(root, document.documentId))
             }
             invoke.resolve(response)
+        } catch (_: RootMismatchException) {
+            invoke.reject("Vault capability is stale", "VAULT_UNAVAILABLE")
         } catch (_: MissingException) {
             invoke.reject("Transfer object was not found", "NOTE_NOT_FOUND")
         } catch (_: LimitException) {
             invoke.reject("Transfer object exceeds the safety limit", "RESOURCE_LIMIT")
         } catch (_: SecurityException) {
-            clearRoot()
+            clearRootIfMatches(args.expectedRootIdentityHex)
             invoke.reject("Vault permission is unavailable", "VAULT_UNAVAILABLE")
         } catch (_: Exception) {
             invoke.reject("Transfer object is unavailable", "VAULT_UNAVAILABLE")
@@ -301,10 +350,12 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
         }
         try {
             val response = synchronized(ioLock) {
-                val root = requireRoot()
+                val root = requireRoot(args.expectedRootIdentityHex)
                 createBinaryDocument(root, path, replacement)
             }
             invoke.resolve(response)
+        } catch (_: RootMismatchException) {
+            invoke.resolve(saveOutcome("vaultUnavailable"))
         } catch (_: ExistingException) {
             invoke.resolve(saveOutcome("alreadyExists"))
         } catch (_: MissingException) {
@@ -314,7 +365,7 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
         } catch (_: UnknownWriteException) {
             invoke.resolve(saveOutcome("writeOutcomeUnknown"))
         } catch (_: SecurityException) {
-            clearRoot()
+            clearRootIfMatches(args.expectedRootIdentityHex)
             invoke.resolve(saveOutcome("writeOutcomeUnknown"))
         } catch (_: Exception) {
             invoke.resolve(saveOutcome("writeOutcomeUnknown"))
@@ -516,7 +567,32 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
         return uri
     }
 
-    private fun requireRoot(): Uri = persistedRoot() ?: throw SecurityException("no root")
+    private fun requireRoot(expectedRootIdentityHex: String): Uri {
+        if (!REVISION.matches(expectedRootIdentityHex)) throw RootMismatchException()
+        val root = persistedRoot() ?: throw SecurityException("no root")
+        if (rootIdentity(root) != expectedRootIdentityHex) throw RootMismatchException()
+        return root
+    }
+
+    private fun activeRootResponse(root: Uri): JSObject = JSObject().apply {
+        put("active", true)
+        put("rootIdentityHex", rootIdentity(root))
+    }
+
+    private fun inactiveRootResponse(): JSObject = JSObject().apply {
+        put("active", false)
+    }
+
+    private fun rootIdentity(root: Uri): String = stableRootIdentityHex(root.toString())
+
+    private fun clearRootIfMatches(expectedRootIdentityHex: String) {
+        synchronized(ioLock) {
+            val persisted = preferences.getString(ROOT_KEY, null) ?: return@synchronized
+            val currentIdentity = stableRootIdentityHex(Uri.parse(persisted).toString())
+            if (currentIdentity == expectedRootIdentityHex) clearRoot()
+        }
+    }
+
     private fun clearRoot() { preferences.edit().remove(ROOT_KEY).commit() }
     private fun digest(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
 
@@ -526,6 +602,7 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
     private class ExistingException : Exception()
     private class UnknownWriteException : Exception()
     private class CharacterCodingException : Exception()
+    private class RootMismatchException : Exception()
 
     companion object {
         private const val ROOT_KEY = "root-uri"
@@ -536,3 +613,5 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
         private val REVISION = Regex("^[0-9a-f]{64}$")
     }
 }
+
+private const val ROOT_IDENTITY_DOMAIN = "myvault:saf-root:v1\u0000"
