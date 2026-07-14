@@ -2436,6 +2436,7 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "myvault-core",
+ "myvault-platform-fs",
  "myvault-private-fs",
  "myvault-snapshots",
  "serde",

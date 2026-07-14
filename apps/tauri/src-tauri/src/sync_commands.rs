@@ -24,6 +24,7 @@ pub enum SyncCommandCode {
     AuthRequired,
     BindingMismatch,
     RescanRequired,
+    Busy,
     ProviderUnavailable,
     StorageUnavailable,
     Internal,
@@ -368,7 +369,8 @@ mod platform {
     use myvault_drive::{AccessToken, ReadOnlyDrive, TransferDrive};
     use myvault_sync_engine::{
         advance_initial_sync, BindOutcome, RemotePreviewEntry, SyncStore, TransferDirection,
-        TransferMimeClass, TransferRecord, TransferRegistrationOutcome, VaultSyncState,
+        TransferMimeClass, TransferPhase, TransferRecord, TransferRegistrationOutcome,
+        VaultSyncState,
     };
     use myvault_transfer::{WorkOutcome, Worker, MAX_TRANSFER_BYTES};
     use std::{
@@ -401,11 +403,53 @@ mod platform {
         connected_account_id: Option<String>,
         root_name: Option<String>,
         active: Option<ActiveSync>,
+        transfer_running_session: Option<VaultSessionId>,
     }
 
     struct ActiveSync {
         session_id: VaultSessionId,
         store: SyncStore,
+    }
+
+    struct DetachedActiveSync {
+        runtime: Arc<SyncRuntime>,
+        active: Option<ActiveSync>,
+    }
+
+    impl DetachedActiveSync {
+        fn store_mut(&mut self) -> Result<&mut SyncStore, SyncCommandError> {
+            self.active
+                .as_mut()
+                .map(|active| &mut active.store)
+                .ok_or_else(SyncCommandError::internal)
+        }
+
+        fn restore(mut self) -> Result<(), SyncCommandError> {
+            self.restore_inner()
+        }
+
+        fn restore_inner(&mut self) -> Result<(), SyncCommandError> {
+            let Some(active) = self.active.take() else {
+                return Ok(());
+            };
+            let mut inner = self
+                .runtime
+                .inner
+                .lock()
+                .map_err(|_| SyncCommandError::internal())?;
+            if inner.active.is_some() || inner.transfer_running_session != Some(active.session_id) {
+                return Err(SyncCommandError::internal());
+            }
+            inner.active = Some(active);
+            inner.transfer_running_session = None;
+            Ok(())
+        }
+    }
+
+    impl Drop for DetachedActiveSync {
+        fn drop(&mut self) {
+            let _ = self.restore_inner();
+        }
     }
 
     fn desktop_client_id() -> Result<String, SyncCommandError> {
@@ -493,6 +537,12 @@ mod platform {
         inner: &'a mut RuntimeInner,
         context: &NativeVaultContext,
     ) -> Result<&'a mut SyncStore, SyncCommandError> {
+        if inner.transfer_running_session.is_some() {
+            return Err(SyncCommandError::new(
+                SyncCommandCode::Busy,
+                "a guarded transfer is already running",
+            ));
+        }
         let same_session = inner
             .active
             .as_ref()
@@ -628,7 +678,11 @@ mod platform {
     }
 
     fn content_kind(path: &str, markdown: bool) -> TransferMimeClass {
-        if markdown || path.ends_with(".md") {
+        if markdown
+            || path
+                .rsplit_once('.')
+                .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("md"))
+        {
             TransferMimeClass::Markdown
         } else {
             TransferMimeClass::Blob
@@ -764,6 +818,33 @@ mod platform {
             .map(|entry| (entry.path.as_str(), entry.file_id.as_str()))
             .collect::<BTreeMap<_, _>>();
         let mut registered = 0_u64;
+        let reconciliation_time = now_unix_ms()?;
+
+        fn register_or_reconcile(
+            store: &mut SyncStore,
+            record: &TransferRecord,
+            reconciliation_time: u64,
+        ) -> Result<bool, SyncCommandError> {
+            match store.register_transfer(record).map_err(map_sync_error)? {
+                TransferRegistrationOutcome::Registered => Ok(true),
+                TransferRegistrationOutcome::AlreadyCompleted => Ok(false),
+                TransferRegistrationOutcome::AlreadyPresent => {
+                    let existing = store
+                        .transfer(record.operation_id)
+                        .map_err(map_sync_error)?
+                        .ok_or_else(SyncCommandError::internal)?;
+                    if existing.phase == TransferPhase::NeedsReconcile {
+                        store
+                            .requeue_transfer_for_reconciliation(
+                                record.operation_id,
+                                reconciliation_time.max(existing.updated_at_unix_ms),
+                            )
+                            .map_err(map_sync_error)?;
+                    }
+                    Ok(false)
+                }
+            }
+        }
 
         for local in local_entries {
             if local.byte_len > MAX_TRANSFER_BYTES {
@@ -840,9 +921,7 @@ mod platform {
                 0,
             )
             .map_err(map_sync_error)?;
-            if store.register_transfer(&record).map_err(map_sync_error)?
-                == TransferRegistrationOutcome::Registered
-            {
+            if register_or_reconcile(store, &record, reconciliation_time)? {
                 registered = registered.saturating_add(1);
             }
         }
@@ -891,9 +970,7 @@ mod platform {
                 0,
             )
             .map_err(map_sync_error)?;
-            if store.register_transfer(&record).map_err(map_sync_error)?
-                == TransferRegistrationOutcome::Registered
-            {
+            if register_or_reconcile(store, &record, reconciliation_time)? {
                 registered = registered.saturating_add(1);
             }
         }
@@ -1241,35 +1318,48 @@ mod platform {
             let context = service
                 .native_vault_context(session_id)
                 .map_err(map_app_error)?;
-            let mut inner = runtime
-                .inner
-                .lock()
-                .map_err(|_| SyncCommandError::internal())?;
-            let account_id = inner.connected_account_id.clone().ok_or_else(|| {
-                SyncCommandError::new(
-                    SyncCommandCode::AuthRequired,
-                    "Google authorization is required",
-                )
-            })?;
-            let bound = ensure_store(&mut inner, &context)?
-                .vault_state()
-                .map_err(map_sync_error)?
-                .ok_or_else(|| {
+            let (account_id, bound, mut detached) = {
+                let mut inner = runtime
+                    .inner
+                    .lock()
+                    .map_err(|_| SyncCommandError::internal())?;
+                let account_id = inner.connected_account_id.clone().ok_or_else(|| {
                     SyncCommandError::new(
-                        SyncCommandCode::BindingMismatch,
-                        "an exact Drive root must be bound before transfer",
+                        SyncCommandCode::AuthRequired,
+                        "Google authorization is required",
                     )
                 })?;
-            if bound.phase != SyncPhase::Ready || bound.rescan_required {
-                return Err(SyncCommandError::new(
-                    SyncCommandCode::RescanRequired,
-                    "Drive metadata must be fully scanned before transfer",
-                ));
-            }
-            require_connected_account(bound.account_id.as_deref(), &account_id)?;
-            let drive = fresh_transfer_drive(&account_id, &bound.remote_root_id)?;
-            {
-                let store = ensure_store(&mut inner, &context)?;
+                let bound = ensure_store(&mut inner, &context)?
+                    .vault_state()
+                    .map_err(map_sync_error)?
+                    .ok_or_else(|| {
+                        SyncCommandError::new(
+                            SyncCommandCode::BindingMismatch,
+                            "an exact Drive root must be bound before transfer",
+                        )
+                    })?;
+                if bound.phase != SyncPhase::Ready || bound.rescan_required {
+                    return Err(SyncCommandError::new(
+                        SyncCommandCode::RescanRequired,
+                        "Drive metadata must be fully scanned before transfer",
+                    ));
+                }
+                require_connected_account(bound.account_id.as_deref(), &account_id)?;
+                let active = inner.active.take().ok_or_else(SyncCommandError::internal)?;
+                inner.transfer_running_session = Some(session_id);
+                (
+                    account_id,
+                    bound,
+                    DetachedActiveSync {
+                        runtime: Arc::clone(&runtime),
+                        active: Some(active),
+                    },
+                )
+            };
+
+            let run_result = (|| {
+                let drive = fresh_transfer_drive(&account_id, &bound.remote_root_id)?;
+                let store = detached.store_mut()?;
                 store
                     .resume_auth_required_transfers(now_unix_ms()?)
                     .map_err(map_sync_error)?;
@@ -1294,18 +1384,14 @@ mod platform {
                         | WorkOutcome::NeedsReconcile(_) => {}
                     }
                 }
-            }
-            service
-                .confirm_active_session(session_id)
-                .map_err(map_app_error)?;
-            let (state, transfers) = {
-                let store = ensure_store(&mut inner, &context)?;
-                (
-                    store.vault_state().map_err(map_sync_error)?,
-                    store.transfer_summary().map_err(map_sync_error)?,
-                )
-            };
-            Ok(status_from(session_id, &inner, state.as_ref(), transfers))
+                service
+                    .confirm_active_session(session_id)
+                    .map_err(map_app_error)
+            })();
+            let restore_result = detached.restore();
+            run_result?;
+            restore_result?;
+            status_impl(&service, &runtime, session_id)
         })
         .await
         .map_err(|_| SyncCommandError::internal())?
@@ -1450,6 +1536,18 @@ mod platform {
         }
 
         #[test]
+        fn transfer_mime_class_accepts_markdown_extensions_case_insensitively() {
+            assert_eq!(
+                content_kind("Notes/one.MD", false),
+                TransferMimeClass::Markdown
+            );
+            assert_eq!(
+                content_kind("attachments/archive.bin", false),
+                TransferMimeClass::Blob
+            );
+        }
+
+        #[test]
         fn runtime_rejects_a_stale_session_before_opening_sync_state() {
             let temporary = tempfile::tempdir().expect("temporary roots");
             let vault_root = temporary.path().join("vault");
@@ -1516,6 +1614,48 @@ mod platform {
             assert!(status.root_name.is_none());
             assert!(!status.connected);
             assert!(status.account_id.is_none());
+        }
+
+        #[test]
+        fn detached_transfer_releases_runtime_lock_and_restores_store_on_drop() {
+            let temporary = tempfile::tempdir().expect("temporary roots");
+            let base = temporary.path().canonicalize().expect("canonical root");
+            let app_data = base.join("app-data");
+            let vault_root = base.join("vault");
+            std::fs::create_dir(&app_data).expect("app data root");
+            std::fs::create_dir(&vault_root).expect("vault root");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&app_data, std::fs::Permissions::from_mode(0o700))
+                    .expect("private app data permissions");
+            }
+            let service = AppService::with_app_data_root(&app_data);
+            let session_id = service
+                .activate_trusted_vault(
+                    Vault::open(vault_root.canonicalize().expect("canonical vault"))
+                        .expect("open vault"),
+                )
+                .expect("activate vault")
+                .session_id
+                .expect("session");
+            let runtime = Arc::new(SyncRuntime::default());
+            status_impl(&service, &runtime, session_id).expect("open sync state");
+
+            let detached = {
+                let mut inner = runtime.inner.lock().expect("runtime lock");
+                let active = inner.active.take().expect("active store");
+                inner.transfer_running_session = Some(session_id);
+                DetachedActiveSync {
+                    runtime: Arc::clone(&runtime),
+                    active: Some(active),
+                }
+            };
+
+            let busy = status_impl(&service, &runtime, session_id).expect_err("busy status");
+            assert_eq!(busy.code, SyncCommandCode::Busy);
+            drop(detached);
+            status_impl(&service, &runtime, session_id).expect("restored sync state");
         }
     }
 }
