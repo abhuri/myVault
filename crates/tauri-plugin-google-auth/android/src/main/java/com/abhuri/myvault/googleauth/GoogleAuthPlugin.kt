@@ -36,7 +36,7 @@ internal class DisconnectArgs {
 
 @TauriPlugin
 class GoogleAuthPlugin(private val activity: Activity) : Plugin(activity) {
-    private val allowedScope = "https://www.googleapis.com/auth/drive"
+    private val allowedScope = "https://www.googleapis.com/auth/drive.metadata.readonly"
     private val authorizationClient = Identity.getAuthorizationClient(activity)
     private val operationInFlight = AtomicBoolean(false)
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -64,8 +64,8 @@ class GoogleAuthPlugin(private val activity: Activity) : Plugin(activity) {
             return
         }
 
-        if (args.scopes.isEmpty() || args.scopes.any { it != allowedScope }) {
-            reject(invoke, "AUTH_INVALID_REQUEST", "Only the configured Drive scope is allowed")
+        if (args.scopes != listOf(allowedScope)) {
+            reject(invoke, "AUTH_INVALID_REQUEST", "Only the configured read-only Drive metadata scope is allowed")
             return
         }
 
@@ -187,8 +187,8 @@ class GoogleAuthPlugin(private val activity: Activity) : Plugin(activity) {
         }
 
         val grantedScopeUris = result.grantedScopes.toSet()
-        if (!grantedScopeUris.containsAll(requestedScopes)) {
-            reject(invoke, "AUTH_SCOPES_MISSING", "Google did not grant every requested scope")
+        if (grantedScopeUris != requestedScopes) {
+            reject(invoke, "AUTH_SCOPES_MISSING", "Google did not grant exactly the requested scope")
             return
         }
 

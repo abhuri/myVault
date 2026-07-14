@@ -10,6 +10,8 @@ mod models;
 pub use error::{Error, Result};
 pub use models::{AccessToken, Authorization};
 
+pub const GOOGLE_DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.metadata.readonly";
+
 use mobile::GoogleAuth;
 
 /// Native-only access to Google authorization. The handle is deliberately not
