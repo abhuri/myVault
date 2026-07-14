@@ -367,7 +367,10 @@ mod platform {
 
     const CLIENT_ID_ENV: &str = "MYVAULT_GOOGLE_DESKTOP_CLIENT_ID";
     const CLIENT_SECRET_ENV: &str = "MYVAULT_GOOGLE_DESKTOP_CLIENT_SECRET";
-    const KEYRING_SERVICE: &str = "com.abhuri.myvault.google-drive";
+    // R2 deliberately uses a new credential namespace. A refresh token granted
+    // for R1's metadata-only scope must never make the full-Drive runtime look
+    // connected without an explicit consent upgrade.
+    const KEYRING_SERVICE: &str = "com.abhuri.myvault.google-drive.r2-full-drive";
     const CALLBACK_TIMEOUT: Duration = Duration::from_secs(180);
 
     #[derive(Default)]
