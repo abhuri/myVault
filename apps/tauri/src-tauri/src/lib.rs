@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 #[allow(dead_code)]
 mod android_transfer_policy;
+#[allow(dead_code)]
+mod android_transfer_runtime;
 mod app_commands;
 mod sync_commands;
 #[cfg(not(target_os = "android"))]
