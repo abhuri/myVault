@@ -53,13 +53,20 @@ impl ReadOnlyDrive {
     pub fn google(token: AccessToken) -> Result<Self> {
         let api_base =
             Url::parse(GOOGLE_API_BASE).map_err(|_| Error::new(ErrorCode::UnexpectedOrigin))?;
-        Self::build(token, api_base, DEFAULT_MAX_RESPONSE_BYTES, true)
+        Self::build(
+            token,
+            api_base,
+            DEFAULT_MAX_RESPONSE_BYTES,
+            REQUEST_TIMEOUT,
+            true,
+        )
     }
 
     fn build(
         token: AccessToken,
         api_base: Url,
         max_response_bytes: usize,
+        request_timeout: Duration,
         https_only: bool,
     ) -> Result<Self> {
         if max_response_bytes == 0
@@ -77,7 +84,7 @@ impl ReadOnlyDrive {
         let client = Client::builder()
             .https_only(https_only)
             .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(request_timeout)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| Error::new(ErrorCode::Transport))?;
@@ -95,7 +102,21 @@ impl ReadOnlyDrive {
         if !api_base.path().ends_with('/') {
             api_base.set_path(&format!("{}/", api_base.path()));
         }
-        Self::build(token, api_base, max_response_bytes, false)
+        Self::build(token, api_base, max_response_bytes, REQUEST_TIMEOUT, false)
+    }
+
+    #[cfg(test)]
+    fn for_test_with_timeout(
+        base: &str,
+        token: AccessToken,
+        max_response_bytes: usize,
+        request_timeout: Duration,
+    ) -> Result<Self> {
+        let mut api_base = Url::parse(base).map_err(|_| Error::new(ErrorCode::InvalidInput))?;
+        if !api_base.path().ends_with('/') {
+            api_base.set_path(&format!("{}/", api_base.path()));
+        }
+        Self::build(token, api_base, max_response_bytes, request_timeout, false)
     }
 
     /// Returns Google's opaque, provider-stable account permission id.
@@ -717,6 +738,29 @@ mod tests {
     }
 
     #[test]
+    fn stalled_provider_response_maps_to_bounded_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+        });
+        let drive = ReadOnlyDrive::for_test_with_timeout(
+            &format!("http://{address}/drive/v3/"),
+            AccessToken::new(TOKEN),
+            4096,
+            Duration::from_millis(20),
+        )
+        .unwrap();
+
+        let error = drive.account_identity().unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::Timeout);
+        assert!(!format!("{error:?} {error}").contains(TOKEN));
+        server.join().unwrap();
+    }
+
+    #[test]
     fn invalid_identifiers_cannot_change_request_origin_or_path() {
         let server = Server::new();
         let drive = client(&server);
@@ -739,6 +783,21 @@ mod tests {
         assert_eq!(entry.path, "Nested/note.md");
         assert!(entry.content_hash.is_some());
         assert_eq!(entry.remote_revision.len(), 64);
+    }
+
+    #[test]
+    fn unicode_metadata_preserves_the_exact_canonical_path() {
+        let file: RemoteFile = serde_json::from_str(
+            r#"{
+                "id":"file_1","name":"บันทึก.md","mimeType":"text/markdown",
+                "parents":["root_1"],"trashed":false,"version":"8"
+            }"#,
+        )
+        .unwrap();
+
+        let entry = file.to_remote_entry("ภาษาไทย/บันทึก.md").unwrap();
+
+        assert_eq!(entry.path, "ภาษาไทย/บันทึก.md");
     }
 
     #[test]
