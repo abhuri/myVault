@@ -89,6 +89,7 @@ jobs:
           cargo test --manifest-path crates/myvault-mutations/Cargo.toml
           cargo test --manifest-path crates/myvault-snapshots/Cargo.toml
           cargo test --manifest-path crates/myvault-app-service/Cargo.toml
+          cargo test --manifest-path crates/myvault-transfer/Cargo.toml
 
       - name: Test native R1 auth and read-only Drive contracts
         run: |

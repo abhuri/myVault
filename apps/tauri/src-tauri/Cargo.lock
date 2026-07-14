@@ -2343,6 +2343,7 @@ dependencies = [
  "myvault-desktop-auth",
  "myvault-drive",
  "myvault-sync-engine",
+ "myvault-transfer",
  "notify",
  "serde",
  "serde_json",
@@ -2465,6 +2466,13 @@ dependencies = [
  "myvault-private-fs",
  "rusqlite",
  "serde",
+ "uuid",
+]
+
+[[package]]
+name = "myvault-transfer"
+version = "0.1.0"
+dependencies = [
  "uuid",
 ]
 
