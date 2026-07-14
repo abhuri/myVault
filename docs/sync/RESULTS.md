@@ -4,7 +4,7 @@ Updated 2026-07-14 Asia/Bangkok ค่ะ
 
 ## R2 — Guarded Transfer
 
-Status: `IMPLEMENTATION CANDIDATE — LIVE/CI PENDING` ค่ะ
+Status: `IMPLEMENTATION CANDIDATE — LIVE PENDING` ค่ะ
 
 R2 started from the merged R1 checkpoint `681271a` on branch
 `codex/r2-guarded-transfer` after one-time execution approval from คุณโอค่ะ The
@@ -56,12 +56,16 @@ runtime integration, but R2 is not complete until every locked Gate 0–8 item i
   move, permission mutation, generic request API, durable bearer capability or
   production dependency on `drive-sync-spike`ค่ะ
 - `pnpm audit --prod` reported no known vulnerabilitiesค่ะ
+- Draft PR #27 candidate `ed90bfb` passed quality run `29357617209`ค่ะ The
+  `quality` job completed in 14m26s and `android-compile` completed in 7m26s,
+  including the Linux Rust fault matrix, static trust-boundary audit, Android
+  APK build, Kotlin native-root tests and 16 KiB alignmentค่ะ
+- Platform run `29357617372` passed Ubuntu 22.04 AppImage in 11m27s and Windows
+  2022 NSIS in 12m19s on the same candidateค่ะ These are package/build claims,
+  not native UI acceptance claimsค่ะ
 
 ### Deliberately pending / externally blocked evidence
 
-- Platform CI must still run from the exact clean Draft PR candidateค่ะ Local
-  aggregate/APK evidence above was produced after all code and audit patches;
-  the remaining uncommitted changes at that moment were evidence documents onlyค่ะ
 - Desktop live acceptance needs OAuth client configuration supplied outside the
   repository plus an exact disposable R2 Drive account/root and disposable
   Local Vault A/B fixture recordค่ะ No desktop OAuth environment is currently

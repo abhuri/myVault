@@ -4,8 +4,8 @@
 
 Built from the R1 merge checkpoint `681271a` on
 `codex/r2-guarded-transfer`ค่ะ This milestone remains an implementation
-candidate until locked live disposable acceptance and platform CI pass on one
-exact clean HEADค่ะ
+candidate until locked live disposable acceptance passes on one exact clean
+HEADค่ะ
 
 - เพิ่ม schema v3 durable upload/download evidence, create-only operation
   markers, retry scheduling, `AuthRequired`, `NeedsReconcile`, restart recovery,
@@ -24,9 +24,11 @@ exact clean HEADค่ะ
 - ขยาย R2 offline aggregate และ CI ให้ครอบคลุม regression crates,
   Android-target strict Clippy, Kotlin policy tests, APK build/alignment และ
   platform packagesค่ะ
-- Live disposable macOS round trip, Android signed-in SAF round trip, auth
-  expiry/reacquisition, restart/offline scenarios และ final platform CI evidence
-  ยัง pending และห้ามตีความ implementation candidate เป็น release completionค่ะ
+- Quality, Android compile/alignment, Ubuntu AppImage และ Windows NSIS CI ผ่าน
+  บน Draft PR candidate แล้วค่ะ Live disposable macOS round trip, Android
+  signed-in SAF round trip, auth expiry/reacquisition และ restart/offline
+  scenarios ยัง pending และห้ามตีความ implementation candidate เป็น release
+  completionค่ะ
 
 ## Unreleased — R1 native auth and read-only binding — 2026-07-14
 

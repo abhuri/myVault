@@ -15,8 +15,8 @@ The first release targets macOS, Windows, Ubuntu, and Android through Tauri 2 wi
 - R2 Guarded Transfer อยู่ในสถานะ implementation candidate บน
   `codex/r2-guarded-transfer` ค่ะ Upload/download แบบ byte-verified,
   create-no-replace, durable retry/reconciliation และ Android SAF runtime ถูก
-  implement แล้ว แต่ locked live disposable round trip กับ platform CI ยังต้อง
-  ผ่านก่อนประกาศ complete หรือ mergeค่ะ
+  implement แล้ว และ quality/Android/Ubuntu/Windows CI ผ่านบน candidate แล้วค่ะ
+  Locked live disposable round trip ยังต้องผ่านก่อนประกาศ complete หรือ mergeค่ะ
 - Roadmap ถูกล็อกเป็น `R1 → R2 → R3 → R4 → R5 → R6 → R7 → R8` จนถึง Personal First Release โดยรายละเอียด scope และ exit gates อยู่ใน [PROJECT_PLAN.md](PROJECT_PLAN.md) ค่ะ
 
 สถานะโดยประมาณคือ 40–45% ของ personal first release เมื่อวัดจาก user-visible outcome ค่ะ รายละเอียดทิศทางและ capability gaps อยู่ใน [PROJECT_PLAN.md](PROJECT_PLAN.md) ส่วน Git checkpoint, verification ล่าสุด และงานถัดไปอยู่ใน [SESSION_HANDOFF.md](SESSION_HANDOFF.md) ค่ะ

@@ -40,13 +40,15 @@ Updated 2026-07-14 Asia/Bangkok ค่ะ
 - R2 implementation candidate มี guarded content upload/download, durable
   transfer state, create-no-replace local publication, exact-root Drive
   mutation boundary, desktop local observation และ Android SAF guarded runtime
-  แล้วค่ะ Locked live disposable acceptance และ platform CI ยังไม่ผ่านครบค่ะ
+  แล้วค่ะ Quality, Android, Ubuntu และ Windows CI ผ่านบน Draft PR candidate
+  แล้วค่ะ Locked live disposable acceptance ยังไม่ผ่านครบค่ะ
 - Conflict engine และ full Sync control-plane UI ยังเป็นงาน R3–R4 ค่ะ
 
 ## 4. Verification — R2 Candidate Audit
 
-สถานะนี้เป็น post-audit local integration evidenceค่ะ Draft PR CI และ locked
-live disposable acceptance ยังต้องผ่านก่อนเปลี่ยน PR เป็น Readyค่ะ
+สถานะนี้เป็น post-audit local integration evidenceค่ะ Draft PR #27 ผ่าน
+quality, Android, Ubuntu AppImage และ Windows NSIS CI บน candidate แล้วค่ะ
+Locked live disposable acceptance ยังต้องผ่านก่อนเปลี่ยน PR เป็น Readyค่ะ
 
 - `pnpm typecheck` ผ่านค่ะ
 - Frontend Vitest ผ่าน 5 files / 40 tests ค่ะ
@@ -122,13 +124,11 @@ Ignored-by-default tests คือ live Drive fixture และ OS keyring mutat
 
 ## 8. Next Actions
 
-1. ปิด P1 จาก final audit และรัน `pnpm quality:r2:offline` จาก clean source
-   candidate เดียวค่ะ
-2. Rebuild/verify/install/cold-launch Android API 36 APK จาก candidate นั้นค่ะ
-3. รัน locked live macOS/Android disposable round trip เมื่อ exact R2 root,
+1. รัน locked live macOS/Android disposable round trip เมื่อ exact R2 root,
    desktop OAuth environment และ emulator test account พร้อมค่ะ
-4. Push Draft PR เพื่อรัน platform CI และเก็บ exact job/artifact evidenceค่ะ
-5. เปลี่ยน PR เป็น Ready และ merge เมื่อ Gate 0–8 ผ่านครบเท่านั้นค่ะ ห้ามแตะ
+2. บันทึก exact account/root กับ disposable Local Vault A/B โดยไม่บันทึก
+   credential หรือ personal path ลง repositoryค่ะ
+3. เปลี่ยน PR เป็น Ready และ merge เมื่อ Gate 0–8 ผ่านครบเท่านั้นค่ะ ห้ามแตะ
    personal Vault/Drive หรือเริ่ม R3 rename/move/Trash/conflict workค่ะ
 
 ## 9. Approval State

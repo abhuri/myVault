@@ -6,9 +6,10 @@ R2 is complete only when every applicable checkbox below is backed by evidence
 from one exact candidate HEADค่ะ Mock, compile, emulator, native runtime, and
 live evidence must remain explicitly distinguishedค่ะ
 
-Current status: `IMPLEMENTATION CANDIDATE — LIVE/CI PENDING` ค่ะ The checklist
+Current status: `IMPLEMENTATION CANDIDATE — LIVE PENDING` ค่ะ The checklist
 records the completed offline contract separately from the exact disposable
-fixture, live-native, platform-CI, PR-ready, and merge gates that remain openค่ะ
+fixture, live-native, PR-ready, and merge gates that remain openค่ะ Platform CI
+has passed on Draft PR #27 candidate `ed90bfb`ค่ะ
 Evidence and external blockers are recorded in [RESULTS.md](RESULTS.md)ค่ะ
 
 ## Gate 0 — Baseline and contract
@@ -134,8 +135,8 @@ Evidence and external blockers are recorded in [RESULTS.md](RESULTS.md)ค่ะ
   reacquisition scenariosค่ะ
 - [ ] Android evidence remains labeled emulator-only; physical-device acceptance
   remains R7 of the product roadmapค่ะ
-- [ ] Ubuntu AppImage and Windows NSIS build/test/package jobs pass on the same
-  candidate HEAD without being mislabeled as native UI acceptanceค่ะ
+- [x] Ubuntu AppImage and Windows NSIS build/test/package jobs pass on Draft PR
+  #27 candidate `ed90bfb` without being mislabeled as native UI acceptanceค่ะ
 
 ## Gate 8 — Final integrated gate
 
