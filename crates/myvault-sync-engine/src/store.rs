@@ -777,6 +777,28 @@ pub enum TransferCompletionOutcome {
     AlreadyCompleted,
 }
 
+/// Redacted durable transfer counts safe to expose through native status DTOs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TransferSummary {
+    pub pending: u64,
+    pub running: u64,
+    pub retry_scheduled: u64,
+    pub auth_required: u64,
+    pub needs_reconcile: u64,
+    pub completed: u64,
+}
+
+impl TransferSummary {
+    #[must_use]
+    pub const fn active(self) -> u64 {
+        self.pending
+            + self.running
+            + self.retry_scheduled
+            + self.auth_required
+            + self.needs_reconcile
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalMutationState {
     Pending,
@@ -1843,6 +1865,29 @@ impl SyncStore {
             &self.connection,
             "SELECT COUNT(*) FROM transfers WHERE phase != 'completed'",
         )
+    }
+
+    /// Returns redacted counts for every durable transfer phase.
+    ///
+    /// # Errors
+    /// Returns a database or invalid count error.
+    pub fn transfer_summary(&self) -> Result<TransferSummary> {
+        let count = |phase: &str| -> Result<u64> {
+            let value: i64 = self.connection.query_row(
+                "SELECT COUNT(*) FROM transfers WHERE phase = ?1",
+                [phase],
+                |row| row.get(0),
+            )?;
+            value.try_into().map_err(|_| Error::InvalidSchema)
+        };
+        Ok(TransferSummary {
+            pending: count(TransferPhase::Pending.as_str())?,
+            running: count(TransferPhase::Running.as_str())?,
+            retry_scheduled: count(TransferPhase::RetryScheduled.as_str())?,
+            auth_required: count(TransferPhase::AuthRequired.as_str())?,
+            needs_reconcile: count(TransferPhase::NeedsReconcile.as_str())?,
+            completed: count(TransferPhase::Completed.as_str())?,
+        })
     }
 
     fn mark_transfer_stopped(

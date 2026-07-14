@@ -17,7 +17,7 @@ pub use store::{
     BindOutcome, ChangeBatch, EnqueueOutcome, JobState, LocalMutationState, LocalMutationStatus,
     QueueJob, QueueJobKind, RemotePreviewCursor, RemotePreviewEntry, RemotePreviewPage, SyncStore,
     TransferCompletion, TransferCompletionOutcome, TransferDirection, TransferMimeClass,
-    TransferPhase, TransferRecord, TransferRegistrationOutcome, VaultSyncState,
+    TransferPhase, TransferRecord, TransferRegistrationOutcome, TransferSummary, VaultSyncState,
     MAX_REMOTE_PREVIEW_PAGE_SIZE, SCHEMA_VERSION, SQLITE_OPEN_RESIDUAL_RISK,
 };
 

@@ -263,6 +263,10 @@ fn offline_pause_preserves_attempt_count_and_resumes_only_when_due() {
     let paused = store.transfer(operation_id).unwrap().unwrap();
     assert_eq!(paused.phase, TransferPhase::RetryScheduled);
     assert_eq!(paused.attempt_count, 0);
+    let summary = store.transfer_summary().unwrap();
+    assert_eq!(summary.retry_scheduled, 1);
+    assert_eq!(summary.active(), 1);
+    assert_eq!(summary.completed, 0);
     assert!(store.claim_next_transfer(29).unwrap().is_none());
     assert_eq!(
         store
