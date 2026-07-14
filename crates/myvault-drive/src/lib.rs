@@ -20,7 +20,7 @@ mod error;
 mod model;
 mod transfer;
 
-pub use client::ReadOnlyDrive;
+pub use client::{ReadOnlyDrive, ResolvedDriveChange};
 pub use error::{Error, ErrorCode, Result};
 pub use model::{
     AccessToken, AccountIdentity, Change, ChangesPage, FilePage, RemoteFile, VerifiedRoot,

@@ -4,8 +4,8 @@ use crate::{
     VerifiedRoot, FOLDER_MIME_TYPE,
 };
 use myvault_sync_engine::{
-    ChangesPage as EngineChangesPage, DriveClient, RemoteChange, RemoteError, ScanPage,
-    ScanRequest, VerifiedRemoteBinding,
+    ChangesPage as EngineChangesPage, DriveClient, RemoteChange, RemoteEntry, RemoteError,
+    ScanPage, ScanRequest, VerifiedRemoteBinding,
 };
 use reqwest::{
     blocking::{Client, Response},
@@ -21,6 +21,16 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const FILE_FIELDS: &str =
     "id,name,mimeType,parents,trashed,version,md5Checksum,sha1Checksum,sha256Checksum";
+const MAX_CHANGE_ANCESTRY_DEPTH: usize = 64;
+
+/// One raw Drive change resolved against the exact bound root without reading
+/// file content or accepting display-path guesses.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolvedDriveChange {
+    Inside(RemoteEntry),
+    OutsideBoundRoot,
+    Removed { file_id: String },
+}
 
 pub struct ReadOnlyDrive {
     pub(crate) client: Client,
@@ -290,6 +300,78 @@ impl ReadOnlyDrive {
         )?;
         validate_changes_page(&page)?;
         Ok(page)
+    }
+
+    /// Resolves one raw Changes item to a canonical path below an exact root.
+    ///
+    /// Every ancestry hop is an exact metadata GET with a single-parent,
+    /// live-folder check. Google-native files are rejected rather than exported
+    /// or transformed. A removed item intentionally carries only its opaque ID;
+    /// the durable store decides whether that ID belonged to the bound root.
+    ///
+    /// # Errors
+    /// Returns a redacted ambiguity or malformed-response classification when
+    /// ancestry, MIME, identity, or portable path evidence is not exact.
+    pub fn resolve_change_below_root(
+        &self,
+        root_id: &str,
+        change: &crate::Change,
+    ) -> Result<ResolvedDriveChange> {
+        validate_identifier(root_id)?;
+        validate_identifier(&change.file_id)
+            .map_err(|_| Error::new(ErrorCode::MalformedResponse))?;
+        if change.removed || change.file.as_ref().is_some_and(|file| file.trashed) {
+            return Ok(ResolvedDriveChange::Removed {
+                file_id: change.file_id.clone(),
+            });
+        }
+        let file = change
+            .file
+            .as_ref()
+            .filter(|file| file.id == change.file_id)
+            .ok_or_else(|| Error::new(ErrorCode::MalformedResponse))?;
+        validate_file(file)?;
+        if file.id == root_id {
+            return Ok(ResolvedDriveChange::OutsideBoundRoot);
+        }
+        if file.mime_type.starts_with("application/vnd.google-apps.") && !file.is_folder() {
+            return Err(Error::new(ErrorCode::CursorAmbiguous));
+        }
+        if file.parents.len() != 1 {
+            return Err(Error::new(ErrorCode::CursorAmbiguous));
+        }
+
+        let mut names = vec![file.name.clone()];
+        let mut parent_id = file.parents[0].clone();
+        let mut visited = std::collections::BTreeSet::from([file.id.clone()]);
+        for _ in 0..MAX_CHANGE_ANCESTRY_DEPTH {
+            if parent_id == root_id {
+                names.reverse();
+                return file
+                    .to_remote_entry(names.join("/"))
+                    .map(ResolvedDriveChange::Inside);
+            }
+            if !visited.insert(parent_id.clone()) {
+                return Err(Error::new(ErrorCode::CursorAmbiguous));
+            }
+            let parent = self.file_metadata(&parent_id).map_err(|error| {
+                if error.code() == ErrorCode::NotFound {
+                    Error::new(ErrorCode::CursorAmbiguous)
+                } else {
+                    error
+                }
+            })?;
+            if parent.trashed || !parent.is_folder() {
+                return Err(Error::new(ErrorCode::CursorAmbiguous));
+            }
+            names.push(parent.name);
+            match parent.parents.as_slice() {
+                [next] => parent_id.clone_from(next),
+                [] => return Ok(ResolvedDriveChange::OutsideBoundRoot),
+                _ => return Err(Error::new(ErrorCode::CursorAmbiguous)),
+            }
+        }
+        Err(Error::new(ErrorCode::CursorAmbiguous))
     }
 
     pub(crate) fn endpoint(&self, relative: &str) -> Result<Url> {
@@ -959,5 +1041,130 @@ mod tests {
             }]
         );
         changes.assert();
+    }
+
+    fn changed_file(parent_id: &str, name: &str, mime_type: &str) -> crate::Change {
+        crate::Change {
+            file_id: "file_1".into(),
+            removed: false,
+            file: Some(RemoteFile {
+                id: "file_1".into(),
+                name: name.into(),
+                mime_type: mime_type.into(),
+                parents: vec![parent_id.into()],
+                trashed: false,
+                version: Some("10".into()),
+                md5_checksum: None,
+                sha1_checksum: None,
+                sha256_checksum: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn change_resolver_builds_nested_unicode_path_below_exact_root() {
+        let mut server = Server::new();
+        let parent = server
+            .mock("GET", "/drive/v3/files/folder_1")
+            .match_query(Matcher::Any)
+            .with_body(
+                r#"{"id":"folder_1","name":"ภาษาไทย","mimeType":"application/vnd.google-apps.folder","parents":["root_1"],"trashed":false,"version":"2"}"#,
+            )
+            .create();
+        let drive = client(&server);
+
+        let resolved = drive
+            .resolve_change_below_root(
+                "root_1",
+                &changed_file("folder_1", "บันทึก.md", "text/markdown"),
+            )
+            .unwrap();
+
+        let ResolvedDriveChange::Inside(entry) = resolved else {
+            panic!("inside root")
+        };
+        assert_eq!(entry.path, "ภาษาไทย/บันทึก.md");
+        assert_eq!(entry.parent_id, "folder_1");
+        parent.assert();
+    }
+
+    #[test]
+    fn change_resolver_distinguishes_outside_root_and_removed_id() {
+        let mut server = Server::new();
+        let outside = server
+            .mock("GET", "/drive/v3/files/outside_1")
+            .match_query(Matcher::Any)
+            .with_body(
+                r#"{"id":"outside_1","name":"Other root","mimeType":"application/vnd.google-apps.folder","parents":[],"trashed":false,"version":"2"}"#,
+            )
+            .create();
+        let drive = client(&server);
+        assert_eq!(
+            drive
+                .resolve_change_below_root(
+                    "root_1",
+                    &changed_file("outside_1", "note.md", "text/markdown"),
+                )
+                .unwrap(),
+            ResolvedDriveChange::OutsideBoundRoot
+        );
+        assert_eq!(
+            drive
+                .resolve_change_below_root(
+                    "root_1",
+                    &crate::Change {
+                        file_id: "removed_1".into(),
+                        removed: true,
+                        file: None,
+                    },
+                )
+                .unwrap(),
+            ResolvedDriveChange::Removed {
+                file_id: "removed_1".into()
+            }
+        );
+        outside.assert();
+    }
+
+    #[test]
+    fn change_resolver_rejects_native_mime_and_ancestry_loops() {
+        let mut server = Server::new();
+        let folder_a = server
+            .mock("GET", "/drive/v3/files/folder_a")
+            .match_query(Matcher::Any)
+            .with_body(
+                r#"{"id":"folder_a","name":"A","mimeType":"application/vnd.google-apps.folder","parents":["folder_b"],"trashed":false,"version":"2"}"#,
+            )
+            .create();
+        let folder_b = server
+            .mock("GET", "/drive/v3/files/folder_b")
+            .match_query(Matcher::Any)
+            .with_body(
+                r#"{"id":"folder_b","name":"B","mimeType":"application/vnd.google-apps.folder","parents":["folder_a"],"trashed":false,"version":"2"}"#,
+            )
+            .create();
+        let drive = client(&server);
+        assert_eq!(
+            drive
+                .resolve_change_below_root(
+                    "root_1",
+                    &changed_file("root_1", "sheet", "application/vnd.google-apps.spreadsheet"),
+                )
+                .unwrap_err()
+                .code(),
+            ErrorCode::CursorAmbiguous
+        );
+        assert_eq!(
+            drive
+                .resolve_change_below_root(
+                    "root_1",
+                    &changed_file("folder_a", "note.md", "text/markdown"),
+                )
+                .unwrap_err()
+                .code(),
+            ErrorCode::CursorAmbiguous
+        );
+        folder_a.assert();
+        folder_b.assert();
     }
 }
