@@ -366,6 +366,7 @@ impl ExecutionFailure {
 #[allow(clippy::missing_errors_doc)]
 pub trait TransferStore {
     fn claim_due(&mut self, now_unix_ms: u64) -> Result<Option<TransferIntent>>;
+    fn begin_local_publish(&mut self, operation_id: Uuid, now_unix_ms: u64) -> Result<()>;
     fn complete_verified(&mut self, verified: &VerifiedTransfer, now_unix_ms: u64) -> Result<()>;
     fn schedule_retry(
         &mut self,
@@ -399,6 +400,10 @@ where
 {
     fn claim_due(&mut self, now_unix_ms: u64) -> Result<Option<TransferIntent>> {
         (**self).claim_due(now_unix_ms)
+    }
+
+    fn begin_local_publish(&mut self, operation_id: Uuid, now_unix_ms: u64) -> Result<()> {
+        (**self).begin_local_publish(operation_id, now_unix_ms)
     }
 
     fn complete_verified(&mut self, verified: &VerifiedTransfer, now_unix_ms: u64) -> Result<()> {
@@ -475,6 +480,11 @@ impl TransferStore for SyncStore {
         .map(Some)
     }
 
+    fn begin_local_publish(&mut self, operation_id: Uuid, now_unix_ms: u64) -> Result<()> {
+        self.begin_transfer_local_publish(operation_id, now_unix_ms)
+            .map_err(|_| Error::Store)
+    }
+
     fn complete_verified(&mut self, verified: &VerifiedTransfer, now_unix_ms: u64) -> Result<()> {
         let local_revision = verified.local_revision().ok_or(Error::InvalidEvidence)?;
         let completion = TransferCompletion::new(
@@ -547,6 +557,7 @@ pub trait TransferExecutor {
     fn execute(
         &mut self,
         intent: &TransferIntent,
+        before_local_publish: &mut dyn FnMut() -> Result<()>,
     ) -> std::result::Result<VerifiedTransfer, ExecutionFailure>;
 }
 
@@ -584,7 +595,22 @@ where
             return Ok(WorkOutcome::Idle);
         };
         let operation_id = intent.operation_id();
-        match self.executor.execute(&intent) {
+        let mut gate_error = None;
+        let execution = {
+            let (store, executor) = (&mut self.store, &mut self.executor);
+            let mut before_local_publish = || {
+                let result = store.begin_local_publish(operation_id, now_unix_ms);
+                if let Err(error) = result {
+                    gate_error = Some(error);
+                }
+                result
+            };
+            executor.execute(&intent, &mut before_local_publish)
+        };
+        if let Some(error) = gate_error {
+            return Err(error);
+        }
+        match execution {
             Ok(verified) => {
                 if !verified.matches(&intent) {
                     self.store.mark_needs_reconcile(
@@ -799,6 +825,7 @@ mod tests {
     #[derive(Default)]
     struct MemoryStore {
         jobs: VecDeque<TransferIntent>,
+        local_publish: Vec<Uuid>,
         completed: Vec<Uuid>,
         retries: Vec<(Uuid, u64, &'static str)>,
         offline_pauses: Vec<(Uuid, u64, &'static str)>,
@@ -809,6 +836,11 @@ mod tests {
     impl TransferStore for MemoryStore {
         fn claim_due(&mut self, _now_unix_ms: u64) -> Result<Option<TransferIntent>> {
             Ok(self.jobs.pop_front())
+        }
+
+        fn begin_local_publish(&mut self, operation_id: Uuid, _now_unix_ms: u64) -> Result<()> {
+            self.local_publish.push(operation_id);
+            Ok(())
         }
 
         fn complete_verified(
@@ -871,8 +903,31 @@ mod tests {
         fn execute(
             &mut self,
             _intent: &TransferIntent,
+            _before_local_publish: &mut dyn FnMut() -> Result<()>,
         ) -> std::result::Result<VerifiedTransfer, ExecutionFailure> {
             self.results.pop_front().expect("scripted result")
+        }
+    }
+
+    struct LocalPublishExecutor {
+        verified: Option<VerifiedTransfer>,
+    }
+
+    impl TransferExecutor for LocalPublishExecutor {
+        fn execute(
+            &mut self,
+            _intent: &TransferIntent,
+            before_local_publish: &mut dyn FnMut() -> Result<()>,
+        ) -> std::result::Result<VerifiedTransfer, ExecutionFailure> {
+            before_local_publish().map_err(|_| {
+                ExecutionFailure::new(
+                    ExecutionFailureKind::NeedsReconcile,
+                    "transfer_store_unavailable",
+                    None,
+                )
+                .expect("failure")
+            })?;
+            Ok(self.verified.take().expect("verified result"))
         }
     }
 
@@ -891,6 +946,30 @@ mod tests {
         let (store, _) = worker.into_parts();
         assert_eq!(store.completed, [id]);
         assert!(store.reconcile.is_empty());
+    }
+
+    #[test]
+    fn download_requests_durable_local_publish_gate_before_completion() {
+        let id = Uuid::new_v4();
+        let mut due = intent(id);
+        due.direction = TransferDirection::Download;
+        due.remote_file_id = Some("remote1".to_owned());
+        due.expected_remote_revision = Some("remoteversion1".to_owned());
+        due.expected_local_revision = None;
+        let store = MemoryStore {
+            jobs: VecDeque::from([due]),
+            ..MemoryStore::default()
+        };
+        let executor = LocalPublishExecutor {
+            verified: Some(verified(id, HASH_A)),
+        };
+        let mut worker = Worker::new(store, executor);
+
+        assert_eq!(worker.run_once(10).unwrap(), WorkOutcome::Completed(id));
+
+        let (store, _) = worker.into_parts();
+        assert_eq!(store.local_publish, [id]);
+        assert_eq!(store.completed, [id]);
     }
 
     #[test]

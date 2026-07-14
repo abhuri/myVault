@@ -252,6 +252,7 @@ impl<'a> NativeTransferExecutor<'a> {
     fn execute_download(
         &mut self,
         intent: &TransferIntent,
+        before_local_publish: &mut dyn FnMut() -> myvault_transfer::Result<()>,
     ) -> Result<VerifiedTransfer, ExecutionFailure> {
         let expected_stage = format!("stage-{}", intent.operation_id());
         if intent.stage_ref() != Some(expected_stage.as_str()) {
@@ -318,6 +319,14 @@ impl<'a> NativeTransferExecutor<'a> {
             Err(error) => return Err(local_failure(error)),
         };
         validate_stage(intent, &stage)?;
+
+        before_local_publish().map_err(|_| {
+            failure(
+                ExecutionFailureKind::NeedsReconcile,
+                "transfer_store_unavailable",
+                None,
+            )
+        })?;
 
         match self.service.publish_staged_transfer(
             self.session_id,
@@ -417,7 +426,11 @@ impl<'a> NativeTransferExecutor<'a> {
 }
 
 impl TransferExecutor for NativeTransferExecutor<'_> {
-    fn execute(&mut self, intent: &TransferIntent) -> Result<VerifiedTransfer, ExecutionFailure> {
+    fn execute(
+        &mut self,
+        intent: &TransferIntent,
+        before_local_publish: &mut dyn FnMut() -> myvault_transfer::Result<()>,
+    ) -> Result<VerifiedTransfer, ExecutionFailure> {
         self.service
             .confirm_active_session(self.session_id)
             .map_err(|_| {
@@ -429,7 +442,7 @@ impl TransferExecutor for NativeTransferExecutor<'_> {
             })?;
         match intent.direction() {
             TransferDirection::Upload => self.execute_upload(intent),
-            TransferDirection::Download => self.execute_download(intent),
+            TransferDirection::Download => self.execute_download(intent, before_local_publish),
         }
     }
 }
@@ -703,7 +716,9 @@ mod tests {
         .expect("test Drive");
         let mut executor = NativeTransferExecutor::new(&service, session_id, drive);
 
-        let verified = executor.execute(&intent).expect("verified no-op");
+        let verified = executor
+            .execute(&intent, &mut || Ok(()))
+            .expect("verified no-op");
 
         assert_eq!(verified.remote_file_id(), "file_1");
         assert_eq!(verified.sha256_hex(), snapshot.sha256.as_str());
@@ -847,7 +862,9 @@ mod tests {
         .expect("test Drive");
         let mut executor = NativeTransferExecutor::new(&service, session_id, drive);
 
-        let verified = executor.execute(&intent).expect("verified create");
+        let verified = executor
+            .execute(&intent, &mut || Ok(()))
+            .expect("verified create");
 
         assert_eq!(verified.remote_file_id(), "file_1");
         assert_eq!(verified.sha256_hex(), snapshot.sha256.as_str());
@@ -945,7 +962,9 @@ mod tests {
         .expect("test Drive");
         let mut executor = NativeTransferExecutor::new(&service, session_id, drive);
 
-        let verified = executor.execute(&intent).expect("verified download");
+        let verified = executor
+            .execute(&intent, &mut || Ok(()))
+            .expect("verified download");
 
         assert_eq!(fs::read(vault_root.join("ภาษาไทย.md")).unwrap(), b"abc");
         assert_eq!(verified.remote_file_id(), "file_1");
@@ -1052,7 +1071,9 @@ mod tests {
         .expect("test Drive");
         let mut executor = NativeTransferExecutor::new(&service, session_id, drive);
 
-        let verified = executor.execute(&intent).expect("recovered download");
+        let verified = executor
+            .execute(&intent, &mut || Ok(()))
+            .expect("recovered download");
 
         assert_eq!(fs::read(vault_root.join("recovered.bin")).unwrap(), b"abc");
         assert_eq!(verified.remote_file_id(), "file_1");
