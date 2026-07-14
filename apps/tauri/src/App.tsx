@@ -540,11 +540,11 @@ function App() {
         <section>
           <p className="section-label">LOCAL WORKSPACE</p>
           <h1>Open a folder as your Vault</h1>
-          <p>Your notes stay as ordinary Markdown files. After opening a Vault, you can optionally connect Google Drive for read-only metadata browsing.</p>
+          <p>Your notes stay as ordinary Markdown files. After opening a Vault, you can optionally connect Google Drive for verified create-only transfer and read-only metadata browsing.</p>
           <button className="primary-button" disabled={opening} onClick={() => void chooseVault()} type="button">{opening ? "Opening…" : "Choose Vault folder"}</button>
           {error && <p className="inline-error" role="alert">{error}</p>}
         </section>
-        <small>Local-first desktop · Optional Drive metadata access</small>
+        <small>Local-first desktop · Optional guarded Drive sync</small>
       </main>
     );
   }

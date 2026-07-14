@@ -310,6 +310,9 @@ pub enum ExecutionFailureKind {
     AuthRequired,
     Offline,
     RateLimited,
+    /// A transient failure proven to have happened before any externally
+    /// visible side effect. Retrying the exact durable intent is safe.
+    TransientSafe,
     TransientUnknown,
     Permanent,
     NeedsReconcile,
@@ -388,6 +391,55 @@ pub trait TransferStore {
         code: &'static str,
         now_unix_ms: u64,
     ) -> Result<()>;
+}
+
+impl<T> TransferStore for &mut T
+where
+    T: TransferStore + ?Sized,
+{
+    fn claim_due(&mut self, now_unix_ms: u64) -> Result<Option<TransferIntent>> {
+        (**self).claim_due(now_unix_ms)
+    }
+
+    fn complete_verified(&mut self, verified: &VerifiedTransfer, now_unix_ms: u64) -> Result<()> {
+        (**self).complete_verified(verified, now_unix_ms)
+    }
+
+    fn schedule_retry(
+        &mut self,
+        operation_id: Uuid,
+        next_attempt_at_unix_ms: u64,
+        code: &'static str,
+    ) -> Result<()> {
+        (**self).schedule_retry(operation_id, next_attempt_at_unix_ms, code)
+    }
+
+    fn pause_offline(
+        &mut self,
+        operation_id: Uuid,
+        next_attempt_at_unix_ms: u64,
+        code: &'static str,
+    ) -> Result<()> {
+        (**self).pause_offline(operation_id, next_attempt_at_unix_ms, code)
+    }
+
+    fn mark_auth_required(
+        &mut self,
+        operation_id: Uuid,
+        code: &'static str,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        (**self).mark_auth_required(operation_id, code, now_unix_ms)
+    }
+
+    fn mark_needs_reconcile(
+        &mut self,
+        operation_id: Uuid,
+        code: &'static str,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        (**self).mark_needs_reconcile(operation_id, code, now_unix_ms)
+    }
 }
 
 impl TransferStore for SyncStore {
@@ -576,6 +628,13 @@ where
                     .and_then(|value| u64::try_from(value.as_millis()).ok())
                     .unwrap_or_else(|| retry_delay_ms(operation_id, attempt));
                 let delay = requested.clamp(BASE_BACKOFF_MS, MAX_BACKOFF_MS);
+                let next = checked_add_ms(now_unix_ms, delay)?;
+                self.store
+                    .schedule_retry(operation_id, next, failure.code())?;
+                Ok(WorkOutcome::RetryScheduled(operation_id))
+            }
+            ExecutionFailureKind::TransientSafe => {
+                let delay = retry_delay_ms(operation_id, attempt);
                 let next = checked_add_ms(now_unix_ms, delay)?;
                 self.store
                     .schedule_retry(operation_id, next, failure.code())?;
@@ -933,6 +992,39 @@ mod tests {
             store.retries,
             [(id, 1_000 + retry_delay_ms(id, 4), "drive_rate_limited")]
         );
+    }
+
+    #[test]
+    fn proven_pre_side_effect_transient_failure_schedules_retry() {
+        let id = Uuid::new_v4();
+        let store = MemoryStore {
+            jobs: VecDeque::from([intent(id)]),
+            ..MemoryStore::default()
+        };
+        let failure = ExecutionFailure::new(
+            ExecutionFailureKind::TransientSafe,
+            "drive_transport_before_side_effect",
+            None,
+        )
+        .unwrap();
+        let executor = ScriptedExecutor {
+            results: VecDeque::from([Err(failure)]),
+        };
+        let mut worker = Worker::new(store, executor);
+        assert_eq!(
+            worker.run_once(1_000).unwrap(),
+            WorkOutcome::RetryScheduled(id)
+        );
+        let (store, _) = worker.into_parts();
+        assert_eq!(
+            store.retries,
+            [(
+                id,
+                1_000 + retry_delay_ms(id, 0),
+                "drive_transport_before_side_effect"
+            )]
+        );
+        assert!(store.reconcile.is_empty());
     }
 
     #[test]

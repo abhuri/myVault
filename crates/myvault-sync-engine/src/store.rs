@@ -1777,6 +1777,24 @@ impl SyncStore {
         )
     }
 
+    /// Reschedules every authorization-paused transfer after the caller has
+    /// obtained a fresh credential for the exact bound account.
+    ///
+    /// # Errors
+    /// Rejects invalid timestamps or unavailable durable storage.
+    pub fn resume_auth_required_transfers(&mut self, now_unix_ms: u64) -> Result<u64> {
+        let now = u64_to_i64(now_unix_ms)?;
+        let changed = self.connection.execute(
+            "UPDATE transfers
+             SET phase = ?1, attempt_count = attempt_count + 1,
+                 next_attempt_at_unix_ms = ?2, updated_at_unix_ms = ?2,
+                 last_error_code = ?3
+             WHERE phase = 'auth_required' AND updated_at_unix_ms <= ?2",
+            params![TransferPhase::RetryScheduled.as_str(), now, "auth_restored"],
+        )?;
+        u64::try_from(changed).map_err(|_| Error::InvalidSchema)
+    }
+
     /// Stops a transfer whose side-effect outcome or revision is ambiguous.
     ///
     /// # Errors

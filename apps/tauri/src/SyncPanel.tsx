@@ -222,6 +222,16 @@ export function SyncPanel({ sessionId, onBusyChange }: { sessionId: string; onBu
             <div><dt>Needs reconcile</dt><dd>{status.needsReconcile}</dd></div>
             <div><dt>Completed</dt><dd>{status.completed}</dd></div>
           </dl>
+          {status.supported && status.bindingAvailable && status.connected && status.bound && (
+            <button
+              className="sync-primary"
+              type="button"
+              disabled={disabled || status.rescanRequired || status.phase.toLocaleLowerCase("en-US") !== "ready"}
+              onClick={() => void runStatusOperation("transfer", () => syncApi.runGuarded(sessionId))}
+            >
+              {state.busy === "transfer" ? "Running guarded sync…" : "Run guarded sync"}
+            </button>
+          )}
         </section>
       )}
 

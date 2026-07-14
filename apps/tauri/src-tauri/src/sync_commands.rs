@@ -359,18 +359,26 @@ fn preview_page(
 #[cfg(not(target_os = "android"))]
 mod platform {
     use super::*;
-    use myvault_app_service::{AppService, NativeVaultContext};
+    use crate::transfer_runtime::NativeTransferExecutor;
+    use myvault_app_service::{AppService, ExplorerKindDto, NativeVaultContext};
     use myvault_desktop_auth::{
         DesktopOAuth, GoogleClientSecret, GoogleTokenClient, NativeTokenProvider, OsKeyringStore,
         SecretStore,
     };
-    use myvault_drive::{AccessToken, ReadOnlyDrive};
-    use myvault_sync_engine::{advance_initial_sync, BindOutcome, SyncStore, VaultSyncState};
+    use myvault_drive::{AccessToken, ReadOnlyDrive, TransferDrive};
+    use myvault_sync_engine::{
+        advance_initial_sync, BindOutcome, RemotePreviewEntry, SyncStore, TransferDirection,
+        TransferMimeClass, TransferRecord, TransferRegistrationOutcome, VaultSyncState,
+    };
+    use myvault_transfer::{WorkOutcome, Worker, MAX_TRANSFER_BYTES};
     use std::{
+        collections::{BTreeMap, BTreeSet},
         process::{Command, Stdio},
         sync::{Arc, Mutex},
         time::Duration,
     };
+    use unicode_normalization::UnicodeNormalization;
+    use uuid::Uuid;
 
     const CLIENT_ID_ENV: &str = "MYVAULT_GOOGLE_DESKTOP_CLIENT_ID";
     const CLIENT_SECRET_ENV: &str = "MYVAULT_GOOGLE_DESKTOP_CLIENT_SECRET";
@@ -379,6 +387,9 @@ mod platform {
     // connected without an explicit consent upgrade.
     const KEYRING_SERVICE: &str = "com.abhuri.myvault.google-drive.r2-full-drive";
     const CALLBACK_TIMEOUT: Duration = Duration::from_secs(180);
+    const TRANSFER_PAGE_SIZE: usize = 200;
+    const MAX_GUARDED_OPERATIONS: usize = 1_000;
+    const TRANSFER_NAMESPACE: Uuid = Uuid::from_u128(0xa9c0_4bb5_7db8_5a83_8e1c_d67a_a646_a4f2);
 
     #[derive(Default)]
     pub struct SyncRuntime {
@@ -574,6 +585,319 @@ mod platform {
             })?;
         ReadOnlyDrive::google(AccessToken::new(access.expose_to_native().to_owned()))
             .map_err(map_drive_error)
+    }
+
+    fn fresh_transfer_drive(
+        account_id: &str,
+        root_id: &str,
+    ) -> Result<TransferDrive, SyncCommandError> {
+        let client_id = desktop_client_id()?;
+        let access = provider(&client_id)?
+            .fresh_access_token(account_id)
+            .map_err(|_| {
+                SyncCommandError::new(
+                    SyncCommandCode::AuthRequired,
+                    "Google authorization is required",
+                )
+            })?;
+        TransferDrive::google(
+            AccessToken::new(access.expose_to_native().to_owned()),
+            account_id,
+            root_id,
+        )
+        .map_err(map_drive_error)
+    }
+
+    fn transfer_operation_id(parts: &[&str]) -> Uuid {
+        let mut evidence = String::from("myvault-r2\0");
+        for part in parts {
+            evidence.push_str(&part.len().to_string());
+            evidence.push(':');
+            evidence.push_str(part);
+            evidence.push('\0');
+        }
+        Uuid::new_v5(&TRANSFER_NAMESPACE, evidence.as_bytes())
+    }
+
+    fn stage_reference(operation_id: Uuid) -> String {
+        format!("stage-{operation_id}")
+    }
+
+    fn operation_marker(operation_id: Uuid) -> String {
+        format!("r2-{}", operation_id.simple())
+    }
+
+    fn content_kind(path: &str, markdown: bool) -> TransferMimeClass {
+        if markdown || path.ends_with(".md") {
+            TransferMimeClass::Markdown
+        } else {
+            TransferMimeClass::Blob
+        }
+    }
+
+    fn parent_path(path: &str) -> Option<&str> {
+        path.rsplit_once('/').map(|(parent, _)| parent)
+    }
+
+    fn display_name(path: &str) -> Result<&str, SyncCommandError> {
+        path.rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                SyncCommandError::new(
+                    SyncCommandCode::InvalidRequest,
+                    "a transfer path is invalid",
+                )
+            })
+    }
+
+    fn collision_key(path: &str) -> String {
+        path.nfc().flat_map(char::to_lowercase).collect()
+    }
+
+    fn reject_portable_path_collisions<'a>(
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), SyncCommandError> {
+        let mut seen = BTreeMap::new();
+        for path in paths {
+            let key = collision_key(path);
+            if seen
+                .insert(key, path)
+                .is_some_and(|existing| existing != path)
+            {
+                return Err(SyncCommandError::new(
+                    SyncCommandCode::InvalidRequest,
+                    "case-folded or Unicode-normalized transfer paths collide",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_remote_preview(
+        store: &SyncStore,
+    ) -> Result<Vec<RemotePreviewEntry>, SyncCommandError> {
+        let mut cursor = None;
+        let mut entries = Vec::new();
+        loop {
+            let page = store
+                .remote_preview(cursor.as_ref(), TRANSFER_PAGE_SIZE)
+                .map_err(map_sync_error)?;
+            if page.rescan_required || page.colliding_entries != 0 {
+                return Err(SyncCommandError::new(
+                    SyncCommandCode::RescanRequired,
+                    "Drive metadata must be collision-free and freshly scanned before transfer",
+                ));
+            }
+            if entries.len().saturating_add(page.entries.len()) > MAX_GUARDED_OPERATIONS * 2 {
+                return Err(SyncCommandError::new(
+                    SyncCommandCode::InvalidRequest,
+                    "the guarded transfer plan exceeds the operation limit",
+                ));
+            }
+            entries.extend(page.entries);
+            if !page.has_more {
+                break;
+            }
+            cursor = page.next_after;
+            if cursor.is_none() {
+                return Err(SyncCommandError::internal());
+            }
+        }
+        Ok(entries)
+    }
+
+    fn collect_local_entries(
+        service: &AppService,
+        session_id: VaultSessionId,
+    ) -> Result<Vec<myvault_app_service::ExplorerEntryDto>, SyncCommandError> {
+        let mut after = None;
+        let mut entries = Vec::new();
+        loop {
+            let page = service
+                .list_explorer(session_id, after.as_deref(), TRANSFER_PAGE_SIZE)
+                .map_err(map_app_error)?;
+            if entries.len().saturating_add(page.entries.len()) > MAX_GUARDED_OPERATIONS {
+                return Err(SyncCommandError::new(
+                    SyncCommandCode::InvalidRequest,
+                    "the guarded transfer plan exceeds the operation limit",
+                ));
+            }
+            entries.extend(page.entries);
+            if !page.has_more {
+                break;
+            }
+            after = page.next_after;
+            if after.is_none() {
+                return Err(SyncCommandError::internal());
+            }
+        }
+        Ok(entries)
+    }
+
+    fn prepare_guarded_transfers(
+        service: &AppService,
+        session_id: VaultSessionId,
+        store: &mut SyncStore,
+        drive: &TransferDrive,
+        root_id: &str,
+    ) -> Result<u64, SyncCommandError> {
+        let remote_entries = collect_remote_preview(store)?;
+        let local_entries = collect_local_entries(service, session_id)?;
+        reject_portable_path_collisions(
+            remote_entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .chain(local_entries.iter().map(|entry| entry.path.as_str())),
+        )?;
+        let local_paths = local_entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<BTreeSet<_>>();
+        let remote_by_path = remote_entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let remote_folders = remote_entries
+            .iter()
+            .filter(|entry| entry.kind == RemoteEntryKind::Folder)
+            .map(|entry| (entry.path.as_str(), entry.file_id.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        let mut registered = 0_u64;
+
+        for local in local_entries {
+            if local.byte_len > MAX_TRANSFER_BYTES {
+                return Err(SyncCommandError::new(
+                    SyncCommandCode::InvalidRequest,
+                    "a local file exceeds the guarded transfer size limit",
+                ));
+            }
+            let mut sink = std::io::sink();
+            let snapshot = service
+                .stream_transfer_source(
+                    session_id,
+                    &local.path,
+                    &mut sink,
+                    MAX_TRANSFER_BYTES as usize,
+                )
+                .map_err(|_| {
+                    SyncCommandError::new(
+                        SyncCommandCode::StorageUnavailable,
+                        "exact local transfer evidence is unavailable",
+                    )
+                })?;
+            let matching_remote = remote_by_path.get(local.path.as_str()).copied();
+            let matching_durable = matching_remote
+                .map(|entry| {
+                    store
+                        .remote_entry(&entry.file_id)
+                        .map_err(map_sync_error)?
+                        .ok_or_else(SyncCommandError::internal)
+                })
+                .transpose()?;
+            let parent_id = if let Some(remote) = matching_remote {
+                remote.parent_id.as_str()
+            } else if let Some(parent) = parent_path(&local.path) {
+                remote_folders.get(parent).copied().ok_or_else(|| {
+                    SyncCommandError::new(
+                        SyncCommandCode::InvalidRequest,
+                        "a required remote parent folder does not exist",
+                    )
+                })?
+            } else {
+                root_id
+            };
+            let remote_identity = matching_remote.map_or("absent", |entry| entry.file_id.as_str());
+            let remote_revision = matching_durable
+                .as_ref()
+                .map_or("absent", |entry| entry.remote_revision.as_str());
+            let operation_id = transfer_operation_id(&[
+                "upload",
+                &local.path,
+                parent_id,
+                remote_identity,
+                remote_revision,
+                &snapshot.revision.hex,
+                snapshot.sha256.as_str(),
+                &snapshot.byte_len.to_string(),
+            ]);
+            let mime_class =
+                content_kind(&local.path, matches!(local.kind, ExplorerKindDto::Markdown));
+            let record = TransferRecord::new(
+                operation_id,
+                TransferDirection::Upload,
+                local.path,
+                parent_id,
+                matching_remote.map(|entry| entry.file_id.clone()),
+                Some(snapshot.revision.hex),
+                matching_durable.map(|entry| entry.remote_revision),
+                snapshot.sha256.as_str(),
+                snapshot.byte_len,
+                mime_class,
+                operation_marker(operation_id),
+                Some(stage_reference(operation_id)),
+                None,
+                0,
+            )
+            .map_err(map_sync_error)?;
+            if store.register_transfer(&record).map_err(map_sync_error)?
+                == TransferRegistrationOutcome::Registered
+            {
+                registered = registered.saturating_add(1);
+            }
+        }
+
+        for remote in remote_entries
+            .iter()
+            .filter(|entry| entry.kind == RemoteEntryKind::File)
+            .filter(|entry| !local_paths.contains(entry.path.as_str()))
+        {
+            let durable = store
+                .remote_entry(&remote.file_id)
+                .map_err(map_sync_error)?
+                .ok_or_else(SyncCommandError::internal)?;
+            let name = display_name(&remote.path)?;
+            let candidate = drive
+                .inspect_download_candidate(
+                    &remote.file_id,
+                    &remote.parent_id,
+                    name,
+                    &durable.remote_revision,
+                )
+                .map_err(map_drive_error)?;
+            let operation_id = transfer_operation_id(&[
+                "download",
+                &remote.path,
+                &remote.parent_id,
+                candidate.file_id(),
+                candidate.sync_revision(),
+                candidate.sha256(),
+                &candidate.size().to_string(),
+            ]);
+            let record = TransferRecord::new(
+                operation_id,
+                TransferDirection::Download,
+                remote.path.clone(),
+                remote.parent_id.clone(),
+                Some(remote.file_id.clone()),
+                None,
+                Some(candidate.sync_revision().to_owned()),
+                candidate.sha256(),
+                candidate.size(),
+                content_kind(&remote.path, false),
+                operation_marker(operation_id),
+                Some(stage_reference(operation_id)),
+                None,
+                0,
+            )
+            .map_err(map_sync_error)?;
+            if store.register_transfer(&record).map_err(map_sync_error)?
+                == TransferRegistrationOutcome::Registered
+            {
+                registered = registered.saturating_add(1);
+            }
+        }
+        Ok(registered)
     }
 
     fn require_connected_account(
@@ -905,6 +1229,89 @@ mod platform {
     }
 
     #[tauri::command(rename_all = "camelCase")]
+    pub async fn sync_run_guarded(
+        service: tauri::State<'_, Arc<AppService>>,
+        runtime: tauri::State<'_, Arc<SyncRuntime>>,
+        session_id: String,
+    ) -> Result<SyncStatusDto, SyncCommandError> {
+        let session_id = parse_session_id(&session_id)?;
+        let service = Arc::clone(service.inner());
+        let runtime = Arc::clone(runtime.inner());
+        tauri::async_runtime::spawn_blocking(move || {
+            let context = service
+                .native_vault_context(session_id)
+                .map_err(map_app_error)?;
+            let mut inner = runtime
+                .inner
+                .lock()
+                .map_err(|_| SyncCommandError::internal())?;
+            let account_id = inner.connected_account_id.clone().ok_or_else(|| {
+                SyncCommandError::new(
+                    SyncCommandCode::AuthRequired,
+                    "Google authorization is required",
+                )
+            })?;
+            let bound = ensure_store(&mut inner, &context)?
+                .vault_state()
+                .map_err(map_sync_error)?
+                .ok_or_else(|| {
+                    SyncCommandError::new(
+                        SyncCommandCode::BindingMismatch,
+                        "an exact Drive root must be bound before transfer",
+                    )
+                })?;
+            if bound.phase != SyncPhase::Ready || bound.rescan_required {
+                return Err(SyncCommandError::new(
+                    SyncCommandCode::RescanRequired,
+                    "Drive metadata must be fully scanned before transfer",
+                ));
+            }
+            require_connected_account(bound.account_id.as_deref(), &account_id)?;
+            let drive = fresh_transfer_drive(&account_id, &bound.remote_root_id)?;
+            {
+                let store = ensure_store(&mut inner, &context)?;
+                store
+                    .resume_auth_required_transfers(now_unix_ms()?)
+                    .map_err(map_sync_error)?;
+                prepare_guarded_transfers(
+                    &service,
+                    session_id,
+                    store,
+                    &drive,
+                    &bound.remote_root_id,
+                )?;
+                let executor = NativeTransferExecutor::new(&service, session_id, drive);
+                let mut worker = Worker::new(store, executor);
+                for _ in 0..MAX_GUARDED_OPERATIONS {
+                    match worker
+                        .run_once(now_unix_ms()?)
+                        .map_err(|_| SyncCommandError::internal())?
+                    {
+                        WorkOutcome::Idle => break,
+                        WorkOutcome::Completed(_)
+                        | WorkOutcome::RetryScheduled(_)
+                        | WorkOutcome::AuthRequired(_)
+                        | WorkOutcome::NeedsReconcile(_) => {}
+                    }
+                }
+            }
+            service
+                .confirm_active_session(session_id)
+                .map_err(map_app_error)?;
+            let (state, transfers) = {
+                let store = ensure_store(&mut inner, &context)?;
+                (
+                    store.vault_state().map_err(map_sync_error)?,
+                    store.transfer_summary().map_err(map_sync_error)?,
+                )
+            };
+            Ok(status_from(session_id, &inner, state.as_ref(), transfers))
+        })
+        .await
+        .map_err(|_| SyncCommandError::internal())?
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
     pub async fn sync_disconnect(
         service: tauri::State<'_, Arc<AppService>>,
         runtime: tauri::State<'_, Arc<SyncRuntime>>,
@@ -989,6 +1396,56 @@ mod platform {
                     .expect_err("wrong bound account")
                     .code,
                 SyncCommandCode::BindingMismatch
+            );
+        }
+
+        #[test]
+        fn transfer_identity_is_deterministic_and_evidence_bound() {
+            let first = transfer_operation_id(&[
+                "upload",
+                "Notes/one.md",
+                "root_1",
+                "absent",
+                "revision_1",
+            ]);
+            assert_eq!(
+                first,
+                transfer_operation_id(&[
+                    "upload",
+                    "Notes/one.md",
+                    "root_1",
+                    "absent",
+                    "revision_1",
+                ])
+            );
+            assert_ne!(
+                first,
+                transfer_operation_id(&[
+                    "upload",
+                    "Notes/one.md",
+                    "root_1",
+                    "absent",
+                    "revision_2",
+                ])
+            );
+            assert_eq!(stage_reference(first), format!("stage-{first}"));
+            assert!(!operation_marker(first).contains('/'));
+        }
+
+        #[test]
+        fn transfer_preflight_rejects_case_and_unicode_collisions() {
+            assert!(reject_portable_path_collisions(["Notes/one.md", "Notes/two.md"]).is_ok());
+            assert_eq!(
+                reject_portable_path_collisions(["Notes/One.md", "notes/one.md"])
+                    .expect_err("case collision")
+                    .code,
+                SyncCommandCode::InvalidRequest
+            );
+            assert_eq!(
+                reject_portable_path_collisions(["Cafe\u{301}.md", "Caf\u{e9}.md"])
+                    .expect_err("Unicode collision")
+                    .code,
+                SyncCommandCode::InvalidRequest
             );
         }
 
@@ -1250,6 +1707,18 @@ mod platform {
         validate_session(&session, &session_id)?;
         let _ = (after, limit);
         Err(SyncCommandError::unsupported())
+    }
+
+    #[tauri::command(rename_all = "camelCase")]
+    pub fn sync_run_guarded(
+        session: tauri::State<'_, AndroidVaultSession>,
+        session_id: String,
+    ) -> Result<SyncStatusDto, SyncCommandError> {
+        validate_session(&session, &session_id)?;
+        Err(SyncCommandError::new(
+            SyncCommandCode::Unsupported,
+            "guarded content transfer is not yet available on Android",
+        ))
     }
 
     #[tauri::command(rename_all = "camelCase")]

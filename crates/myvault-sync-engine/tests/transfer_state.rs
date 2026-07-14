@@ -310,6 +310,39 @@ fn offline_pause_preserves_attempt_count_and_resumes_only_when_due() {
 }
 
 #[test]
+fn fresh_authorization_reschedules_only_auth_paused_transfers() {
+    let fixture = Fixture::new();
+    let mut store = bound_store(&fixture);
+    let auth_id = Uuid::new_v4();
+    let pending_id = Uuid::new_v4();
+    store
+        .register_transfer(&upload(auth_id, "marker-auth-resume"))
+        .unwrap();
+    assert_eq!(
+        store.claim_next_transfer(10).unwrap().unwrap().operation_id,
+        auth_id
+    );
+    store
+        .mark_transfer_auth_required(auth_id, "drive_unauthorized", 11)
+        .unwrap();
+    store
+        .register_transfer(&upload(pending_id, "marker-pending-stays"))
+        .unwrap();
+
+    assert_eq!(store.resume_auth_required_transfers(20).unwrap(), 1);
+    let resumed = store.transfer(auth_id).unwrap().unwrap();
+    assert_eq!(resumed.phase, TransferPhase::RetryScheduled);
+    assert_eq!(resumed.attempt_count, 1);
+    assert_eq!(resumed.next_attempt_at_unix_ms, 20);
+    assert_eq!(resumed.last_error_code.as_deref(), Some("auth_restored"));
+    assert_eq!(
+        store.transfer(pending_id).unwrap().unwrap().phase,
+        TransferPhase::Pending
+    );
+    assert_eq!(store.resume_auth_required_transfers(20).unwrap(), 0);
+}
+
+#[test]
 fn transfer_transitions_completion_and_base_publication_are_atomic_and_idempotent() {
     let fixture = Fixture::new();
     let mut store = bound_store(&fixture);

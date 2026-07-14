@@ -27,6 +27,8 @@ myvault-core = { path = "../../../crates/myvault-core" }
 myvault-app-service = { path = "../../../crates/myvault-app-service" }
 myvault-sync-engine = { path = "../../../crates/myvault-sync-engine" }
 myvault-transfer = { path = "../../../crates/myvault-transfer" }
+uuid = { version = "=1.20.0", features = ["v4", "v5"] }
+unicode-normalization = "=0.1.25"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 myvault-desktop-auth = { path = "../../../crates/desktop-auth" }

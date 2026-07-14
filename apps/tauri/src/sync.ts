@@ -46,7 +46,7 @@ export type PreviewPage = {
   hasMore: boolean;
 };
 
-export type SyncBusy = "status" | "connect" | "folders" | "bind" | "scan" | "preview" | "disconnect" | null;
+export type SyncBusy = "status" | "connect" | "folders" | "bind" | "scan" | "preview" | "transfer" | "disconnect" | null;
 
 export type SyncUiState = {
   sessionId: string;
@@ -320,6 +320,12 @@ export const syncApi = {
       await invoke<unknown>("sync_preview", { sessionId, after, limit }),
       sessionId,
       after,
+    );
+  },
+  async runGuarded(sessionId: string): Promise<SyncStatus> {
+    return mapSyncStatus(
+      await invoke<unknown>("sync_run_guarded", { sessionId }),
+      sessionId,
     );
   },
   async disconnect(sessionId: string): Promise<SyncStatus> {

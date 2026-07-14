@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 mod app_commands;
 mod sync_commands;
+#[cfg(not(target_os = "android"))]
+mod transfer_runtime;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,6 +67,7 @@ pub fn run() {
             sync_commands::sync_bind_root,
             sync_commands::sync_scan_step,
             sync_commands::sync_preview,
+            sync_commands::sync_run_guarded,
             sync_commands::sync_disconnect,
             app_commands::vault_status,
             app_commands::vault_read_note,
