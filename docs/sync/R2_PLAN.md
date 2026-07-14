@@ -63,6 +63,19 @@ statusค่ะ
 
 ## Durable transfer contract
 
+### Frozen implementation bounds
+
+- Desktop accepts one transfer payload up to 512 MiB and streams through
+  descriptor-backed capabilitiesค่ะ
+- Android SAF accepts one transfer payload up to 16 MiBค่ะ The Android bridge
+  uses a bounded whole-buffer native capability rather than claiming desktop
+  streaming equivalenceค่ะ Unknown provider sizes are treated as unknown until
+  a bounded read establishes the actual byte lengthค่ะ
+- Resumable upload chunks are 8 MiB, one guarded run processes at most 1,000
+  operations, and one incremental drain processes at most 100 Changes pagesค่ะ
+- A run that reaches any bound stops truthfully with durable evidence; it never
+  widens a limit or advances a cursor past unfinished workค่ะ
+
 Schema v3 adds enough evidence to reconcile an interrupted transfer without
 guessingค่ะ A durable transfer records the following before network or local
 publication side effectsค่ะ
@@ -85,7 +98,8 @@ Base objects and staged payloads live as descriptor-relative files under the
 private per-Vault app-data rootค่ะ They are immutable once published, use
 content-addressed names, are fsynced before reference publication, and are never
 stored inside SQLite or the Vaultค่ะ Orphan cleanup is evidence-preserving and
-bounded; ambiguous objects are quarantined rather than deletedค่ะ
+bounded; ambiguous objects are retained and fail closed rather than being
+deleted or described as quarantined when no quarantine mechanism existsค่ะ
 
 ## Transfer state machine
 
@@ -141,10 +155,11 @@ echoes are suppressed by operation/revision fingerprintsค่ะ Protected
 - The main integrator owns `crates/myvault-transfer/**`, `apps/tauri/**`, root
   manifests/scripts, lockfiles, workflows, and R2 evidenceค่ะ
 
-Each lane works in an isolated worktree and does not modify shared manifests or
-lockfilesค่ะ The main integrator applies dependency and lockfile changes after
-lane contracts passค่ะ Final integration and every release gate run on one exact
-source HEADค่ะ
+Lanes use explicit file ownership whether the Codex surface provides isolated
+worktrees or a shared workspaceค่ะ Shared-workspace agents must not edit the
+same file concurrently; the main integrator owns manifests, lockfiles, conflict
+resolution, and final commitsค่ะ Final integration and every release gate run on
+one exact source HEADค่ะ
 
 ## Codex execution profile
 

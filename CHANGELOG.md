@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased — R2 guarded transfer implementation candidate — 2026-07-14
+
+Built from the R1 merge checkpoint `681271a` on
+`codex/r2-guarded-transfer`ค่ะ This milestone remains an implementation
+candidate until locked live disposable acceptance and platform CI pass on one
+exact clean HEADค่ะ
+
+- เพิ่ม schema v3 durable upload/download evidence, create-only operation
+  markers, retry scheduling, `AuthRequired`, `NeedsReconcile`, restart recovery,
+  cursor-gated mutation batches และ redacted transfer historyค่ะ
+- เพิ่ม narrow Drive transfer capability สำหรับ exact-root create/resumable
+  upload, status/reconciliation และ bounded exact-ID blob download โดยไม่มี
+  DELETE, Trash, rename, move, permission mutation หรือ blind overwrite pathค่ะ
+- เพิ่ม private staged payload/content-addressed base publication, byte/hash
+  verification และ guarded create-no-replace local publication สำหรับ desktop
+  กับ Android SAFค่ะ
+- เพิ่ม desktop local observation และ bounded Android SAF inventory/hints พร้อม
+  protected-path, duplicate-path, size-bound และ stale-capability fail-closed
+  policyค่ะ
+- เพิ่ม single-owned guarded worker, bounded 100-page/1,000-operation runs,
+  resumable 8 MiB chunks, desktop 512 MiB payload cap และ Android 16 MiB capค่ะ
+- ขยาย R2 offline aggregate และ CI ให้ครอบคลุม regression crates,
+  Android-target strict Clippy, Kotlin policy tests, APK build/alignment และ
+  platform packagesค่ะ
+- Live disposable macOS round trip, Android signed-in SAF round trip, auth
+  expiry/reacquisition, restart/offline scenarios และ final platform CI evidence
+  ยัง pending และห้ามตีความ implementation candidate เป็น release completionค่ะ
+
+## Unreleased — R1 native auth and read-only binding — 2026-07-14
+
+Merged to `main` via PR #26 at `681271a`ค่ะ
+
+- เชื่อม desktop native OAuth/OS credential store และ Android Google
+  authorization bridge โดยไม่ส่ง token เข้า WebView, SQLite หรือ logค่ะ
+- เพิ่ม production GET-only Drive adapter, exact account/root binding,
+  start-token-before-scan, bounded recursive inventory, Changes drain และ
+  restart restorationค่ะ
+- เพิ่ม redacted Tauri Sync connect/bind/scan/preview/status/disconnect commands
+  โดย R1 ไม่มี Drive mutation pathค่ะ
+- R1 live disposable acceptance, Quality, Android compile/emulator, Ubuntu
+  AppImage และ Windows NSIS ผ่านบน candidate เดียวก่อน mergeค่ะ
+
 ## Unreleased — Phase 3A sync foundation — 2026-07-13
 
 Merged to `main` via PR #23 at `db85177` on 2026-07-14ค่ะ This engineering milestone has not yet shipped in a user-facing releaseค่ะ

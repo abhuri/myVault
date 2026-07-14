@@ -2,6 +2,90 @@
 
 Updated 2026-07-14 Asia/Bangkok ค่ะ
 
+## R2 — Guarded Transfer
+
+Status: `IMPLEMENTATION CANDIDATE — LIVE/CI PENDING` ค่ะ
+
+R2 started from the merged R1 checkpoint `681271a` on branch
+`codex/r2-guarded-transfer` after one-time execution approval from คุณโอค่ะ The
+candidate implements durable byte-verified upload/download and Android SAF
+runtime integration, but R2 is not complete until every locked Gate 0–8 item in
+[R2_ACCEPTANCE.md](R2_ACCEPTANCE.md) is evidenced on one final clean HEADค่ะ
+
+### Implemented candidate scope
+
+- Schema v3 records exact upload/download intent, immutable operation marker,
+  expected revisions, SHA-256/length/MIME, private stage/base reference, durable
+  retry state and redacted outcomes before side effectsค่ะ Interrupted `Running`
+  work reopens as `NeedsReconcile` rather than replaying blindlyค่ะ
+- Production Drive transfer code is limited to exact-root metadata/media reads,
+  create/resumable-init POST and resumable-session PUTค่ะ It re-verifies account,
+  root ancestry, exact parent/file identities, hash/length/revision and lost
+  final responses before deciding whether another create is safeค่ะ
+- Guarded local publication is create-no-replaceค่ะ Same-byte targets are
+  verified no-ops; differing or unknown outcomes preserve evidence and stop at
+  `NeedsReconcile` without replacementค่ะ
+- Desktop payloads are streamed and capped at 512 MiBค่ะ Android SAF payloads
+  use bounded native whole-buffer operations capped at 16 MiBค่ะ Upload chunks
+  are 8 MiB and each run is capped at 1,000 operations and 100 Changes pagesค่ะ
+- Changes cursor advancement is transactional with declared local mutation
+  completion and durable remote transfer completionค่ะ Expired/ambiguous cursors,
+  remote moves/removals/renames, protected paths and duplicate exact paths force
+  a durable full rescanค่ะ
+- Frontend receives opaque sessions/operation IDs and redacted status onlyค่ะ
+  Tokens, resumable session URIs, provider bodies, content bodies and ambient
+  Vault paths remain outside frontend DTOs, logs and SQLiteค่ะ
+
+### Integrated offline and emulator evidence
+
+- The post-audit integrated working tree passed `pnpm quality:r2:offline` on
+  2026-07-14 Asia/Bangkokค่ะ This includes frontend typecheck, 5 files/40 tests,
+  production build, Rustfmt, strict Clippy, and all expanded R2/regression testsค่ะ
+- Key final Rust counts include Drive 51, private-root 9, Sync engine 47,
+  transfer 14, and Tauri 54 testsค่ะ The matrix includes real SQLite transaction
+  aborts, exact staged/base durability failures, restart recovery, and every
+  emitted 8 MiB resumable upload/status boundary for 0, 1, 8 MiB, 8 MiB + 1,
+  and 16 MiB payloadsค่ะ
+- Android aarch64 strict Clippy and Kotlin Vault SAF unit tests passedค่ะ The
+  final API 36 debug APK passed 16 KiB alignment and APK Signature Scheme v2,
+  then installed fresh and cold-launched in 669 ms with a live PID and zero
+  matching fatal process logsค่ะ
+- Final local APK SHA-256 is
+  `96d7791718cb5ba4326d74a8bd0076837f1fd52cdc8107e54a071cfbcda2c87e`ค่ะ
+- Static Drive mutation/token audits found no reachable DELETE, Trash, rename,
+  move, permission mutation, generic request API, durable bearer capability or
+  production dependency on `drive-sync-spike`ค่ะ
+- `pnpm audit --prod` reported no known vulnerabilitiesค่ะ
+
+### Deliberately pending / externally blocked evidence
+
+- Platform CI must still run from the exact clean Draft PR candidateค่ะ Local
+  aggregate/APK evidence above was produced after all code and audit patches;
+  the remaining uncommitted changes at that moment were evidence documents onlyค่ะ
+- Desktop live acceptance needs OAuth client configuration supplied outside the
+  repository plus an exact disposable R2 Drive account/root and disposable
+  Local Vault A/B fixture recordค่ะ No desktop OAuth environment is currently
+  available in this workspaceค่ะ
+- Android live acceptance needs a Google test account signed into the API 36
+  emulator and the same exact disposable Drive rootค่ะ The current emulator has
+  no Google account, so consent, round trip and auth reacquisition cannot runค่ะ
+- No personal Drive item, personal Vault, credential, 2FA flow or physical
+  Android device has been accessed during this candidate runค่ะ Physical-device
+  acceptance remains R7ค่ะ
+- Draft PR/CI is allowed for evidence collection, but the PR must not become
+  Ready and must not merge until the live gate and every remaining P1 closeค่ะ
+
+## R1 — Native Auth + Read-only Existing Drive Binding
+
+Status: `COMPLETE — MERGED VIA PR #26` ค่ะ
+
+R1 source was merged into `main` at `681271a` on 2026-07-14 after live
+disposable read-only acceptance and Quality, Android compile/emulator, Ubuntu
+AppImage and Windows NSIS checks passed on the same candidateค่ะ R1 connected
+native desktop/Android authorization, production GET-only Drive access, exact
+account/root binding, recursive scan, Changes drain, restart restoration and
+redacted Tauri status without exposing Drive mutation operationsค่ะ
+
 ## Phase 3A — Sync Foundation
 
 Status: `COMPLETE — MERGED VIA PR #23` ค่ะ
