@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Run the latest uncommitted Phase 1 build against a disposable copy of the Synthetic Demo Vaultค่ะ This acceptance checks watcher refresh, clean-note reload, dirty-buffer conflict protection, repeated guarded saves, and desktop recovery snapshots without touching a real Vaultค่ะ
+This runbook was used on 2026-07-13 to test the then-uncommitted Phase 1 build against a disposable copy of the Synthetic Demo Vaultค่ะ The tested implementation was later captured by `66c299f` and `cbde0c1` ค่ะ The acceptance checks watcher refresh, clean-note reload, dirty-buffer conflict protection, repeated guarded saves, and desktop recovery snapshots without touching a real Vaultค่ะ
 
 ## Safety Preconditions
 

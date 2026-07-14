@@ -1,789 +1,401 @@
-# myVault — Project Plan and Session Handoff
+# myVault — Locked Product Roadmap
 
-Latest restart checkpoint อยู่ที่ [SESSION_HANDOFF.md](SESSION_HANDOFF.md) ค่ะ Session ใหม่ต้องอ่านไฟล์ดังกล่าวก่อนเริ่มงานค่ะ
+Locked on 2026-07-14 เขตเวลา Asia/Bangkok โดยได้รับ approval จากคุณโอค่ะ
 
-> เอกสารหลักสำหรับกำหนดทิศทาง วางแผน ติดตามสถานะ และส่งต่องานข้าม session ค่ะ
+เอกสารนี้เป็นเจ้าของ North Star, release scope, milestone order, exit gates และ change-control rules ค่ะ สถานะ Git กับ operational checkpoint ล่าสุดอยู่ที่ [SESSION_HANDOFF.md](SESSION_HANDOFF.md) ค่ะ หลักฐานการทดสอบอยู่ใน `docs/*/RESULTS.md` และประวัติการเปลี่ยนแปลงอยู่ที่ [CHANGELOG.md](CHANGELOG.md) ค่ะ
 
-## 1. Project Summary
+## 1. North Star
 
-`myVault` เป็นแอปจัดการ Markdown Vault แบบ local-first ที่มีประสบการณ์ใกล้เคียง Obsidian และ Sync กับ Vault บน Google Drive ได้โดยตรงค่ะ
+ส่งมอบแอปส่วนตัวที่เปิด Local Vault หรือ Existing Google Drive Vault ได้อย่างปลอดภัย, ทำงาน offline, Sync โดยไม่เขียนทับข้อมูลเงียบ และกู้คืนหรืออธิบาย conflict ได้บน macOS, Windows, Ubuntu และ Android ค่ะ
 
-รุ่นแรกเป็น Native cross-platform application สำหรับผู้ใช้คนเดียว รองรับ Windows, macOS, Ubuntu และ Android โดยไม่มี backend, hosting, VPN, App Store หรือ Play Store ค่ะ
+งานที่ไม่ช่วยให้เส้นทาง end-to-end นี้ปลอดภัยขึ้นหรือใช้งานได้จริงจะไม่อยู่บน critical path ค่ะ
 
-เป้าหมายสูงสุดของรุ่นแรกคือข้อมูลต้องไม่สูญหาย ทำงาน offline ได้ และจัดการ conflict อย่างโปร่งใสค่ะ
+## 2. นิยาม Project Complete
 
-## 2. Locked Decisions
+Project รุ่นปัจจุบันถือว่าเสร็จเมื่อ **Personal First Release** ผ่านทุก release gate ใน R8 ค่ะ
 
-- ใช้ Tauri 2 เป็น application shell ค่ะ
-- ใช้ React และ TypeScript สำหรับ UI ร่วมกันทุก platform ค่ะ
-- ใช้ Rust สำหรับ filesystem, SQLite, secure storage, file watcher และ platform integration ค่ะ
-- ใช้ Google Drive REST API เป็นระบบ Sync กลางค่ะ
-- เชื่อม Google Drive โดยตรงจากแต่ละอุปกรณ์ค่ะ
-- ไม่มี application backend ในรุ่นแรกค่ะ
-- ไม่มี hosting, domain หรือ VPN ในรุ่นแรกค่ะ
-- ใช้งานส่วนตัวเพียงคนเดียวในรุ่นแรกค่ะ
-- ไม่เผยแพร่ผ่าน App Store, Play Store หรือ Microsoft Store ในรุ่นแรกค่ะ
-- แจก build ผ่าน GitHub Releases หรือติดตั้งด้วยไฟล์ที่ build เองค่ะ
-- ใช้ Existing Vault บน Google Drive ได้ค่ะ
-- ไฟล์ Markdown และ attachment ยังคงเป็นไฟล์ปกติและไม่ผูกขาดกับแอปค่ะ
-- Obsidian บน desktop สามารถเปิด local Vault เดียวกันกับ myVault ได้ค่ะ
-- SQLite เป็นเพียง index และ operational state ที่สร้างใหม่ได้ ไม่ใช่ source of truth ค่ะ
-- การลบไฟล์ใช้ Vault-local `.trash/` เพื่อให้ย้ายและกู้คืนได้สม่ำเสมอข้าม platform ค่ะ
-- `.trash/` ต้องถูกซ่อนจาก file explorer ปกติ และไม่ถูกรวมใน index, search, backlinks หรือ graph ค่ะ
-- ห้ามใช้ silent last-write-wins เมื่อเกิด Sync conflict ค่ะ
-- เลื่อน Canvas, plugin system, collaboration, public sharing และ E2EE ออกจากรุ่นแรกค่ะ
+คำว่าเสร็จหมายถึงผู้ใช้คนเดียวสามารถทำ journey ต่อไปนี้ได้จริงค่ะ
 
-## 3. Zero-cost Constraint
+1. ติดตั้งและเปิดแอปบน platform เป้าหมายค่ะ
+2. เปิดหรือสร้าง Local Vault โดยไม่เปิดเผย native capability สู่ WebView ค่ะ
+3. สร้าง, อ่าน, แก้ไข, rename, move, Trash และ Restore เนื้อหาโดยไม่มี silent overwrite ค่ะ
+4. เชื่อม Google account ผ่าน native authorization และ bind Existing Drive root ด้วย exact ID ค่ะ
+5. ทำงาน offline แล้ว Sync Markdown กับ attachment เมื่อกลับ online ค่ะ
+6. Restart ระหว่าง scan, upload, download หรือ mutation ได้โดยไม่ทำข้อมูลหายหรือทำงานซ้ำแบบ blind ค่ะ
+7. จัดการ local/remote conflict โดยรักษาทั้งสองฉบับหรือ merge เมื่อพิสูจน์ได้ว่าปลอดภัยค่ะ
+8. เห็น Sync status, history, retry, Auth Required, Needs Reconcile และ recovery action ที่เข้าใจได้ค่ะ
+9. ค้นหาและนำทาง knowledge core ที่ถูกสร้างจาก full-vault index จริงได้ค่ะ
+10. ผ่าน native runtime acceptance บน macOS, Windows, Ubuntu และ physical Android ตาม contract ของแต่ละ platform ค่ะ
+11. ผ่าน recovery drill, upgrade/migration test และ release verification บน artifact ที่จะส่งมอบจริงค่ะ
 
-เป้าหมายค่าใช้จ่ายเงินสดของรุ่นแรกคือ 0 บาทค่ะ
+Demo, compile-only, mock-only, emulator-only หรือ foundation-only ไม่ถูกนับว่า Project Complete ค่ะ
 
-- Windows ใช้ unsigned installer หรือ portable build และยอมรับ SmartScreen warning บนเครื่องส่วนตัวค่ะ
-- macOS ใช้ local build หรือ unsigned/ad-hoc signed build และอนุญาตผ่าน Gatekeeper ด้วยตัวเองค่ะ
-- Ubuntu ใช้ AppImage หรือ `.deb` ที่สร้างเองค่ะ
-- Android ใช้ signed APK และ sideload ด้วยตัวเองค่ะ
-- ใช้ GitHub repository และ GitHub Releases ภายในโควตาฟรีค่ะ
-- ใช้ GitHub Actions ภายในโควตาฟรี หรือใช้ self-hosted/local runners ค่ะ
-- ใช้ Google Drive API ภายใน personal usage quota ค่ะ
-- ใช้พื้นที่ Google Drive ที่มีอยู่แล้วค่ะ
+## 3. Locked Constraints
 
-ค่าใช้จ่ายที่อาจพิจารณาภายหลัง ได้แก่ Google Play Developer account, Apple Developer Program, Windows code signing และ infrastructure สำหรับ public distribution ค่ะ
+- ใช้ Tauri 2, React, TypeScript, Rust, native SQLite และ Google Drive REST API ค่ะ
+- แต่ละอุปกรณ์เชื่อม Drive โดยตรงและไม่มี application backend ค่ะ
+- รุ่นแรกเป็น personal use และตั้งเป้าค่าใช้จ่ายเงินสด 0 บาทค่ะ
+- ไม่มี hosting, domain, VPN หรือ Store distribution ใน Personal First Release ค่ะ
+- Markdown กับ attachment ใน Vault เป็น source of truth ส่วน SQLite เป็น derived หรือ operational state ที่สร้างใหม่หรือกู้คืนได้ค่ะ
+- Refresh token ต้องอยู่ใน OS secure storage และ token ห้ามอยู่ใน repository, log, SQLite Sync state หรือ WebView ค่ะ
+- ไม่มี silent overwrite, permanent delete หรือ automatic conflict-copy deletion ค่ะ
+- `.obsidian/` และ `.trash/` เป็น protected paths และไม่อยู่ใน index หรือ Sync ปกติค่ะ
+- Android SAF มี durability contract อ่อนกว่า desktop และต้องรายงาน `directorySyncUnsupported` หรือ `writeOutcomeUnknown` ตามจริงค่ะ
+- Physical-device หรือ native-OS acceptance ห้ามถูกแทนด้วย compile, mock หรือ emulator เมื่อ contract ต้องการ hardware/runtime จริงค่ะ
+- ใช้ disposable fixture หรือ exact allowlisted test root จนกว่า milestone gate จะอนุญาตให้ขยาย scope ค่ะ
 
-## 4. Product Scope
+## 4. สถานะจริง ณ Roadmap Lock
 
-### 4.1 MVP Features
+สถานะรวมโดยประมาณคือ **40–45% ของ Personal First Release เมื่อวัดจาก user-visible outcome** ค่ะ ตัวเลขนี้ใช้กำกับทิศทางและไม่ใช่ earned-value accounting ค่ะ
 
-- Google OAuth และเลือก Existing Drive Vault folder ค่ะ
-- เลือกหรือสร้าง local Vault ค่ะ
-- File explorer และ folder tree ค่ะ
-- สร้าง แก้ไข rename move trash และ restore note ค่ะ
-- Edit Mode และ Reader Mode ค่ะ
-- Markdown headings, lists, task lists และ tables ค่ะ
-- Syntax-highlighted code blocks ค่ะ
-- Mermaid diagrams ค่ะ
-- Images และ attachments ค่ะ
-- YAML frontmatter และ properties ค่ะ
-- `[[Wiki Links]]` และ `![[Embeds]]` ค่ะ
-- Backlinks และ unlinked mentions รุ่นพื้นฐานค่ะ
-- Full-text search และ quick switcher ค่ะ
-- Local Graph และ Global Graph รุ่นพื้นฐานค่ะ
-- Offline editing และ durable sync queue ค่ะ
-- Three-way merge และ conflict copies ค่ะ
-- Local recovery snapshots ค่ะ
-- Sync status, history, retry และ diagnostics ค่ะ
-- Dark mode และ responsive desktop/Android layout ค่ะ
+ฐานเทคนิคไปไกลกว่าตัวผลิตภัณฑ์ที่ผู้ใช้เห็นค่ะ Local safety, recovery และ Sync state foundation มี implementation กับ regression tests จริง แต่ production Drive integration, Sync UI และ cross-device journey ยังไม่ต่อครบค่ะ
 
-### 4.2 Deferred Features
+| Capability | สถานะจริง | หลักฐานหรือช่องว่างสำคัญ |
+|---|---|---|
+| Local Vault open, explorer, read และ guarded save | Usable in Demo | macOS live UAT ผ่านค่ะ Android SAF ผ่าน emulator แต่ Windows/Ubuntu native runtime และ physical Android ยัง deferred ค่ะ |
+| Local recovery snapshots และ stale-write protection | Runtime integrated | Desktop save publish pre-save snapshot แบบ byte-exact และ fail closed เมื่อ recovery unavailable ค่ะ |
+| Create, rename, move, Trash และ Restore | Foundation only | Core/mutation services มี safety tests แต่ Tauri commands และ UI journey ยังไม่ครบค่ะ |
+| Editor และ Reader | Partially usable | CodeMirror, autosave, GFM, sanitized Reader, code และ Mermaid ใช้งานได้ค่ะ Attachment workflow, properties และ embeds ยังไม่ครบค่ะ |
+| Search, backlinks และ graph | Prototype | Filter/quick switcher และ opened-note backlinks/graph มีใน Demo ค่ะ ยังไม่มี persistent full-vault content index ค่ะ |
+| Native Google authorization | Foundation only | Desktop OAuth/Keyring primitives และ Android bridge มีแล้วค่ะ Desktop ยังไม่ต่อเข้า runtime และ Android ยังขาด physical-device evidence ค่ะ |
+| Drive REST behavior | Spike only | Live disposable fixture, pagination, resumable upload และ trash-only cleanup เคยผ่านค่ะ ยังไม่ใช่ production adapter ในแอปค่ะ |
+| Sync state foundation | Complete เฉพาะ 3A | Private SQLite, exact binding, lease, scan state, queue, cursor และ reconciliation ผ่าน 17 tests และ merge แล้วค่ะ Crate ยังไม่เป็น dependency ของ Tauri app ค่ะ |
+| Production Drive Sync | Missing | ยังไม่มี Existing Drive binding, production scan, transfer, conflict handling หรือ Sync UI ในแอปค่ะ |
+| Packaging และ release | Partial | Demo artifacts และ CI builds มีแล้วค่ะ Native acceptance, recovery guide และ Personal First Release gate ยังไม่ครบค่ะ |
 
-- Obsidian plugin API compatibility ค่ะ
-- Arbitrary JavaScript plugins ค่ะ
+คำว่า `Complete` หมายถึง complete ตามขอบเขต milestone เท่านั้น และไม่แปลว่าผลิตภัณฑ์ทั้งเส้นทางเสร็จแล้วค่ะ
+
+## 5. Personal First Release Scope Freeze
+
+### 5.1 Must Ship
+
+- Local Vault open/create และ persisted activation ตาม platform contract ค่ะ
+- Bounded explorer และ local Create/Rename/Move/Trash/Restore ที่ไม่ overwrite ปลายทางเงียบค่ะ
+- Revision-checked editor, autosave/manual save, explicit reload และ recovery snapshots ค่ะ
+- Sanitized Reader สำหรับ headings, lists, tasks, tables, code, Mermaid และ local images ค่ะ
+- Attachment add/open/move/Trash และ Sync โดยตรวจ content hash ค่ะ
+- YAML frontmatter preservation โดยไม่ต้องมี visual properties editor เต็มรูปแบบค่ะ
+- Wiki-link navigation, basic embeds, persistent full-text search, quick switcher และ backlinks จาก full-vault index ค่ะ
+- Basic Local Graph และ Global Graph ที่อ่านจาก persistent index เดียวกันค่ะ
+- Native Google authorization, exact Existing Drive binding และ direct Drive Sync ค่ะ
+- Offline queue, restart recovery, retry/backoff, unknown-outcome reconciliation และ conflict copies ค่ะ
+- Sync status/history/retry/diagnostics ที่ไม่รั่ว token, note body หรือ ambient path ค่ะ
+- macOS, Windows, Ubuntu และ physical Android runtime acceptance ค่ะ
+- Install, backup, recovery, upgrade และ known-limitations guide ค่ะ
+
+### 5.2 Explicitly Post-release
+
+- Obsidian plugin API และ community plugins ค่ะ
 - Canvas แบบเต็มรูปแบบค่ะ
+- Dataview-compatible query engine ค่ะ
+- Advanced visual properties editor และ database-like views ค่ะ
+- Unlinked mentions, semantic search และ AI features ค่ะ
+- Arbitrary graph analytics หรือ graph ขนาดใหญ่เกิน release acceptance fixture ค่ะ
 - Real-time multi-user collaboration ค่ะ
 - End-to-end encryption ค่ะ
-- Public publishing ค่ะ
-- Dataview-compatible query engine แบบเต็มรูปแบบค่ะ
-- Store distribution และ polished code signing ค่ะ
+- Public publishing, backend, hosting และ VPN ค่ะ
+- App Store, Play Store และ Microsoft Store distribution ค่ะ
+- Auto-update service และ polished commercial code signing ค่ะ
+- iOS target ค่ะ
 
-## 5. Architecture
+รายการ Post-release อาจมี prototype ค้างอยู่ใน repository ได้ แต่ห้ามเป็น blocker ของ Personal First Release และห้ามดึงเวลาจาก active milestone ค่ะ
 
-```mermaid
-flowchart TB
-    UI["React และ TypeScript UI"] --> CORE["Shared Application Core"]
-    CORE --> EDITOR["Editor และ Reader"]
-    CORE --> INDEX["Search, Links และ Graph"]
-    CORE --> SYNC["Drive Sync Engine"]
-    CORE --> PLATFORM["Platform API"]
+## 6. Locked Execution Rules
 
-    PLATFORM --> DESKTOP["Windows, macOS และ Ubuntu"]
-    PLATFORM --> ANDROID["Android"]
+- ลำดับบังคับคือ `R1 → R2 → R3 → R4 → R5 → R6 → R7 → R8` ค่ะ
+- เปิด implementation milestone ได้ครั้งละหนึ่ง milestone เท่านั้นค่ะ
+- ห้ามเริ่ม milestone ถัดไปจน current exit gate ผ่านและคุณโออนุมัติ transition ค่ะ
+- ภายใน milestone สามารถแบ่ง bounded parallel tasks ได้ แต่ final integration และ gate ต้องตรวจบน source head เดียวกันค่ะ
+- Bug, security finding หรือ data-loss risk ที่อยู่ใน scope ต้องแก้ก่อนผ่าน gate และไม่ถือเป็น scope expansion ค่ะ
+- Feature request ใหม่ทั้งหมดเข้า Post-release backlog จนกว่าจะผ่าน change-control ค่ะ
+- Planning range เป็นค่าประมาณและไม่ใช่ deadline lock ค่ะ Scope, order และ gates เท่านั้นที่ถูกล็อกค่ะ
 
-    DESKTOP --> LOCALFS["Local Vault และ Native SQLite"]
-    ANDROID --> SAF["SAF Document-tree Vault และ Native SQLite"]
-    SYNC <--> DRIVE["Google Drive API"]
-```
+Planning range รวมที่เหลือจากผลรวม milestone คือประมาณ **10–19 focused engineering weeks** โดยไม่รวมเวลารอ physical device, native OS environment, external review หรือ account approval ค่ะ
 
-### 5.1 Recommended Repository Structure
+## 7. Locked Roadmap Overview
+
+| Milestone | Outcome | Dependency | Planning range | Status |
+|---|---|---|---|---|
+| R1 — Native Auth + Read-only Binding | แอปเชื่อม account, bind exact root และอ่าน remote state โดยไม่เขียน Drive ค่ะ | Phase 3A | 1–2 weeks | NEXT — approval required |
+| R2 — Guarded Transfer | Markdown และ attachment upload/download แบบ verified และ restart-safe ค่ะ | R1 | 2–3 weeks | Locked planned |
+| R3 — Mutations + Conflict Safety | Rename/move/Trash และ two-sided conflicts ปลอดภัยข้ามอุปกรณ์ค่ะ | R2 | 2–3 weeks | Locked planned |
+| R4 — Sync Control Plane + Safe Sync Alpha | ผู้ใช้ควบคุมและเข้าใจ Sync ได้ พร้อม end-to-end alpha acceptance ค่ะ | R3 | 1–2 weeks | Locked planned |
+| R5 — Local Product Completion | Local CRUD, attachment และ remaining editor/reader journey เชื่อม UI ครบค่ะ | R4 | 1–2 weeks | Locked planned |
+| R6 — Knowledge Core | Persistent index, search, links, backlinks และ basic graphs ใช้ full-vault truth ค่ะ | R5 | 1–2 weeks | Locked planned |
+| R7 — Cross-platform Runtime Acceptance | Release candidate journey ผ่านบนทุก platform เป้าหมายค่ะ | R6 | 1–3 weeks | Locked planned |
+| R8 — Recovery Drill + Personal First Release | Artifact, migration, recovery, docs และ release evidence พร้อมส่งมอบค่ะ | R7 | 1–2 weeks | Locked planned |
+
+## 8. Milestone Specifications
+
+### R1 — Native Auth + Read-only Existing Drive Binding
+
+Outcome คือพิสูจน์ integration ระหว่าง native auth, production Drive adapter, Sync engine และ Tauri โดยยังไม่แก้ remote data ค่ะ
+
+In scope มีดังนี้ค่ะ
+
+- ต่อ Desktop OAuth, token exchange และ OS keyring เข้ากับ Tauri native runtime ค่ะ
+- รวม Android authorization provider หลัง native interface เดียวกันเท่าที่ platform contract อนุญาตค่ะ
+- สร้าง production Drive read-only adapter โดย reuse validated HTTP behavior จาก spike ค่ะ
+- เลือก Existing Drive root และ persist exact account/root ID binding ค่ะ
+- ทำ start-token-before-scan, paginated scan, duplicate visibility และ Changes drain ค่ะ
+- แสดง read-only preview/status แบบ redacted ค่ะ
+- ทดสอบเฉพาะ disposable fixture หรือ exact allowlisted test root ค่ะ
+
+Non-goals คือ upload, download-to-Vault, rename, move, Trash, conflict merge และ continuous background Sync ค่ะ
+
+Exit gate มีดังนี้ค่ะ
+
+- ไม่มี Drive mutation ใน runtime หรือ test log ค่ะ
+- Token ไม่ออกสู่ WebView, SQLite, log หรือ serialized error ค่ะ
+- Exact account/root binding ปฏิเสธ wrong account, wrong ID และ name-only match ค่ะ
+- Initial scan/restart/cursor tests ผ่านโดย local state ไม่ล้ำ remote cursor ค่ะ
+- Native macOS read-only fixture journey ผ่านค่ะ Android compile/emulator evidence ต้องผ่าน ส่วน physical Android ยืนยันใน R7 ค่ะ
+- Quality, security review, diff review และ documentation evidence ผ่านบน head เดียวกันค่ะ
+
+### R2 — Guarded Upload and Download
+
+Outcome คือ Sync เนื้อหาได้โดยตรวจ bytes และกู้คืนจาก crash/unknown outcome ได้ค่ะ
+
+In scope มีดังนี้ค่ะ
+
+- ต่อ local mutation observation เข้ากับ durable queue ค่ะ
+- Verified resumable upload พร้อม exact remote ID/hash reconciliation ค่ะ
+- Staged download ไป private temporary area, hash verification และ guarded local publication ค่ะ
+- Markdown และ binary attachment transfer ค่ะ
+- Retry/backoff, auth expiry, offline pause/resume และ unknown-outcome reconciliation ค่ะ
+- Base object/revision capture ที่จำเป็นต่อ R3 conflicts ค่ะ
+
+Exit gate มีดังนี้ค่ะ
+
+- Disposable Local Vault → Drive → second Local Vault round trip ผ่านแบบ byte-exact ค่ะ
+- Restart/fault injection ครบทุก persistent transfer boundary ที่มีผลต่อความถูกต้องค่ะ
+- Duplicate retry ไม่สร้าง duplicate remote object หรือ overwrite local revision ที่เปลี่ยนแล้วค่ะ
+- Hash mismatch, stale revision, quota/network error และ auth expiry fail closed พร้อม recovery action ค่ะ
+- ไม่มี cursor advancement ก่อน local commit หรือ verified remote completion ค่ะ
+
+### R3 — Remote Mutations and Conflict Safety
+
+Outcome คือสองอุปกรณ์แก้ไขพร้อมกันได้โดยไม่มีข้อมูลสูญหายหรือ remote deletion ที่กำกวมค่ะ
+
+In scope มีดังนี้ค่ะ
+
+- Rename, move และ Vault-local Trash propagation ค่ะ
+- Remote removed/trashed item handling โดยใช้ exact remote ID ค่ะ
+- Markdown three-way merge เมื่อ base/local/remote ชัดและ merge ปลอดภัยค่ะ
+- Conflict copy เมื่อ merge ไม่ปลอดภัยหรือเป็น binary attachment ค่ะ
+- Delete-versus-edit, rename-versus-edit, move collisions และ duplicate remote paths ค่ะ
+- Device/time metadata ที่จำเป็นต่อ conflict explanation โดยไม่พึ่ง timestamp เพื่อความถูกต้องค่ะ
+
+Exit gate มีดังนี้ค่ะ
+
+- Conflict matrix ครอบคลุม local-only, remote-only, both-changed, delete/edit, rename/edit และ offline replay ค่ะ
+- ไม่มี conflict copy ถูกลบอัตโนมัติค่ะ
+- Remote Trash ต้องยืนยัน exact identity และไม่มี permanent-delete API ค่ะ
+- Two-device disposable fixture journey ผ่านพร้อม restart ระหว่าง mutation ค่ะ
+- ทุก unknown outcome จบที่ verified completion, retry-safe state หรือ Needs Reconcile ค่ะ
+
+### R4 — Sync Control Plane and Safe Sync Alpha
+
+Outcome คือผู้ใช้เห็น, ควบคุม และแก้ปัญหา Sync ได้โดยไม่ต้องอ่าน log หรือ SQLite ค่ะ
+
+In scope มีดังนี้ค่ะ
+
+- Connect/disconnect, bind/unbind, pause/resume และ manual sync ค่ะ
+- Status สำหรับ Clean, Local Dirty, Remote Changed, Syncing, Retry Scheduled, Auth Required, Conflict และ Needs Reconcile ค่ะ
+- Redacted history, retry action, diagnostics export และ safe recovery guidance ค่ะ
+- Background lifecycle policy, app restart และ network transition ค่ะ
+- Safe Sync Alpha end-to-end acceptance บน disposable two-device setup ค่ะ
+
+Exit gate มีดังนี้ค่ะ
+
+- User-visible state ตรงกับ durable state หลัง restart ค่ะ
+- Retry/action ทุกชนิด idempotent หรือบังคับ explicit reconciliation ค่ะ
+- Diagnostics ไม่มี token, note body, absolute Vault path หรือ raw provider response body ค่ะ
+- Safe Sync Alpha journey ผ่านบน macOS พร้อม Drive fixture ที่ยืนยัน exact root ค่ะ
+- R1–R4 regression matrix, CI และ security review ผ่านบน release-candidate head เดียวกันค่ะ
+
+### R5 — Local Product Completion
+
+Outcome คือ local-only product journey ครบโดยไม่ต้องเรียก core function ผ่าน test harness ค่ะ
+
+In scope มีดังนี้ค่ะ
+
+- Tauri commands และ UI สำหรับ Create/Rename/Move/Trash/Restore ค่ะ
+- Local Vault creation และ activation persistence ตาม platform ค่ะ
+- Attachment add/open/move/Trash และ local image rendering ค่ะ
+- Frontmatter preservation, wiki-link navigation และ basic embeds ค่ะ
+- Error/recovery UI สำหรับ stale revision, recovery unavailable และ write outcome unknown ค่ะ
+- Accessibility และ compact layout fixes ที่ blocker ต่อ release journey ค่ะ
+
+Exit gate มีดังนี้ค่ะ
+
+- Copy-of-Vault UAT รุ่นใหม่ผ่าน CRUD, attachment, restart และ recovery journey ค่ะ
+- Core capability ที่อยู่ใน first-release scope มี Tauri/UI path และ automated integration test ค่ะ
+- ไม่มี UI action ที่รับ arbitrary ambient root/path หรือข้าม opaque session boundary ค่ะ
+- Dirty buffer, note switch และ external edit ไม่ทำข้อมูลหายค่ะ
+
+### R6 — Persistent Knowledge Core
+
+Outcome คือ search, link และ graph ไม่พึ่งเฉพาะโน้ตที่เคยเปิดค่ะ
+
+In scope มีดังนี้ค่ะ
+
+- Persistent full-vault content index ที่ rebuild จาก Vault ได้ค่ะ
+- Incremental index updates จาก watcher และ Sync commits ค่ะ
+- Full-text search, quick switcher, wiki-link resolution และ backlinks ค่ะ
+- Basic local/global graph จาก persistent index เดียวกันค่ะ
+- Tags และ frontmatter fields สำหรับ discovery โดยรักษา unknown fields ค่ะ
+- Bounded indexing, malformed-content handling และ schema migration ค่ะ
+
+Exit gate มีดังนี้ค่ะ
+
+- Cold start, rebuild และ incremental update ให้ผล search/link/graph ตรงกันค่ะ
+- External editor และ Sync mutation อัปเดต index โดยไม่ index `.obsidian/` หรือ `.trash/` ค่ะ
+- Fixture อย่างน้อย 5,000 Markdown notes ผ่าน resource bounds ที่ประกาศค่ะ
+- Index เสียหายสามารถ rebuild จาก Vault โดยไม่แก้ source files ค่ะ
+- Prototype opened-note graph ถูกแทนหรือถูกลดบทบาทอย่างชัดเจนค่ะ
+
+### R7 — Cross-platform Runtime Acceptance
+
+Outcome คือ release candidate เดียวกันผ่าน native journey บนทุก platform เป้าหมายค่ะ
+
+Platform gates มีดังนี้ค่ะ
+
+| Platform | Required evidence |
+|---|---|
+| macOS | Install/launch, folder persistence, local CRUD, Keychain restart, Drive Sync, offline/restart, conflict และ recovery drill ค่ะ |
+| Windows | Installer/launch, picker persistence, NTFS safety, Credential Manager restart, Drive Sync, conflict และ recovery drill ค่ะ |
+| Ubuntu | AppImage/launch, picker persistence, filesystem/ACL behavior, Secret Service restart, Drive Sync, conflict และ recovery drill ค่ะ |
+| Physical Android | Sideload/launch, SAF persistence, Google consent/reacquisition, Thai IME, lifecycle/lock-unlock, offline Sync, conflict, recovery outcomes และ real-GPU rendering ค่ะ |
+
+Exit gate มีดังนี้ค่ะ
+
+- Artifact ของแต่ละ platform มาจาก release-candidate source head เดียวกันค่ะ
+- Compile, emulator และ native/physical evidence ถูกแยกประเภทชัดเจนค่ะ
+- ไม่มี P0/P1 และไม่มี unresolved data-loss, token-leak หรือ silent-overwrite finding ค่ะ
+- Platform limitation ทุกข้อมี typed behavior และ user-facing known limitation ค่ะ
+- หากไม่มี physical Android device ให้ R7 เป็น Blocked และห้ามเรียก Project Complete ค่ะ
+
+### R8 — Recovery Drill and Personal First Release
+
+Outcome คือ artifact ที่ส่งมอบสามารถติดตั้ง, upgrade, ใช้งาน และกู้คืนได้ตามเอกสารจริงค่ะ
+
+In scope มีดังนี้ค่ะ
+
+- Database/schema upgrade test จาก Demo/previous checkpoint มายัง release candidate ค่ะ
+- Backup/export และ restore/import drill สำหรับ disposable Vault ค่ะ
+- Simulated interrupted Sync, corrupt derived database, expired auth และ lost network recovery drill ค่ะ
+- Final threat-model, dependency, secret, license และ artifact integrity review ค่ะ
+- Installation, connection, backup, recovery, troubleshooting และ known-limitations guides ค่ะ
+- Version/tag, changelog, checksums และ GitHub Personal Release artifacts ค่ะ
+
+Exit gate มีดังนี้ค่ะ
+
+- Full verification matrix ผ่านบน exact tagged source และ release artifacts ค่ะ
+- Fresh install กับ supported upgrade path ผ่านค่ะ
+- Recovery runbook ถูกทดลองตามข้อความจริงโดยไม่แตะ personal Vault ค่ะ
+- Checksums, artifact names, architecture และ version ตรงกันทุกเอกสารค่ะ
+- คุณโอทำ Final Release Review และอนุมัติ publish ค่ะ
+- หลัง publish ต้องตรวจ artifact download/install smoke และบันทึก final handoff ค่ะ
+
+## 9. Verification Matrix
+
+| Gate type | R1 | R2 | R3 | R4 | R5 | R6 | R7 | R8 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Unit/property tests | Required | Required | Required | Required | Required | Required | Regression | Regression |
+| Integration tests | Required | Required | Required | Required | Required | Required | Required | Required |
+| Fault/restart tests | Scan/auth | Transfer | Mutation/conflict | Control plane | Local writes | Index rebuild | Platform journey | Recovery drill |
+| Live Drive fixture | Read-only | Read/write | Mutations | Two-device | Regression | Regression | Each platform | Final smoke |
+| macOS native UAT | Required | Required | Required | Required | Required | Required | Full | Final |
+| Windows native UAT | Compile initially | Compile initially | Compile initially | Build | Targeted | Targeted | Full | Final |
+| Ubuntu native UAT | Compile/test | Compile/test | Compile/test | Build | Targeted | Targeted | Full | Final |
+| Physical Android | Deferred to R7 | Emulator | Emulator | Emulator | Emulator | Emulator | Full | Final |
+
+ทุก evidence ต้องบันทึก source head, dirty state, environment, command, result และสิ่งที่ deliberately ไม่ได้ทดสอบค่ะ
+
+## 10. Change-control Lock
+
+Roadmap นี้ถูกล็อกตาม approval `Approve lock roadmap` เมื่อ 2026-07-14 ค่ะ
+
+การเปลี่ยน scope, order, exit gate หรือ Personal First Release definition ต้องทำครบทุกข้อดังนี้ค่ะ
+
+1. เขียน Change Request ที่ระบุเหตุผลและปัญหาที่แก้ค่ะ
+2. ระบุผลกระทบต่อ data safety, security, architecture, dependencies, test matrix และ planning range ค่ะ
+3. ระบุสิ่งที่จะเพิ่ม, ตัด, เลื่อน และหลักฐานว่าทางเลือกเดิมไม่เหมาะสมค่ะ
+4. ขอ explicit approval จากคุณโอค่ะ
+5. อัปเดตไฟล์นี้, handoff และ evidence owner ที่เกี่ยวข้องใน diff เดียวกันค่ะ
+
+กรณีเดียวที่ interrupt roadmap ได้ทันทีคือ confirmed P0 security/data-loss incident ค่ะ Sunday ต้องหยุด active milestone, preserve evidence, เสนอ incident plan และขอ approval ก่อน remediation ที่เปลี่ยน source ค่ะ
+
+Refactor, dependency upgrade, code splitting หรือ cleanup ทำได้เฉพาะเมื่อจำเป็นต่อ active milestone, ลดความเสี่ยงที่พิสูจน์ได้ หรือได้รับ approval แยกค่ะ
+
+## 11. Architecture and Complexity Guardrails
 
 ```text
-myVault/
-├── apps/
-│   └── tauri/
-│       ├── frontend/
-│       └── src-tauri/
-├── packages/
-│   ├── core/
-│   ├── editor/
-│   ├── markdown/
-│   ├── search/
-│   ├── graph/
-│   ├── sync/
-│   ├── platform-api/
-│   └── ui/
-├── crates/
-│   ├── vault-fs/
-│   ├── vault-db/
-│   ├── drive-client/
-│   ├── secure-storage/
-│   └── sync-engine/
-├── tests/
-│   ├── fixtures/
-│   ├── sync-scenarios/
-│   └── cross-platform/
-└── PROJECT_PLAN.md
+React UI
+  -> Tauri commands ที่รับ opaque session/IDs
+  -> Application orchestration
+     -> Local Vault services
+     -> Native authorization provider
+     -> Sync engine
+        -> Production Drive adapter
+        -> Private operational SQLite
+
+Vault Markdown/attachments = source of truth
+Private recovery/sync stores = outside Vault และ disjoint จาก Vault
+Phase 0 fixture harness = test/spike only และห้ามกลายเป็น production adapter โดยอ้อม
 ```
 
-โครงสร้างจริงอาจปรับหลัง Technical Spike แต่ต้องรักษาหลักการแบ่ง shared logic ออกจาก platform-specific mechanics ค่ะ
+- เพิ่ม crate หรือ state machine ใหม่ได้เมื่อมี trust boundary, platform boundary หรือ independently testable lifecycle ที่ชัดค่ะ
+- ห้ามสร้าง abstraction เผื่ออนาคตโดยยังไม่มี consumer ใน active milestone ค่ะ
+- R1 ต้อง reuse `desktop-auth`, validated Drive behavior และ `myvault-sync-engine` ก่อนสร้าง layer ใหม่ค่ะ
+- Sync operational database ห้ามรับหน้าที่เป็น content index, backlinks database หรือ UI cache ค่ะ
+- Prototype ใน `App.tsx` ต้องติดป้าย prototype จนกว่าจะอ่าน full-vault index จริงค่ะ
+- เมื่อ capability ยังไม่ต่อถึง UI ให้ใช้คำว่า `Foundation only` แทน `Complete` ค่ะ
+- ห้ามเพิ่ม parallel implementation milestone เพื่อเร่งเวลา เพราะจะเพิ่ม integration ambiguity ค่ะ
 
-## 6. Vault and Storage Model
+## 12. Global Definition of Done
 
-### 6.1 Source of Truth
+Milestone จะถือว่า complete เมื่อครบทุกข้อที่เกี่ยวข้องค่ะ
 
-- Markdown และ attachment ใน Vault เป็นข้อมูลจริงค่ะ
-- Google Drive เป็น remote copy และจุดแลกเปลี่ยนข้อมูลระหว่างอุปกรณ์ค่ะ
-- Local Vault เป็น working copy ของแต่ละอุปกรณ์ค่ะ
-- SQLite เก็บข้อมูลที่คำนวณใหม่หรือกู้คืนจาก Vault และ Drive ได้ค่ะ
+- มี user-visible หรือ machine-verifiable outcome ที่ตรงกับ milestone ค่ะ
+- happy path, error path, restart/retry และ recovery path มีหลักฐานตามระดับความเสี่ยงค่ะ
+- ไม่แตะ personal Vault/Drive หาก acceptance ระบุให้ใช้ disposable fixture ค่ะ
+- ไม่มี silent overwrite, ambiguous remote binding หรือ cursor advancement ก่อน local commit ค่ะ
+- Token, note body, absolute path และ provider response body ไม่รั่วสู่ UI/log โดยไม่จำเป็นค่ะ
+- Test, typecheck, build, formatting และ strict lint ที่เกี่ยวข้องผ่านบน source head เดียวกันค่ะ
+- Compile/mock/emulator ถูกติดป้ายตามจริงและไม่อ้างเป็น native/physical acceptance ค่ะ
+- ไม่มี unresolved P0/P1 และ finding ต่ำกว่าต้องมี owner กับ disposition ค่ะ
+- Plan, handoff และ evidence docs ใช้สถานะเดียวกันค่ะ
+- Sunday ตรวจ diff, integration impact, scope drift และ final gate แล้วค่ะ
+- คุณโออนุมัติ milestone transition ก่อนเริ่ม milestone ถัดไปค่ะ
 
-### 6.2 Desktop Behavior
+## 13. Active Risks
 
-- myVault เปิด local folder จริงค่ะ
-- Obsidian สามารถเปิด local folder เดียวกันได้ค่ะ
-- file watcher ตรวจจับการเปลี่ยนแปลงจาก Obsidian หรือโปรแกรมอื่นค่ะ
-- ห้ามใช้ Google Drive Desktop Sync กับ working folder เดียวกันพร้อมกับ myVault Sync Engine ค่ะ
-
-### 6.3 Android Behavior
-
-- รุ่นแรกเปิด local Vault ผ่าน Android Storage Access Framework document-tree capability ค่ะ Native layer ถือ persisted read/write URI grant และไม่เปิดเผย opaque `content://` capability ให้ WebView ค่ะ
-- myVault เป็น editor หลักของ local Android Vault ค่ะ
-- Android Sync กับ Drive ผ่าน Drive API โดยตรงค่ะ
-- Android SAF write contract ใช้ synchronized revision compare, truncating write, descriptor sync และ byte-for-byte readback verification ค่ะ
-- SAF ไม่รับประกัน descriptor-relative atomic rename และ parent-directory fsync แบบ desktop core ค่ะ เมื่อยืนยัน directory durability ไม่ได้ต้องรายงาน `directorySyncUnsupported` และ publication ที่ผลลัพธ์ไม่แน่นอนต้องรายงาน `writeOutcomeUnknown` แทนการอ้างว่าสำเร็จค่ะ
-
-### 6.4 Obsidian Compatibility Rules
-
-- รักษา Markdown ที่ไม่รู้จักไว้โดยไม่ rewrite ทั้งไฟล์โดยไม่จำเป็นค่ะ
-- รักษา YAML frontmatter และ unknown fields ค่ะ
-- รองรับ wiki links, embeds, tags, callouts และ relative attachment paths ค่ะ
-- ไม่แก้หรือลบไฟล์ใน `.obsidian` โดยอัตโนมัติค่ะ
-- ไม่พยายามโหลด Obsidian community plugins ในรุ่นแรกค่ะ
-
-## 7. Sync Mechanics
-
-### 7.1 Local-first Write Path
-
-1. เขียนไฟล์ลง local storage แบบ atomic write ค่ะ
-2. บันทึก local revision และ content hash ค่ะ
-3. เพิ่มงานลง durable sync queue ค่ะ
-4. ตรวจ remote metadata และ revision ก่อน upload ค่ะ
-5. upload เมื่อยืนยันว่าไม่มี remote conflict ค่ะ
-6. ตรวจ remote revision หลัง upload ค่ะ
-7. ลบงานออกจาก queue เมื่อ verify สำเร็จเท่านั้นค่ะ
-
-### 7.2 Pull Path
-
-1. เรียก Drive Changes API จาก page token ล่าสุดค่ะ
-2. ดึง metadata เฉพาะไฟล์ที่เปลี่ยนค่ะ
-3. เปรียบเทียบ remote state กับ base และ local state ค่ะ
-4. ดาวน์โหลดเฉพาะเมื่อ local ไม่ dirty ค่ะ
-5. ทำ three-way merge หรือสร้าง conflict copy เมื่อทั้งสองฝั่งเปลี่ยนค่ะ
-6. re-index เฉพาะไฟล์ที่ได้รับผลกระทบค่ะ
-
-### 7.3 Sync State
-
-```text
-Clean
-LocalDirty
-RemoteChanged
-Uploading
-Downloading
-Conflict
-Merging
-NeedsReview
-RetryScheduled
-AuthRequired
-```
-
-### 7.4 Conflict Rules
-
-- ถ้าเปลี่ยนเฉพาะ local ให้อัปโหลดค่ะ
-- ถ้าเปลี่ยนเฉพาะ remote ให้ดาวน์โหลดค่ะ
-- ถ้าทั้ง local และ remote เปลี่ยน ให้ใช้ three-way merge ค่ะ
-- ถ้า merge ไม่ปลอดภัย ให้รักษาทั้งสองฉบับค่ะ
-- ถ้าฝั่งหนึ่งลบแต่อีกฝั่งแก้ ให้รักษาฉบับที่ถูกแก้ค่ะ
-- delete ต้องย้ายเข้า Trash ก่อนค่ะ
-- ห้ามลบ conflict copy อัตโนมัติค่ะ
-- ต้องมีประวัติว่า conflict เกิดจาก device ใดและเวลาใดค่ะ
-
-ตัวอย่างชื่อไฟล์ conflict ค่ะ
-
-```text
-Project (conflict from Android 2026-07-11 18-30).md
-```
-
-## 8. Security Rules
-
-- เปิด Google OAuth ผ่าน system browser ค่ะ
-- ใช้ PKCE และ native-app authorization flow ตาม platform ค่ะ
-- เก็บ refresh token ใน OS secure storage ค่ะ
-- ห้ามเก็บ refresh token ใน repository, log หรือ plaintext settings ค่ะ
-- ห้าม commit Android signing keystore หรือรหัสผ่านค่ะ
-- sanitize rendered HTML ก่อนแสดงใน Reader Mode ค่ะ
-- ใช้ CSP และปิด `eval` ค่ะ
-- ใช้ Mermaid security mode แบบ strict หรือ sandbox ค่ะ
-- จำกัดสิทธิ์ Tauri commands และ filesystem scopes ตาม least privilege ค่ะ
-- ตรวจ MIME type, file size และ path traversal สำหรับ attachments ค่ะ
-- log ต้องไม่บันทึก note content หรือ token โดยปริยายค่ะ
-
-## 9. Team Operating Model
-
-### 9.1 Leadership
-
-Sunday เป็นหัวหน้าทีมและเป็นผู้รับผิดชอบผลลัพธ์สุดท้ายของโครงการค่ะ
-
-Sunday มีหน้าที่ดังนี้ค่ะ
-
-- กำหนด architecture, domain boundaries, data flow และ public contracts ค่ะ
-- กำหนด logic ของระบบและ mechanics ที่ sub-agents ต้องปฏิบัติตามค่ะ
-- แยกงานเป็น bounded tasks ที่มี input, output และ acceptance criteria ชัดเจนค่ะ
-- เลือกงานที่สามารถทำขนานกันได้โดยลดโอกาสแก้ไฟล์ชนกันค่ะ
-- spawn sub-agents เพื่อทำงานย่อยที่เป็นอิสระเมื่อคุ้มค่ากับเวลาและ context ค่ะ
-- ระบุไฟล์ที่แต่ละ sub-agent มีสิทธิ์แก้และไฟล์ที่ห้ามแตะค่ะ
-- ตรวจ assumption, design choice, patch และ test result ของ sub-agents ค่ะ
-- ตัดสินใจเมื่อผลจากหลาย sub-agents ขัดแย้งกันค่ะ
-- แก้ไขสถานการณ์เมื่อเกิด blocker, regression หรือ scope drift ค่ะ
-- รวมผลงานและรักษาความสอดคล้องของระบบทั้งหมดค่ะ
-- เป็นผู้อนุมัติขั้นสุดท้ายก่อนถือว่างานย่อยเสร็จค่ะ
-- อัปเดตเอกสาร handoff และสถานะโครงการเมื่อจบแต่ละช่วงงานค่ะ
-
-### 9.2 Sub-agent Task Brief
-
-ทุกงานที่มอบหมายให้ sub-agent ต้องระบุข้อมูลต่อไปนี้ค่ะ
-
-- เป้าหมายที่วัดผลได้ค่ะ
-- ขอบเขตไฟล์และ module ที่รับผิดชอบค่ะ
-- interface หรือ contract ที่ต้องรักษาค่ะ
-- สิ่งที่ห้ามเปลี่ยนค่ะ
-- dependency และ assumption ค่ะ
-- acceptance criteria ค่ะ
-- test commands ที่ต้องรันค่ะ
-- รูปแบบรายงานผลกลับค่ะ
-
-### 9.3 Parallel Work Rules
-
-- งานขนานต้องแยกตาม module หรือ file ownership ให้ชัดเจนค่ะ
-- ห้ามให้ sub-agents หลายตัวแก้ไฟล์เดียวกันพร้อมกันโดยไม่มี coordination ค่ะ
-- Architecture decision และ cross-module contract ต้องผ่าน Sunday ค่ะ
-- Sub-agent สามารถเสนอทางเลือกได้ แต่ห้ามเปลี่ยน architecture เองนอกขอบเขตที่ได้รับค่ะ
-- งานที่เสี่ยงต่อข้อมูลสูญหายต้องมี design review ก่อน implementation ค่ะ
-- งาน Sync, migration, deletion และ security ต้องได้รับ review เพิ่มเป็นพิเศษค่ะ
-- Sunday ต้องตรวจ diff และผลทดสอบก่อน integration ทุกครั้งค่ะ
-
-### 9.4 Incident Handling
-
-เมื่อเกิด test failure, regression หรือ implementation ไม่ตรง contract ให้ดำเนินการดังนี้ค่ะ
-
-1. หยุดการรวม patch ที่เกี่ยวข้องค่ะ
-2. บันทึกอาการ วิธี reproduce และผลกระทบค่ะ
-3. แยกว่าปัญหาอยู่ที่ requirement, contract หรือ implementation ค่ะ
-4. Sunday กำหนด corrective action และเจ้าของงานค่ะ
-5. เพิ่ม regression test ก่อนหรือพร้อมการแก้ไขค่ะ
-6. ตรวจผลซ้ำบน platform ที่ได้รับผลกระทบค่ะ
-7. อัปเดต handoff และ risk register ค่ะ
-
-### 9.5 Definition of Done
-
-งานจะถือว่าเสร็จเมื่อมีเงื่อนไขครบดังนี้ค่ะ
-
-- ตรงตาม acceptance criteria ค่ะ
-- ไม่มีการเปลี่ยน scope โดยไม่ได้รับอนุมัติค่ะ
-- มี test ตามระดับความเสี่ยงค่ะ
-- test ที่เกี่ยวข้องผ่านค่ะ
-- error path และ recovery path ได้รับการพิจารณาค่ะ
-- Sunday ตรวจ diff และ integration impact แล้วค่ะ
-- เอกสารหรือ handoff ได้รับการอัปเดตเมื่อจำเป็นค่ะ
-
-## 10. Delivery Roadmap
-
-### Phase 0 — Technical Spike
-
-ระยะเวลาเป้าหมาย 1–2 สัปดาห์ค่ะ
-
-- bootstrap Tauri 2, React, TypeScript และ Rust workspace ค่ะ
-- เปิด application shell บน macOS, Windows, Ubuntu และ Android ค่ะ
-- ทดลอง local filesystem และ native SQLite ค่ะ
-- ทดลอง Android Storage Access Framework document-tree capability และ persisted URI permission ค่ะ
-- ทดลอง Google OAuth ผ่าน system browser ค่ะ
-- ทดลองเลือก Existing Drive folder ค่ะ
-- upload, download และตรวจ changes ของ Markdown หนึ่งไฟล์ค่ะ
-- ทดลอง secure token storage ค่ะ
-- ทดลอง CodeMirror, Mermaid และ Sigma.js บน Android WebView ค่ะ
-- ทดสอบภาษาไทย, IME, selection และ virtual keyboard ค่ะ
-
-จุดตัดสินใจคือ Tauri Android และ library stack ต้องผ่านก่อนลงทุนสร้าง UI เต็มระบบค่ะ
-
-### Phase 1 — Local Vault Core
-
-ระยะเวลาเป้าหมาย 2 สัปดาห์ค่ะ
-
-- local Vault selection และ creation ค่ะ
-- file explorer และ file operations ค่ะ
-- desktop file watcher ค่ะ
-- atomic writes และ crash recovery ค่ะ
-- SQLite metadata schema และ migrations ค่ะ
-- local recovery snapshots ค่ะ
-- `.obsidian` preservation policy ค่ะ
-
-ลำดับ implementation ที่อนุมัติแล้วมีดังนี้ค่ะ
-
-1. ล็อก portable Vault path contract, safety policy และ error contract ข้าม Windows, macOS, Ubuntu และ Android ค่ะ
-2. เพิ่ม Vault inventory, bounded scan, create และ list operations ค่ะ
-3. เพิ่ม rename, move, Vault-local `.trash/` และ restore โดยห้าม overwrite ปลายทางโดยเงียบค่ะ
-4. เพิ่ม private recovery snapshots, stale-revision protection และ crash recovery ค่ะ
-5. อัปเกรด SQLite derived-index schema และทดสอบ rebuild จาก Vault ค่ะ
-6. เพิ่ม desktop native watcher และการ normalize/suppress event ค่ะ
-7. เชื่อม custom least-privilege Tauri commands, desktop folder picker และ Android SAF document-tree Vault โดยคง opaque native capability ค่ะ
-8. สร้าง file explorer ขั้นต่ำและรัน cross-platform acceptance suite ค่ะ
-
-ค่าเริ่มต้นของ Phase 1 คือ portable UTF-8 paths, no silent overwrite, recovery snapshots เก็บ 30 วันหรือสูงสุด 100 revisions ต่อ note และรวมไม่เกิน 1 GiB ต่อ Vault ค่ะ `.obsidian/` และ `.trash/` เป็น protected/internal directories ที่ไม่รวมใน index ปกติค่ะ
-
-#### Phase 1 Local Implementation Closure Checklist — 2026-07-13
-
-| Workstream | Status | Closure evidence / remaining check |
+| Risk | ระดับ | การควบคุม |
 |---|---|---|
-| Portable paths, bounded inventory/read และ no-overwrite operations | DONE | Core, app-service และ adversarial suites ผ่านแล้วค่ะ |
-| Trash, Restore, NormalMove, CaseRename และ crash recovery | DONE | Journal-first state machines, immutable manifests และ retry/resume ผ่าน independent safety audits แล้วค่ะ |
-| Recovery snapshots และ retention/GC | DONE | Desktop guarded-save path เปิด private snapshot store ต่อ Vault และ publish exact pre-save payload ก่อน replace ค่ะ Integration test ยืนยัน payload เก่าและไฟล์ใหม่แบบ byte-exact ค่ะ เมื่อ configured snapshot store สร้าง snapshot ไม่ได้ save ต้องคืน stable `recoveryUnavailable` และหยุดก่อน Vault mutation ค่ะ ส่วน retention/quarantine/verified deletion ผ่าน 62 tests ค่ะ |
-| SQLite schema, migrations และ rebuild | DONE | Phase 1 contract คือ private derived-index schema v2, transactional migrations/rebuild และ source-of-truth recovery ซึ่งผ่าน isolated suites แล้วค่ะ Persistent full-content runtime index สำหรับ search/backlinks/graph แยกเป็น milestone ถัดไปโดยตั้งใจค่ะ |
-| Desktop watcher | DONE | Native recursive watcher ถูกผูกกับ active opaque session, watcher เดิมถูก drop เมื่อเปลี่ยน Vault และ frontend debounce event ก่อน bounded explorer refresh ค่ะ Event ไม่เผย ambient path และ native external-change test ผ่านค่ะ |
-| Native Vault activation, explorer, read และ guarded save | DONE — LOCAL IMPLEMENTATION | macOS live Demo ผ่าน native picker, bounded explorer, Thai/Unicode read, autosave และ external-edit conflict stop แล้วค่ะ Android SAF activation ผ่าน API 36 emulator พร้อม weaker publication/durability contract ที่รายงาน `directorySyncUnsupported` และ `writeOutcomeUnknown` แบบ fail-closed ค่ะ |
-| Windows/Ubuntu native runtime acceptance | DEFERRED | Build artifacts ผ่าน CI แล้วค่ะ Native picker persistence, Trash/Restore และ secret-store restart evidence ยังต้องรันบนระบบจริง แต่ไม่ย้อนกลับไปลบผล safety suites ค่ะ |
-| Physical Android acceptance | DEFERRED | รออุปกรณ์จริงตามการตัดสินใจของคุณโอค่ะ Emulator ใช้เป็นหลักฐานระหว่างรอ แต่ไม่แทน IME, Play Services consent และ real-GPU evidence ค่ะ |
+| Foundation เยอะกว่าความสามารถที่ผู้ใช้เห็น | High | ใช้ milestone outcome และห้ามนับ library completion เป็น product completion ค่ะ |
+| Production integration เชื่อม auth, Drive และ Sync state หลาย trust boundary | High | R1 เป็น read-only gate และห้าม mutation ก่อนผ่านค่ะ |
+| Conflict semantics อาจทำข้อมูลหาย | High | R3 ใช้ conflict matrix, preserve both และไม่มี automatic conflict deletion ค่ะ |
+| Android SAF ไม่เทียบเท่า desktop atomic filesystem | High | ใช้ typed weaker outcomes และ physical-device acceptance ค่ะ |
+| Windows/Ubuntu runtime ยังไม่มี live evidence | High | R7 บังคับ native UAT ก่อน Project Complete ค่ะ |
+| Scope กลับไปกว้างแบบ Obsidian clone | High | ใช้ scope freeze และ Post-release list ค่ะ |
+| Physical Android availability | Medium | เตรียม runbook/emulator ก่อน แต่ R7 จะ Blocked จนมีเครื่องจริงค่ะ |
+| Frontend bundle ใหญ่ประมาณ 1.06 MB | Low | Code splitting ทำเมื่อจำเป็นต่อ R5–R7 performance gate ค่ะ |
+| เอกสาร drift | Medium | ใช้ document ownership และ change-control ในไฟล์นี้ค่ะ |
 
-สถานะ Phase 1 คือ `Local implementation closure complete` เมื่อ 2026-07-13 ค่ะ Core safety, native activation/explorer/save, pre-save recovery snapshot และ desktop watcher runtime integration ผ่านแล้วค่ะ สถานะนี้ไม่ใช่ cross-platform runtime PASS ค่ะ Windows/Ubuntu native runtime evidence และ physical Android evidence ยังคง deferred ตาม environment ค่ะ
+## 14. Document Ownership
 
-### Phase 2 — Editor and Reader
+- [README.md](README.md) เป็น snapshot สั้นสำหรับคนเข้าใหม่ค่ะ
+- ไฟล์นี้เป็นเจ้าของ locked direction, release scope, roadmap, gates และ risks ค่ะ
+- [SESSION_HANDOFF.md](SESSION_HANDOFF.md) เป็นเจ้าของ branch, dirty diff, verification ล่าสุด, active milestone และ approval state ค่ะ
+- [CHANGELOG.md](CHANGELOG.md) เก็บการเปลี่ยนแปลงตาม release/engineering milestone โดยไม่ทำหน้าที่เป็น handoff ค่ะ
+- `docs/*/RESULTS.md` เก็บ evidence พร้อมวันที่และ commit โดยข้อมูลเก่าต้องติดป้าย historical หรือ superseded ค่ะ
+- Git และผล command ปัจจุบันเป็น source of truth เมื่อขัดกับ checkpoint ค่ะ
 
-ระยะเวลาเป้าหมาย 2–3 สัปดาห์ค่ะ
+## 15. Current Transition
 
-- CodeMirror 6 editor ค่ะ
-- Reader Mode และ sanitized rendering ค่ะ
-- GFM tables และ task lists ค่ะ
-- code highlighting และ Mermaid ค่ะ
-- images และ attachments ค่ะ
-- frontmatter, wiki links และ embeds ค่ะ
-- responsive desktop/Android layout ค่ะ
-
-### Phase 3 — Drive Sync Engine
-
-ระยะเวลาเป้าหมาย 3–4 สัปดาห์ค่ะ
-
-- initial Drive scan ค่ะ
-- upload และ download paths ค่ะ
-- Changes API cursor ค่ะ
-- durable queue และ retry policy ค่ะ
-- rename, move, delete และ attachment handling ค่ะ
-- three-way merge และ conflict copies ค่ะ
-- token expiry และ re-authentication ค่ะ
-- Sync UI, history และ diagnostics ค่ะ
-
-#### Phase 3 Delivery Slices
-
-| Slice | Status | Scope / gate |
-|---|---|---|
-| 3A — Sync Foundation | IMPLEMENTATION COMPLETE — PUBLISHED IN PR #23 | แยก production `myvault-sync-engine` จาก spike harness, เพิ่ม private SQLite schema v1, exact remote binding, exclusive per-Vault Sync lease, initial-scan/cursor state machine, completed-operation tombstones, `NeedsReconcile`, evidence-preserving schema validation และ crash-aware local-mutation cursor protocol ค่ะ Architecture, acceptance และผลทดสอบอยู่ใน [`docs/sync`](docs/sync) ค่ะ |
-| 3B — Native Auth + Read-only Binding | NEXT — REQUIRES APPROVAL | เชื่อม Desktop OAuth runtime, รวม native authorization provider, เลือก Existing Drive root ด้วย exact ID และทำ read-only start-token/scan/drain ค่ะ Live Drive access ต้องขออนุมัติแยกค่ะ |
-| 3C — Guarded Upload/Download | PLANNED | durable local queue integration, verified resumable upload, staged/hashed download, retry/backoff และ unknown-outcome reconciliation ค่ะ |
-| 3D — Mutations + Conflicts | PLANNED | rename/move/Trash, attachments, base objects, three-way merge, conflict copies และ delete-versus-edit ค่ะ |
-| 3E — Sync UI + Hardening | PLANNED | Sync status/history/retry/diagnostics, scale tests และ platform lifecycle evidence ค่ะ |
-
-Phase 3A ไม่เรียก OAuth หรือ Google Drive network และไม่แตะ personal Vault/Drive ค่ะ Production remote adapter และ live read-only binding เริ่มใน 3B หลัง approval ใหม่ค่ะ
-
-### Phase 4 — Knowledge Features
-
-ระยะเวลาเป้าหมาย 2–3 สัปดาห์ค่ะ
-
-- wiki link autocomplete ค่ะ
-- backlinks และ unlinked mentions ค่ะ
-- tags และ properties ค่ะ
-- full-text search และ quick switcher ค่ะ
-- outline, Local Graph และ Global Graph ค่ะ
-- incremental indexing ค่ะ
-
-### Phase 5 — Cross-platform Hardening
-
-ระยะเวลาเป้าหมาย 2–3 สัปดาห์ค่ะ
-
-- Windows portable/installer build ค่ะ
-- macOS app/DMG build ค่ะ
-- Ubuntu AppImage build ค่ะ
-- Android signed APK ค่ะ
-- platform permissions และ lifecycle handling ค่ะ
-- database upgrade testing ค่ะ
-- import, export และ recovery testing ค่ะ
-
-### Phase 6 — Personal Release
-
-ระยะเวลาเป้าหมาย 1–2 สัปดาห์ค่ะ
-
-- GitHub release workflow ค่ะ
-- versioning และ changelog ค่ะ
-- manual update process ค่ะ
-- installation guides ค่ะ
-- signing-key backup procedure ค่ะ
-- known limitations และ recovery guide ค่ะ
-
-ระยะรวมเป้าหมายสำหรับงานเต็มเวลาคือประมาณ 13–17 สัปดาห์ค่ะ
-
-## 11. Required Test Scenarios
-
-### 11.1 Data Safety
-
-- ปิดแอประหว่าง atomic write ค่ะ
-- ปิดเครื่องระหว่าง upload ค่ะ
-- อินเทอร์เน็ตหลุดระหว่าง download ค่ะ
-- token หมดอายุระหว่าง Sync ค่ะ
-- Drive ตอบ `403`, `429` และ `5xx` ค่ะ
-- SQLite เสียและ rebuild จาก Vault ค่ะ
-- local disk หรือ Drive storage เต็มค่ะ
-
-### 11.2 Conflict Matrix
-
-- แก้บรรทัดเดียวกันจากสองอุปกรณ์ค่ะ
-- แก้คนละส่วนของไฟล์ค่ะ
-- rename พร้อม edit ค่ะ
-- move พร้อม edit ค่ะ
-- delete พร้อม edit ค่ะ
-- สร้างชื่อไฟล์เดียวกันพร้อมกันค่ะ
-- Android offline หลายวันแล้วกลับมา Sync ค่ะ
-- Obsidian แก้ไฟล์ขณะ myVault เปิดอยู่ค่ะ
-
-### 11.3 Compatibility and Scale
-
-- ภาษาไทยและ Unicode ค่ะ
-- path ที่มีช่องว่างและชื่อไฟล์ภาษาไทยค่ะ
-- YAML frontmatter และ wiki links ค่ะ
-- relative attachments ค่ะ
-- Markdown ขนาดใหญ่ค่ะ
-- image และ PDF attachments ค่ะ
-- Vault ขนาด 1,000, 5,000 และ 10,000 notes ค่ะ
-
-## 12. Risk Register
-
-| Risk | Impact | Mitigation |
-|---|---|---|
-| Tauri Android plugin หรือ WebView มีข้อจำกัดค่ะ | สูงค่ะ | พิสูจน์ใน Phase 0 ก่อนสร้าง UI เต็มระบบค่ะ |
-| Sync race ทำให้ข้อมูลสูญหายค่ะ | วิกฤตค่ะ | three-way merge, conflict copy, revision verification และ destructive-operation tests ค่ะ |
-| Android background task ถูกจำกัดค่ะ | สูงค่ะ | Sync ตอน launch, foreground, manual action และใช้ background schedule เท่าที่ระบบอนุญาตค่ะ |
-| Existing Vault มี syntax ที่ parser ไม่รู้จักค่ะ | สูงค่ะ | preserve raw content และหลีกเลี่ยง full-document rewrite ค่ะ |
-| OAuth token ถูกเปิดเผยค่ะ | วิกฤตค่ะ | PKCE, OS secure storage, redacted logs และ secret scanning ค่ะ |
-| Multi-platform build แตกต่างกันค่ะ | กลางค่ะ | platform matrix CI และทดสอบ spike ตั้งแต่ต้นค่ะ |
-| `.obsidian` ถูกแก้โดยไม่ตั้งใจค่ะ | สูงค่ะ | deny-by-default write policy และ integration tests ค่ะ |
-| GitHub Actions เกินโควตาฟรีค่ะ | ต่ำค่ะ | local/self-hosted builds และลด artifact retention ค่ะ |
-
-## 13. Git and GitHub Strategy
-
-ควรเริ่ม local Git repository และสร้าง private GitHub repository หลังเอกสารแผนนี้ได้รับอนุมัติ และก่อนเริ่มสร้าง source code ค่ะ
-
-ลำดับที่แนะนำมีดังนี้ค่ะ
-
-1. สร้าง `PROJECT_PLAN.md` ค่ะ
-2. `git init` ใน project folder ค่ะ
-3. เพิ่ม `.gitignore`, `.editorconfig` และ security-safe defaults ค่ะ
-4. commit เอกสารแผนเป็น initial commit ค่ะ
-5. สร้าง private GitHub repository ชื่อ `myVault` ค่ะ
-6. เพิ่ม remote และ push initial commit ค่ะ
-7. เปิด branch protection หรือกำหนด workflow ตามความเหมาะสมค่ะ
-8. เริ่ม Phase 0 บน feature branches ค่ะ
-
-เหตุผลที่ควรเปิด repo ก่อนเขียน source code คือสามารถย้อนดู architecture decision, review patch จาก sub-agents, เปรียบเทียบ regression และใช้ GitHub Releases ภายหลังได้ง่ายค่ะ
-
-ห้าม commit credential, refresh token, `.env`, Android keystore, signing password หรือ Vault จริงค่ะ
-
-## 14. Current Status
-
-- สถานะโครงการคือ Phase 0 OAuth/Live Drive Spike Complete — Phase 1 Local Implementation Closure Complete — Phase 3A Sync Foundation Final Hardening ค่ะ PR #23 ยังไม่ merge และ merge gate บังคับให้ current PR head ผ่าน scope review, latest-head CI, Final Merge Review และคุณโออนุมัติ merge แยกต่างหากค่ะ Phase 3B live read-only binding ยังไม่เริ่มค่ะ Windows/Ubuntu native runtime และ physical Android evidence ยัง deferred จึงยังไม่ใช่ cross-platform runtime PASS ค่ะ
-- Git repository เชื่อมกับ `https://github.com/abhuri/myVault.git` แล้วค่ะ
-- initial repository safeguards ถูก push ไปที่ `main` ใน commit `6597e18` แล้วค่ะ
-- Phase 0 ถูก merge เข้า `main` ผ่าน PR #1 ที่ merge commit `dab395a` แล้วค่ะ
-- Phase 1 portable core ถูก merge เข้า `main` ผ่าน PR #2 ที่ merge commit `838e220` แล้วค่ะ
-- Phase 1 mutation/recovery ถูก merge เข้า `main` ผ่าน PR #3 ที่ merge commit `5470e2c` แล้วค่ะ
-- revision-checked Trash/Restore boundary ถูก merge เข้า `main` ผ่าน PR #4 ที่ merge commit `0f44619` แล้วค่ะ
-- canonical manifest-bound TrashStore ถูก merge เข้า `main` ผ่าน PR #5 ที่ merge commit `b96a536` แล้วค่ะ
-- atomic staging → items, restore และ unsupported recovery evidence ถูก merge เข้า `main` ผ่าน PR #6 ที่ merge commit `a61285d` แล้วค่ะ
-- crash-safe Trash mutation service ถูก merge เข้า `main` ผ่าน PR #7 ที่ merge commit `e269ddb` แล้วค่ะ
-- original-path Restore, journaled NormalMove และ retained-recovery ABA hardening ถูก merge เข้า `main` ผ่าน PR #8 ที่ merge commit `0a4767d` แล้วค่ะ
-- compound CaseRename core/service ถูก merge เข้า `main` ผ่าน PR #9 ที่ merge commit `7475de4` แล้วค่ะ
-- revision-checked atomic content overwrite ถูก merge เข้า `main` ผ่าน PR #10 ที่ merge commit `731aef3` แล้วค่ะ
-- shared private-filesystem policy extraction ถูก merge เข้า `main` ผ่าน PR #11 ที่ merge commit `433d141` แล้วค่ะ
-- Windows owner/DACL/reparse privacy proof ถูก merge เข้า `main` ผ่าน PR #12 ที่ merge commit `fd1a3e8` แล้วค่ะ
-- Android native no-backup private-root capability ถูก merge เข้า `main` ผ่าน PR #13 ที่ merge commit `35ddfd1` แล้วค่ะ
-- immutable snapshot store พร้อม canonical timestamp, stable Vault binding, bounded payload, atomic no-replace publication และ mount-instance privacy proof ถูก merge เข้า `main` ผ่าน PR #14 ที่ merge commit `a8a64c4` แล้วค่ะ
-- cross-process snapshot operation lock, bounded inventory และ deterministic retention dry-run ถูก merge เข้า `main` ผ่าน PR #15 ที่ merge commit `bc1981a` แล้วค่ะ
-- immutable GC plan, atomic quarantine detach, bounded marker staging และ crash recovery ถูก merge เข้า `main` ผ่าน PR #16 ที่ merge commit `c779083` หลัง independent audit สถานะ SAFE และ cross-platform CI ผ่านครบแล้วค่ะ
-- verified quarantined byte deletion และ completed-run cleanup บน branch `agent/phase-1-snapshot-delete` ผ่าน independent deep audit สถานะ SAFE โดยไม่เหลือ P0/P1/P2 แล้วค่ะ
-- deletion ใช้ nested two-pass preflight, held-handle-bound identity, payload → manifest → empty item ordering, canonical completion marker และ retained terminal ledger เพื่อให้ crash retry พิสูจน์สถานะได้ค่ะ
-- retained terminal ledgers ไม่ถูกนับใน active-run cap 128 รายการ แต่ physical evidence scan จำกัด 512 รายการและสงวน capacity ก่อน terminal publication ค่ะ Ledger compaction ถูกเลื่อนไปหลัง v0.1 ค่ะ
-- verified quarantined byte deletion ถูก merge เข้า `main` ผ่าน PR #17 ที่ merge commit `bd9ed58` หลัง independent audit สถานะ SAFE และ cross-platform CI ผ่านครบแล้วค่ะ
-- coherent note read, bounded Trash pagination, Tauri-free app-service และ least-privilege Tauri commands ผ่าน independent audit สถานะ SAFE บน branch `agent/phase-1-app-service-read` แล้วค่ะ
-- package manager ที่เลือกคือ `pnpm` ค่ะ
-- Tauri 2, React, TypeScript และ Rust scaffold ถูกสร้างที่ `apps/tauri` ค่ะ
-- diagnostic shell มี Rust platform bridge, CodeMirror, Mermaid strict mode, Sigma 1,000/5,000-node probes, runtime evidence และ Android Google authorization controls แล้วค่ะ
-- Phase 0 acceptance, OAuth/Drive และ environment contracts อยู่ใน `docs/phase-0` ค่ะ
-- Phase 0 local checkpoint บน macOS host ผ่าน frontend typecheck, 8 Vitest tests, production build, Rust fmt, Clippy และ Rust suites รวม 49 tests ค่ะ
-- Tauri debug binary build และ native launch ผ่านบน macOS host ค่ะ
-- GitHub quality, Android compile + 16 KB alignment, Windows NSIS และ Ubuntu AppImage checks ของ Draft PR #1 ผ่านที่ commit `0aecda5` แล้วค่ะ
-- Android Studio, JBR 21, API 36, Platform Tools, Build Tools, Command-line Tools และ NDK ถูกติดตั้งแล้วค่ะ
-- Rust Android targets ทั้งสี่ architecture ถูกติดตั้งแล้วค่ะ
-- `tauri android init` และ ARM64 debug APK build ผ่านแล้วค่ะ
-- Android GIS `AuthorizationClient` plugin และ native-only zeroizing token boundary ถูก implement และ compile ใน APK แล้วค่ะ
-- descriptor-relative filesystem safety, atomic writes, watcher normalization และ SQLite derived-index spike ผ่าน 13 tests ค่ะ
-- desktop loopback OAuth + PKCE, exact Drive scope และ OS keyring adapter ผ่าน 9 tests พร้อม macOS Keychain live probe ค่ะ
-- Drive REST fixture harness, resumable upload, changes/cursor, hash verification และ verified trash-only cleanup ผ่าน 25 tests ค่ะ
-- Phase 3A เพิ่ม production `myvault-sync-engine` แยกจาก fixture harness พร้อม private SQLite schema v1, exclusive per-Vault Sync lease, typed remote checksums, exact initial-scan cursors, completed-operation tombstones, interrupted-job reconciliation, evidence-preserving exact schema validation และ crash-aware cursor commit protocol ค่ะ Isolated suite ผ่าน 17 tests รวม negative schema-version rejection และถูกเพิ่มเข้า local/CI quality matrices แล้วค่ะ Native Linux รัน suite ส่วน native Windows เป็น compile-only จนกว่าจะเชื่อม private-root provisioning ค่ะ
-- Security audit P0/P1 ถูกแก้แล้ว โดยเฉพาะ symlink TOCTOU และ Drive cleanup identity ค่ะ
-- ยังไม่มีอุปกรณ์ Android เชื่อมต่อ จึงยังไม่ทดสอบ Thai IME, lifecycle และ WebView บนมือถือจริงค่ะ
-- project tree, Android SDK, Emulator/AVD และ Gradle cache อยู่บน `AWB-Apps` โดยคง compatibility path เดิมผ่าน symlink ค่ะ
-- backup ภายในถูกลบหลัง migration verification และพื้นที่ภายในเหลือประมาณ 42 GiB ค่ะ
-- full Xcode ยังไม่จำเป็นต่อ target Windows/macOS/Ubuntu/Android ใน Phase 0 จึงชะลอไว้ค่ะ
-- Google Cloud project `myVault Personal` (`myvault-personal-0aecda5`) ถูกสร้างและ Google Drive API ถูกเปิดใช้งานแล้วค่ะ
-- Google Auth Platform ตั้งค่าเสร็จแล้ว โดยยอมรับ User Data Policy, ใช้ External testing audience, เพิ่มเฉพาะบัญชีทดสอบที่อนุมัติ, บันทึก full Drive scope และสร้าง Android/Desktop OAuth clients แล้วค่ะ
-- Desktop OAuth + PKCE และ env-gated live Drive fixture ผ่านจริงเมื่อ 2026-07-13 พร้อมตรวจ exact folder ID และ verified trash-only cleanup ค่ะ Android consent บนอุปกรณ์จริงยังเลื่อนไว้จนกว่าจะมีมือถือค่ะ
-- คุณโอเลือก Vault-local `.trash/` โดยซ่อนและตัดออกจาก index, search, backlinks และ graph ปกติค่ะ
-- Phase 1 portable path contract, Unicode/case collision policy, bounded inventory/read, create-new แบบ no-overwrite และ SQLite derived-index schema v2 ทำเสร็จแล้วค่ะ
-- atomic no-replace file/directory move พร้อม held-directory capabilities ทำเสร็จสำหรับ macOS, Linux, Android และ Windows native `NtSetInformationFile` boundary ค่ะ
-- append-only recovery journal, immutable completion tombstones, directory durability retry และ descriptor-native ACL validation ทำเสร็จแล้วค่ะ Physical journal GC ถูกเลื่อนไว้โดยตั้งใจเพื่อไม่ให้มี check-to-unlink race ค่ะ
-- `myvault-core` ผ่าน 148 tests, recovery ผ่าน 38 tests และ mutation service ผ่าน 45 tests รวม revision-checked overwrite, CaseRename, fault injection, adversarial symlink/reparse, collision, ACL, malformed-index recovery, typed operation topology, bounded evidence scans และ concurrent Vault instances ค่ะ
-- file revision ใช้ bounded streaming BLAKE3 และ privileged Trash/Restore payload move ผูก expected revision ไว้ภายใต้ root mutation lock เดียวกันค่ะ
-- post-publication move failures เก็บสถานะ durability ของ source/destination แยกกัน และไม่ปลอมเป็น stale precondition ค่ะ
-- recovery journal schema v4 ใช้ caller-supplied stable operation ID, ผูก Trash timestamp เพื่อ reconstruct manifest หลัง crash และบังคับ endpoint topology ของ `NormalMove`, `CaseRename`, `Trash` และ `Restore` ค่ะ
-- canonical Trash manifest จำกัด 16 KiB, payload จำกัด 64 MiB และผูก digest/source/revision ภายใต้ root mutation lock เดียวกันค่ะ
-- TrashStore เตรียม `.trash/v1/staging` แบบ descriptor-relative, nofollow, no-replace, no-unlink และรักษา durability evidence หลัง publication ค่ะ
-- TrashStore publish ทั้ง UUID directory จาก staging → items แบบ atomic no-replace และ restore เฉพาะ payload โดยคง immutable manifest ไว้ค่ะ
-- การยืนยัน authoritative directory ใช้ held-handle identity; Windows ใช้ full `VolumeSerialNumber + FILE_ID_128` และ fail closed หากอ่านไม่ได้ค่ะ
-- recovery evidence listing รายงาน v2, v3 และ future non-v4 versions โดยไม่ reinterpret/rewrite และจำกัด physical scan 8,192 entries แยกจาก active cap 4,096 entries ค่ะ
-- `myvault-mutations` ใช้ journal-first ordering และ atomic manifest ensure จึง resume Trash จาก `OperationId` ได้หลังทุก persistent crash boundary โดยไม่ซ้อน journal/vault locks ค่ะ
-- original-path Restore และ NormalMove รองรับ journal-first execute/retry/resume, idempotent completion และ no-overwrite โดยไม่สร้าง parent directory อัตโนมัติค่ะ
-- CaseRename ใช้ exact directory enumeration และ deterministic same-parent temporary path ทำ `Source → Temporary → Destination` แบบ no-replace ภายใต้ root lock เดียว พร้อมแยก Fresh/Retained เพื่อป้องกัน source-only ABA ค่ะ
-- revision-checked content overwrite ตรวจ expected revision, parent identity, regular+nlink1 target และ temp integrity ซ้ำก่อน replacing rename พร้อม typed postpublication outcome-unknown และ durability evidence ค่ะ
-- `myvault-private-fs` รวม held-capability root disjointness, identity, owner/mode/ACL, symlink และ link-count policy เพื่อให้ recovery กับ snapshots ใช้ security boundary เดียวกันค่ะ
-- Windows privacy proof ตรวจ current-user owner, protected non-NULL DACL, trusted SID allowlist, bounded ACE/SID parsing และ reparse/device จาก held handle ค่ะ Directory flush ที่ Windows ไม่รองรับถูก report เป็น `DirectorySyncUnsupported` และ recovery ยัง fail closed โดยตั้งใจค่ะ
-
-## 15. Next Actions
-
-1. ก่อน merge PR #23 ต้องยืนยันว่า final blocker remediation ถูก commit และ publish ครบ, latest PR head ผ่าน CI, Final Merge Review เป็น PASS และคุณโออนุมัติ merge แยกต่างหากค่ะ
-2. หลัง 3A ผ่าน review ให้เสนอ Phase 3B Native Auth + Read-only Existing Drive Binding พร้อม exact live-account safety gate และขอ approval ก่อนแตะ Google Drive จริงค่ะ
-3. วาง milestone แยกสำหรับ persistent full-vault content index, backlinks/graph และ frontmatter/properties presentation โดยไม่ดึงมาปนกับ Sync operational database ค่ะ
-4. ทำ P3 code splitting ของ Mermaid/Sigma และ modules ขนาดใหญ่หลัง Sync foundation โดยไม่กระทบ safety contracts ค่ะ
-5. ทำ Windows/Ubuntu native acceptance และ physical Android validation เมื่อมี environment/อุปกรณ์ โดยไม่ใช้ compile หรือ emulator แทน evidence ที่ contract ระบุว่าต้องเป็นเครื่องจริงค่ะ
-
-## 16. Session Handoff
-
-### Approved PR18 Service Slice
-
-- หลัง physical snapshot deletion ผ่าน audit ให้เพิ่ม coherent `read_note_with_revision` ใน `myvault-core` โดยอ่าน held file stream เดียว จำกัด 16 MiB รองรับเฉพาะ `.md`/`.MD` และคำนวณ revision จาก byte ที่คืนจริงค่ะ
-- เพิ่ม deterministic bounded Trash item pagination จำกัด scan 8,192 entries และ page 1–100 entries โดย valid evidence แสดง metadata และ malformed/future evidence แสดงเป็น opaque โดยไม่เปิดสิทธิ์ restore ค่ะ
-- สร้าง crate `myvault-app-service` ที่ไม่ขึ้นกับ Tauri, UI, Drive, OAuth, mutations หรือ snapshots และถือ opaque `VaultSessionId` สำหรับป้องกัน response จาก Vault เก่าปะปนกับ Vault ใหม่ค่ะ
-- frontend-safe errors ต้องเป็น stable code และห้ามเผย absolute path, OS error, token หรือ backtrace ค่ะ
-- Tauri PR18 เปิดเฉพาะ `vault_status`, `vault_read_note` และ `vault_list_trash` โดยห้ามมี IPC command ที่รับ arbitrary Vault root path ค่ะ
-- native folder picker, Android managed-root activation, watcher, save/autosave, snapshot orchestration, explorer inventory และ UI integration แยกเป็น milestone ถัดไปค่ะ
-- PR18 acceptance คือ integration test เปิด Synthetic Vault จาก trusted native boundary, อ่าน Markdown ภาษาไทยพร้อม exact revision, list valid/opaque Trash อย่าง deterministic และ serialize safe DTO ได้โดยไม่มี ambient filesystem path จาก frontend ค่ะ
-
-### Current Handoff
-
-- วันที่อัปเดตคือ 2026-07-13 21:23 เขตเวลา Asia/Bangkok ค่ะ Phase 1 closure ถูก push แล้วและ Phase 3A PR #23 อยู่ระหว่าง final hardening ที่คุณโออนุมัติให้ดำเนินการต่อเนื่องจนพร้อม merge ค่ะ
-- restart checkpoint หลักอยู่ที่ `SESSION_HANDOFF.md` ค่ะ ให้ session ใหม่อ่านไฟล์นั้นก่อนเอกสารอื่นค่ะ
-- branch ปัจจุบันคือ `codex/phase-3-sync-foundation` และ base คือ `cbde0c1` ค่ะ ให้ใช้ current local/remote/PR head จาก Git และ GitHub เป็น source of truth แทน static commit list ค่ะ ทุก head ใหม่ต้องผ่าน scope review กับ CI ของตัวเองก่อน merge และห้ามทำ commit/push ซ้ำเมื่อ head ทั้งสามตรงกันค่ะ
-- คุณโอเลือก Phase 3 ก่อน Phase 2 และอนุมัติ Phase 3A Sync Foundation แล้วค่ะ Phase 3B/live Drive access ยังต้องขอ approval ใหม่ค่ะ
-- ผู้ใช้เรียกว่า คุณโอ หรือบอส ค่ะ
-- Sunday เป็นหัวหน้าทีมและเจ้าของ architecture, logic, mechanics และ final integration ค่ะ
-- Sunday สามารถ spawn sub-agents สำหรับ bounded parallel tasks ตาม Operating Model ในเอกสารนี้ค่ะ
-- ทุก implementation plan ต้องขออนุมัติคุณโอก่อนลงมือค่ะ
-- รุ่นแรกเป็น personal-use native application แบบ zero-cash-cost ค่ะ
-- คุณโออนุมัติเป้าหมายต่อเนื่องถึง `v0.1.0-demo` โดยเลือก Local Desktop Demo, Synthetic Demo Vault, macOS acceptance target, autosave 750 ms + manual save และ Obsidian-inspired dark UI ค่ะ
-- architecture ที่ล็อกคือ Tauri 2, React, TypeScript, Rust, native SQLite และ direct Google Drive API ค่ะ
-- ไม่มี backend, hosting, VPN หรือ Store distribution ในรุ่นแรกค่ะ
-- compatibility project path คือ `/Users/awb/My Apps/myVault` และ physical path คือ `/Volumes/AWB-Apps/My Apps/myVault` ค่ะ
-- `/Users/awb/My Apps` เป็น symlink ไป `/Volumes/AWB-Apps/My Apps` ค่ะ
-- Android SDK physical path คือ `/Volumes/AWB-Apps/Developer/Android/sdk` และ `~/Library/Android/sdk` เป็น symlink ค่ะ
-- Gradle cache physical path คือ `/Volumes/AWB-Apps/Developer/Gradle` และ `~/.gradle` เป็น symlink ค่ะ
-- remote repository คือ `https://github.com/abhuri/myVault.git` ค่ะ
-- `main` มี initial commit `6597e18` ค่ะ
-- `v0.1.0-demo` release แล้วจาก merge commit `0c5fbf0` ค่ะ PR #1 ถึง PR #20 merge เข้า `main` แล้วค่ะ
-- PR17 merge หลังผ่าน strict host checks, snapshot tests 62 รายการ, private-fs 13 รายการ, platform-fs 2 รายการ, Windows platform/private cross-check และ Android aarch64 cross-Clippy แล้วค่ะ
-- PR18 core/app-service ผ่าน independent deep audit สถานะ SAFE พร้อม core 73 unit tests + integration suites, note-read 4, Trash-listing 7 และ app-service 7 tests ค่ะ
-- PR18 Tauri bridge เปิดเฉพาะ `vault_status`, `vault_read_note` และ `vault_list_trash`, ใช้ canonical session ID + `spawn_blocking`, ไม่มี root/open/activation IPC และผ่าน Tauri tests 4 รายการค่ะ
-- PR18 merge เข้า `main` ผ่าน PR #18 ที่ merge commit `596a9d5` หลัง quality, Android, Windows และ Ubuntu ผ่านครบค่ะ
-- PR19 local-vault activation/explorer ผ่าน independent deep audit สถานะ SAFE โดยไม่เหลือ P0/P1/P2 ค่ะ Desktop ใช้ custom path-free native picker, Android ตอบ typed unsupported และ explorer ใช้ bounded deterministic pagination ค่ะ
-- PR19 harden `Vault::open` ด้วย canonical-before/after, held no-follow capability และ full directory identity verification พร้อม core 77 unit tests, app-service 8 tests, Tauri 5 tests และ Android aarch64 cross-Clippy ผ่านค่ะ
-- PR19 merge เข้า `main` ที่ merge commit `c569ba0` หลัง quality, Android, Windows และ Ubuntu ผ่านครบค่ะ
-- revision-checked save bridge ถือ session guard ตลอด publication, map join failure เป็น outcome-unknown และผ่าน independent audit สถานะ SAFE โดยไม่เหลือ P0/P1/P2 ค่ะ
-- `Technical Utility` Demo UI พร้อม editor/reader, 750 ms autosave, safe conflict stop, quick switcher, outline, backlinks และ graph prototype ค่ะ
-- frontend deep audit ปิด edit-during-save, cross-session response, unsafe switch, sanitizer/CSS spoof, wiki-code corruption, focus containment และ WebView top-navigation findings ครบ โดย verdict สุดท้าย SAFE ค่ะ
-- local gates ผ่าน TypeScript, Vitest 19, Vite build, app-service 10 tests, Tauri 6 tests, strict host Clippy, Android aarch64 cross-Clippy และ macOS debug `.app` bundle ค่ะ
-- live macOS test ผ่าน native picker, 5-note explorer, Thai read, Reader table/code, exact autosave และ external-edit conflict ที่ไม่ overwrite disk ค่ะ
-- GitHub Release คือ `https://github.com/abhuri/myVault/releases/tag/v0.1.0-demo` พร้อม macOS ARM64, Windows x64, Linux amd64 และ SHA-256 checksums ค่ะ
-- checkpoint หลัง release ที่ commit `99d42c4` เป็นประวัติเดิมค่ะ Phase 1 closure อยู่บน `origin/main` ที่ `cbde0c1` และ Phase 3A branch `codex/phase-3-sync-foundation` อยู่ใน PR #23 ค่ะ ผล CI ของ head เก่าเป็นหลักฐานเชิงประวัติเท่านั้น ส่วน merge gate ต้องอ่านจาก current PR head ตาม `SESSION_HANDOFF.md` ค่ะ
-- session ใหม่ให้เริ่มด้วยการอ่าน `SESSION_HANDOFF.md`, `PROJECT_PLAN.md`, `docs/phase-0/RESULTS.md`, `docs/demo/RESULTS.md`, `docs/demo/ACCEPTANCE.md` และ `CHANGELOG.md` ก่อนวางแผนรอบถัดไปค่ะ
-- Live Copy-of-Vault UAT ผ่านตาม [Phase 1 Hardening — Copy-of-Vault Acceptance](docs/demo/PHASE1_HARDENING_ACCEPTANCE.md) แล้วค่ะ ผลละเอียดอยู่ใน [Demo Results](docs/demo/RESULTS.md) ค่ะ
-- malicious same-UID syscall race บน Unix/macOS อยู่นอก threat model ที่ประกาศไว้ เพราะไม่มี portable unlink-by-handle primitive; cooperating myVault processes ถูก serialize ด้วย operation lock ค่ะ
-- Phase 0 diagnostic shell และ contracts ถูกสร้างแล้วค่ะ
-- Phase 0 local checkpoint ที่บันทึกไว้ผ่าน TypeScript, Vitest 8 tests, Vite build, Rust fmt/Clippy, Rust 49 tests, macOS Keychain live probe และ Tauri debug build ค่ะ
-- GitHub quality, Android compile + 16 KB alignment, Windows NSIS และ Ubuntu AppImage checks ของ Draft PR #1 ผ่านที่ commit `0aecda5` แล้วค่ะ
-- Android toolchain พร้อมและ ARM64 debug APK build ผ่านจาก external SSD แล้วค่ะ
-- Android Emulator API 36, WebView 133, Mermaid และ Sigma 1,000 nodes ผ่าน; 5,000 nodes ทำให้ headless surface ดำและถูกบันทึกเป็น non-gating capacity result ค่ะ
-- frontend, Rust, macOS native debug build และ Android build ผ่านหลังรวม core/auth/Drive dependencies ค่ะ
-- พื้นที่ internal เหลือประมาณ 42 GiB และ migration backup ถูกลบแล้วค่ะ
-- Android physical-device test ถูกเลื่อนตามการตัดสินใจของคุณโอ เพราะยังไม่มีอุปกรณ์ค่ะ งานที่ไม่พึ่งมือถือดำเนินต่อได้ค่ะ
-- full Xcode ถูกชะลอโดยตั้งใจเพราะยังไม่มี iOS target และ Command Line Tools เพียงพอสำหรับ macOS Phase 0 ค่ะ
-- Android Google OAuth ใช้ GIS `AuthorizationClient` ผ่าน Kotlin Tauri plugin โดย access token อยู่ใน memory/native layer เท่านั้นค่ะ
-- Drive live harness ไม่มี permanent-delete API, จำกัด Google origin และตรวจ random marker ก่อน Trash ค่ะ
-- คุณโอเลือก Vault-local `.trash/` ซึ่งต้องไม่ปรากฏใน index, search, backlinks หรือ graph ปกติค่ะ
-- Google Cloud project `myVault Personal` (`myvault-personal-0aecda5`), Drive API, User Data Policy, full Drive scope และ Android/Desktop OAuth clients พร้อมแล้วค่ะ Live Desktop OAuth + Drive fixture ผ่านแล้วค่ะ
-- Phase 1 portable paths, bounded inventory/read, no-overwrite create, revision-checked overwrite, derived index schema v2, atomic no-replace move และ file-only Trash/Restore/NormalMove/CaseRename state transitions พร้อมแล้วและผ่าน core 148 tests ค่ะ
-- append-only recovery journal schema v4 ผ่าน 38 tests ไม่มี production unlink/hardlink cleanup API, typed operation บังคับ endpoint topology และ unsupported evidence ถูก report แบบ bounded/fail-closed ค่ะ
-- Trash, original-path Restore, NormalMove และ CaseRename services แบบ journal-first ผ่าน 45 tests โดย retained NormalMove/CaseRename ปฏิเสธ source-only topology ที่กำกวมเพื่อป้องกัน ABA ค่ะ
-- Phase 1 local implementation closure audit เสร็จแล้วค่ะ Desktop guarded save publish exact pre-save snapshot และ fail closed ด้วย stable `recoveryUnavailable` ก่อน Vault mutation เมื่อ configured snapshot store ล้มเหลวค่ะ Native watcher refresh explorer ผ่าน opaque session event และ SQLite schema/rebuild ถูกยืนยันว่าเสร็จตาม Phase 1 contract โดย full-content index อยู่ milestone ถัดไปค่ะ สถานะนี้ไม่แทน Windows/Ubuntu native runtime หรือ physical Android evidence ค่ะ
-- Final uncommitted Phase 1 local implementation closure checkpoint เมื่อ 2026-07-13 ผ่าน frontend 24 tests, Tauri 8 tests, app-service 14 tests (2 unit + 12 integration), snapshot 62 tests และ SAF policy 3 tests ค่ะ Strict host Clippy, Android aarch64 Clippy, production frontend build, full Android debug APK build และ macOS debug application bundle ผ่านค่ะ Frontend build ยังมี non-blocking large-chunk warning ค่ะ
-- Android APK SHA-256 คือ `ace5ca1504ea06a0964a67904172b21d1babc2630b999e3ea18b9a803fd20a5f` ค่ะ 16 KB zip alignment และ APK Signature Scheme v2 ผ่านค่ะ
-- Live Copy-of-Vault UAT บน macOS ผ่านค่ะ Clean watcher reload, stale-revision conflict stop, explicit reload, guarded saves สาม revision, recovery snapshots แบบ byte-exact, Reader keyboard navigation, Mermaid failure isolation และ restart continuity ผ่านโดยไม่แตะ source fixture หรือ personal Vault ค่ะ
-- OAuth configuration และ live Drive fixture ผ่านแล้ว จึงไม่ใช่ blocker ของ Phase 1 หรือ production Drive milestone อีกต่อไปค่ะ Physical Android validation ยัง deferred จนกว่าจะมีอุปกรณ์จริงค่ะ
-- ไม่มี approval ด้าน User Data Policy ค้างอยู่ค่ะ Credential และ token สำหรับ live spike ถูกเก็บนอก repository และต้องไม่ commit ค่ะ
-
-### Handoff Update Template
-
-```markdown
-## Session Handoff — YYYY-MM-DD HH:mm Asia/Bangkok
-
-### Objective
-- เป้าหมายของ session ค่ะ
-
-### Completed
-- งานที่เสร็จแล้วค่ะ
-
-### Files Changed
-- `path/to/file` — สรุปการเปลี่ยนแปลงค่ะ
-
-### Decisions Made
-- การตัดสินใจและเหตุผลค่ะ
-
-### Commands and Tests
-- `command` — ผลลัพธ์ค่ะ
-
-### Known Issues and Risks
-- ปัญหา ความเสี่ยง และวิธี reproduce ค่ะ
-
-### Active Sub-agents
-- ชื่อ task, ขอบเขต และสถานะค่ะ
-
-### Next Actions
-1. งานถัดไปค่ะ
-
-### Approval Required
-- สิ่งที่ต้องขออนุมัติคุณโอก่อนดำเนินการค่ะ
-```
-
-## 17. Change Log
-
-### 2026-07-13
-
-- ปิด Phase 1 local implementation closure audit และแก้ runtime gaps ที่พบ โดยยังแยก Windows/Ubuntu native runtime กับ physical Android evidence เป็น deferred ค่ะ
-- เชื่อม private recovery snapshot store เข้ากับ desktop app-data root และ publish exact pre-save payload ก่อน revision-checked replace ค่ะ Configured snapshot failure คืน stable `recoveryUnavailable` และหยุด save ก่อน Vault mutation ค่ะ
-- เพิ่ม native recursive desktop watcher ที่ผูกกับ opaque Vault session และ frontend debounce refresh โดยไม่เผย ambient path ค่ะ
-- ยืนยันว่า SQLite schema v2, migrations และ rebuild เป็น Phase 1 derived-index contract ส่วน persistent full-content search/backlinks/graph index เป็น milestone ถัดไปค่ะ
-- Final uncommitted Phase 1 local implementation closure checkpoint ผ่าน frontend 24 tests, Tauri 8 tests, app-service 14 tests, snapshot 62 tests และ SAF policy 3 tests พร้อม strict host/Android aarch64 Clippy, frontend production build, full Android debug APK build และ macOS debug application bundle ค่ะ Frontend build ยังมี non-blocking large-chunk warning ค่ะ
-- Final Android debug APK SHA-256 คือ `ace5ca1504ea06a0964a67904172b21d1babc2630b999e3ea18b9a803fd20a5f` ค่ะ 16 KB zip alignment และ APK Signature Scheme v2 ผ่านค่ะ Live Copy-of-Vault UAT บน macOS ผ่านตาม runbook แล้วค่ะ
-- ปรับ architecture record ให้ Android ใช้ SAF document-tree capability พร้อมระบุ publication/durability contract ที่อ่อนกว่า desktop และแยก pre-SAF baseline ออกจาก current SAF evidence ค่ะ
-- Google OAuth configuration, Android/Desktop clients, full Drive scope และ live Drive fixture round trip ผ่านแล้วค่ะ
-
-### 2026-07-12
-
-- merge PR #20 ที่ commit `0c5fbf0` หลัง quality, Android, Windows และ Ubuntu CI ผ่านครบ แล้วออก GitHub Release `v0.1.0-demo` พร้อม macOS/Windows/Linux assets และ checksums ค่ะ
-- live macOS acceptance ยืนยัน native picker, Thai read, 750 ms autosave และ stale-revision conflict ที่รักษา external bytes โดยไม่ overwrite ค่ะ
-- frontend และ save bridge ผ่าน final independent deep audit สถานะ SAFE โดยไม่เหลือ P0/P1/P2 ค่ะ
-- merge PR #18 ที่ commit `596a9d5` พร้อม coherent note read, bounded Trash listing, opaque app session และ least-privilege Tauri read bridge หลัง cross-platform CI ผ่านทั้งหมดค่ะ
-- เพิ่ม desktop native folder picker แบบไม่มี path argument/response, Android typed unsupported response และ bounded explorer pagination สำหรับ Local Demo ค่ะ
-- harden การเปิด Vault ด้วย held no-follow root identity verification และ exact-looking replacement rejection ค่ะ
-- PR19 ผ่าน independent deep audit สถานะ SAFE โดยไม่เหลือ P0/P1/P2 พร้อม host strict suites และ Android aarch64 cross-Clippy ค่ะ
-- merge PR #17 ที่ commit `bd9ed58` พร้อม marker-authorized physical deletion, retained terminal ledger และ full crash fault matrix หลัง cross-platform CI ผ่านทั้งหมดค่ะ
-- เพิ่ม coherent single-stream note read ขนาดสูงสุด 16 MiB, deterministic bounded Trash pagination และ Tauri-free opaque Vault session service ค่ะ
-- PR18 core/app-service ผ่าน independent audit สถานะ SAFE หลังปิด I/O-vs-Opaque classification, item identity revalidation, canonical session input, camelCase DTO, capability-only activation และ stale-session race findings ค่ะ
-- เชื่อม app-service เข้า Tauri ด้วย `Arc<AppService>` และ safe typed commands พร้อม CI gates; bridge ผ่าน independent audit สถานะ SAFE โดยไม่เหลือ P0/P1/P2 ค่ะ
-- เพิ่ม marker-authorized physical quarantine deletion พร้อม nested two-pass preflight ซึ่งตรวจทุก candidate และ unknown evidence ก่อน mutation ใด ๆ ค่ะ
-- เพิ่ม canonical completed-run marker, retained terminal ledger, bounded attempt families, reserved physical capacity และ retry-convergent fault matrix ครบทุก destructive boundary ค่ะ
-- เพิ่ม Windows full file identity, held-handle-bound removal contract และ `DeletedButLockLost(DeletionReport)` เพื่อรักษาข้อเท็จจริงหลัง operation lock สูญหายค่ะ
-- PR17 ผ่าน independent deep audit สถานะ SAFE โดยไม่เหลือ P0/P1/P2 พร้อม snapshot 62, private-fs 13 และ platform-fs 2 tests ค่ะ
-- merge PR #16 ที่ commit `c779083` พร้อม immutable GC plan, atomic quarantine detach และ crash recovery หลัง quality, Android, Windows และ Ubuntu CI ผ่านทั้งหมดค่ะ
-- เริ่ม verified quarantined byte deletion โดยล็อก invariant ว่า หลัง detached marker ห้ามแตะ snapshot object ชื่อเดิม และหลัง completed-run marker ให้ทำ metadata cleanup เท่านั้นค่ะ
-- merge PR #15 ที่ commit `bc1981a` พร้อม cross-process lock, bounded inventory และ deterministic retention dry-run หลัง cross-platform CI ผ่านทั้งหมดค่ะ
-- เพิ่ม atomic work-to-runs GC plan publication, bounded marker staging, quarantine detach และ destination-only crash recovery โดยไม่มี unlink/remove/delete ค่ะ
-- quarantine detach ผ่าน independent audit สถานะ SAFE หลังปิด request-order, run-cap, marker-staging, typed outcome, plan semantics และ Windows cfg findings ค่ะ
-- merge PR #14 ที่ commit `a8a64c4` พร้อม immutable private snapshot store และ native mount-instance privacy proof หลัง quality, Android, Windows และ Ubuntu CI ผ่านทั้งหมดค่ะ
-- เพิ่ม per-Vault cross-process lock, bounded snapshot inventory และ deterministic retention dry-run สำหรับ 30 วัน, 100 revisions ต่อ path lineage และ 1 GiB logical bytes โดยยังไม่มี production deletion path ค่ะ
-- retention dry-run ผ่าน independent audit สถานะ SAFE หลังปิด split-lock, held-read budget, exact cutoff, checked arithmetic, duplicate/mixed Vault และ Android cfg findings ค่ะ
-- คุณโออนุมัติค่าเริ่มต้นทั้งหมดและให้ Sunday เดินงานต่อเนื่องถึง `v0.1.0-demo` ค่ะ
-- ล็อก Demo scope เป็น Local Desktop, Synthetic Demo Vault, macOS-first acceptance, autosave 750 ms + manual save และ Obsidian-inspired `Technical Utility` dark UI ค่ะ
-- immutable snapshot store และ mount-instance privacy proof ผ่าน independent audit สถานะ SAFE โดยไม่เหลือ P0/P1/P2 ค่ะ FUSE mirror ที่สร้าง identity ใหม่ถูกระบุไว้นอก native inode/mount threat model ค่ะ
-- merge PR #13 ที่ commit `35ddfd1` พร้อม Android native no-backup private-root capability หลัง quality, Android, Windows และ Ubuntu CI ผ่านทั้งหมดค่ะ
-- merge PR #12 ที่ commit `fd1a3e8` พร้อม Windows owner/DACL/reparse privacy proof หลัง Windows runtime และ cross-platform CI ผ่านทั้งหมดค่ะ
-- เพิ่ม Android native-only Tauri bridge สำหรับ `noBackupFilesDir`, opaque held capabilities, exact owner/mode/link/ACL checks และไม่เปิด path หรือ command ให้ frontend ค่ะ
-- ยืนยัน Android private-root patch ด้วย private-fs 8 tests, desktop repository compile gate, Android cross-clippy และ full Rust/Kotlin/Gradle APK build ค่ะ Physical-device evidence ถูกเลื่อนตามการตัดสินใจของคุณโอค่ะ
-- merge PR #11 ที่ commit `433d141` พร้อม shared `myvault-private-fs` หลัง cross-platform CI ผ่านทั้งหมดค่ะ
-- เพิ่ม Windows native owner/DACL/ACE/reparse privacy proof โดยจำกัด `unsafe` ไว้ใน platform ACL facade และตรวจ SID bounds ก่อนเรียก Win32 ค่ะ
-- Windows directory sync ที่ handle ปัจจุบันไม่รองรับถูกแยกเป็น typed `DirectorySyncUnsupported`; retry ไม่สามารถข้าม durability check และ RecoveryJournal ยัง fail closed ค่ะ
-- merge PR #10 ที่ commit `731aef3` พร้อม revision-checked content overwrite หลัง cross-platform CI ผ่านทั้งหมดค่ะ
-- แยก private root/permission/ACL/file-link policy จาก recovery เป็น crate `myvault-private-fs` โดยคง recovery schema และ evidence bytes เดิมค่ะ
-- shared privacy boundary ผ่าน private-fs 8 tests, recovery 38 tests, clippy และ compile checks บน Windows/Android โดยสอง platform ยังคง fail closed จน native privacy proof พร้อมค่ะ
-- merge PR #9 ที่ commit `7475de4` พร้อม crash-safe CaseRename หลัง quality, Android, Windows และ Ubuntu CI ผ่านทั้งหมดค่ะ
-- เพิ่ม revision-checked atomic content overwrite สำหรับ snapshot prerequisite พร้อม stale protection, temp/target revalidation, parent identity และ typed durability outcome ค่ะ
-- revision-checked overwrite ผ่าน independent safety audit โดยไม่เหลือ P0/P1/P2 และ local regression ผ่าน core 148 กับ Tauri Rust 2 tests ค่ะ
-- merge PR #8 ที่ commit `0a4767d` พร้อม original-path Restore, journaled NormalMove และ fail-closed source-only retained recovery เพื่อป้องกัน ABA ค่ะ
-- เพิ่ม compound CaseRename แบบ exact-name `Source → Temporary → Destination`, deterministic temp, journal-first Fresh/Retained routing, revision+nlink checks และ typed phase errors ค่ะ
-- CaseRename ผ่าน independent core/service safety audits โดยไม่เหลือ P0/P1/P2 และ local regression ผ่าน core 137, recovery 38, mutations 45 และ Tauri Rust 2 tests ค่ะ
-- ปิด Phase 0 automated CI ที่ commit `0aecda5` โดย quality, Android compile + 16 KB alignment, Windows NSIS และ Ubuntu AppImage ผ่านทั้งหมดค่ะ
-- merge Phase 0 เข้า `main` ผ่าน PR #1 ที่ merge commit `dab395a` และแยก branch `agent/phase-1-local-vault` แล้วค่ะ
-- เลื่อน physical Android validation จนกว่าคุณโอจะมีอุปกรณ์ โดยไม่บล็อก Phase 1 ค่ะ
-- ล็อกการลบและกู้คืนด้วย Vault-local `.trash/` ซึ่งถูกตัดออกจากมุมมองและดัชนีปกติค่ะ
-- คุณโออนุมัติให้ Sunday ดำเนินการ Google Cloud project, Drive API และ OAuth clients ผ่าน logged-in browser session ค่ะ
-- เพิ่มลำดับ implementation และ safety defaults สำหรับ Phase 1 ค่ะ
-- เพิ่ม portable UTF-8 path contract, NFKC/full-casefold collision policy, internal-root protection, bounded inventory/read และ no-overwrite create พร้อม explicit commit outcomes ค่ะ
-- อัปเกรด derived SQLite index เป็น schema v2 ที่ self-rebuild ได้และบังคับ portable collision key ค่ะ
-- ปิด audit P1 เรื่อง sibling collision, allocation bound, mutation policy, shared per-root process lock และ app-data ancestor permissions ค่ะ
-- merge portable core เข้า `main` ผ่าน PR #2 ที่ merge commit `838e220` และแยก branch `agent/phase-1-mutations` แล้วค่ะ
-- เพิ่ม atomic no-replace move สำหรับ Unix/Android/macOS ผ่าน `rustix` และ Windows ผ่าน native `NtSetInformationFile` ใน isolated unsafe crate ค่ะ
-- เพิ่ม append-only recovery journal, completion tombstones, retry durability, ACL validation และ native-platform runtime tests ใน CI ค่ะ
-- merge mutation/recovery เข้า `main` ผ่าน PR #3 ที่ merge commit `5470e2c` ค่ะ
-- เพิ่ม bounded file revision, exact `.trash/v1` payload paths และ post-publication durability outcomes ที่รักษาสถานะราย parent ค่ะ
-- เพิ่ม recovery journal schema v4 พร้อม stable operation ID, reconstructable Trash timestamp และ exact endpoint topology สำหรับ NormalMove, CaseRename, Trash และ Restore ค่ะ
-- merge revision-checked Trash boundary เข้า `main` ผ่าน PR #4 ที่ merge commit `0f44619` ค่ะ
-- เพิ่ม canonical Trash manifest, bounded nofollow reader, immutable staging publication และ manifest-bound payload move แบบ no-unlink ค่ะ
-- merge canonical manifest-bound TrashStore เข้า `main` ผ่าน PR #5 ที่ merge commit `b96a536` ค่ะ
-- เพิ่ม atomic staging → items publication, payload-only restore, authoritative directory identity และ bounded unsupported recovery evidence listing ค่ะ
-- merge verified Trash publish/restore เข้า `main` ผ่าน PR #6 ที่ merge commit `a61285d` ค่ะ
-- เพิ่ม journal-first Trash mutation service, atomic manifest ensure และ crash resume จาก `OperationId` ค่ะ
-- merge crash-safe Trash mutation service เข้า `main` ผ่าน PR #7 ที่ merge commit `e269ddb` ค่ะ
-- เพิ่ม original-path Restore และ revision-checked NormalMove core/service flows พร้อม journal-only crash resume ค่ะ
-
-### 2026-07-11
-
-- สร้าง Project Plan และ Session Handoff ฉบับแรกค่ะ
-- ล็อก Native zero-cost architecture สำหรับ personal use ค่ะ
-- เพิ่ม Team Operating Model โดย Sunday เป็นหัวหน้าทีมค่ะ
-- กำหนดแนวทาง parallel sub-agent delegation, review และ incident handling ค่ะ
-- กำหนดจังหวะสร้าง Git และ private GitHub repository ก่อนเริ่ม source code ค่ะ
-- เริ่ม Phase 0 และสร้าง repository baseline ค่ะ
-- push initial commit `6597e18` ไปที่ `main` ค่ะ
-- สร้าง Tauri 2 React/TypeScript diagnostic shell ค่ะ
-- เพิ่ม Phase 0 acceptance, OAuth/Drive และ environment contracts ค่ะ
-- ยืนยันว่า desktop OAuth ใช้ loopback + PKCE และ Android ใช้ GIS `AuthorizationClient` ค่ะ
-- เพิ่ม pinned-action Linux quality workflow ค่ะ
-- แก้ pnpm v11 build allowlist และยืนยัน GitHub quality check ค่ะ
-- ติดตั้ง Android Studio และ Android minimal toolchain โดยไม่ติดตั้ง Emulator ค่ะ
-- สร้าง Android project และ ARM64 debug APK สำเร็จค่ะ
-- ชะลอ full Xcode เพราะพื้นที่ว่างต่ำกว่าเกณฑ์ปลอดภัยค่ะ
-- ย้าย `My Apps`, Android SDK และ Gradle cache ไป `AWB-Apps` พร้อมสร้าง symlink compatibility paths ค่ะ
-- ยืนยันหลัง migration ด้วย frontend typecheck/Vitest/Vite build, Rust fmt/clippy/tests, macOS native debug build และ Android ARM64 APK build ค่ะ
-- ลบ backup ของ Android SDK และ Gradle แล้ว และลบ `My Apps.internal-backup` หลัง Codex restart/verification ค่ะ
-- ลบ migration backup ภายในสำเร็จและย้าย Android Emulator/AVD ไป `AWB-Apps` ค่ะ
-- เพิ่ม Android GIS plugin, desktop OAuth/Keyring, capability filesystem/SQLite และ Drive REST fixture harness ค่ะ
-- เพิ่ม 57 automated tests รวม frontend และ Rust พร้อม macOS Keychain live probe ค่ะ
-- เพิ่ม API 36 emulator evidence, Thai composition instrumentation และ Sigma 1,000/5,000-node capacity controls ค่ะ
-- ปิด Security Audit P0/P1 สำหรับ symlink TOCTOU, Drive cleanup identity/origin, cursor IDs, OAuth parser/lifecycle และ Gradle verification ค่ะ
-- เพิ่ม native Windows NSIS, Ubuntu AppImage และ Android compile CI gates ค่ะ
+- Roadmap lock documentation round ได้รับ approval และกำลังรอ review/stage/commit/push ค่ะ
+- Active implementation milestone ยังไม่มีค่ะ
+- Milestone ถัดไปคือ R1 — Native Auth + Read-only Existing Drive Binding ค่ะ
+- ก่อนเริ่ม R1 ต้องเสนอ implementation plan ที่ระบุ exact fixture/root, credential boundary, production adapter boundary, rollback/cleanup, acceptance commands และจุดที่ต้องขอ approval ก่อนเปิด browser หรือแตะ Google Drive จริงค่ะ

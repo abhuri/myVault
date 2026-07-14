@@ -1,97 +1,122 @@
 # myVault — Latest Session Handoff
 
-Updated 2026-07-13 21:23 Asia/Bangkokค่ะ
+Updated 2026-07-14 Asia/Bangkok ค่ะ
 
-## Start Here
+ไฟล์นี้เป็นเจ้าของ Git checkpoint, verification ล่าสุด, งานถัดไป และ approval state ค่ะ ทิศทางผลิตภัณฑ์อยู่ที่ [PROJECT_PLAN.md](PROJECT_PLAN.md) ค่ะ
 
-Session ใหม่ให้อ่านไฟล์นี้ก่อน แล้วอ่าน `PROJECT_PLAN.md`, `docs/phase-0/RESULTS.md`, `docs/demo/RESULTS.md`, `docs/demo/ACCEPTANCE.md` และ `CHANGELOG.md` ค่ะ
+## 1. Start Here
 
-Sunday ต้องตรวจ `git status --short` และ `git diff` ก่อนแก้ไฟล์เสมอค่ะ หาก working tree มีงานใหม่ ต้องรักษาการแก้ไขทั้งหมดและห้าม reset, checkout, clean หรือ overwrite งานเดิมค่ะ
+1. รัน `git status --short --branch` และ `git diff --check` ก่อนแก้ไฟล์ค่ะ
+2. อ่านหัวข้อ Current Truth, Locked Roadmap Checkpoint และ Next Actions ในไฟล์นี้ค่ะ
+3. อ่าน [PROJECT_PLAN.md](PROJECT_PLAN.md) เฉพาะเมื่อต้องวาง scope หรือเปลี่ยนลำดับ milestone ค่ะ
+4. อ่าน evidence เฉพาะส่วนที่เกี่ยวข้องแทนการโหลดประวัติทั้งหมดค่ะ
 
-## Repository Checkpoint
+หาก working tree มีงานใหม่ ต้องรักษาการแก้ไขทั้งหมดและห้าม reset, checkout, clean หรือ overwrite งานเดิมค่ะ Git กับผล command ปัจจุบันเป็น source of truth เมื่อขัดกับเอกสารค่ะ
 
-- Compatibility path คือ `/Users/awb/My Apps/myVault` และ physical path อยู่บน `/Volumes/AWB-Apps/My Apps/myVault` ค่ะ
-- Branch ปัจจุบันคือ `codex/phase-3-sync-foundation` และ base คือ `cbde0c1` ซึ่งตรงกับ `origin/main` ตอนสร้าง branch ค่ะ
-- Phase 1 closure ถูกแยก commit เป็น `66c299f` และ `cbde0c1` แล้ว push ไป `origin/main` สำเร็จค่ะ
-- Phase 3A branch อยู่ใน PR #23 และยังไม่ merge ค่ะ ให้เปรียบเทียบ current local, remote และ PR head เป็น source of truth แทน static commit list ค่ะ ทุก head ใหม่ต้องผ่าน scope review, latest-head CI และ Final Merge Review ก่อนขออนุมัติ merge และห้ามทำ commit/push ซ้ำเมื่อ head ตรงกันค่ะ
+## 2. Repository Checkpoint
 
-## Completed This Session
+- Physical path คือ `/Volumes/AWB-Apps/My Apps/myVault` และ compatibility path คือ `/Users/awb/My Apps/myVault` ค่ะ
+- Branch คือ `codex/phase-3a-merge-handoff` ซึ่งสร้างจาก `origin/main` ที่ `db85177` ค่ะ
+- Phase 3A source head `7f5b8d6` ถูก merge ผ่าน PR #23 ที่ `db85177` เมื่อ 2026-07-14 ค่ะ
+- Post-merge Quality run `29270038450` ผ่านทั้ง `quality` และ `android-compile` ค่ะ
+- Working tree รอบนี้เป็น documentation-only alignment และยังไม่ได้ stage, commit หรือ push ค่ะ
+- Expected changed files คือ `PROJECT_PLAN.md`, `SESSION_HANDOFF.md`, `README.md`, `CHANGELOG.md`, `apps/tauri/DESIGN.md`, `docs/demo/RESULTS.md`, `docs/demo/PHASE1_HARDENING_ACCEPTANCE.md`, `docs/phase-0/DEVICE_TEST.md`, `docs/phase-0/ENVIRONMENT.md`, `docs/phase-0/RESULTS.md` และ `docs/sync/RESULTS.md` ค่ะ
 
-- Google Cloud project `myVault Personal` (`myvault-personal-0aecda5`) พร้อม Drive API, External/Testing audience, approved personal test user, User Data Policy, full Drive scope และ Android/Desktop OAuth clients แล้วค่ะ
-- Desktop loopback OAuth + PKCE และ live Drive acceptance fixture ผ่านจริงค่ะ Fixture ที่ยืนยัน exact ID ถูกย้ายเข้า Trash เท่านั้น และไม่มี Existing Vault หรือข้อมูล Drive อื่นถูกแตะค่ะ
-- Short-lived OAuth token และไฟล์ทดสอบชั่วคราวถูกลบแล้วค่ะ Desktop credential ถูกเก็บนอก repository ที่ `/Volumes/AWB Storage/myVault/credentials/desktop-oauth-client.json` ด้วย permission `600` ค่ะ ห้ามแสดงหรือ commit เนื้อหาไฟล์นี้ค่ะ
-- Android API 36 emulator ผ่าน SAF Vault activation, persisted permission, bounded inventory, Thai/Unicode read, guarded save, Reader scrolling และ sanitized Mermaid ค่ะ SAF ใช้ synchronized revision compare, descriptor sync และ byte-for-byte readback แต่ไม่อ้าง atomic rename หรือ parent-directory fsync แบบ desktop ค่ะ ผลที่ยืนยัน durability ไม่ได้ต้องเป็น `directorySyncUnsupported` หรือ `writeOutcomeUnknown` ค่ะ
-- Phase 1 local implementation closure audit เสร็จแล้วและสถานะคือ `Local Implementation Closure Complete` ค่ะ สถานะนี้ไม่ใช่ cross-platform runtime PASS ค่ะ
-- Desktop guarded-save runtime เปิด private recovery snapshot store และ publish exact pre-save payload ก่อน revision-checked replace ค่ะ เมื่อ configured snapshot store ล้มเหลว save คืน stable `recoveryUnavailable` และหยุดก่อน Vault mutation ค่ะ Stale save ไม่ publish recovery snapshot ค่ะ
-- Native recursive desktop watcher ผูกกับ opaque Vault session และ frontend debounce event ก่อน bounded explorer refresh ค่ะ Event ไม่เผย ambient Vault path ค่ะ
-- SQLite Phase 1 contract คือ private derived-index schema v2, migrations และ transactional rebuild ซึ่งเสร็จแล้วค่ะ Persistent full-content search/backlinks/graph index เป็น milestone ถัดไปค่ะ
-- Live Copy-of-Vault UAT บน macOS ผ่านโดยใช้ disposable Vault `/tmp/myvault-phase1-uat.ykjiuo/Vault` ค่ะ Native picker, watcher refresh, conflict protection, explicit reload, sequential guarded saves, recovery snapshots, Reader keyboard navigation, Mermaid isolation และ restart continuity ผ่านครบค่ะ
-- คุณโอเลือกทำ Phase 3 Production Drive Sync ก่อน Phase 2 และอนุมัติแผน Phase 3A ค่ะ
-- Phase 3A สร้าง `myvault-sync-engine` แยกจาก `drive-sync-spike` พร้อม private SQLite schema v1, exact remote-root binding, typed remote checksums, start-token-before-scan orchestration, durable completed-operation tombstones, `NeedsReconcile`, exact schema validation และ crash-aware local-mutation cursor protocol ค่ะ
-- Final Merge Review พบ live-worker false recovery และ version-zero malformed-schema mutation ค่ะ คุณโออนุมัติ remediation ที่เพิ่ม exclusive per-Vault Sync lease และ transactional all-object schema validation แล้วค่ะ
-- Final hardening review พบ negative `user_version` ที่หลุด fail-closed gate ค่ะ คุณโออนุมัติให้แก้ regression และเดิน Phase 3A ต่อเนื่องจนพร้อม merge โดยการ merge เข้า `main` ยังต้องขออนุมัติแยกค่ะ
-- Phase 3A ไม่มี OAuth runtime, Google Drive network request, live Drive read/write หรือ personal Vault access ค่ะ Architecture, acceptance และ results อยู่ใน `docs/sync` ค่ะ
+## 3. Current Truth
 
-## Verification Passed — Phase 1 Local Implementation Closure Checkpoint
+- Project Complete ถูกนิยามเป็น Personal First Release ที่ผ่าน R8 ตาม [Locked Product Roadmap](PROJECT_PLAN.md) ค่ะ
+- เป้าหมายระยะใกล้คือ **Safe Sync Alpha** จาก R1–R4 โดยไม่เพิ่ม knowledge features หรือ polish ระหว่างทางค่ะ
+- สถานะโดยประมาณคือ 40–45% ของ personal first release เมื่อวัดจาก user-visible outcome ค่ะ
+- Local Vault open/explorer/read/save และ desktop recovery snapshots เชื่อม runtime แล้วค่ะ
+- Create/Rename/Move/Trash/Restore มี core/mutation foundation แต่ยังไม่มี Tauri/UI journey ครบค่ะ
+- Editor/Reader ใช้งานได้บางส่วน ส่วน attachments, properties และ embeds ยังไม่ครบค่ะ
+- Search/backlinks/graph ที่เห็นใน Demo เป็น filter หรือ opened-note prototype ไม่ใช่ persistent full-vault index ค่ะ
+- Desktop OAuth/Keyring primitives, Android auth bridge และ Drive fixture harness มีจริง แต่ยังไม่รวมเป็น production authorization/Drive runtime เดียวกันค่ะ
+- Phase 3A Sync Foundation complete ตาม slice และผ่าน 17 tests แต่ `myvault-sync-engine` ยังไม่เป็น dependency ของ Tauri app ค่ะ
+- แอปยังไม่มี production Existing Drive binding, read-only scan, upload/download, conflict engine หรือ Sync UI ค่ะ
+- UI ยังแสดงข้อความตามจริงว่า Demo ไม่เชื่อม Google Drive ค่ะ
 
-Checkpoint นี้รันเมื่อ 2026-07-13 กับ uncommitted Phase 1 local implementation closure/runtime integration scope ค่ะ
+## 4. Verification — Current Audit
 
-- Frontend TypeScript typecheck ผ่านค่ะ
-- Frontend Vitest ผ่าน 24 tests ค่ะ
-- Production Vite build ผ่าน โดยยังมี non-blocking large-chunk warning สำหรับ Mermaid/graph modules ค่ะ
-- Tauri Rust ผ่าน 8 tests ค่ะ
-- App-service ผ่าน 14 tests แบ่งเป็น 2 unit และ 12 integration tests รวม exact pre-save snapshot, stale-save no-snapshot และ configured snapshot failure ที่คืน `recoveryUnavailable` พร้อมหยุดก่อน Vault mutation ค่ะ
-- Snapshot retention/quarantine/deletion suites ผ่าน 62 tests ค่ะ
-- Android SAF policy ผ่าน 3 tests ค่ะ
-- Rust formatting, strict host Clippy `-D warnings` และ Android aarch64 Clippy ผ่านค่ะ
-- Full Android debug APK build ผ่านค่ะ SHA-256 คือ `ace5ca1504ea06a0964a67904172b21d1babc2630b999e3ea18b9a803fd20a5f`, 16 KB zip alignment ผ่าน และ APK Signature Scheme v2 ผ่านค่ะ
-- macOS debug application bundle ถูก build สำเร็จที่ expected target path ค่ะ
-- Secret scan ไม่พบ OAuth client secret หรือ token จริงใน repository ค่ะ
-- [Phase 1 Hardening — Copy-of-Vault Acceptance](docs/demo/PHASE1_HARDENING_ACCEPTANCE.md) ผ่าน live macOS UAT แล้วค่ะ Guarded saves สาม revision จบที่ `1080` bytes และ recovery payload ก่อนบันทึก `845`, `937`, `1009` bytes เทียบ byte-exact ผ่านทั้งหมดค่ะ Reader keys และ Mermaid failure isolation ผ่าน และ restart แล้วยังอ่าน Explorer `6` ไฟล์พร้อม snapshot objects `3` ก้อนได้ค่ะ
+รันเมื่อ 2026-07-14 บน macOS workspace ปัจจุบันค่ะ
 
-## Verification Passed — Phase 3A Sync Foundation Checkpoint
+- `pnpm typecheck` ผ่านค่ะ
+- Frontend Vitest ผ่าน 4 files / 24 tests ค่ะ
+- `pnpm build` ผ่านค่ะ Main chunk ประมาณ 1.06 MB และมี non-blocking chunk-size warning ค่ะ
+- Rust native test matrix ผ่าน 399 tests, 0 failed และ 2 ignored-by-default tests ค่ะ Matrix ครอบคลุม Tauri, Core, platform ACL/FS, private FS, recovery, mutations, snapshots, app service, desktop auth, Drive spike และ Sync Foundation ค่ะ
+- `cargo fmt --manifest-path apps/tauri/src-tauri/Cargo.toml --all -- --check` ผ่านค่ะ
+- `git diff --check` ผ่านหลัง documentation alignment ค่ะ
 
-- `myvault-sync-engine` isolated suite ผ่าน 17 integration tests ค่ะ
-- Strict Clippy `-D warnings` และ Rust formatting สำหรับ crate ใหม่ผ่านค่ะ
-- `pnpm test:rust` ผ่าน Tauri 8 tests, myvault-core suites, Desktop Auth 9 tests, Drive spike 25 tests และ Sync Foundation tests ค่ะ
-- Initial sync, restart resume, stale scan cursor, removed changes, duplicate remote paths, typed checksums, post-completion exact queue retry, operation collision, exclusive live-worker lease, interrupted remote/local unknown outcomes, atomic history, partial cursor blocking, constraint-weakened schema, negative schema version, view-only v0 schema และ corrupt evidence preservation มี regression tests ค่ะ
-- Native Linux platform CI รัน Sync Foundation suite และ native Windows compile tests แบบ `--no-run` ค่ะ Windows Sync runtime acceptance ยัง deferred จนกว่าจะเชื่อม private-root provisioning ค่ะ
-- Live Drive fixture และ OS keyring mutation tests ยังคง ignored by default และไม่ได้ถูกรันใน Phase 3A ค่ะ
+Filesystem watcher และ Unix-socket fixture ล้มเมื่อรันใน restricted sandbox แต่กรณีเดียวกันผ่านเมื่อรันด้วย native filesystem permissions ค่ะ จึงจัดเป็น environment restriction ไม่ใช่ product regression ในรอบนี้ค่ะ
 
-## Phase 3A Commit Scope
+Ignored-by-default tests คือ live Drive fixture และ OS keyring mutation เพราะแตะ external account/credential store ค่ะ รอบ audit นี้ไม่ได้รันสองรายการดังกล่าวค่ะ
 
-- Production foundation crate อยู่ใน `crates/myvault-sync-engine` และใช้ pinned cross-platform `fs2` สำหรับ lifetime lease ค่ะ Generated `Cargo.lock` และ `target/` ของ crate ถูก ignore และห้าม commit ค่ะ
-- Architecture, acceptance และ results อยู่ใน `docs/sync` ค่ะ
-- Local/CI test registration เปลี่ยนที่ `package.json`, `.github/workflows/quality.yml` และ `.github/workflows/platform-build.yml` ค่ะ
-- Phase 3 status/handoff เปลี่ยนที่ `PROJECT_PLAN.md`, `CHANGELOG.md` และ `SESSION_HANDOFF.md` ค่ะ
+## 5. Completed in This Alignment Round
 
-ห้ามสมมติว่าไฟล์ใดไฟล์หนึ่งเป็น disposable เพียงเพราะยัง untracked หรือไม่ถูก commit ค่ะ ตรวจ diff และความสัมพันธ์ของงานก่อนทุกครั้งค่ะ
+- แยกหน้าที่เอกสารให้ `PROJECT_PLAN.md` เป็น direction/roadmap และไฟล์นี้เป็น operational handoff ค่ะ
+- เปลี่ยน MVP checklist ที่กำกวมเป็น capability matrix ซึ่งแยก Usable, Prototype, Foundation only และ Missing ค่ะ
+- แสดง execution order จริงว่า Phase 3 มาก่อนงาน Phase 2/4 ที่เหลือค่ะ
+- ติดป้าย Phase 1 และ Phase 3A ว่า complete เฉพาะขอบเขต foundation/slice ค่ะ
+- เปลี่ยน milestone ถัดไปเป็น R1 — Native Auth + Read-only Existing Drive Binding และ freeze งานที่ไม่ช่วย Safe Sync Alpha ค่ะ
+- อัปเดต Sync Results จาก waiting-for-merge เป็น merged และย้าย OAuth configuration ออกจาก Phase 0 blockers ค่ะ
+- ติดป้าย Demo/Phase 0 evidence เก่าให้เป็น historical หรือ pre-commit ตามจริงค่ะ
+- ล็อก Personal First Release scope, Post-release scope และ execution order R1–R8 ตาม approval `Approve lock roadmap` ค่ะ
+- เพิ่ม milestone dependencies, exit gates, verification matrix และ change-control rules ใน `PROJECT_PLAN.md` ค่ะ
 
-## Deferred Evidence
+## 6. Locked Roadmap Checkpoint
 
-- Windows และ Ubuntu native picker persistence, Trash/Restore และ secret-store restart evidence ยังต้องรันบนระบบจริงค่ะ CI build ไม่ใช้แทน native runtime evidence ค่ะ
-- Physical Android Play Services consent, Thai IME, lifecycle/lock-unlock และ real-GPU evidence ยังรออุปกรณ์จริงค่ะ Emulator evidence ไม่ใช้แทน physical-device evidence ค่ะ
-- Store signing และ public distribution ยังอยู่นอกขอบเขตปัจจุบันค่ะ
+- Locked sequence คือ `R1 → R2 → R3 → R4 → R5 → R6 → R7 → R8` ค่ะ
+- R1–R4 ส่งมอบ Safe Sync Alpha ค่ะ
+- R5 ปิด Local Product Completion ค่ะ
+- R6 ปิด Persistent Knowledge Core ค่ะ
+- R7 บังคับ native runtime acceptance บน macOS, Windows, Ubuntu และ physical Android ค่ะ
+- R8 ทำ recovery drill, release verification และ Personal First Release ค่ะ
+- Active implementation milestone ยังไม่มีค่ะ Milestone ถัดไปคือ R1 — Native Auth + Read-only Existing Drive Binding ค่ะ
+- เปิด implementation milestone ได้ครั้งละหนึ่ง milestone และต้องผ่าน exit gate พร้อม approval ก่อน transition ค่ะ
+- Planning range ที่เหลือจากผลรวม milestone คือ 10–19 focused engineering weeks โดยไม่รวมเวลารอ environment, device, external review หรือ account approval ค่ะ
+- Scope, order และ exit gates ถูกล็อกค่ะ Planning range ไม่ใช่ deadline lock ค่ะ
 
-## Recommended Next Actions
+## 7. Known Gaps and Direction Risks
 
-1. ก่อน merge PR #23 ต้องยืนยันว่า final blocker remediation ถูก commit และ publish ครบ, latest PR head ผ่าน CI, Final Merge Review เป็น PASS และคุณโออนุมัติ merge แยกต่างหากค่ะ
-2. ห้ามเริ่ม Phase 3B หรือ live Drive access ระหว่างปิด Phase 3A merge gate ค่ะ
-3. หลัง 3A ผ่าน review ให้เสนอ Phase 3B Native Auth + Read-only Existing Drive Binding และขอ approval ใหม่ก่อน live Drive access ค่ะ
-4. แยก persistent content index และ P3 frontend code splitting ออกจาก Sync operational state ค่ะ
-5. ทำ Windows/Ubuntu native acceptance และ physical Android validation เมื่อมี environment/อุปกรณ์ที่เหมาะสมค่ะ
+### Product blockers
 
-## Approval State
+- ไม่มี production native auth integration และ exact Existing Drive binding ค่ะ
+- ไม่มี production Drive read/write path หรือ cross-device end-to-end journey ค่ะ
+- ไม่มี user-visible Sync status/retry/conflict recovery ค่ะ
+- Local mutation services ยังไม่ถูก expose ถึง UI ครบค่ะ
 
-- Phase 1 plan update และ Phase 1 execution ได้รับอนุมัติและดำเนินการแล้วค่ะ
-- OAuth configuration, User Data Policy และ live Drive fixture ได้รับอนุมัติและดำเนินการแล้วค่ะ
-- Documentation-only hardening round สำหรับ plan/handoff/changelog และ Phase 0 evidence ได้รับอนุมัติและดำเนินการแล้วค่ะ ไม่มี source code อยู่ใน ownership รอบนี้ค่ะ
-- Live Copy-of-Vault UAT และ documentation finalization ได้รับอนุมัติและดำเนินการแล้วค่ะ
-- Phase 1 closure commits และ direct push ไป `origin/main` ได้รับอนุมัติและดำเนินการแล้วค่ะ
-- Phase 3 plan และ Phase 3A Sync Foundation implementation ได้รับอนุมัติและดำเนินการแล้วค่ะ
-- Phase 3A commit-blocker remediation ได้รับอนุมัติและดำเนินการแล้วค่ะ
-- Phase 3A implementation, documentation, remediation commits, push, PR creation และการเปลี่ยน PR #23 เป็น Ready for review ได้รับอนุมัติแล้วค่ะ Current PR head เป็น source of truth และ PR ยังไม่ merge ค่ะ
-- Final Merge Review และ blocker-fix rounds ได้รับอนุมัติให้ดำเนินการต่อเนื่องจน Phase 3A พร้อม merge ค่ะ ทุก head ใหม่ยังต้องผ่าน scope review, latest-head CI และ review ซ้ำ ส่วนการ merge เข้า `main` ต้องขอ explicit approval แยกค่ะ
-- Phase 3B และ live Google Drive access ยังไม่ได้รับ approval ค่ะ
-- ไม่มี approval ด้าน OAuth หรือ User Data Policy ค้างอยู่ค่ะ
-- งาน implementation ใหม่หลัง handoff ต้องเสนอแผนและขออนุมัติคุณโอตาม `AGENTS.md` ค่ะ
+### Evidence gaps
+
+- Windows/Ubuntu native picker persistence, Trash/Restore และ secret-store restart ยัง deferred ค่ะ
+- Physical Android Play Services consent, Thai IME, lifecycle/lock-unlock และ real-GPU evidence ยัง deferred ค่ะ
+- Compile, CI artifact และ emulator evidence ห้ามใช้แทน native/physical acceptance ค่ะ
+
+### Complexity risks
+
+- Production source มีหลาย safety-focused crates ขณะที่ Sync ยังไม่ต่อถึงแอปค่ะ ห้ามเพิ่ม abstraction ใหม่ใน 3B ถ้า reuse `desktop-auth`, `myvault-sync-engine` หรือ application service ได้ค่ะ
+- Sync operational database ต้องไม่ปนกับ future content index ค่ะ
+- Frontend prototype knowledge features ต้องไม่ดึง engineering effort ออกจาก Safe Sync Alpha ค่ะ
+
+## 8. Next Actions
+
+1. ตรวจ locked-roadmap diff ให้ไม่มี stale milestone, duplicate ownership, broken links หรือ gate ที่ขัดกับ evidence ค่ะ
+2. ขออนุมัติ stage/commit/push documentation-only scope แยกตาม workflow ค่ะ
+3. เสนอ R1 implementation plan เพียง milestone เดียว โดยระบุ read-only fixture/root, native credential boundary, production adapter boundary, rollback/cleanup และ acceptance ค่ะ
+4. หลัง R1 approval จึงต่อ Desktop OAuth และ production read-only Drive adapter เข้ากับ Tauri/Sync engine ค่ะ
+5. ห้ามเริ่ม R2 upload/download, remote mutation หรือแตะ personal Existing Vault ก่อน R1 exit gate ผ่านค่ะ
+
+## 9. Approval State
+
+- Documentation audit, alignment และ roadmap lock รอบนี้ได้รับอนุมัติแล้วค่ะ
+- Locked scope/order/gates ได้รับ approval ด้วยข้อความ `Approve lock roadmap` เมื่อ 2026-07-14 ค่ะ
+- การแก้ source code, stage, commit และ push ยังไม่ได้รับ approval ในรอบนี้ค่ะ
+- R1 implementation และ live OAuth/Google Drive access ยังไม่ได้รับ approval ค่ะ
+- ไม่มี approval ด้าน User Data Policy ค้างอยู่ค่ะ OAuth credential และ token ต้องอยู่ภายนอก repository และห้ามแสดงใน log ค่ะ
+- งาน implementation ใหม่ต้องเสนอแผนและขออนุมัติคุณโอก่อนลงมือค่ะ
+
+## 10. Evidence Index
+
+- Phase 0 feasibility และ external gates อยู่ที่ [docs/phase-0/RESULTS.md](docs/phase-0/RESULTS.md) ค่ะ
+- Local Demo และ macOS UAT อยู่ที่ [docs/demo/RESULTS.md](docs/demo/RESULTS.md) ค่ะ
+- Sync Foundation architecture, acceptance และผลอยู่ใน [docs/sync](docs/sync) ค่ะ
+- Engineering/release history อยู่ที่ [CHANGELOG.md](CHANGELOG.md) ค่ะ

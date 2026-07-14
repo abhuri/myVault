@@ -1,5 +1,7 @@
 Chosen canonical direction: Technical Utility
 
+> Historical Demo design brief ค่ะ Implementation status และ roadmap ปัจจุบันอยู่ที่ [../../PROJECT_PLAN.md](../../PROJECT_PLAN.md) ส่วน live Demo evidence อยู่ที่ [../../docs/demo/RESULTS.md](../../docs/demo/RESULTS.md) ค่ะ
+
 ---
 version: demo-0.1
 name: myVault local desktop workspace
@@ -43,7 +45,7 @@ myVault is a working instrument, not a dashboard. Technical Utility supports den
 - Primary job: open a Vault, find a note, read or edit it, and understand whether work is safely saved.
 - Primary action: open a Vault when none is active; otherwise select and edit a note.
 - Viewports: desktop from 760px upward; compact drawer layout at 360px and 412px.
-- Data contract: `vault_status`, `vault_choose_folder`, paged `vault_list_explorer`, `vault_read_note`, and planned `vault_save_note`.
+- Data contract: `vault_status`, `vault_choose_folder`, paged `vault_list_explorer`, `vault_read_note`, and `vault_save_note` ค่ะ
 - Runtime truth: frontend can compile independently; full behavior requires the Tauri commands.
 - Done means: coherent three-pane shell, safe conflict states, Markdown reader, keyboard navigation, and responsive drawers.
 
@@ -91,4 +93,4 @@ Do not use hero layouts, dashboard cards, gradients, fake metrics, glass effects
 - restraint: 5/5
 - buildability: 4/5
 
-Remaining verification: live Tauri picker/read/save commands and browser checks at desktop, 412px, and 360px.
+Live Tauri picker/read/save และ macOS Copy-of-Vault UAT ผ่านแล้วค่ะ Compact 412px/360px behavior มี implementation และ automated logic checks แต่ยังไม่มีหลักฐาน physical Android viewport/IME จึงต้องไม่อ่าน review score ด้านบนเป็น cross-platform visual acceptance ค่ะ

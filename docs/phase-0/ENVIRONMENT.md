@@ -1,6 +1,6 @@
 # Phase 0 Environment Record
 
-Recorded on 2026-07-11 and updated on 2026-07-13 in Asia/Bangkokค่ะ
+Recorded on 2026-07-11 and updated on 2026-07-14 in Asia/Bangkok ค่ะ
 
 ## Current macOS host
 
@@ -28,8 +28,11 @@ Recorded on 2026-07-11 and updated on 2026-07-13 in Asia/Bangkokค่ะ
 ## Blocking prerequisites
 
 - Connect a physical Android device with USB or wireless debugging for IME/WebView testsค่ะ
-- Configure the Google Cloud Android OAuth client with package `com.abhuri.myvault` and the relevant signing-certificate SHA-1ค่ะ
-- Configure a Google Desktop OAuth client for live loopback + PKCE and Drive testsค่ะ
+
+## Completed prerequisites
+
+- Google Cloud Android OAuth client สำหรับ package `com.abhuri.myvault` และ debug signing-certificate SHA-1 ถูก configure แล้วค่ะ
+- Google Desktop OAuth client, live loopback + PKCE และ Drive fixture test ถูก configure และยืนยันแล้วค่ะ
 
 ## Android verification result
 
@@ -39,14 +42,14 @@ Recorded on 2026-07-11 and updated on 2026-07-13 in Asia/Bangkokค่ะ
 - Generated Android configuration uses compile SDK 36, target SDK 36, minimum SDK 24, and Gradle 8.14.3ค่ะ
 - An ARM64 debug APK built successfully on this hostค่ะ
 - The APK is signed with the local Android debug certificate and verifies with APK Signature Scheme v2ค่ะ
-- The current fixture APK SHA-256 is `dfa259d379b9cb20163185b32b8c721a7fcf8f92ad42f3fb5fc0381e4d7bef47` ค่ะ
+- Historical Phase 0 fixture APK SHA-256 is `dfa259d379b9cb20163185b32b8c721a7fcf8f92ad42f3fb5fc0381e4d7bef47` ค่ะ
 - An API 36 ARM64 emulator is stored under `/Volumes/AWB-Apps/Developer/Android` and launches the APK successfullyค่ะ
 - Emulator System WebView is `133.0.6943.137` ค่ะ
 - The 1,000-node Sigma graph renders after an intersection-triggered refresh; the 5,000-node headless-emulator probe blacks out the display surface and remains physical-device capacity dataค่ะ
 - APK alignment verification passes Build Tools 36 `zipalign -c -P 16 -v 4`ค่ะ
 - The production APK activates an emulator document tree through Android SAF and retains its read/write URI grant across APK replacement and cold relaunchค่ะ
 - The SAF capability remains native-onlyค่ะ Its guarded-save contract uses synchronized revision comparison, descriptor sync, and byte-for-byte readback, while unsupported directory durability and uncertain publication are surfaced as `directorySyncUnsupported` and `writeOutcomeUnknown` rather than being treated as desktop-equivalent atomic successค่ะ
-- The final uncommitted production APK SHA-256 is `ace5ca1504ea06a0964a67904172b21d1babc2630b999e3ea18b9a803fd20a5f`ค่ะ Full debug APK build, 3 SAF policy tests, Android aarch64 Clippy, 16 KB zip alignment, and APK Signature Scheme v2 verification passค่ะ
+- Phase 1 SAF closure APK was tested before its implementation was committedค่ะ Its SHA-256 is `ace5ca1504ea06a0964a67904172b21d1babc2630b999e3ea18b9a803fd20a5f`ค่ะ Full debug APK build, 3 SAF policy tests, Android aarch64 Clippy, 16 KB zip alignment, and APK Signature Scheme v2 verification passedค่ะ The implementation was later captured by commits `66c299f` and `cbde0c1` ค่ะ
 
 ## External storage layout
 
