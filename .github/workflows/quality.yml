@@ -128,19 +128,36 @@ jobs:
           cargo test --manifest-path crates/tauri-plugin-private-root/Cargo.toml
           cargo test --manifest-path crates/tauri-plugin-vault-saf/Cargo.toml
 
-      - name: Audit R1 static trust boundaries
+      - name: Audit R2 static trust boundaries
         shell: bash
         run: |
           set +e
-          git grep -n -E '\.(post|put|patch|delete)[[:space:]]*\(|Method::(POST|PUT|PATCH|DELETE)' -- crates/myvault-drive/src
-          drive_audit_status=$?
+          git grep -n -E '\.(patch|delete)[[:space:]]*\(|Method::(PATCH|DELETE)' -- crates/myvault-drive/src
+          forbidden_method_status=$?
           set -e
-          if [[ $drive_audit_status -eq 0 ]]; then
-            echo "::error::The production Drive adapter contains a mutating HTTP construction path."
+          if [[ $forbidden_method_status -eq 0 ]]; then
+            echo "::error::The R2 Drive adapter contains a forbidden PATCH or DELETE construction path."
             exit 1
-          elif [[ $drive_audit_status -ne 1 ]]; then
-            echo "::error::The production Drive adapter audit could not run."
-            exit "$drive_audit_status"
+          elif [[ $forbidden_method_status -ne 1 ]]; then
+            echo "::error::The forbidden-method audit could not run."
+            exit "$forbidden_method_status"
+          fi
+          mutation_paths="$(git grep -l -E '\.(post|put)[[:space:]]*\(|Method::(POST|PUT)' -- crates/myvault-drive/src || true)"
+          if [[ "$mutation_paths" != "crates/myvault-drive/src/transfer.rs" ]]; then
+            echo "::error::R2 POST/PUT construction escaped the single guarded transfer module."
+            printf '%s\n' "$mutation_paths"
+            exit 1
+          fi
+          set +e
+          git grep -n -E '(addParents|removeParents|/permissions|trashed[[:space:]]*[:=][[:space:]]*true)' -- crates/myvault-drive/src
+          forbidden_endpoint_status=$?
+          set -e
+          if [[ $forbidden_endpoint_status -eq 0 ]]; then
+            echo "::error::The R2 Drive adapter contains a forbidden mutation endpoint or field."
+            exit 1
+          elif [[ $forbidden_endpoint_status -ne 1 ]]; then
+            echo "::error::The forbidden-endpoint audit could not run."
+            exit "$forbidden_endpoint_status"
           fi
           set +e
           git grep -n -I -E '(access[_-]?token|refresh[_-]?token|authorization[_-]?code|code[_-]?verifier)' -- ':(glob)apps/tauri/src/**/*.ts' ':(glob)apps/tauri/src/**/*.tsx' ':(exclude,glob)apps/tauri/src/**/*.test.ts' ':(exclude,glob)apps/tauri/src/**/*.test.tsx'
