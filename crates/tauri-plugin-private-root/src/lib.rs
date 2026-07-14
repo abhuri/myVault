@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 #![cfg(target_os = "android")]
 
-use std::{io, io::Read, io::Write, path::Path};
+use std::{io, io::Read, io::Write};
 
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
 use cap_std::fs::{Dir, File, OpenOptions};
@@ -10,13 +10,13 @@ use tauri::{
     plugin::{Builder, TauriPlugin},
     Manager, Runtime,
 };
+use uuid::Uuid;
 
 mod mobile;
 
 /// Opaque native-provenance capability for Android's no-backup directory.
 pub struct NativeNoBackupRoot {
-    directory: Dir,
-    acl: myvault_private_fs::AndroidAclInspection,
+    inspected: myvault_private_fs::InspectedAndroidPrivateRoot,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -42,7 +42,31 @@ impl NativeNoBackupRoot {
     /// because native code is the sole constructor of this capability.
     #[must_use]
     pub fn acl_inspection(&self) -> myvault_private_fs::AndroidAclInspection {
-        self.acl
+        self.inspected.acl_inspection()
+    }
+
+    /// Opens crash-safe per-Vault sync state below the native no-backup root.
+    /// No ambient path or JavaScript command participates in this operation.
+    ///
+    /// # Errors
+    /// Revalidates native root identity before and after open, and rejects
+    /// invalid Vault IDs, unsafe descendants, lease contention, or bad schema.
+    pub fn open_sync_store(
+        &self,
+        vault_id: Uuid,
+    ) -> Result<myvault_sync_engine::SyncStore, PrivateRootError> {
+        self.inspected
+            .revalidate()
+            .map_err(PrivateRootError::Validation)?;
+        let store = myvault_sync_engine::SyncStore::open_from_android_no_backup_root(
+            &self.inspected,
+            vault_id,
+        )
+        .map_err(PrivateRootError::Sync)?;
+        self.inspected
+            .revalidate()
+            .map_err(PrivateRootError::Validation)?;
+        Ok(store)
     }
 
     /// Creates or opens one dedicated child directory without following links.
@@ -54,7 +78,11 @@ impl NativeNoBackupRoot {
         &self,
         name: &str,
     ) -> Result<NativePrivateDirectory, PrivateRootError> {
-        create_or_open_directory(&self.directory, name)
+        let directory = self
+            .inspected
+            .try_clone_directory()
+            .map_err(PrivateRootError::Validation)?;
+        create_or_open_directory(&directory, name)
     }
 
     /// Creates one new private file with exact mode 0600 and nlink one.
@@ -62,7 +90,11 @@ impl NativeNoBackupRoot {
     /// # Errors
     /// Rejects invalid names, collisions, links, ACLs, or durability failures.
     pub fn create_private_file(&self, name: &str) -> Result<NativePrivateFile, PrivateRootError> {
-        create_file(&self.directory, name)
+        let directory = self
+            .inspected
+            .try_clone_directory()
+            .map_err(PrivateRootError::Validation)?;
+        create_file(&directory, name)
     }
 
     /// Publishes or verifies one immutable content-addressed transfer base
@@ -76,7 +108,11 @@ impl NativeNoBackupRoot {
         bytes: &[u8],
         expected_sha256_hex: &str,
     ) -> Result<NativeBaseObjectRef, PrivateRootError> {
-        publish_content_addressed_base(&self.directory, bytes, expected_sha256_hex)
+        let directory = self
+            .inspected
+            .try_clone_directory()
+            .map_err(PrivateRootError::Validation)?;
+        publish_content_addressed_base(&directory, bytes, expected_sha256_hex)
     }
 }
 
@@ -154,18 +190,12 @@ pub trait PrivateRootExt<R: Runtime> {
     ///
     /// # Errors
     /// Fails when the native bridge or held-root validation fails.
-    fn native_no_backup_root(
-        &self,
-        vault_root: &Path,
-    ) -> Result<NativeNoBackupRoot, PrivateRootError>;
+    fn native_no_backup_root(&self) -> Result<NativeNoBackupRoot, PrivateRootError>;
 }
 
 impl<R: Runtime, T: Manager<R>> PrivateRootExt<R> for T {
-    fn native_no_backup_root(
-        &self,
-        vault_root: &Path,
-    ) -> Result<NativeNoBackupRoot, PrivateRootError> {
-        self.state::<mobile::PrivateRoot<R>>().claim(vault_root)
+    fn native_no_backup_root(&self) -> Result<NativeNoBackupRoot, PrivateRootError> {
+        self.state::<mobile::PrivateRoot<R>>().claim()
     }
 }
 
@@ -177,6 +207,7 @@ pub enum PrivateRootError {
     ResourceLimit,
     DigestMismatch,
     Validation(myvault_private_fs::Error),
+    Sync(myvault_sync_engine::Error),
 }
 
 impl std::fmt::Display for PrivateRootError {
@@ -188,6 +219,7 @@ impl std::fmt::Display for PrivateRootError {
             Self::ResourceLimit => formatter.write_str("private base exceeds the byte limit"),
             Self::DigestMismatch => formatter.write_str("private base bytes do not match digest"),
             Self::Validation(error) => write!(formatter, "invalid native no-backup root: {error}"),
+            Self::Sync(error) => write!(formatter, "native sync state unavailable: {error}"),
         }
     }
 }
@@ -201,6 +233,7 @@ impl std::error::Error for PrivateRootError {
             | Self::ResourceLimit
             | Self::DigestMismatch => None,
             Self::Validation(error) => Some(error),
+            Self::Sync(error) => Some(error),
         }
     }
 }

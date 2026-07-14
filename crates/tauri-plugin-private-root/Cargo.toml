@@ -10,9 +10,11 @@ links = "tauri-plugin-private-root"
 cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
 myvault-private-fs = { path = "../myvault-private-fs" }
+myvault-sync-engine = { path = "../myvault-sync-engine" }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 tauri = "2.11.3"
+uuid = { version = "=1.20.0" }
 
 [build-dependencies]
 tauri-plugin = { version = "2.6.3", features = ["build"] }
