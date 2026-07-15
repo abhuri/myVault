@@ -83,6 +83,15 @@ fn make_private(path: &Path) {
 #[cfg(not(unix))]
 fn make_private(_path: &Path) {}
 
+#[cfg(unix)]
+fn make_private_file(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private file mode");
+}
+
+#[cfg(not(unix))]
+fn make_private_file(_path: &Path) {}
+
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -90,7 +99,7 @@ fn sha256(bytes: &[u8]) -> String {
 #[derive(Clone, Copy, Debug)]
 enum PrivateCrashBoundary {
     BeforeStagedFsync,
-    AfterBaseLinkBeforeStageCleanup,
+    AfterBasePublishBeforeStageCleanup,
 }
 
 struct FailAt(DurabilityPoint);
@@ -112,7 +121,10 @@ fn injected_sync_fault_matrix_preserves_evidence_and_allows_exact_retry() {
     for point in [
         DurabilityPoint::FinishStageFile,
         DurabilityPoint::FinishStageDirectory,
-        DurabilityPoint::BaseLinkDirectory,
+        DurabilityPoint::BaseCopyFile,
+        DurabilityPoint::BaseCopyDirectory,
+        DurabilityPoint::BasePublishDirectory,
+        DurabilityPoint::BaseVerifiedFile,
         DurabilityPoint::BaseVerifiedDirectory,
         DurabilityPoint::BaseCleanupDirectory,
     ] {
@@ -150,7 +162,8 @@ fn injected_sync_fault_matrix_preserves_evidence_and_allows_exact_retry() {
         );
         if matches!(
             point,
-            DurabilityPoint::BaseLinkDirectory
+            DurabilityPoint::BasePublishDirectory
+                | DurabilityPoint::BaseVerifiedFile
                 | DurabilityPoint::BaseVerifiedDirectory
                 | DurabilityPoint::BaseCleanupDirectory
         ) {
@@ -194,7 +207,7 @@ fn injected_sync_fault_matrix_preserves_evidence_and_allows_exact_retry() {
 fn private_store_crash_matrix_preserves_or_recovers_exact_evidence() {
     for boundary in [
         PrivateCrashBoundary::BeforeStagedFsync,
-        PrivateCrashBoundary::AfterBaseLinkBeforeStageCleanup,
+        PrivateCrashBoundary::AfterBasePublishBeforeStageCleanup,
     ] {
         let fixture = Fixture::new();
         let vault_id = Uuid::new_v4();
@@ -231,24 +244,25 @@ fn private_store_crash_matrix_preserves_or_recovers_exact_evidence() {
                     .expect("strictly short stage is safe to discard");
                 assert!(!fixture.stage_path(vault_id, operation_id).exists());
             }
-            PrivateCrashBoundary::AfterBaseLinkBeforeStageCleanup => {
+            PrivateCrashBoundary::AfterBasePublishBeforeStageCleanup => {
                 let mut writer = store.begin_stage(operation_id).expect("stage");
                 writer.write_all(expected).expect("body");
                 let stage = store
                     .finish_stage(writer, &digest, expected.len() as u64)
                     .expect("verified stage");
-                fs::hard_link(
+                fs::copy(
                     fixture.stage_path(vault_id, operation_id),
                     fixture.object_path(vault_id, &digest),
                 )
-                .expect("inject completed base-link boundary");
+                .expect("inject completed base-publish boundary");
+                make_private_file(&fixture.object_path(vault_id, &digest));
                 drop(stage);
                 drop(store);
 
                 let reopened = fixture.store(vault_id);
                 let recovered = reopened
                     .load_verified_stage(operation_id, &digest, expected.len() as u64)
-                    .expect("linked stage recovery");
+                    .expect("published stage recovery");
                 assert_eq!(recovered.operation_id(), operation_id);
                 assert_eq!(recovered.sha256(), digest);
                 assert_eq!(recovered.byte_len(), expected.len() as u64);

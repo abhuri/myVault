@@ -1,11 +1,12 @@
 # Changelog
 
-## Unreleased — R2 guarded transfer implementation candidate — 2026-07-14
+## Unreleased — R2 guarded transfer final candidate — 2026-07-15
 
 Built from the R1 merge checkpoint `681271a` on
-`codex/r2-guarded-transfer`ค่ะ This milestone remains an implementation
-candidate until locked live disposable acceptance passes on one exact clean
-HEADค่ะ
+`codex/r2-guarded-transfer`ค่ะ Disposable macOS byte-exact round trip และ
+Android API 36 live acceptance ผ่านแล้วค่ะ This milestone remains a final
+candidate until the remaining macOS restart/offline/auth lifecycle, current
+fixes, fresh CI, review, PR readiness, and merge pass on one exact clean HEADค่ะ
 
 - เพิ่ม schema v3 durable upload/download evidence, create-only operation
   markers, retry scheduling, `AuthRequired`, `NeedsReconcile`, restart recovery,
@@ -19,16 +20,26 @@ HEADค่ะ
 - เพิ่ม desktop local observation และ bounded Android SAF inventory/hints พร้อม
   protected-path, duplicate-path, size-bound และ stale-capability fail-closed
   policyค่ะ
+- เปลี่ยน Android binary bridge เป็น transcript-checked 192 KiB chunks เพื่อ
+  ไม่ส่ง payload 16 MiB เป็น Base64 message เดียว และตรวจ offset, length,
+  SHA-256, EOF กับ native readback ทุกครั้งค่ะ
+- เปลี่ยน Android private base publication จาก hard link ที่ SELinux ปฏิเสธ
+  เป็น durable private copy + exact verification + create-no-replace rename
+  พร้อม crash recovery ที่รักษา ambiguous evidenceค่ะ
+- แก้ Android no-backup `O_PATH` directory fsync ด้วย capability-relative
+  syncable reopen และคง private state/stage durability แบบ fail-closedค่ะ
 - เพิ่ม single-owned guarded worker, bounded 100-page/1,000-operation runs,
   resumable 8 MiB chunks, desktop 512 MiB payload cap และ Android 16 MiB capค่ะ
 - ขยาย R2 offline aggregate และ CI ให้ครอบคลุม regression crates,
   Android-target strict Clippy, Kotlin policy tests, APK build/alignment และ
   platform packagesค่ะ
-- Quality, Android compile/alignment, Ubuntu AppImage และ Windows NSIS CI ผ่าน
-  บน Draft PR candidate แล้วค่ะ Live disposable macOS round trip, Android
-  signed-in SAF round trip, auth expiry/reacquisition และ restart/offline
-  scenarios ยัง pending และห้ามตีความ implementation candidate เป็น release
-  completionค่ะ
+- macOS A → Drive → B และ Android API 36 A/B/C ผ่าน byte-exact disposable
+  journeys รวมไฟล์ Unicode, zero-byte, 6 MiB + 1, 12 MiB และ 15 MiBค่ะ Android
+  offline injection ไม่สร้าง remote duplicate และ cold restart ฟื้น durable
+  pending/reconcile state จนกลับ readyค่ะ Physical Android ยัง deferred ไป R7ค่ะ
+- Local final aggregate, Android cross-target Clippy, Kotlin tests, APK build และ
+  16 KiB alignment ผ่านค่ะ Earlier Draft PR CI เป็น historical evidence; ต้อง
+  รัน fresh exact-HEAD CI หลัง final commit ก่อน mergeค่ะ
 
 ## Unreleased — R1 native auth and read-only binding — 2026-07-14
 

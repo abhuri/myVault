@@ -1,16 +1,18 @@
 # Phase 3 Sync Evidence
 
-Updated 2026-07-14 Asia/Bangkok ค่ะ
+Updated 2026-07-15 Asia/Bangkok ค่ะ
 
 ## R2 — Guarded Transfer
 
-Status: `IMPLEMENTATION CANDIDATE — LIVE PENDING` ค่ะ
+Status: `FINAL CANDIDATE — LIVE ACCEPTANCE PASSED; FINAL HEAD/CI PENDING` ค่ะ
 
 R2 started from the merged R1 checkpoint `681271a` on branch
 `codex/r2-guarded-transfer` after one-time execution approval from คุณโอค่ะ The
 candidate implements durable byte-verified upload/download and Android SAF
-runtime integration, but R2 is not complete until every locked Gate 0–8 item in
-[R2_ACCEPTANCE.md](R2_ACCEPTANCE.md) is evidenced on one final clean HEADค่ะ
+runtime integrationค่ะ Live macOS byte-exact round trip and API 36 emulator
+acceptance now pass, but R2 is not complete until the remaining macOS lifecycle,
+current dirty working tree, fresh exact-HEAD CI, final review, Draft PR #27
+readiness and merge close ตาม [R2_ACCEPTANCE.md](R2_ACCEPTANCE.md)ค่ะ
 
 ### Implemented candidate scope
 
@@ -26,8 +28,25 @@ runtime integration, but R2 is not complete until every locked Gate 0–8 item i
   verified no-ops; differing or unknown outcomes preserve evidence and stop at
   `NeedsReconcile` without replacementค่ะ
 - Desktop payloads are streamed and capped at 512 MiBค่ะ Android SAF payloads
-  use bounded native whole-buffer operations capped at 16 MiBค่ะ Upload chunks
-  are 8 MiB and each run is capped at 1,000 operations and 100 Changes pagesค่ะ
+  are capped at 16 MiB and cross the Rust/Kotlin bridge in transcript-checked
+  192 KiB chunks through one stateful read session, never as one whole Base64
+  messageค่ะ Holding one provider stream makes the read path O(n) in payload
+  size rather than reopening and rereading every prefixค่ะ The session binds the
+  exact root, portable path and document ID, while owner/foreign transcript
+  isolation prevents an unrelated or malformed contender from aborting the
+  active ownerค่ะ Upload chunks are 8 MiB and each run is capped at 1,000
+  operations and 100 Changes pagesค่ะ
+- Android private base publication uses a private copy, file and directory
+  durability checks, exact identity/hash verification, and `renameat2`
+  create-no-replaceค่ะ Pending source identity, link count, metadata, bytes and
+  hash are revalidated after the final pre-rename fault boundary, and the named
+  final file is reopened, verified and fsynced before stage cleanupค่ะ This
+  closes the pending source-swap window while retaining crash evidence and
+  immutable final objectsค่ะ
+- Android no-backup roots opened as `O_PATH` capabilities are reopened relative
+  to the held descriptor as syncable read-only directories before `fsync`ค่ะ
+  The private Sync/stage store therefore fails closed instead of treating
+  `EBADF` as weaker SAF durabilityค่ะ
 - Changes cursor advancement is transactional with declared local mutation
   completion and durable remote transfer completionค่ะ Expired/ambiguous cursors,
   remote moves/removals/renames, protected paths and duplicate exact paths force
@@ -36,22 +55,48 @@ runtime integration, but R2 is not complete until every locked Gate 0–8 item i
   Tokens, resumable session URIs, provider bodies, content bodies and ambient
   Vault paths remain outside frontend DTOs, logs and SQLiteค่ะ
 
-### Integrated offline and emulator evidence
+### Integrated deterministic and native evidence
 
-- The post-audit integrated working tree passed `pnpm quality:r2:offline` on
-  2026-07-14 Asia/Bangkokค่ะ This includes frontend typecheck, 5 files/40 tests,
+- The post-live integrated working tree passed `pnpm quality:r2:offline` on
+  2026-07-15 Asia/Bangkokค่ะ This includes frontend typecheck, 5 files/40 tests,
   production build, Rustfmt, strict Clippy, and all expanded R2/regression testsค่ะ
-- Key final Rust counts include Drive 51, private-root 9, Sync engine 47,
-  transfer 14, and Tauri 54 testsค่ะ The matrix includes real SQLite transaction
+- A final macOS debug application and DMG bundle built successfully from the
+  same working tree after the live fixesค่ะ
+- Key final Rust counts include Drive 53, private-root 18, Vault SAF 10,
+  transfer 14, and Tauri 56 testsค่ะ The matrix includes real SQLite transaction
   aborts, exact staged/base durability failures, restart recovery, and every
   emitted 8 MiB resumable upload/status boundary for 0, 1, 8 MiB, 8 MiB + 1,
   and 16 MiB payloadsค่ะ
-- Android aarch64 strict Clippy and Kotlin Vault SAF unit tests passedค่ะ The
-  final API 36 debug APK passed 16 KiB alignment and APK Signature Scheme v2,
-  then installed fresh and cold-launched in 669 ms with a live PID and zero
-  matching fatal process logsค่ะ
+- Android aarch64 strict Clippy and Gradle Vault SAF unit tests passedค่ะ The
+  final API 36 debug APK is 304,052,519 bytes, passed `zipalign` verification
+  for 16 KiB page alignment, and built successfully after the final source
+  fixesค่ะ
 - Final local APK SHA-256 is
-  `96d7791718cb5ba4326d74a8bd0076837f1fd52cdc8107e54a071cfbcda2c87e`ค่ะ
+  `a3a1cef9b2a4e3e08118cef2ce4209d76578e6fb366edbc395e566369070bd4a`ค่ะ
+- macOS live acceptance used only disposable Local Vaults and one exact
+  disposable Drive rootค่ะ Markdown, Thai Unicode paths, zero-byte files,
+  6 MiB + 1 byte and two 15 MiB restart fixtures completed a byte-exact
+  Local A → Drive → Local B journeyค่ะ
+- Android API 36 Vault A converged to `ready` with 9 files and no active,
+  pending, retry, auth-required, or reconcile workค่ะ Vault B downloaded the
+  same 9-file manifest byte-exactly; its recursive manifest SHA-256 was
+  `afda517b358b185071d90cd6a91c457f042202f5ee6af03068a59786227fec01`ค่ะ
+- A 12 MiB upload was interrupted after its private durable stage by disabling
+  emulator networking, then completed after connectivity restorationค่ะ The
+  remote metadata contained exactly one matching fixture, proving no duplicate
+  create across the offline boundaryค่ะ
+- Android Vault C was force-stopped after the first recovered fileค่ะ Relaunch
+  restored the exact SAF root and Drive binding as 1 completed, 8 pending and
+  1 reconcile operation; same-account authorization reacquisition resumed the
+  work to `ready` with all counters zeroค่ะ Vault B and C then matched byte for
+  byte across 10 files with manifest SHA-256
+  `e3782952e5eebc7ce2919a858fe59c1b1c2cd4db82a9ba22bb7958d6c446542c`ค่ะ
+- The final rebuilt APK then downloaded the same exact-root fixture into empty
+  Android Vault D through the stateful SAF write transcriptค่ะ All 10 files
+  completed with zero active, pending, retry, authorization or reconcile work,
+  and Vault D's per-path SHA-256 manifest exactly equaled Vault Cค่ะ A cold
+  force-stop/relaunch reconnected the same binding and returned to `ready` with
+  every queue counter still zeroค่ะ
 - Static Drive mutation/token audits found no reachable DELETE, Trash, rename,
   move, permission mutation, generic request API, durable bearer capability or
   production dependency on `drive-sync-spike`ค่ะ
@@ -64,20 +109,20 @@ runtime integration, but R2 is not complete until every locked Gate 0–8 item i
   2022 NSIS in 12m19s on the same candidateค่ะ These are package/build claims,
   not native UI acceptance claimsค่ะ
 
-### Deliberately pending / externally blocked evidence
+### Deliberately pending / finalization work
 
-- Desktop live acceptance needs OAuth client configuration supplied outside the
-  repository plus an exact disposable R2 Drive account/root and disposable
-  Local Vault A/B fixture recordค่ะ No desktop OAuth environment is currently
-  available in this workspaceค่ะ
-- Android live acceptance needs a Google test account signed into the API 36
-  emulator and the same exact disposable Drive rootค่ะ The current emulator has
-  no Google account, so consent, round trip and auth reacquisition cannot runค่ะ
-- No personal Drive item, personal Vault, credential, 2FA flow or physical
-  Android device has been accessed during this candidate runค่ะ Physical-device
-  acceptance remains R7ค่ะ
-- Draft PR/CI is allowed for evidence collection, but the PR must not become
-  Ready and must not merge until the live gate and every remaining P1 closeค่ะ
+- The current evidence is from a dirty working tree based on branch HEAD
+  `e39d131`; the final candidate commit does not exist yetค่ะ Earlier green CI
+  on `ed90bfb` cannot satisfy the final-head gateค่ะ
+- Live desktop auth-expiry/disconnect was not forced because disconnecting the
+  native credential requires a fresh action-time confirmationค่ะ Deterministic
+  auth-expiry, refresh, retry, and idempotent disconnect suites pass, while the
+  broader macOS scenario checkbox remains open and must be described honestlyค่ะ
+- No personal Drive item, personal Vault, raw credential, 2FA flow, or physical
+  Android device was accessedค่ะ Physical-device acceptance remains R7ค่ะ
+- Draft PR #27 must remain Draft until the final commit is pushed, fresh Quality,
+  Android, Ubuntu, and Windows checks pass, and final security/diff review finds
+  no blockerค่ะ
 
 ## R1 — Native Auth + Read-only Existing Drive Binding
 

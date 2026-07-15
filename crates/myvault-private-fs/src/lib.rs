@@ -455,7 +455,7 @@ pub fn inspect_android_no_backup_root(
     use std::os::unix::fs::MetadataExt;
 
     let candidate_before = candidate.canonicalize()?;
-    let directory = open_absolute_dir_nofollow(candidate)?;
+    let directory = open_android_native_dir_nofollow(candidate)?;
     let candidate_after = candidate.canonicalize()?;
     if candidate_before != candidate_after {
         return Err(Error::InvalidRoot("root changed while it was opened"));
@@ -479,6 +479,21 @@ pub fn inspect_android_no_backup_root(
 }
 
 #[cfg(target_os = "android")]
+fn open_android_native_dir_nofollow(candidate: &Path) -> Result<Dir, Error> {
+    // Android app sandboxes permit traversing private parent directories but
+    // deny opening those parents for enumeration. Open the exact native-proven
+    // leaf directly, while rejecting a final symlink before and after open.
+    if fs::symlink_metadata(candidate)?.file_type().is_symlink() {
+        return Err(Error::InvalidRoot("root contains a symlink component"));
+    }
+    let directory = Dir::open_ambient_dir(candidate, ambient_authority())?;
+    if fs::symlink_metadata(candidate)?.file_type().is_symlink() {
+        return Err(Error::InvalidRoot("root contains a symlink component"));
+    }
+    Ok(directory)
+}
+
+#[cfg(target_os = "android")]
 fn inspect_android_acl(file: &std::fs::File) -> Result<AndroidAclInspection, Error> {
     use xattr::FileExt;
     let mut unsupported = false;
@@ -486,10 +501,7 @@ fn inspect_android_acl(file: &std::fs::File) -> Result<AndroidAclInspection, Err
         match file.get_xattr(name) {
             Ok(Some(_)) => return Err(Error::ExtendedAcl),
             Ok(None) => {}
-            Err(error)
-                if error.kind() == io::ErrorKind::Unsupported
-                    || error.raw_os_error() == Some(rustix::io::Errno::NOTSUP.raw_os_error()) =>
-            {
+            Err(error) if android_acl_query_unavailable(&error) => {
                 unsupported = true;
             }
             Err(error) => return Err(Error::Io(error)),
@@ -500,6 +512,13 @@ fn inspect_android_acl(file: &std::fs::File) -> Result<AndroidAclInspection, Err
     } else {
         AndroidAclInspection::Clean
     })
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_acl_query_unavailable(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Unsupported
+        || error.raw_os_error() == Some(rustix::io::Errno::NOTSUP.raw_os_error())
+        || error.raw_os_error() == Some(rustix::io::Errno::ACCESS.raw_os_error())
 }
 
 impl fmt::Display for Error {
@@ -753,6 +772,26 @@ pub fn verify_private_file(file: &File, max_links: u64) -> Result<(), Error> {
 ///
 /// Returns the operating-system error when the held directory cannot be synced.
 pub fn sync_directory(directory: &Dir) -> Result<(), Error> {
+    #[cfg(target_os = "android")]
+    {
+        use std::os::fd::AsFd;
+
+        let reopened = rustix::fs::openat(
+            directory.as_fd(),
+            ".",
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| Error::Io(io::Error::from_raw_os_error(error.raw_os_error())))?;
+        rustix::fs::fsync(&reopened)
+            .map_err(|error| Error::Io(io::Error::from_raw_os_error(error.raw_os_error())))?;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "android"))]
     match directory.try_clone()?.into_std_file().sync_all() {
         Ok(()) => Ok(()),
         #[cfg(windows)]
@@ -1092,6 +1131,25 @@ mod tests {
         fs::create_dir(&other).expect("other root");
         fs::set_permissions(&app, fs::Permissions::from_mode(0o700)).expect("private app root");
         (temporary, app, other)
+    }
+
+    #[test]
+    fn android_acl_unavailable_accepts_eacces_but_not_eperm() {
+        assert!(android_acl_query_unavailable(&io::Error::from(
+            io::ErrorKind::Unsupported
+        )));
+        assert!(android_acl_query_unavailable(
+            &io::Error::from_raw_os_error(rustix::io::Errno::ACCESS.raw_os_error())
+        ));
+        assert!(android_acl_query_unavailable(
+            &io::Error::from_raw_os_error(rustix::io::Errno::NOTSUP.raw_os_error())
+        ));
+        assert!(!android_acl_query_unavailable(
+            &io::Error::from_raw_os_error(rustix::io::Errno::PERM.raw_os_error())
+        ));
+        assert!(!android_acl_query_unavailable(&io::Error::from(
+            io::ErrorKind::InvalidData
+        )));
     }
 
     #[test]

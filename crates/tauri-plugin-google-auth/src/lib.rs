@@ -11,6 +11,8 @@ pub use error::{Error, Result};
 pub use models::{AccessToken, Authorization};
 
 pub const GOOGLE_DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive";
+const GOOGLE_DRIVE_METADATA_READONLY_SCOPE: &str =
+    "https://www.googleapis.com/auth/drive.metadata.readonly";
 
 use mobile::GoogleAuth;
 

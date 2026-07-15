@@ -12,7 +12,7 @@ cap-std = "=4.0.2"
 myvault-platform-fs = { path = "../myvault-platform-fs" }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "=1.1.4", features = ["process"] }
+rustix = { version = "=1.1.4", features = ["fs", "process"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 xattr = { version = "=1.6.1", default-features = false }

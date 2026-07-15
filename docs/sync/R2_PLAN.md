@@ -68,9 +68,12 @@ statusค่ะ
 - Desktop accepts one transfer payload up to 512 MiB and streams through
   descriptor-backed capabilitiesค่ะ
 - Android SAF accepts one transfer payload up to 16 MiBค่ะ The Android bridge
-  uses a bounded whole-buffer native capability rather than claiming desktop
-  streaming equivalenceค่ะ Unknown provider sizes are treated as unknown until
-  a bounded read establishes the actual byte lengthค่ะ
+  moves bounded 192 KiB chunks through a stateful provider read session rather
+  than one whole-buffer Base64 messageค่ะ The session holds one provider stream
+  for O(n) traversal, binds the exact root/path/document identity, and isolates
+  its owner transcript from foreign or malformed contendersค่ะ Unknown provider
+  sizes remain unknown until bounded traversal establishes the actual byte
+  lengthค่ะ
 - Resumable upload chunks are 8 MiB, one guarded run processes at most 1,000
   operations, and one incremental drain processes at most 100 Changes pagesค่ะ
 - A run that reaches any bound stops truthfully with durable evidence; it never

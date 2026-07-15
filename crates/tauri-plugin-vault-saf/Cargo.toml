@@ -8,8 +8,9 @@ links = "tauri-plugin-vault-saf"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 tauri = "2.11.3"
-uuid = { version = "=1.20.0", features = ["v5"] }
+uuid = { version = "=1.20.0", features = ["v4", "v5"] }
 
 [build-dependencies]
 tauri-plugin = { version = "2.6.3", features = ["build"] }

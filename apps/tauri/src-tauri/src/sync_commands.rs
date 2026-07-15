@@ -255,6 +255,54 @@ fn map_sync_error(error: myvault_sync_engine::Error) -> SyncCommandError {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn requeue_prior_absent_upload_if_exact(
+    store: &mut myvault_sync_engine::SyncStore,
+    operation_id: uuid::Uuid,
+    portable_path: &str,
+    remote_parent_id: &str,
+    local_revision: &str,
+    sha256: &str,
+    byte_length: u64,
+    mime_class: myvault_sync_engine::TransferMimeClass,
+    reconciliation_time: u64,
+    excluded_error_code: Option<&str>,
+) -> Result<bool, SyncCommandError> {
+    let Some(prior) = store.transfer(operation_id).map_err(map_sync_error)? else {
+        return Ok(false);
+    };
+    if prior.phase != myvault_sync_engine::TransferPhase::NeedsReconcile
+        || excluded_error_code
+            .is_some_and(|excluded| prior.last_error_code.as_deref() == Some(excluded))
+    {
+        return Ok(false);
+    }
+    let expected_marker = format!("r2-{}", operation_id.simple());
+    let expected_stage = format!("stage-{operation_id}");
+    let exact_prior_absent_upload = prior.direction
+        == myvault_sync_engine::TransferDirection::Upload
+        && prior.portable_path == portable_path
+        && prior.remote_parent_id == remote_parent_id
+        && prior.remote_file_id.is_none()
+        && prior.expected_local_revision.as_deref() == Some(local_revision)
+        && prior.expected_remote_revision.is_none()
+        && prior.sha256 == sha256
+        && prior.byte_length == byte_length
+        && prior.mime_class == mime_class
+        && prior.operation_marker == expected_marker
+        && prior.stage_reference.as_deref() == Some(expected_stage.as_str());
+    if !exact_prior_absent_upload {
+        return Err(SyncCommandError::internal());
+    }
+    store
+        .requeue_transfer_for_reconciliation(
+            operation_id,
+            reconciliation_time.max(prior.updated_at_unix_ms),
+        )
+        .map_err(map_sync_error)?;
+    Ok(true)
+}
+
 fn now_unix_ms() -> Result<u64, SyncCommandError> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -942,13 +990,39 @@ mod platform {
                 .map(|entry| store.remote_base(&entry.file_id).map_err(map_sync_error))
                 .transpose()?
                 .flatten();
-            if matching_durable.as_ref().is_some_and(|durable| {
+            let exact_base_match = matching_durable.as_ref().is_some_and(|durable| {
                 matching_base.as_ref().is_some_and(|base| {
                     base.local_revision == snapshot.revision.hex
                         && base.remote_revision == durable.remote_revision
                         && base.content_hash == snapshot.sha256.as_str()
                 })
-            }) {
+            });
+            if exact_base_match {
+                let remote = matching_remote.ok_or_else(SyncCommandError::internal)?;
+                let operation_id = transfer_operation_id(&[
+                    "upload",
+                    &local.path,
+                    &remote.parent_id,
+                    "absent",
+                    "absent",
+                    &snapshot.revision.hex,
+                    snapshot.sha256.as_str(),
+                    &snapshot.byte_len.to_string(),
+                ]);
+                if requeue_prior_absent_upload_if_exact(
+                    store,
+                    operation_id,
+                    &local.path,
+                    &remote.parent_id,
+                    &snapshot.revision.hex,
+                    snapshot.sha256.as_str(),
+                    snapshot.byte_len,
+                    content_kind(&local.path, matches!(local.kind, ExplorerKindDto::Markdown)),
+                    reconciliation_time,
+                    None,
+                )? {
+                    registered = registered.saturating_add(1);
+                }
                 continue;
             }
             let parent_id = if let Some(remote) = matching_remote {
@@ -1904,6 +1978,43 @@ mod platform {
             }
         }
 
+        struct SingleFileInitialDrive {
+            entry: Option<myvault_sync_engine::RemoteEntry>,
+        }
+
+        impl myvault_sync_engine::DriveClient for SingleFileInitialDrive {
+            fn get_start_page_token(
+                &mut self,
+            ) -> std::result::Result<String, myvault_sync_engine::RemoteError> {
+                Ok("cursor_1".to_owned())
+            }
+
+            fn scan_folder_page(
+                &mut self,
+                _request: &myvault_sync_engine::ScanRequest,
+            ) -> std::result::Result<myvault_sync_engine::ScanPage, myvault_sync_engine::RemoteError>
+            {
+                Ok(myvault_sync_engine::ScanPage {
+                    entries: self.entry.take().into_iter().collect(),
+                    next_page_token: None,
+                })
+            }
+
+            fn changes_page(
+                &mut self,
+                _page_token: &str,
+            ) -> std::result::Result<
+                myvault_sync_engine::ChangesPage,
+                myvault_sync_engine::RemoteError,
+            > {
+                Ok(myvault_sync_engine::ChangesPage {
+                    changes: Vec::new(),
+                    next_page_token: None,
+                    new_start_page_token: Some("cursor_1".to_owned()),
+                })
+            }
+        }
+
         #[test]
         fn desktop_client_id_and_exact_connected_account_are_fail_closed() {
             assert!(validate_client_id("client-123.apps.googleusercontent.com").is_ok());
@@ -2117,6 +2228,447 @@ mod platform {
             assert_eq!(busy.code, SyncCommandCode::Busy);
             drop(detached);
             status_impl(&service, &runtime, session_id).expect("restored sync state");
+        }
+
+        #[test]
+        fn exact_base_match_requeues_only_the_prior_absent_upload() {
+            let temporary = tempfile::tempdir().expect("temporary roots");
+            let base = temporary.path().canonicalize().expect("canonical root");
+            let app_data = base.join("app-data");
+            let vault_root = base.join("vault");
+            std::fs::create_dir(&app_data).expect("app data root");
+            std::fs::create_dir(&vault_root).expect("vault root");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&app_data, std::fs::Permissions::from_mode(0o700))
+                    .expect("private app data permissions");
+            }
+            let service = AppService::with_app_data_root(&app_data);
+            let session_id = service
+                .activate_trusted_vault(
+                    Vault::open(vault_root.canonicalize().expect("canonical vault"))
+                        .expect("open vault"),
+                )
+                .expect("activate vault")
+                .session_id
+                .expect("session");
+            let context = service.native_vault_context(session_id).expect("context");
+            let mut store = SyncStore::open(
+                context.app_data_root().expect("app data"),
+                context.vault_root(),
+                context.vault_id(),
+            )
+            .expect("sync store");
+            let binding = myvault_sync_engine::VerifiedRemoteBinding::new(
+                "account_1",
+                "root_1",
+                "account_1",
+                "root_1",
+            )
+            .expect("binding");
+            store.bind_remote_root(&binding, 1).expect("bind");
+
+            let local_revision = "1".repeat(64);
+            let sha256 = "2".repeat(64);
+            let register_stopped =
+                |store: &mut SyncStore, portable_path: &str, error_code: &str| {
+                    let operation_id = transfer_operation_id(&[
+                        "upload",
+                        portable_path,
+                        "root_1",
+                        "absent",
+                        "absent",
+                        &local_revision,
+                        &sha256,
+                        "3",
+                    ]);
+                    let record = TransferRecord::new(
+                        operation_id,
+                        TransferDirection::Upload,
+                        portable_path,
+                        "root_1",
+                        None,
+                        Some(local_revision.clone()),
+                        None,
+                        &sha256,
+                        3,
+                        TransferMimeClass::Markdown,
+                        operation_marker(operation_id),
+                        Some(stage_reference(operation_id)),
+                        None,
+                        5,
+                    )
+                    .expect("transfer evidence");
+                    store.register_transfer(&record).expect("register transfer");
+                    store
+                        .claim_next_transfer(5)
+                        .expect("claim transfer")
+                        .expect("claimed transfer");
+                    store
+                        .mark_transfer_needs_reconcile(operation_id, error_code, 6)
+                        .expect("stop transfer");
+                    operation_id
+                };
+            let exact = register_stopped(&mut store, "note.md", "drive_revision_mismatch");
+            let unrelated = register_stopped(&mut store, "other.md", "drive_revision_mismatch");
+            let android_publication_unknown = register_stopped(
+                &mut store,
+                "android.md",
+                "android_local_publication_unknown",
+            );
+
+            assert!(requeue_prior_absent_upload_if_exact(
+                &mut store,
+                exact,
+                "note.md",
+                "root_1",
+                &local_revision,
+                &sha256,
+                3,
+                TransferMimeClass::Markdown,
+                7,
+                None,
+            )
+            .expect("requeue exact prior upload"));
+
+            assert!(!requeue_prior_absent_upload_if_exact(
+                &mut store,
+                android_publication_unknown,
+                "android.md",
+                "root_1",
+                &local_revision,
+                &sha256,
+                3,
+                TransferMimeClass::Markdown,
+                7,
+                Some("android_local_publication_unknown"),
+            )
+            .expect("Android publication-unknown evidence remains stopped"));
+
+            let exact = store.transfer(exact).unwrap().unwrap();
+            assert_eq!(exact.phase, TransferPhase::RetryScheduled);
+            assert_eq!(
+                exact.last_error_code.as_deref(),
+                Some("reconcile_requested")
+            );
+            assert_eq!(exact.attempt_count, 1);
+            let unrelated = store.transfer(unrelated).unwrap().unwrap();
+            assert_eq!(unrelated.phase, TransferPhase::NeedsReconcile);
+            assert_eq!(unrelated.attempt_count, 0);
+            assert_eq!(
+                store
+                    .transfer(android_publication_unknown)
+                    .unwrap()
+                    .unwrap()
+                    .phase,
+                TransferPhase::NeedsReconcile
+            );
+
+            let completed_path = "completed.md";
+            let completed = transfer_operation_id(&[
+                "upload",
+                completed_path,
+                "root_1",
+                "absent",
+                "absent",
+                &local_revision,
+                &sha256,
+                "3",
+            ]);
+            let completed_record = TransferRecord::new(
+                completed,
+                TransferDirection::Upload,
+                completed_path,
+                "root_1",
+                None,
+                Some(local_revision.clone()),
+                None,
+                &sha256,
+                3,
+                TransferMimeClass::Markdown,
+                operation_marker(completed),
+                Some(stage_reference(completed)),
+                None,
+                8,
+            )
+            .expect("completed transfer evidence");
+            store
+                .register_transfer(&completed_record)
+                .expect("register completed transfer");
+            let mut claimed = store
+                .claim_next_transfer(8)
+                .expect("claim transfer")
+                .expect("transfer claimed");
+            if claimed.operation_id != completed {
+                claimed = store
+                    .claim_next_transfer(8)
+                    .expect("claim completed transfer")
+                    .expect("completed transfer claimed");
+            }
+            assert_eq!(claimed.operation_id, completed);
+            let completion = myvault_sync_engine::TransferCompletion::new(
+                "remote-file",
+                "3".repeat(64),
+                local_revision.clone(),
+                "base.abcdef",
+                "upload_verified",
+                9,
+            )
+            .expect("completion evidence");
+            store
+                .complete_verified_transfer(completed, &completion)
+                .expect("complete transfer");
+
+            assert!(!requeue_prior_absent_upload_if_exact(
+                &mut store,
+                completed,
+                completed_path,
+                "root_1",
+                &local_revision,
+                &sha256,
+                3,
+                TransferMimeClass::Markdown,
+                10,
+                None,
+            )
+            .expect("completed transfers are not reconciliation candidates"));
+            assert_eq!(
+                store.transfer(completed).unwrap().unwrap().phase,
+                TransferPhase::Completed
+            );
+        }
+
+        #[test]
+        fn recovered_absent_upload_completes_with_get_only_remote_verification() {
+            const SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+            const REMOTE_REVISION: &str =
+                "0000000000000000000000000000000000000000000000000000000000000002";
+            let temporary = tempfile::tempdir().expect("temporary roots");
+            let base = temporary.path().canonicalize().expect("canonical root");
+            let app_data = base.join("app-data");
+            let vault_root = base.join("vault");
+            std::fs::create_dir(&app_data).expect("app data root");
+            std::fs::create_dir(&vault_root).expect("vault root");
+            std::fs::write(vault_root.join("note.md"), b"abc").expect("local source");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&app_data, std::fs::Permissions::from_mode(0o700))
+                    .expect("private app data permissions");
+            }
+            let service = AppService::with_app_data_root(&app_data);
+            let session_id = service
+                .activate_trusted_vault(
+                    Vault::open(vault_root.canonicalize().expect("canonical vault"))
+                        .expect("open vault"),
+                )
+                .expect("activate vault")
+                .session_id
+                .expect("session");
+            let mut sink = std::io::sink();
+            let snapshot = service
+                .stream_transfer_source(
+                    session_id,
+                    "note.md",
+                    &mut sink,
+                    MAX_TRANSFER_BYTES as usize,
+                )
+                .expect("local evidence");
+            assert_eq!(snapshot.sha256.as_str(), SHA256);
+            let context = service.native_vault_context(session_id).expect("context");
+            let mut store = SyncStore::open(
+                context.app_data_root().expect("app data"),
+                context.vault_root(),
+                context.vault_id(),
+            )
+            .expect("sync store");
+            let binding = myvault_sync_engine::VerifiedRemoteBinding::new(
+                "account_1",
+                "root_1",
+                "account_1",
+                "root_1",
+            )
+            .expect("binding");
+            store.bind_remote_root(&binding, 1).expect("bind");
+            let remote = myvault_sync_engine::RemoteEntry {
+                file_id: "file_1".to_owned(),
+                parent_id: "root_1".to_owned(),
+                path: "note.md".to_owned(),
+                kind: RemoteEntryKind::File,
+                content_hash: Some(
+                    myvault_sync_engine::RemoteContentHash::new(
+                        myvault_sync_engine::RemoteHashAlgorithm::Sha256,
+                        SHA256,
+                    )
+                    .expect("remote hash"),
+                ),
+                remote_revision: REMOTE_REVISION.to_owned(),
+            };
+            let mut initial = SingleFileInitialDrive {
+                entry: Some(remote.clone()),
+            };
+            for now in 2..=4 {
+                advance_initial_sync(&mut store, &mut initial, now).expect("initial step");
+            }
+
+            let seed_id = Uuid::new_v4();
+            let seed = TransferRecord::new(
+                seed_id,
+                TransferDirection::Download,
+                "note.md",
+                "root_1",
+                Some("file_1".to_owned()),
+                None,
+                Some(REMOTE_REVISION.to_owned()),
+                SHA256,
+                3,
+                TransferMimeClass::Markdown,
+                operation_marker(seed_id),
+                Some(stage_reference(seed_id)),
+                None,
+                5,
+            )
+            .expect("seed transfer");
+            store.register_transfer(&seed).expect("register seed");
+            assert_eq!(
+                store
+                    .claim_next_transfer(5)
+                    .expect("claim seed")
+                    .expect("seed claimed")
+                    .operation_id,
+                seed_id
+            );
+            let completion = myvault_sync_engine::TransferCompletion::new(
+                "file_1",
+                REMOTE_REVISION,
+                snapshot.revision.hex.clone(),
+                "base.seed",
+                "download_existing_verified",
+                6,
+            )
+            .expect("seed completion");
+            store
+                .complete_verified_transfer(seed_id, &completion)
+                .expect("publish exact base");
+
+            let operation_id = transfer_operation_id(&[
+                "upload",
+                "note.md",
+                "root_1",
+                "absent",
+                "absent",
+                &snapshot.revision.hex,
+                SHA256,
+                "3",
+            ]);
+            let stopped = TransferRecord::new(
+                operation_id,
+                TransferDirection::Upload,
+                "note.md",
+                "root_1",
+                None,
+                Some(snapshot.revision.hex.clone()),
+                None,
+                SHA256,
+                3,
+                TransferMimeClass::Markdown,
+                operation_marker(operation_id),
+                Some(stage_reference(operation_id)),
+                None,
+                7,
+            )
+            .expect("stopped transfer");
+            store.register_transfer(&stopped).expect("register stopped");
+            assert_eq!(
+                store
+                    .claim_next_transfer(7)
+                    .expect("claim stopped")
+                    .expect("stopped claimed")
+                    .operation_id,
+                operation_id
+            );
+            store
+                .mark_transfer_needs_reconcile(operation_id, "drive_revision_mismatch", 8)
+                .expect("stop upload");
+
+            let mut server = mockito::Server::new();
+            let about = server
+                .mock("GET", "/drive/v3/about")
+                .match_query(mockito::Matcher::Any)
+                .with_body(r#"{"user":{"permissionId":"account_1"}}"#)
+                .expect(2)
+                .create();
+            let root = server
+                .mock("GET", "/drive/v3/files/root_1")
+                .match_query(mockito::Matcher::Any)
+                .with_body(r#"{"id":"root_1","name":"Root","mimeType":"application/vnd.google-apps.folder","parents":[],"trashed":false,"version":"1"}"#)
+                .expect(2)
+                .create();
+            let marker = operation_marker(operation_id);
+            let remote_json = format!(
+                r#"{{"id":"file_1","name":"note.md","mimeType":"text/markdown","parents":["root_1"],"trashed":false,"version":"2","size":"3","sha256Checksum":"{SHA256}","appProperties":{{"myvaultOperation":"{marker}","myvaultSha256":"{SHA256}","myvaultSize":"3"}}}}"#,
+            );
+            let query = server
+                .mock("GET", "/drive/v3/files")
+                .match_query(mockito::Matcher::Any)
+                .with_body(format!(r#"{{"files":[{remote_json}]}}"#))
+                .expect(1)
+                .create();
+            let metadata = server
+                .mock("GET", "/drive/v3/files/file_1")
+                .match_query(mockito::Matcher::Any)
+                .with_body(remote_json)
+                .expect(1)
+                .create();
+            let post = server
+                .mock("POST", "/upload/drive/v3/files")
+                .match_query(mockito::Matcher::Any)
+                .expect(0)
+                .create();
+            let origin = server.url();
+            let drive = TransferDrive::for_test_origins(
+                &format!("{origin}/drive/v3/"),
+                &format!("{origin}/upload/drive/v3/"),
+                "account_1",
+                "root_1",
+                MAX_TRANSFER_BYTES,
+            )
+            .expect("test Drive");
+
+            assert_eq!(
+                prepare_guarded_transfers(&service, session_id, &mut store, &drive, "root_1",)
+                    .expect("requeue stopped upload"),
+                1
+            );
+            assert_eq!(
+                store.transfer(operation_id).unwrap().unwrap().phase,
+                TransferPhase::RetryScheduled
+            );
+            let executor = NativeTransferExecutor::new(&service, session_id, drive);
+            let mut worker = Worker::new(&mut store, executor);
+            let recovered = worker
+                .run_once(now_unix_ms().expect("worker time"))
+                .expect("GET-only recovery");
+            assert!(matches!(
+                recovered,
+                WorkOutcome::Completed(completed) if completed == operation_id
+            ));
+            assert_eq!(
+                worker
+                    .run_once(now_unix_ms().expect("idle time"))
+                    .expect("idle worker"),
+                WorkOutcome::Idle
+            );
+            assert_eq!(
+                store.transfer(operation_id).unwrap().unwrap().phase,
+                TransferPhase::Completed
+            );
+            about.assert();
+            root.assert();
+            query.assert();
+            metadata.assert();
+            post.assert();
         }
 
         #[test]
@@ -2900,6 +3452,7 @@ mod platform {
         store: &mut SyncStore,
         record: &TransferRecord,
         reconciliation_time: u64,
+        local_absence_proven: bool,
     ) -> Result<bool, SyncCommandError> {
         match store.register_transfer(record).map_err(map_sync_error)? {
             TransferRegistrationOutcome::Registered => Ok(true),
@@ -2910,8 +3463,9 @@ mod platform {
                     .map_err(map_sync_error)?
                     .ok_or_else(SyncCommandError::internal)?;
                 if existing.phase == TransferPhase::NeedsReconcile
-                    && existing.last_error_code.as_deref()
-                        != Some("android_local_publication_unknown")
+                    && (local_absence_proven
+                        || existing.last_error_code.as_deref()
+                            != Some("android_local_publication_unknown"))
                 {
                     store
                         .requeue_transfer_for_reconciliation(
@@ -2975,7 +3529,7 @@ mod platform {
             let digest = myvault_core::Sha256Digest::from_bytes(&binary.bytes);
             let revision = myvault_core::FileRevision::from_bytes(&binary.bytes);
             if (local.byte_len_known && binary.byte_len != local.byte_len)
-                || binary.revision_hex != revision.hex
+                || binary.revision_hex != digest.as_str()
             {
                 return Err(SyncCommandError::new(
                     SyncCommandCode::StorageUnavailable,
@@ -2995,13 +3549,39 @@ mod platform {
                 .map(|entry| store.remote_base(&entry.file_id).map_err(map_sync_error))
                 .transpose()?
                 .flatten();
-            if matching_durable.as_ref().is_some_and(|durable| {
+            let exact_base_match = matching_durable.as_ref().is_some_and(|durable| {
                 matching_base.as_ref().is_some_and(|base| {
                     base.local_revision == revision.hex
                         && base.remote_revision == durable.remote_revision
                         && base.content_hash == digest.as_str()
                 })
-            }) {
+            });
+            if exact_base_match {
+                let remote = matching_remote.ok_or_else(SyncCommandError::internal)?;
+                let operation_id = transfer_operation_id(&[
+                    "upload",
+                    &local.path,
+                    &remote.parent_id,
+                    "absent",
+                    "absent",
+                    &revision.hex,
+                    digest.as_str(),
+                    &binary.byte_len.to_string(),
+                ]);
+                if requeue_prior_absent_upload_if_exact(
+                    store,
+                    operation_id,
+                    &local.path,
+                    &remote.parent_id,
+                    &revision.hex,
+                    digest.as_str(),
+                    binary.byte_len,
+                    content_kind(&local.path, local.kind == "markdown"),
+                    reconciliation_time,
+                    Some("android_local_publication_unknown"),
+                )? {
+                    registered = registered.saturating_add(1);
+                }
                 continue;
             }
             let parent_id = if let Some(remote) = matching_remote {
@@ -3047,7 +3627,7 @@ mod platform {
                 0,
             )
             .map_err(map_sync_error)?;
-            if register_or_reconcile(store, &record, reconciliation_time)? {
+            if register_or_reconcile(store, &record, reconciliation_time, false)? {
                 registered = registered.saturating_add(1);
             }
         }
@@ -3101,7 +3681,11 @@ mod platform {
                 0,
             )
             .map_err(map_sync_error)?;
-            if register_or_reconcile(store, &record, reconciliation_time)? {
+            // This record is created only from the exact current SAF inventory
+            // branch where the portable path is absent. A prior publication-
+            // unknown attempt can therefore be retried without replacing an
+            // existing local document.
+            if register_or_reconcile(store, &record, reconciliation_time, true)? {
                 registered = registered.saturating_add(1);
             }
         }

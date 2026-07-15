@@ -22,7 +22,10 @@ pub(crate) enum DurabilityPoint {
     FinishStageFile,
     FinishStageDirectory,
     DiscardStageDirectory,
-    BaseLinkDirectory,
+    BaseCopyFile,
+    BaseCopyDirectory,
+    BasePublishDirectory,
+    BaseVerifiedFile,
     BaseVerifiedDirectory,
     BaseCleanupDirectory,
 }
@@ -31,10 +34,22 @@ pub(crate) trait DurabilityHook: Send + Sync {
     fn before_sync(&self, point: DurabilityPoint) -> Result<()>;
 }
 
+pub(crate) trait RenameHook: Send + Sync {
+    fn before_rename(&self) -> Result<()>;
+}
+
 struct SystemDurability;
 
 impl DurabilityHook for SystemDurability {
     fn before_sync(&self, _point: DurabilityPoint) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct SystemRename;
+
+impl RenameHook for SystemRename {
+    fn before_rename(&self) -> Result<()> {
         Ok(())
     }
 }
@@ -49,6 +64,7 @@ pub struct AndroidTransferStore {
     objects: HeldDirectory,
     vault_name: String,
     durability: Arc<dyn DurabilityHook>,
+    rename: Arc<dyn RenameHook>,
 }
 
 struct HeldDirectory {
@@ -121,6 +137,15 @@ impl AndroidTransferStore {
         vault_id: Uuid,
         durability: Arc<dyn DurabilityHook>,
     ) -> Result<Self> {
+        Self::open_with_hooks(root, vault_id, durability, Arc::new(SystemRename))
+    }
+
+    pub(crate) fn open_with_hooks(
+        root: Dir,
+        vault_id: Uuid,
+        durability: Arc<dyn DurabilityHook>,
+        rename: Arc<dyn RenameHook>,
+    ) -> Result<Self> {
         if vault_id.is_nil() {
             return Err(TransferStoreError::InvalidVaultId);
         }
@@ -141,6 +166,7 @@ impl AndroidTransferStore {
             objects,
             vault_name,
             durability,
+            rename,
         };
         store.verify_store()?;
         Ok(store)
@@ -324,63 +350,76 @@ impl AndroidTransferStore {
         let bytes = self.read_verified_stage(stage)?;
         self.verify_store()?;
         let name = format!("{}.blob", stage.sha256);
-        let stage_links = file_link_count(&stage.file)?;
-        let (mut existing, linked_from_stage) = if stage_links == 2 {
-            let existing = open_file_links(&self.objects.directory, &name, 2)?;
-            if myvault_platform_fs::file_identity(&existing)? != stage.identity {
-                return Err(TransferStoreError::EvidenceAmbiguous);
+        let temporary_name = format!("{}.pending", stage.operation_id);
+        let mut existing = match open_file(&self.objects.directory, &name) {
+            Ok(mut existing) => {
+                verify_exact_base(&mut existing, &bytes, stage)?;
+                self.cleanup_recoverable_pending(&temporary_name, &bytes, stage)?;
+                existing
             }
-            (existing, true)
-        } else {
-            match open_file(&self.objects.directory, &name) {
-                Ok(existing) => (existing, false),
-                Err(TransferStoreError::StageUnavailable) => {
-                    self.staging
-                        .directory
-                        .hard_link(
-                            stage_name(stage.operation_id),
-                            &self.objects.directory,
-                            &name,
-                        )
-                        .map_err(|error| {
-                            if error.kind() == io::ErrorKind::AlreadyExists {
-                                TransferStoreError::EvidenceAmbiguous
-                            } else {
-                                TransferStoreError::Io(error)
-                            }
-                        })?;
-                    self.sync_directory(
-                        DurabilityPoint::BaseLinkDirectory,
-                        &self.objects.directory,
-                    )?;
-                    let existing = open_file_links(&self.objects.directory, &name, 2)?;
-                    if myvault_platform_fs::file_identity(&existing)? != stage.identity {
+            Err(TransferStoreError::StageUnavailable) => {
+                let temporary = self.prepare_base_copy(&temporary_name, &bytes, stage)?;
+                let temporary_identity = myvault_platform_fs::file_identity(&temporary)?;
+                if self.read_verified_stage(stage)? != bytes {
+                    return Err(TransferStoreError::EvidenceAmbiguous);
+                }
+                self.rename.before_rename()?;
+                let mut current_temporary = open_file(&self.objects.directory, &temporary_name)?;
+                if myvault_platform_fs::file_identity(&current_temporary)? != temporary_identity {
+                    return Err(TransferStoreError::EvidenceAmbiguous);
+                }
+                verify_exact_base(&mut current_temporary, &bytes, stage)?;
+                if current_temporary.metadata()?.len() != stage.byte_len
+                    || myvault_platform_fs::file_identity(&current_temporary)? != temporary_identity
+                {
+                    return Err(TransferStoreError::EvidenceAmbiguous);
+                }
+                let published_identity = match rename_noreplace(
+                    &self.objects.directory,
+                    &temporary_name,
+                    &self.objects.directory,
+                    &name,
+                ) {
+                    Ok(()) => Some(temporary_identity),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        let mut raced = open_file(&self.objects.directory, &name)?;
+                        verify_exact_base(&mut raced, &bytes, stage)?;
+                        self.remove_exact_pending(&temporary_name, &temporary_identity)?;
+                        None
+                    }
+                    Err(error) => return Err(TransferStoreError::Io(error)),
+                };
+                self.sync_directory(
+                    DurabilityPoint::BasePublishDirectory,
+                    &self.objects.directory,
+                )?;
+                let published = open_file(&self.objects.directory, &name)?;
+                if let Some(identity) = published_identity {
+                    if myvault_platform_fs::file_identity(&published)? != identity {
                         return Err(TransferStoreError::EvidenceAmbiguous);
                     }
-                    (existing, true)
                 }
-                Err(error) => return Err(error),
+                published
             }
+            Err(error) => return Err(error),
         };
-        let identity = myvault_platform_fs::file_identity(&existing)?;
-        let readback = read_exact_bounded(&mut existing, stage.byte_len)?;
-        if readback != bytes || sha256(&readback) != stage.sha256 {
-            return Err(TransferStoreError::DigestMismatch);
-        }
-        let current = open_file_links(
-            &self.objects.directory,
-            &name,
-            if linked_from_stage { 2 } else { 1 },
-        )?;
-        if myvault_platform_fs::file_identity(&existing)? != identity
-            || myvault_platform_fs::file_identity(&current)? != identity
-        {
-            return Err(TransferStoreError::EvidenceAmbiguous);
-        }
+        verify_exact_base(&mut existing, &bytes, stage)?;
+        let existing_identity = myvault_platform_fs::file_identity(&existing)?;
+        self.sync_file(DurabilityPoint::BaseVerifiedFile, &existing)?;
+        verify_exact_base(&mut existing, &bytes, stage)?;
         self.sync_directory(
             DurabilityPoint::BaseVerifiedDirectory,
             &self.objects.directory,
         )?;
+        let mut current_base = open_file(&self.objects.directory, &name)?;
+        if myvault_platform_fs::file_identity(&current_base)? != existing_identity {
+            return Err(TransferStoreError::EvidenceAmbiguous);
+        }
+        verify_exact_base(&mut current_base, &bytes, stage)?;
+        let current_stage = open_file(&self.staging.directory, &stage_name(stage.operation_id))?;
+        if myvault_platform_fs::file_identity(&current_stage)? != stage.identity {
+            return Err(TransferStoreError::EvidenceAmbiguous);
+        }
         self.staging
             .directory
             .remove_file(stage_name(stage.operation_id))?;
@@ -389,15 +428,106 @@ impl AndroidTransferStore {
             &self.staging.directory,
         )?;
         let mut existing = open_file(&self.objects.directory, &name)?;
-        let readback = read_exact_bounded(&mut existing, stage.byte_len)?;
-        if readback != bytes || sha256(&readback) != stage.sha256 {
-            return Err(TransferStoreError::DigestMismatch);
-        }
+        verify_exact_base(&mut existing, &bytes, stage)?;
         self.verify_store()?;
         Ok(NativeBaseObjectRef {
             opaque_ref: format!("sha256-{}", stage.sha256),
             byte_len: stage.byte_len,
         })
+    }
+
+    fn prepare_base_copy(
+        &self,
+        temporary_name: &str,
+        bytes: &[u8],
+        stage: &VerifiedAndroidStage,
+    ) -> Result<File> {
+        match open_file(&self.objects.directory, temporary_name) {
+            Ok(mut existing) => {
+                let identity = myvault_platform_fs::file_identity(&existing)?;
+                match verify_exact_base(&mut existing, bytes, stage) {
+                    Ok(()) => {
+                        self.sync_file(DurabilityPoint::BaseCopyFile, &existing)?;
+                        self.sync_directory(
+                            DurabilityPoint::BaseCopyDirectory,
+                            &self.objects.directory,
+                        )?;
+                        return Ok(existing);
+                    }
+                    Err(TransferStoreError::DigestMismatch)
+                        if existing.metadata()?.len() < stage.byte_len =>
+                    {
+                        self.remove_exact_pending(temporary_name, &identity)?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(TransferStoreError::StageUnavailable) => {}
+            Err(error) => return Err(error),
+        }
+
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        let mut temporary = self
+            .objects
+            .directory
+            .open_with(temporary_name, &options)
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    TransferStoreError::EvidenceAmbiguous
+                } else {
+                    TransferStoreError::Io(error)
+                }
+            })?;
+        harden_new_file(&temporary)?;
+        verify_file(&temporary)?;
+        let identity = myvault_platform_fs::file_identity(&temporary)?;
+        temporary.write_all(bytes)?;
+        temporary.flush()?;
+        self.sync_file(DurabilityPoint::BaseCopyFile, &temporary)?;
+        if myvault_platform_fs::file_identity(&temporary)? != identity {
+            return Err(TransferStoreError::EvidenceAmbiguous);
+        }
+        verify_exact_base(&mut temporary, bytes, stage)?;
+        self.sync_directory(DurabilityPoint::BaseCopyDirectory, &self.objects.directory)?;
+        Ok(temporary)
+    }
+
+    fn cleanup_recoverable_pending(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        stage: &VerifiedAndroidStage,
+    ) -> Result<()> {
+        let mut pending = match open_file(&self.objects.directory, name) {
+            Ok(pending) => pending,
+            Err(TransferStoreError::StageUnavailable) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let identity = myvault_platform_fs::file_identity(&pending)?;
+        match verify_exact_base(&mut pending, bytes, stage) {
+            Ok(()) => self.remove_exact_pending(name, &identity),
+            Err(TransferStoreError::DigestMismatch)
+                if pending.metadata()?.len() < stage.byte_len =>
+            {
+                self.remove_exact_pending(name, &identity)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn remove_exact_pending(&self, name: &str, identity: &FileIdentity) -> Result<()> {
+        let current = open_file(&self.objects.directory, name)?;
+        if myvault_platform_fs::file_identity(&current)? != *identity {
+            return Err(TransferStoreError::EvidenceAmbiguous);
+        }
+        self.objects.directory.remove_file(name)?;
+        self.sync_directory(DurabilityPoint::BaseCopyDirectory, &self.objects.directory)?;
+        Ok(())
     }
 
     fn verify_stage(&self, stage: &VerifiedAndroidStage) -> Result<()> {
@@ -408,26 +538,11 @@ impl AndroidTransferStore {
         {
             return Err(TransferStoreError::EvidenceAmbiguous);
         }
-        let links = file_link_count(&stage.file)?;
-        verify_file_links(&stage.file, links)?;
-        if links == 2 {
-            let object = open_file_links(
-                &self.objects.directory,
-                &format!("{}.blob", stage.sha256),
-                2,
-            )?;
-            if myvault_platform_fs::file_identity(&object)? != stage.identity {
-                return Err(TransferStoreError::EvidenceAmbiguous);
-            }
-        }
+        verify_file(&stage.file)?;
         if myvault_platform_fs::file_identity(&stage.file)? != stage.identity {
             return Err(TransferStoreError::EvidenceAmbiguous);
         }
-        let current = open_file_links(
-            &self.staging.directory,
-            &stage_name(stage.operation_id),
-            links,
-        )?;
+        let current = open_file_links(&self.staging.directory, &stage_name(stage.operation_id), 1)?;
         if myvault_platform_fs::file_identity(&current)? != stage.identity
             || current.metadata()?.len() != stage.byte_len
         {
@@ -600,11 +715,6 @@ fn verify_file_links(file: &File, expected_links: u64) -> Result<()> {
     Ok(())
 }
 
-fn file_link_count(file: &File) -> Result<u64> {
-    use std::os::unix::fs::MetadataExt;
-    Ok(file.try_clone()?.into_std().metadata()?.nlink())
-}
-
 fn open_file(parent: &Dir, name: &str) -> Result<File> {
     open_file_links(parent, name, 1)
 }
@@ -665,6 +775,52 @@ fn stage_name(operation_id: Uuid) -> String {
 
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn verify_exact_base(file: &mut File, bytes: &[u8], stage: &VerifiedAndroidStage) -> Result<()> {
+    verify_file(file)?;
+    let identity = myvault_platform_fs::file_identity(file)?;
+    let readback = read_exact_bounded(file, stage.byte_len)?;
+    if readback != bytes || sha256(&readback) != stage.sha256 {
+        return Err(TransferStoreError::DigestMismatch);
+    }
+    let current_identity = myvault_platform_fs::file_identity(file)?;
+    if current_identity != identity {
+        return Err(TransferStoreError::EvidenceAmbiguous);
+    }
+    Ok(())
+}
+
+fn rename_noreplace(
+    source_parent: &Dir,
+    source_name: &str,
+    destination_parent: &Dir,
+    destination_name: &str,
+) -> io::Result<()> {
+    #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
+    {
+        rustix::fs::renameat_with(
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(Into::into)
+    }
+    #[cfg(not(any(target_os = "android", target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        );
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic no-replace rename is unavailable",
+        ))
+    }
 }
 
 #[derive(Debug)]

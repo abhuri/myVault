@@ -8,8 +8,12 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
-use transfer_store::{AndroidTransferStore, TransferStoreError, MAX_ANDROID_TRANSFER_BYTES};
+use transfer_store::{
+    AndroidTransferStore, DurabilityHook, RenameHook, TransferStoreError,
+    MAX_ANDROID_TRANSFER_BYTES,
+};
 use uuid::Uuid;
 
 struct Fixture {
@@ -52,6 +56,94 @@ impl Fixture {
             .join("objects")
             .join(format!("{digest}.blob"))
     }
+
+    fn pending_path(&self, vault_id: Uuid, operation_id: Uuid) -> PathBuf {
+        self.root_path
+            .join("guarded-transfer/v1")
+            .join(vault_id.to_string())
+            .join("objects")
+            .join(format!("{operation_id}.pending"))
+    }
+
+    fn store_with_rename_hook(
+        &self,
+        vault_id: Uuid,
+        rename: Arc<dyn RenameHook>,
+    ) -> AndroidTransferStore {
+        AndroidTransferStore::open_with_hooks(
+            self.root.try_clone().unwrap(),
+            vault_id,
+            Arc::new(NoopDurability),
+            rename,
+        )
+        .expect("transfer store with rename hook")
+    }
+}
+
+struct NoopDurability;
+
+impl DurabilityHook for NoopDurability {
+    fn before_sync(&self, _point: transfer_store::DurabilityPoint) -> transfer_store::Result<()> {
+        Ok(())
+    }
+}
+
+struct CreateDestinationBeforeRename {
+    destination: PathBuf,
+    bytes: Vec<u8>,
+    mode: Option<u32>,
+    invoked: Mutex<bool>,
+}
+
+impl CreateDestinationBeforeRename {
+    fn new(destination: PathBuf, bytes: &[u8], mode: Option<u32>) -> Self {
+        Self {
+            destination,
+            bytes: bytes.to_vec(),
+            mode,
+            invoked: Mutex::new(false),
+        }
+    }
+}
+
+impl RenameHook for CreateDestinationBeforeRename {
+    fn before_rename(&self) -> transfer_store::Result<()> {
+        let mut invoked = self.invoked.lock().expect("rename hook lock");
+        if !*invoked {
+            fs::write(&self.destination, &self.bytes).expect("race destination");
+            make_private_file(&self.destination);
+            #[cfg(unix)]
+            if let Some(mode) = self.mode {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&self.destination, fs::Permissions::from_mode(mode))
+                    .expect("race destination mode");
+            }
+            *invoked = true;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+struct ReplacePendingBeforeRename {
+    pending: PathBuf,
+    detached: PathBuf,
+    replacement: Vec<u8>,
+    invoked: Mutex<bool>,
+}
+
+#[cfg(unix)]
+impl RenameHook for ReplacePendingBeforeRename {
+    fn before_rename(&self) -> transfer_store::Result<()> {
+        let mut invoked = self.invoked.lock().expect("rename hook lock");
+        if !*invoked {
+            fs::rename(&self.pending, &self.detached).expect("detach exact pending source");
+            fs::write(&self.pending, &self.replacement).expect("install wrong pending source");
+            make_private_file(&self.pending);
+            *invoked = true;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -72,6 +164,15 @@ fn make_private(path: &Path) {
 
 #[cfg(not(unix))]
 fn make_private(_path: &Path) {}
+
+#[cfg(unix)]
+fn make_private_file(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[cfg(not(unix))]
+fn make_private_file(_path: &Path) {}
 
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -118,7 +219,7 @@ fn stage_round_trip_and_immutable_base_are_exact_and_restart_safe() {
 }
 
 #[test]
-fn crash_after_base_link_resumes_and_removes_stage_without_copying() {
+fn crash_after_base_publish_resumes_and_removes_stage() {
     let fixture = Fixture::new();
     let vault_id = Uuid::new_v4();
     let operation_id = Uuid::new_v4();
@@ -126,11 +227,12 @@ fn crash_after_base_link_resumes_and_removes_stage_without_copying() {
     let digest = sha256(bytes);
     let store = fixture.store(vault_id);
     let stage = verified_stage(&store, operation_id, bytes);
-    fs::hard_link(
+    fs::copy(
         fixture.stage_path(vault_id, operation_id),
         fixture.object_path(vault_id, &digest),
     )
     .unwrap();
+    make_private_file(&fixture.object_path(vault_id, &digest));
     drop(stage);
     drop(store);
 
@@ -291,4 +393,274 @@ fn wrong_existing_base_is_never_overwritten_or_deleted() {
         Err(TransferStoreError::DigestMismatch)
     ));
     assert_eq!(fs::read(&object_path).unwrap(), b"xyz");
+}
+
+#[test]
+fn exact_and_partial_pending_evidence_resume_without_replacing_final() {
+    for pending_bytes in [b"pending-body".as_slice(), b"pending".as_slice()] {
+        let fixture = Fixture::new();
+        let vault_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let expected = b"pending-body";
+        let digest = sha256(expected);
+        let store = fixture.store(vault_id);
+        let stage = verified_stage(&store, operation_id, expected);
+        let pending = fixture.pending_path(vault_id, operation_id);
+        fs::write(&pending, pending_bytes).unwrap();
+        make_private_file(&pending);
+
+        let base = store.publish_base(&stage).unwrap();
+        assert_eq!(base.opaque_ref(), format!("sha256-{digest}"));
+        assert!(!pending.exists());
+        assert!(!fixture.stage_path(vault_id, operation_id).exists());
+        assert_eq!(
+            fs::read(fixture.object_path(vault_id, &digest)).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn wrong_or_oversized_pending_evidence_is_preserved() {
+    for pending_bytes in [b"xyz".as_slice(), b"oversized".as_slice()] {
+        let fixture = Fixture::new();
+        let vault_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let expected = b"abc";
+        let digest = sha256(expected);
+        let store = fixture.store(vault_id);
+        let stage = verified_stage(&store, operation_id, expected);
+        let pending = fixture.pending_path(vault_id, operation_id);
+        fs::write(&pending, pending_bytes).unwrap();
+        make_private_file(&pending);
+
+        assert!(matches!(
+            store.publish_base(&stage),
+            Err(TransferStoreError::DigestMismatch)
+        ));
+        assert_eq!(fs::read(&pending).unwrap(), pending_bytes);
+        assert!(fixture.stage_path(vault_id, operation_id).exists());
+        assert!(!fixture.object_path(vault_id, &digest).exists());
+    }
+}
+
+#[test]
+fn pending_evidence_above_the_store_limit_is_preserved() {
+    let fixture = Fixture::new();
+    let vault_id = Uuid::new_v4();
+    let operation_id = Uuid::new_v4();
+    let expected = b"abc";
+    let digest = sha256(expected);
+    let store = fixture.store(vault_id);
+    let stage = verified_stage(&store, operation_id, expected);
+    let pending = fixture.pending_path(vault_id, operation_id);
+    let oversized = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&pending)
+        .unwrap();
+    oversized.set_len(MAX_ANDROID_TRANSFER_BYTES + 1).unwrap();
+    drop(oversized);
+    make_private_file(&pending);
+
+    assert!(matches!(
+        store.publish_base(&stage),
+        Err(TransferStoreError::DigestMismatch)
+    ));
+    assert_eq!(
+        fs::metadata(&pending).unwrap().len(),
+        MAX_ANDROID_TRANSFER_BYTES + 1
+    );
+    assert!(fixture.stage_path(vault_id, operation_id).exists());
+    assert!(!fixture.object_path(vault_id, &digest).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn unsafe_pending_evidence_is_preserved() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    for case in ["symlink", "hardlink", "mode"] {
+        let fixture = Fixture::new();
+        let vault_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let expected = b"abc";
+        let digest = sha256(expected);
+        let store = fixture.store(vault_id);
+        let stage = verified_stage(&store, operation_id, expected);
+        let pending = fixture.pending_path(vault_id, operation_id);
+        let secondary = pending.with_extension("secondary");
+        match case {
+            "symlink" => {
+                fs::write(&secondary, expected).unwrap();
+                symlink(&secondary, &pending).unwrap();
+            }
+            "hardlink" => {
+                fs::write(&pending, expected).unwrap();
+                make_private_file(&pending);
+                fs::hard_link(&pending, &secondary).unwrap();
+            }
+            "mode" => {
+                fs::write(&pending, expected).unwrap();
+                fs::set_permissions(&pending, fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        assert!(store.publish_base(&stage).is_err(), "case: {case}");
+        assert!(pending.symlink_metadata().is_ok(), "case: {case}");
+        assert!(
+            fixture.stage_path(vault_id, operation_id).exists(),
+            "case: {case}"
+        );
+        assert!(
+            !fixture.object_path(vault_id, &digest).exists(),
+            "case: {case}"
+        );
+    }
+}
+
+#[test]
+fn exact_final_cleans_exact_or_partial_pending_evidence() {
+    for pending_bytes in [b"abc".as_slice(), b"a".as_slice()] {
+        let fixture = Fixture::new();
+        let vault_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let expected = b"abc";
+        let digest = sha256(expected);
+        let store = fixture.store(vault_id);
+        let stage = verified_stage(&store, operation_id, expected);
+        let object = fixture.object_path(vault_id, &digest);
+        let pending = fixture.pending_path(vault_id, operation_id);
+        fs::write(&object, expected).unwrap();
+        make_private_file(&object);
+        fs::write(&pending, pending_bytes).unwrap();
+        make_private_file(&pending);
+
+        store.publish_base(&stage).unwrap();
+        assert_eq!(fs::read(&object).unwrap(), expected);
+        assert!(!pending.exists());
+        assert!(!fixture.stage_path(vault_id, operation_id).exists());
+    }
+}
+
+#[test]
+fn exact_final_preserves_wrong_full_length_pending_evidence() {
+    let fixture = Fixture::new();
+    let vault_id = Uuid::new_v4();
+    let operation_id = Uuid::new_v4();
+    let expected = b"abc";
+    let digest = sha256(expected);
+    let store = fixture.store(vault_id);
+    let stage = verified_stage(&store, operation_id, expected);
+    let object = fixture.object_path(vault_id, &digest);
+    let pending = fixture.pending_path(vault_id, operation_id);
+    fs::write(&object, expected).unwrap();
+    make_private_file(&object);
+    fs::write(&pending, b"xyz").unwrap();
+    make_private_file(&pending);
+
+    assert!(matches!(
+        store.publish_base(&stage),
+        Err(TransferStoreError::DigestMismatch)
+    ));
+    assert_eq!(fs::read(&object).unwrap(), expected);
+    assert_eq!(fs::read(&pending).unwrap(), b"xyz");
+    assert!(fixture.stage_path(vault_id, operation_id).exists());
+}
+
+#[test]
+fn rename_race_accepts_only_an_exact_destination() {
+    for exact in [true, false] {
+        let fixture = Fixture::new();
+        let vault_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let expected = b"race-body";
+        let digest = sha256(expected);
+        let object = fixture.object_path(vault_id, &digest);
+        let raced = if exact {
+            expected.as_slice()
+        } else {
+            b"wrong-body".as_slice()
+        };
+        let hook = Arc::new(CreateDestinationBeforeRename::new(
+            object.clone(),
+            raced,
+            None,
+        ));
+        let store = fixture.store_with_rename_hook(vault_id, hook);
+        let stage = verified_stage(&store, operation_id, expected);
+        let pending = fixture.pending_path(vault_id, operation_id);
+
+        let outcome = store.publish_base(&stage);
+        if exact {
+            outcome.unwrap();
+            assert!(!pending.exists());
+            assert!(!fixture.stage_path(vault_id, operation_id).exists());
+            assert_eq!(fs::read(&object).unwrap(), expected);
+        } else {
+            assert!(matches!(outcome, Err(TransferStoreError::DigestMismatch)));
+            assert_eq!(fs::read(&pending).unwrap(), expected);
+            assert!(fixture.stage_path(vault_id, operation_id).exists());
+            assert_eq!(fs::read(&object).unwrap(), raced);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn pending_source_swap_before_rename_never_publishes_replacement() {
+    let fixture = Fixture::new();
+    let vault_id = Uuid::new_v4();
+    let operation_id = Uuid::new_v4();
+    let expected = b"publish-me";
+    let replacement = b"wrong-data";
+    let digest = sha256(expected);
+    let object = fixture.object_path(vault_id, &digest);
+    let pending = fixture.pending_path(vault_id, operation_id);
+    let detached = pending.with_extension("detached");
+    let hook = Arc::new(ReplacePendingBeforeRename {
+        pending: pending.clone(),
+        detached: detached.clone(),
+        replacement: replacement.to_vec(),
+        invoked: Mutex::new(false),
+    });
+    let store = fixture.store_with_rename_hook(vault_id, hook);
+    let stage = verified_stage(&store, operation_id, expected);
+
+    assert!(matches!(
+        store.publish_base(&stage),
+        Err(TransferStoreError::EvidenceAmbiguous)
+    ));
+    assert!(!object.exists());
+    assert_eq!(fs::read(&pending).unwrap(), replacement);
+    assert_eq!(fs::read(&detached).unwrap(), expected);
+    assert_eq!(
+        fs::read(fixture.stage_path(vault_id, operation_id)).unwrap(),
+        expected
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rename_race_preserves_an_unsafe_destination_and_exact_pending() {
+    let fixture = Fixture::new();
+    let vault_id = Uuid::new_v4();
+    let operation_id = Uuid::new_v4();
+    let expected = b"race-body";
+    let digest = sha256(expected);
+    let object = fixture.object_path(vault_id, &digest);
+    let hook = Arc::new(CreateDestinationBeforeRename::new(
+        object.clone(),
+        expected,
+        Some(0o644),
+    ));
+    let store = fixture.store_with_rename_hook(vault_id, hook);
+    let stage = verified_stage(&store, operation_id, expected);
+    let pending = fixture.pending_path(vault_id, operation_id);
+
+    assert!(store.publish_base(&stage).is_err());
+    assert_eq!(fs::read(&pending).unwrap(), expected);
+    assert!(fixture.stage_path(vault_id, operation_id).exists());
+    assert_eq!(fs::read(&object).unwrap(), expected);
 }

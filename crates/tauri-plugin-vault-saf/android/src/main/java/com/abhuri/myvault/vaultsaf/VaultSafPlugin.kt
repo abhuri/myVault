@@ -4,6 +4,7 @@ import android.app.Activity
 import android.database.ContentObserver
 import android.content.Intent
 import android.net.Uri
+import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.util.Base64
 import androidx.activity.result.ActivityResult
@@ -18,11 +19,13 @@ import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
 import java.io.ByteArrayOutputStream
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.ArrayDeque
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
 @InvokeArg
@@ -44,12 +47,40 @@ internal class SaveArgs {
 }
 
 @InvokeArg
-internal class BinaryWriteArgs {
+internal class BinaryReadBeginArgs {
     lateinit var expectedRootIdentityHex: String
     lateinit var path: String
-    lateinit var bytesBase64: String
+    lateinit var sessionId: String
+}
+
+@InvokeArg
+internal class BinaryReadChunkArgs {
+    lateinit var expectedRootIdentityHex: String
+    lateinit var sessionId: String
+    var offset: Long = -1
+}
+
+@InvokeArg
+internal class BinaryWriteBeginArgs {
+    lateinit var expectedRootIdentityHex: String
+    lateinit var path: String
     lateinit var sha256Hex: String
+    lateinit var sessionId: String
     var byteLen: Long = -1
+}
+
+@InvokeArg
+internal class BinaryWriteChunkArgs {
+    lateinit var expectedRootIdentityHex: String
+    lateinit var sessionId: String
+    lateinit var bytesBase64: String
+    var offset: Long = -1
+}
+
+@InvokeArg
+internal class BinarySessionArgs {
+    lateinit var expectedRootIdentityHex: String
+    lateinit var sessionId: String
 }
 
 private data class Child(
@@ -60,6 +91,76 @@ private data class Child(
     val sizeKnown: Boolean,
 )
 private data class PendingDirectory(val documentId: String, val path: String, val depth: Int)
+private data class BinaryReadSession(
+    val id: String,
+    val rootIdentityHex: String,
+    val root: Uri,
+    val path: String,
+    val documentId: String,
+    val input: InputStream,
+    val digest: MessageDigest,
+    var read: Long,
+)
+private data class BinaryWriteSession(
+    val id: String,
+    val rootIdentityHex: String,
+    val root: Uri,
+    val path: String,
+    val documentId: String,
+    val expectedSha256Hex: String,
+    val expectedByteLen: Long,
+    val descriptor: ParcelFileDescriptor,
+    val output: FileOutputStream,
+    val digest: MessageDigest,
+    var written: Long,
+)
+
+internal const val BINARY_MAX_TRANSFER_BYTES = 16 * 1024 * 1024
+internal const val BINARY_BRIDGE_CHUNK_BYTES = 192 * 1024
+
+internal fun isCanonicalBinarySessionId(value: String): Boolean = try {
+    val parsed = UUID.fromString(value)
+    parsed.version() == 4 && parsed.toString() == value
+} catch (_: IllegalArgumentException) {
+    false
+}
+
+internal fun isValidBinaryReadOffset(offset: Long): Boolean =
+    offset in 0..BINARY_MAX_TRANSFER_BYTES.toLong()
+
+internal fun isBinaryChunkEof(chunkSize: Int): Boolean =
+    chunkSize in 0 until BINARY_BRIDGE_CHUNK_BYTES
+
+internal fun nextBinaryWriteOffset(
+    written: Long,
+    expectedByteLen: Long,
+    requestOffset: Long,
+    chunkSize: Int,
+): Long? {
+    if (chunkSize !in 1..BINARY_BRIDGE_CHUNK_BYTES || requestOffset != written) return null
+    val next = written + chunkSize
+    return next.takeIf { next >= written && next <= expectedByteLen }
+}
+
+internal fun malformedBinaryWriteOutcome(hasActiveWriteSession: Boolean): String =
+    if (hasActiveWriteSession) "writeOutcomeUnknown" else "invalidRequest"
+
+internal fun malformedBinaryReadOutcome(hasActiveReadSession: Boolean): String =
+    if (hasActiveReadSession) "nativeBridge" else "invalidRequest"
+
+internal enum class BinarySessionOwnership { IDLE, OWNER, FOREIGN }
+
+internal fun classifyBinarySessionOwnership(
+    activeSessionId: String?,
+    activeRootIdentityHex: String?,
+    requestSessionId: String?,
+    requestRootIdentityHex: String?,
+): BinarySessionOwnership = when {
+    activeSessionId == null && activeRootIdentityHex == null -> BinarySessionOwnership.IDLE
+    activeSessionId == requestSessionId && activeRootIdentityHex == requestRootIdentityHex ->
+        BinarySessionOwnership.OWNER
+    else -> BinarySessionOwnership.FOREIGN
+}
 
 internal fun isProtectedRootName(name: String): Boolean = name == ".trash" || name == ".obsidian"
 
@@ -129,6 +230,8 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
     private var foreground = true
     private var observedRootIdentity: String? = null
     private var observerRegistered = false
+    private var binaryReadSession: BinaryReadSession? = null
+    private var binaryWriteSession: BinaryWriteSession? = null
     private val contentObserver = object : ContentObserver(null) {
         override fun onChange(selfChange: Boolean, uri: Uri?) {
             synchronized(ioLock) {
@@ -160,6 +263,8 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
 
     override fun onDestroy(activity: AppCompatActivity) {
         synchronized(ioLock) {
+            closeBinaryReadSession()
+            closeBinaryWriteSession()
             foreground = false
             unregisterObserver()
         }
@@ -169,6 +274,8 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
     fun status(invoke: Invoke) {
         val response = synchronized(ioLock) {
             try {
+                binaryReadSession?.let { return@synchronized activeRootResponse(it.root) }
+                binaryWriteSession?.let { return@synchronized activeRootResponse(it.root) }
                 val root = persistedRoot() ?: return@synchronized inactiveRootResponse()
                 DocumentsContract.getTreeDocumentId(root)
                 queryChildren(root, DocumentsContract.getTreeDocumentId(root))
@@ -184,6 +291,10 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun chooseRoot(invoke: Invoke) {
+        if (synchronized(ioLock) { activeBinarySessionId() != null }) {
+            invoke.reject("A native Vault transfer is active", "PICKER_BUSY")
+            return
+        }
         if (!operationInFlight.compareAndSet(false, true)) {
             invoke.reject("Another folder selection is active", "PICKER_BUSY")
             return
@@ -230,6 +341,7 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
             resolver.takePersistableUriPermission(uri, flags)
             newlyAcquiredPermission = !permissionAlreadyPersisted
             val response = synchronized(ioLock) {
+                requireNoBinarySession()
                 val previousRoot = persistedRoot()
                 // Validate that the tree root is queryable before replacing the old capability.
                 DocumentsContract.getTreeDocumentId(uri)
@@ -400,54 +512,193 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
-    fun readBinary(invoke: Invoke) {
-        val args = try { invoke.parseArgs(PathArgs::class.java) }
+    fun beginBinaryRead(invoke: Invoke) {
+        val args = try { invoke.parseArgs(BinaryReadBeginArgs::class.java) }
         catch (_: Exception) {
-            invoke.reject("Invalid transfer path", "INVALID_PATH")
+            invoke.resolve(saveOutcome("invalidRequest"))
             return
         }
         val path = try { canonicalPortablePath(args.path) }
         catch (_: Exception) {
-            invoke.reject("Invalid transfer path", "INVALID_PATH")
+            invoke.resolve(saveOutcome("invalidRequest"))
+            return
+        }
+        if (!isCanonicalBinarySessionId(args.sessionId)) {
+            invoke.resolve(saveOutcome("invalidRequest"))
             return
         }
         try {
             val response = synchronized(ioLock) {
+                requireNoBinarySession()
                 val root = requireRoot(args.expectedRootIdentityHex)
                 val document = resolveDocument(root, path) ?: throw MissingException()
                 if (document.mime == DocumentsContract.Document.MIME_TYPE_DIR) throw MissingException()
-                binaryResponse(readBounded(root, document.documentId))
+                val uri = DocumentsContract.buildDocumentUriUsingTree(root, document.documentId)
+                val input = resolver.openInputStream(uri) ?: throw MissingException()
+                try {
+                    binaryReadSession = BinaryReadSession(
+                        args.sessionId,
+                        args.expectedRootIdentityHex,
+                        root,
+                        path,
+                        document.documentId,
+                        input,
+                        MessageDigest.getInstance("SHA-256"),
+                        0,
+                    )
+                    saveOutcome("ready").apply { put("sessionId", args.sessionId) }
+                } catch (error: Exception) {
+                    try { input.close() } catch (_: Exception) {}
+                    throw error
+                }
             }
             invoke.resolve(response)
+        } catch (_: BinarySessionBusyException) {
+            invoke.resolve(saveOutcome("busy"))
         } catch (_: RootMismatchException) {
-            invoke.reject("Vault capability is stale", "VAULT_UNAVAILABLE")
+            invoke.resolve(saveOutcome("vaultUnavailable"))
         } catch (_: MissingException) {
-            invoke.reject("Transfer object was not found", "NOTE_NOT_FOUND")
+            invoke.resolve(saveOutcome("notFound"))
+        } catch (_: SecurityException) {
+            clearRootIfMatches(args.expectedRootIdentityHex)
+            invoke.resolve(saveOutcome("vaultUnavailable"))
+        } catch (_: Exception) {
+            invoke.resolve(saveOutcome("nativeBridge"))
+        }
+    }
+
+    @Command
+    fun readBinaryChunk(invoke: Invoke) {
+        val args = try { invoke.parseArgs(BinaryReadChunkArgs::class.java) }
+        catch (_: Exception) {
+            val hadActiveSession = synchronized(ioLock) { binaryReadSession != null }
+            if (hadActiveSession) {
+                invoke.reject("Binary read transcript is malformed", "NATIVE_BRIDGE")
+            } else {
+                invoke.reject("Invalid binary read request", "INVALID_PATH")
+            }
+            return
+        }
+        if (!isCanonicalBinarySessionId(args.sessionId) || !isValidBinaryReadOffset(args.offset)) {
+            val ownership = synchronized(ioLock) {
+                val session = binaryReadSession
+                classifyBinarySessionOwnership(
+                    session?.id,
+                    session?.rootIdentityHex,
+                    args.sessionId,
+                    args.expectedRootIdentityHex,
+                ).also {
+                    if (it == BinarySessionOwnership.OWNER) {
+                        closeBinaryReadSession(args.sessionId)
+                    }
+                }
+            }
+            if (ownership != BinarySessionOwnership.IDLE) {
+                invoke.reject("Binary read transcript is malformed", "NATIVE_BRIDGE")
+            } else {
+                invoke.reject("Transfer object exceeds the safety limit", "RESOURCE_LIMIT")
+            }
+            return
+        }
+        try {
+            val response = synchronized(ioLock) {
+                val session = binaryReadSession ?: throw BinarySessionMismatchException()
+                if (classifyBinarySessionOwnership(
+                        session.id,
+                        session.rootIdentityHex,
+                        args.sessionId,
+                        args.expectedRootIdentityHex,
+                    ) != BinarySessionOwnership.OWNER) {
+                    throw BinarySessionMismatchException()
+                }
+                if (session.read != args.offset) {
+                    closeBinaryReadSession(args.sessionId)
+                    throw BinarySessionMismatchException()
+                }
+                requireRoot(args.expectedRootIdentityHex, args.sessionId)
+                val chunk = readNextChunk(session.input)
+                val next = session.read + chunk.size
+                if (next > BINARY_MAX_TRANSFER_BYTES) {
+                    closeBinaryReadSession(args.sessionId)
+                    throw LimitException()
+                }
+                session.digest.update(chunk)
+                session.read = next
+                val eof = isBinaryChunkEof(chunk.size)
+                JSObject().apply {
+                    put("offset", args.offset)
+                    put("bytesBase64", Base64.encodeToString(chunk, Base64.NO_WRAP))
+                    put("eof", eof)
+                    if (eof) {
+                        val streamedDigest = session.digest.digest().toHex()
+                        val streamedLength = session.read
+                        closeBinaryReadSession(args.sessionId)
+                        val current = resolveDocument(session.root, session.path)
+                            ?.takeIf {
+                                it.documentId == session.documentId &&
+                                    it.mime != DocumentsContract.Document.MIME_TYPE_DIR
+                            }
+                            ?: throw StaleException()
+                        val verification = verifyBinaryDocument(session.root, current.documentId)
+                        if (verification.first != streamedDigest || verification.second != streamedLength) {
+                            throw StaleException()
+                        }
+                        put("revisionHex", streamedDigest)
+                        put("byteLen", streamedLength)
+                    }
+                }
+            }
+            invoke.resolve(response)
+        } catch (_: BinarySessionMismatchException) {
+            invoke.reject("Binary read transcript is stale", "NATIVE_BRIDGE")
+        } catch (_: RootMismatchException) {
+            closeBinaryReadSession(args.sessionId)
+            invoke.reject("Vault capability is stale", "VAULT_UNAVAILABLE")
+        } catch (_: StaleException) {
+            closeBinaryReadSession(args.sessionId)
+            invoke.reject("Transfer object changed during the native read", "NATIVE_BRIDGE")
         } catch (_: LimitException) {
+            closeBinaryReadSession(args.sessionId)
             invoke.reject("Transfer object exceeds the safety limit", "RESOURCE_LIMIT")
         } catch (_: SecurityException) {
             clearRootIfMatches(args.expectedRootIdentityHex)
             invoke.reject("Vault permission is unavailable", "VAULT_UNAVAILABLE")
         } catch (_: Exception) {
+            closeBinaryReadSession(args.sessionId)
             invoke.reject("Transfer object is unavailable", "VAULT_UNAVAILABLE")
         }
     }
 
     @Command
-    fun createBinary(invoke: Invoke) {
-        writeBinary(invoke)
+    fun abortBinaryRead(invoke: Invoke) {
+        val args = try { invoke.parseArgs(BinarySessionArgs::class.java) }
+        catch (_: Exception) {
+            val hadActiveSession = synchronized(ioLock) { binaryReadSession != null }
+            invoke.resolve(saveOutcome(malformedBinaryReadOutcome(hadActiveSession)))
+            return
+        }
+        val response = synchronized(ioLock) {
+            val session = binaryReadSession
+            val ownership = classifyBinarySessionOwnership(
+                session?.id,
+                session?.rootIdentityHex,
+                args.sessionId,
+                args.expectedRootIdentityHex,
+            )
+            if (ownership != BinarySessionOwnership.OWNER) {
+                return@synchronized saveOutcome(
+                    malformedBinaryReadOutcome(ownership == BinarySessionOwnership.FOREIGN),
+                )
+            }
+            closeBinaryReadSession(args.sessionId)
+            saveOutcome("aborted")
+        }
+        invoke.resolve(response)
     }
 
     @Command
-    fun replaceBinary(invoke: Invoke) {
-        // SAF exposes neither atomic compare-and-swap nor a portable
-        // evacuation/no-replace sequence. R2 therefore never mutates an
-        // existing transfer target; R3 conflict handling owns that decision.
-        invoke.resolve(saveOutcome("unsupportedReplace"))
-    }
-
-    private fun writeBinary(invoke: Invoke) {
-        val args = try { invoke.parseArgs(BinaryWriteArgs::class.java) }
+    fun beginBinaryCreate(invoke: Invoke) {
+        val args = try { invoke.parseArgs(BinaryWriteBeginArgs::class.java) }
         catch (_: Exception) {
             invoke.resolve(saveOutcome("invalidRequest"))
             return
@@ -457,30 +708,50 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.resolve(saveOutcome("invalidRequest"))
             return
         }
-        val replacement = try { Base64.decode(args.bytesBase64, Base64.NO_WRAP) }
-        catch (_: Exception) {
+        if (!REVISION.matches(args.sha256Hex) || !isCanonicalBinarySessionId(args.sessionId) ||
+            args.byteLen < 0 || args.byteLen > BINARY_MAX_TRANSFER_BYTES) {
             invoke.resolve(saveOutcome("invalidRequest"))
-            return
-        }
-        if (replacement.size > MAX_TRANSFER_BYTES || replacement.size.toLong() != args.byteLen ||
-            !REVISION.matches(args.sha256Hex) || digest(replacement) != args.sha256Hex) {
-            invoke.resolve(saveOutcome("digestMismatch"))
             return
         }
         try {
             val response = synchronized(ioLock) {
+                requireNoBinarySession()
                 val root = requireRoot(args.expectedRootIdentityHex)
-                createBinaryDocument(root, path, replacement)
+                val documentId = createEmptyBinaryDocument(root, path)
+                val uri = DocumentsContract.buildDocumentUriUsingTree(root, documentId)
+                val descriptor = try {
+                    resolver.openFileDescriptor(uri, "rwt") ?: throw UnknownWriteException()
+                } catch (error: Exception) {
+                    throw UnknownWriteException(error)
+                }
+                try {
+                    val output = FileOutputStream(descriptor.fileDescriptor)
+                    binaryWriteSession = BinaryWriteSession(
+                        args.sessionId,
+                        args.expectedRootIdentityHex,
+                        root,
+                        path,
+                        documentId,
+                        args.sha256Hex,
+                        args.byteLen,
+                        descriptor,
+                        output,
+                        MessageDigest.getInstance("SHA-256"),
+                        0,
+                    )
+                    saveOutcome("ready").apply { put("sessionId", args.sessionId) }
+                } catch (error: Exception) {
+                    try { descriptor.close() } catch (_: Exception) {}
+                    throw UnknownWriteException(error)
+                }
             }
             invoke.resolve(response)
+        } catch (_: BinarySessionBusyException) {
+            invoke.resolve(saveOutcome("busy"))
         } catch (_: RootMismatchException) {
             invoke.resolve(saveOutcome("vaultUnavailable"))
         } catch (_: ExistingException) {
             invoke.resolve(saveOutcome("alreadyExists"))
-        } catch (_: MissingException) {
-            invoke.resolve(saveOutcome("notFound"))
-        } catch (_: LimitException) {
-            invoke.resolve(saveOutcome("resourceLimit"))
         } catch (_: UnknownWriteException) {
             invoke.resolve(saveOutcome("writeOutcomeUnknown"))
         } catch (_: SecurityException) {
@@ -491,7 +762,164 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
-    private fun createBinaryDocument(root: Uri, path: String, bytes: ByteArray): JSObject {
+    @Command
+    fun appendBinaryChunk(invoke: Invoke) {
+        val args = try { invoke.parseArgs(BinaryWriteChunkArgs::class.java) }
+        catch (_: Exception) {
+            val hadActiveSession = synchronized(ioLock) { binaryWriteSession != null }
+            invoke.resolve(saveOutcome(malformedBinaryWriteOutcome(hadActiveSession)))
+            return
+        }
+        val chunk = try { Base64.decode(args.bytesBase64, Base64.NO_WRAP) }
+        catch (_: Exception) {
+            val ownership = synchronized(ioLock) {
+                val session = binaryWriteSession
+                classifyBinarySessionOwnership(
+                    session?.id,
+                    session?.rootIdentityHex,
+                    args.sessionId,
+                    args.expectedRootIdentityHex,
+                ).also {
+                    if (it == BinarySessionOwnership.OWNER) {
+                        closeBinaryWriteSession(args.sessionId)
+                    }
+                }
+            }
+            invoke.resolve(
+                saveOutcome(
+                    malformedBinaryWriteOutcome(ownership != BinarySessionOwnership.IDLE),
+                ),
+            )
+            return
+        }
+        val response = synchronized(ioLock) {
+            val session = binaryWriteSession
+                ?: return@synchronized saveOutcome(malformedBinaryWriteOutcome(false))
+            val ownership = classifyBinarySessionOwnership(
+                session.id,
+                session.rootIdentityHex,
+                args.sessionId,
+                args.expectedRootIdentityHex,
+            )
+            if (ownership != BinarySessionOwnership.OWNER) {
+                return@synchronized saveOutcome(
+                    malformedBinaryWriteOutcome(ownership == BinarySessionOwnership.FOREIGN),
+                )
+            }
+            val nextOffset = nextBinaryWriteOffset(
+                session.written,
+                session.expectedByteLen,
+                args.offset,
+                chunk.size,
+            )
+            if (nextOffset == null) {
+                closeBinaryWriteSession(args.sessionId)
+                return@synchronized saveOutcome("writeOutcomeUnknown")
+            }
+            try {
+                requireRoot(args.expectedRootIdentityHex, args.sessionId)
+                session.output.write(chunk)
+                session.digest.update(chunk)
+                session.written = nextOffset
+                saveOutcome("accepted").apply { put("nextOffset", session.written) }
+            } catch (_: Exception) {
+                closeBinaryWriteSession(args.sessionId)
+                saveOutcome("writeOutcomeUnknown")
+            }
+        }
+        invoke.resolve(response)
+    }
+
+    @Command
+    fun finishBinaryCreate(invoke: Invoke) {
+        val args = try { invoke.parseArgs(BinarySessionArgs::class.java) }
+        catch (_: Exception) {
+            val hadActiveSession = synchronized(ioLock) { binaryWriteSession != null }
+            invoke.resolve(saveOutcome(malformedBinaryWriteOutcome(hadActiveSession)))
+            return
+        }
+        val response = synchronized(ioLock) {
+            val session = binaryWriteSession
+                ?: return@synchronized saveOutcome(malformedBinaryWriteOutcome(false))
+            val ownership = classifyBinarySessionOwnership(
+                session.id,
+                session.rootIdentityHex,
+                args.sessionId,
+                args.expectedRootIdentityHex,
+            )
+            if (ownership != BinarySessionOwnership.OWNER) {
+                return@synchronized saveOutcome(
+                    malformedBinaryWriteOutcome(ownership == BinarySessionOwnership.FOREIGN),
+                )
+            }
+            try {
+                requireRoot(args.expectedRootIdentityHex, args.sessionId)
+                if (session.written != session.expectedByteLen ||
+                    session.digest.digest().toHex() != session.expectedSha256Hex) {
+                    closeBinaryWriteSession(args.sessionId)
+                    return@synchronized saveOutcome("writeOutcomeUnknown")
+                }
+                session.output.flush()
+                session.descriptor.fileDescriptor.sync()
+                closeBinaryWriteSession(args.sessionId)
+                val current = resolveDocument(session.root, session.path)
+                    ?.takeIf {
+                        it.documentId == session.documentId &&
+                            it.mime != DocumentsContract.Document.MIME_TYPE_DIR
+                    }
+                    ?: return@synchronized saveOutcome("writeOutcomeUnknown")
+                val verification = verifyBinaryDocument(session.root, current.documentId)
+                if (verification.second != session.expectedByteLen ||
+                    verification.first != session.expectedSha256Hex) {
+                    saveOutcome("writeOutcomeUnknown")
+                } else {
+                    savedBinaryEvidence(verification.first, verification.second)
+                }
+            } catch (_: Exception) {
+                closeBinaryWriteSession(args.sessionId)
+                saveOutcome("writeOutcomeUnknown")
+            }
+        }
+        invoke.resolve(response)
+    }
+
+    @Command
+    fun abortBinaryCreate(invoke: Invoke) {
+        val args = try { invoke.parseArgs(BinarySessionArgs::class.java) }
+        catch (_: Exception) {
+            val hadActiveSession = synchronized(ioLock) { binaryWriteSession != null }
+            invoke.resolve(saveOutcome(malformedBinaryWriteOutcome(hadActiveSession)))
+            return
+        }
+        val response = synchronized(ioLock) {
+            val session = binaryWriteSession
+                ?: return@synchronized saveOutcome(malformedBinaryWriteOutcome(false))
+            val ownership = classifyBinarySessionOwnership(
+                session.id,
+                session.rootIdentityHex,
+                args.sessionId,
+                args.expectedRootIdentityHex,
+            )
+            if (ownership != BinarySessionOwnership.OWNER) {
+                return@synchronized saveOutcome(
+                    malformedBinaryWriteOutcome(ownership == BinarySessionOwnership.FOREIGN),
+                )
+            }
+            closeBinaryWriteSession(args.sessionId)
+            saveOutcome("aborted")
+        }
+        invoke.resolve(response)
+    }
+
+    @Command
+    fun replaceBinary(invoke: Invoke) {
+        // SAF exposes neither atomic compare-and-swap nor a portable
+        // evacuation/no-replace sequence. R2 therefore never mutates an
+        // existing transfer target; R3 conflict handling owns that decision.
+        invoke.resolve(saveOutcome("unsupportedReplace"))
+    }
+
+    private fun createEmptyBinaryDocument(root: Uri, path: String): String {
         val parts = path.split('/')
         var parentId = DocumentsContract.getTreeDocumentId(root)
         for (component in parts.dropLast(1)) {
@@ -522,22 +950,9 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
             name,
         ) ?: throw UnknownWriteException()
         val documentId = DocumentsContract.getDocumentId(created)
-        writeAndVerify(root, documentId, bytes)
         val matches = queryChildren(root, parentId).filter { it.name == name }
         if (matches.size != 1 || matches.single().documentId != documentId) throw UnknownWriteException()
-        return savedBinaryResponse(bytes)
-    }
-
-    private fun writeAndVerify(root: Uri, documentId: String, bytes: ByteArray) {
-        val uri = DocumentsContract.buildDocumentUriUsingTree(root, documentId)
-        resolver.openFileDescriptor(uri, "rwt")?.use { descriptor ->
-            FileOutputStream(descriptor.fileDescriptor).use { output ->
-                output.write(bytes)
-                output.flush()
-                descriptor.fileDescriptor.sync()
-            }
-        } ?: throw MissingException()
-        if (!readBounded(root, documentId).contentEquals(bytes)) throw UnknownWriteException()
+        return documentId
     }
 
     private fun buildInventory(root: Uri): JSObject {
@@ -623,10 +1038,46 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
             while (true) {
                 val count = input.read(buffer)
                 if (count < 0) break
-                if (output.size() + count > MAX_TRANSFER_BYTES) throw LimitException()
+                if (count == 0) throw MissingException()
+                if (output.size() + count > MAX_NOTE_BYTES) throw LimitException()
                 output.write(buffer, 0, count)
             }
             return output.toByteArray()
+        }
+        throw MissingException()
+    }
+
+    private fun readNextChunk(input: InputStream): ByteArray {
+        val output = ByteArrayOutputStream(BINARY_BRIDGE_CHUNK_BYTES)
+        val buffer = ByteArray(8192)
+        while (output.size() < BINARY_BRIDGE_CHUNK_BYTES) {
+            val count = input.read(
+                buffer,
+                0,
+                minOf(buffer.size, BINARY_BRIDGE_CHUNK_BYTES - output.size()),
+            )
+            if (count < 0) break
+            if (count == 0) throw MissingException()
+            output.write(buffer, 0, count)
+        }
+        return output.toByteArray()
+    }
+
+    private fun verifyBinaryDocument(root: Uri, documentId: String): Pair<String, Long> {
+        val uri = DocumentsContract.buildDocumentUriUsingTree(root, documentId)
+        resolver.openInputStream(uri)?.use { input ->
+            val digest = MessageDigest.getInstance("SHA-256")
+            val buffer = ByteArray(8192)
+            var byteLen = 0L
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                if (count == 0) throw MissingException()
+                byteLen += count
+                if (byteLen > BINARY_MAX_TRANSFER_BYTES) throw LimitException()
+                digest.update(buffer, 0, count)
+            }
+            return Pair(digest.digest().toHex(), byteLen)
         }
         throw MissingException()
     }
@@ -645,16 +1096,10 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
-    private fun binaryResponse(bytes: ByteArray): JSObject = JSObject().apply {
-        put("bytesBase64", Base64.encodeToString(bytes, Base64.NO_WRAP))
-        put("revisionHex", digest(bytes))
-        put("byteLen", bytes.size.toLong())
-    }
-
-    private fun savedBinaryResponse(bytes: ByteArray): JSObject = JSObject().apply {
+    private fun savedBinaryEvidence(revisionHex: String, byteLen: Long): JSObject = JSObject().apply {
         put("outcome", "saved")
-        put("revisionHex", digest(bytes))
-        put("byteLen", bytes.size.toLong())
+        put("revisionHex", revisionHex)
+        put("byteLen", byteLen)
     }
 
     private fun saveOutcome(outcome: String): JSObject = JSObject().apply { put("outcome", outcome) }
@@ -736,7 +1181,19 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
         return uri
     }
 
-    private fun requireRoot(expectedRootIdentityHex: String): Uri {
+    private fun activeBinarySessionId(): String? = binaryReadSession?.id ?: binaryWriteSession?.id
+
+    private fun requireNoBinarySession() {
+        if (activeBinarySessionId() != null || operationInFlight.get()) {
+            throw BinarySessionBusyException()
+        }
+    }
+
+    private fun requireRoot(expectedRootIdentityHex: String, ownerSessionId: String? = null): Uri {
+        val activeSessionId = activeBinarySessionId()
+        if (activeSessionId != null && activeSessionId != ownerSessionId) {
+            throw BinarySessionBusyException()
+        }
         if (!REVISION.matches(expectedRootIdentityHex)) throw RootMismatchException()
         val root = persistedRoot() ?: throw SecurityException("no root")
         if (rootIdentity(root) != expectedRootIdentityHex) throw RootMismatchException()
@@ -763,23 +1220,46 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     private fun clearRoot() {
+        closeBinaryReadSession()
+        closeBinaryWriteSession()
         unregisterObserver()
         preferences.edit().remove(ROOT_KEY).commit()
     }
-    private fun digest(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+
+    private fun closeBinaryReadSession(expectedSessionId: String? = null) {
+        synchronized(ioLock) {
+            val session = binaryReadSession ?: return@synchronized
+            if (expectedSessionId != null && session.id != expectedSessionId) return@synchronized
+            binaryReadSession = null
+            try { session.input.close() } catch (_: Exception) {}
+        }
+    }
+
+    private fun closeBinaryWriteSession(expectedSessionId: String? = null) {
+        synchronized(ioLock) {
+            val session = binaryWriteSession ?: return@synchronized
+            if (expectedSessionId != null && session.id != expectedSessionId) return@synchronized
+            binaryWriteSession = null
+            try { session.output.close() } catch (_: Exception) {}
+            try { session.descriptor.close() } catch (_: Exception) {}
+        }
+    }
+    private fun digest(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256").digest(bytes).toHex()
+    private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 
     private class MissingException : Exception()
     private class LimitException : Exception()
     private class StaleException : Exception()
     private class ExistingException : Exception()
-    private class UnknownWriteException : Exception()
+    private class UnknownWriteException(cause: Throwable? = null) : Exception(cause)
     private class CharacterCodingException : Exception()
     private class RootMismatchException : Exception()
+    private class BinarySessionBusyException : Exception()
+    private class BinarySessionMismatchException : Exception()
 
     companion object {
         private const val ROOT_KEY = "root-uri"
         private const val MAX_NOTE_BYTES = 16 * 1024 * 1024
-        private const val MAX_TRANSFER_BYTES = 16 * 1024 * 1024
         private const val MAX_ENTRIES = 5000
         private const val MAX_DEPTH = 64
         private val REVISION = Regex("^[0-9a-f]{64}$")

@@ -1,6 +1,6 @@
 # myVault — Latest Session Handoff
 
-Updated 2026-07-14 Asia/Bangkok ค่ะ
+Updated 2026-07-15 Asia/Bangkok ค่ะ
 
 ไฟล์นี้เป็นเจ้าของ Git checkpoint, verification ล่าสุด, งานถัดไป และ approval state ค่ะ ทิศทางผลิตภัณฑ์อยู่ที่ [PROJECT_PLAN.md](PROJECT_PLAN.md) ค่ะ
 
@@ -22,6 +22,8 @@ Updated 2026-07-14 Asia/Bangkok ค่ะ
   และ Windows NSIS ผ่านบน candidate เดียวก่อน mergeค่ะ
 - Active implementation milestone คือ R2 และ shared workspace อยู่บน
   `codex/r2-guarded-transfer` ซึ่งเริ่มจาก `681271a` ค่ะ
+- Current branch HEAD คือ `e39d131` และ working tree ยัง dirty ด้วย final live
+  Android fixes/evidenceค่ะ ห้ามใช้ earlier green CI แทน final-head CIค่ะ
 
 ## 3. Current Truth
 
@@ -37,32 +39,44 @@ Updated 2026-07-14 Asia/Bangkok ค่ะ
   bounded preview เชื่อม Tauri runtime แล้วค่ะ
 - `myvault-sync-engine` และ production GET-only Drive adapter เป็น Tauri
   dependencies แล้ว โดย token/body/ambient path ไม่ออกสู่ frontend/SQLite/logค่ะ
-- R2 implementation candidate มี guarded content upload/download, durable
+- R2 final candidate มี guarded content upload/download, durable
   transfer state, create-no-replace local publication, exact-root Drive
   mutation boundary, desktop local observation และ Android SAF guarded runtime
-  แล้วค่ะ Quality, Android, Ubuntu และ Windows CI ผ่านบน Draft PR candidate
-  แล้วค่ะ Locked live disposable acceptance ยังไม่ผ่านครบค่ะ
+  แล้วค่ะ macOS disposable byte-exact round trip และ Android API 36 disposable
+  live acceptance ผ่านแล้วค่ะ งานค้างคือ macOS restart/offline/auth lifecycle,
+  commit current fixes, push, fresh exact-HEAD CI, final review, เปลี่ยน Draft PR
+  #27 เป็น Ready และ mergeค่ะ
 - Conflict engine และ full Sync control-plane UI ยังเป็นงาน R3–R4 ค่ะ
 
 ## 4. Verification — R2 Candidate Audit
 
-สถานะนี้เป็น post-audit local integration evidenceค่ะ Draft PR #27 ผ่าน
-quality, Android, Ubuntu AppImage และ Windows NSIS CI บน candidate แล้วค่ะ
-Locked live disposable acceptance ยังต้องผ่านก่อนเปลี่ยน PR เป็น Readyค่ะ
+สถานะนี้เป็น post-live local integration evidenceบน dirty working tree ที่
+branch HEAD `e39d131` ค่ะ Draft PR #27 เคยผ่าน quality, Android, Ubuntu
+AppImage และ Windows NSIS บน earlier candidate แต่ต้องรันใหม่หลัง final commitค่ะ
 
 - `pnpm typecheck` ผ่านค่ะ
 - Frontend Vitest ผ่าน 5 files / 40 tests ค่ะ
 - `pnpm build` ผ่านค่ะ Main chunk ประมาณ 1.06 MB และมี non-blocking chunk-size warning ค่ะ
 - `pnpm quality:r2:offline` ผ่านหลังรวม final audit fixes ทั้งหมดค่ะ
+- Final macOS debug `.app` และ `.dmg` bundle build ผ่านจาก working tree เดียวกันค่ะ
 - Rust R2 matrix ครอบคลุม Core, platform ACL/FS, private FS, recovery,
   mutations, snapshots, app service, desktop auth, Drive spike, Google auth,
   private root, Vault SAF, Sync engine, Drive, transfer และ Tauriค่ะ
 - `cargo fmt --manifest-path apps/tauri/src-tauri/Cargo.toml --all -- --check` ผ่านค่ะ
 - Android aarch64 strict Clippy, Kotlin Vault SAF unit tests, full debug APK
-  build, 16 KiB alignment, v2 signature, fresh API 36 install และ cold launch
-  ผ่านค่ะ Cold launch ใช้ 669 ms และไม่พบ matching fatal process logค่ะ APK
-  SHA-256 คือ
-  `96d7791718cb5ba4326d74a8bd0076837f1fd52cdc8107e54a071cfbcda2c87e`ค่ะ
+  build และ 16 KiB alignment ผ่านหลัง final source fixesค่ะ Final APK มีขนาด
+  304,052,519 bytes และ SHA-256 คือ
+  `a3a1cef9b2a4e3e08118cef2ce4209d76578e6fb366edbc395e566369070bd4a`ค่ะ
+- macOS disposable A → exact Drive root → B ผ่าน Markdown, Unicode, zero-byte,
+  6 MiB + 1 และ 15 MiB restart fixtures แบบ byte-exactค่ะ
+- Android API 36 A/B ผ่าน 9-file byte-exact round tripค่ะ Offline injection
+  หลัง private durable stage กลับมา complete โดย remote มี fixture เดียวค่ะ
+  Cold restart ของ C ฟื้นจาก 1 completed / 8 pending / 1 reconcile ไปเป็น
+  ready/zero counters และ B/C ตรงกัน 10 files แบบ byte-exactค่ะ
+- Final APK ดาวน์โหลด exact-root fixture เข้า empty Vault D ผ่าน stateful SAF
+  transcript ครบ 10/10 files และ per-path SHA-256 manifest ตรงกับ Vault Cค่ะ
+  Cold restart แล้ว reconnect binding เดิม กลับสู่ ready โดยทุก queue counter
+  เป็นศูนย์ค่ะ
 - Static R2 mutation/token audit ผ่าน, production dependency tree ไม่มี
   `drive-sync-spike` และ `pnpm audit --prod` ไม่พบ known vulnerabilityค่ะ
 
@@ -105,8 +119,9 @@ Ignored-by-default tests คือ live Drive fixture และ OS keyring mutat
 
 ### Product blockers
 
-- Production guarded Drive transfer path มีแล้ว แต่ยังไม่มี locked live
-  cross-device R2 evidence จาก disposable root/Vault A/Vault B ค่ะ
+- Production guarded Drive transfer path และ locked disposable macOS/Android
+  round-trip evidence ผ่านแล้วค่ะ macOS restart/offline/auth lifecycle และ final
+  clean HEAD/CI/PR merge ยังไม่ผ่านค่ะ
 - ไม่มี user-visible Sync status/retry/conflict recovery ค่ะ
 - Local mutation services ยังไม่ถูก expose ถึง UI ครบค่ะ
 
@@ -124,11 +139,13 @@ Ignored-by-default tests คือ live Drive fixture และ OS keyring mutat
 
 ## 8. Next Actions
 
-1. รัน locked live macOS/Android disposable round trip เมื่อ exact R2 root,
-   desktop OAuth environment และ emulator test account พร้อมค่ะ
-2. บันทึก exact account/root กับ disposable Local Vault A/B โดยไม่บันทึก
-   credential หรือ personal path ลง repositoryค่ะ
-3. เปลี่ยน PR เป็น Ready และ merge เมื่อ Gate 0–8 ผ่านครบเท่านั้นค่ะ ห้ามแตะ
+1. ปิด macOS restart/offline lifecycle บน disposable Vault/root และขอ
+   action-time confirmation ก่อนทดสอบ Disconnect Google Drive/credential
+   restorationค่ะ
+2. ตรวจ final diff/secret/docs, commit current R2 fixes และ push branchค่ะ
+3. รอ fresh Quality, Android compile, Ubuntu AppImage และ Windows NSIS บน exact
+   final HEAD แล้วบันทึก run IDs กับผลค่ะ
+4. เปลี่ยน PR เป็น Ready และ merge เมื่อ Gate 0–8 ผ่านครบเท่านั้นค่ะ ห้ามแตะ
    personal Vault/Drive หรือเริ่ม R3 rename/move/Trash/conflict workค่ะ
 
 ## 9. Approval State

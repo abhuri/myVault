@@ -35,9 +35,7 @@ impl<R: Runtime> GoogleAuth<R> {
             .run_mobile_plugin("authorize", AuthorizeRequest { scopes })
             .map_err(|_| crate::Error::NativeBridge)?;
 
-        if response.granted_scopes.as_slice() != [crate::GOOGLE_DRIVE_SCOPE] {
-            return Err(crate::Error::InvalidScopes);
-        }
+        validate_granted_scopes(&response.granted_scopes)?;
 
         Ok(Authorization {
             access_token: AccessToken::new(response.access_token),
@@ -83,9 +81,26 @@ fn validate_scopes(scopes: &[&str]) -> crate::Result<()> {
     }
 }
 
+fn validate_granted_scopes(scopes: &[String]) -> crate::Result<()> {
+    let mut observed = scopes.iter().map(String::as_str).collect::<Vec<_>>();
+    observed.sort_unstable();
+    observed.dedup();
+    let exact = [crate::GOOGLE_DRIVE_SCOPE];
+    let mut redundant = [
+        crate::GOOGLE_DRIVE_SCOPE,
+        crate::GOOGLE_DRIVE_METADATA_READONLY_SCOPE,
+    ];
+    redundant.sort_unstable();
+    if observed.len() == scopes.len() && (observed.as_slice() == exact || observed == redundant) {
+        Ok(())
+    } else {
+        Err(crate::Error::InvalidScopes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::validate_scopes;
+    use super::{validate_granted_scopes, validate_scopes};
 
     #[test]
     fn scope_allowlist_requires_exactly_one_full_drive_scope() {
@@ -96,5 +111,25 @@ mod tests {
             validate_scopes(&["https://www.googleapis.com/auth/drive.metadata.readonly"]).is_err()
         );
         assert!(validate_scopes(&[crate::GOOGLE_DRIVE_SCOPE, "openid"]).is_err());
+    }
+
+    #[test]
+    fn native_grants_allow_only_full_drive_and_one_redundant_subset() {
+        assert!(validate_granted_scopes(&[crate::GOOGLE_DRIVE_SCOPE.to_owned()]).is_ok());
+        assert!(validate_granted_scopes(&[
+            crate::GOOGLE_DRIVE_METADATA_READONLY_SCOPE.to_owned(),
+            crate::GOOGLE_DRIVE_SCOPE.to_owned(),
+        ])
+        .is_ok());
+        assert!(validate_granted_scopes(&[
+            crate::GOOGLE_DRIVE_SCOPE.to_owned(),
+            crate::GOOGLE_DRIVE_SCOPE.to_owned(),
+        ])
+        .is_err());
+        assert!(validate_granted_scopes(&[
+            crate::GOOGLE_DRIVE_SCOPE.to_owned(),
+            "openid".to_owned(),
+        ])
+        .is_err());
     }
 }

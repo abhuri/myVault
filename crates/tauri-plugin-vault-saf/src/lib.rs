@@ -3,6 +3,8 @@
 use serde::Deserialize;
 #[cfg(target_os = "android")]
 use serde::Serialize;
+#[cfg(any(target_os = "android", test))]
+use sha2::{Digest, Sha256};
 #[cfg(target_os = "android")]
 use tauri::{
     plugin::{Builder, TauriPlugin},
@@ -134,10 +136,21 @@ struct NativeSave {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg(target_os = "android")]
-struct NativeBinary {
+struct NativeBinaryChunk {
+    offset: u64,
     bytes_base64: String,
-    revision_hex: String,
-    byte_len: u64,
+    eof: bool,
+    revision_hex: Option<String>,
+    byte_len: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg(target_os = "android")]
+struct NativeWriteProgress {
+    outcome: String,
+    session_id: Option<String>,
+    next_offset: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -211,12 +224,48 @@ struct SaveRequest<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg(target_os = "android")]
-struct BinaryWriteRequest<'a> {
+struct BinaryReadChunkRequest<'a> {
+    expected_root_identity_hex: &'a str,
+    session_id: &'a str,
+    offset: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg(target_os = "android")]
+struct BinaryReadBeginRequest<'a> {
     expected_root_identity_hex: &'a str,
     path: &'a str,
-    bytes_base64: String,
+    session_id: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg(target_os = "android")]
+struct BinaryWriteBeginRequest<'a> {
+    expected_root_identity_hex: &'a str,
+    path: &'a str,
     sha256_hex: &'a str,
+    session_id: &'a str,
     byte_len: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg(target_os = "android")]
+struct BinaryWriteChunkRequest<'a> {
+    expected_root_identity_hex: &'a str,
+    session_id: &'a str,
+    bytes_base64: String,
+    offset: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg(target_os = "android")]
+struct BinarySessionRequest<'a> {
+    expected_root_identity_hex: &'a str,
+    session_id: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -428,25 +477,123 @@ impl<R: Runtime> VaultSaf<R> {
         if !policy::is_valid_portable_path(path) {
             return Err(SafTransferError::InvalidPath);
         }
-        let response: NativeBinary = self
-            .0
-            .run_mobile_plugin(
-                "readBinary",
-                PathRequest {
-                    expected_root_identity_hex: vault.expected_root_identity_hex(),
-                    path,
-                },
-            )
-            .map_err(map_transfer_plugin_error)?;
-        let bytes = decode_base64_bounded(&response.bytes_base64, max_bytes)?;
-        if bytes.len() as u64 != response.byte_len {
-            return Err(SafTransferError::NativeBridge);
+        if max_bytes > MAX_NATIVE_TRANSFER_BYTES {
+            return Err(SafTransferError::InvalidRequest);
         }
-        Ok(SafBinary {
-            bytes,
-            revision_hex: response.revision_hex,
-            byte_len: response.byte_len,
-        })
+        let session_id = Uuid::new_v4().to_string();
+        let begin: Result<NativeWriteProgress, _> = self.0.run_mobile_plugin(
+            "beginBinaryRead",
+            BinaryReadBeginRequest {
+                expected_root_identity_hex: vault.expected_root_identity_hex(),
+                path,
+                session_id: &session_id,
+            },
+        );
+        let begin = match begin {
+            Ok(begin) => begin,
+            Err(error) => {
+                let _: Result<NativeWriteProgress, _> = self.0.run_mobile_plugin(
+                    "abortBinaryRead",
+                    BinarySessionRequest {
+                        expected_root_identity_hex: vault.expected_root_identity_hex(),
+                        session_id: &session_id,
+                    },
+                );
+                return Err(map_transfer_plugin_error(error));
+            }
+        };
+        let begin_decision = classify_native_begin_response(
+            &begin.outcome,
+            begin.session_id.as_deref(),
+            &session_id,
+            &[
+                "notFound",
+                "resourceLimit",
+                "vaultUnavailable",
+                "busy",
+                "invalidRequest",
+            ],
+        );
+        if begin_decision != NativeBeginDecision::Proceed {
+            if begin_decision == NativeBeginDecision::RejectAndAbort {
+                let _: Result<NativeWriteProgress, _> = self.0.run_mobile_plugin(
+                    "abortBinaryRead",
+                    BinarySessionRequest {
+                        expected_root_identity_hex: vault.expected_root_identity_hex(),
+                        session_id: &session_id,
+                    },
+                );
+            }
+            return Err(match begin.outcome.as_str() {
+                "notFound" => SafTransferError::NotFound,
+                "resourceLimit" => SafTransferError::ResourceLimit,
+                "vaultUnavailable" | "busy" => SafTransferError::VaultUnavailable,
+                "invalidRequest" => SafTransferError::InvalidRequest,
+                _ => SafTransferError::NativeBridge,
+            });
+        }
+
+        let read_result = (|| {
+            let mut bytes = Vec::new();
+            loop {
+                let offset =
+                    u64::try_from(bytes.len()).map_err(|_| SafTransferError::ResourceLimit)?;
+                let response: NativeBinaryChunk = self
+                    .0
+                    .run_mobile_plugin(
+                        "readBinaryChunk",
+                        BinaryReadChunkRequest {
+                            expected_root_identity_hex: vault.expected_root_identity_hex(),
+                            session_id: &session_id,
+                            offset,
+                        },
+                    )
+                    .map_err(map_transfer_plugin_error)?;
+                if response.offset != offset {
+                    return Err(SafTransferError::NativeBridge);
+                }
+                let chunk =
+                    decode_base64_bounded(&response.bytes_base64, MAX_NATIVE_BRIDGE_CHUNK_BYTES)?;
+                let invalid_eof_chunk =
+                    response.eof && chunk.len() == MAX_NATIVE_BRIDGE_CHUNK_BYTES;
+                let invalid_continuation = !response.eof
+                    && (chunk.len() != MAX_NATIVE_BRIDGE_CHUNK_BYTES
+                        || response.revision_hex.is_some()
+                        || response.byte_len.is_some());
+                if invalid_eof_chunk || invalid_continuation {
+                    return Err(SafTransferError::NativeBridge);
+                }
+                if bytes.len().saturating_add(chunk.len()) > max_bytes {
+                    return Err(SafTransferError::ResourceLimit);
+                }
+                bytes.extend_from_slice(&chunk);
+                if response.eof {
+                    let revision_hex = response
+                        .revision_hex
+                        .filter(|value| is_canonical_digest(value))
+                        .ok_or(SafTransferError::NativeBridge)?;
+                    let byte_len = response.byte_len.ok_or(SafTransferError::NativeBridge)?;
+                    if byte_len != bytes.len() as u64 || digest_sha256_hex(&bytes) != revision_hex {
+                        return Err(SafTransferError::NativeBridge);
+                    }
+                    return Ok(SafBinary {
+                        bytes,
+                        revision_hex,
+                        byte_len,
+                    });
+                }
+            }
+        })();
+        if read_result.is_err() {
+            let _: Result<NativeWriteProgress, _> = self.0.run_mobile_plugin(
+                "abortBinaryRead",
+                BinarySessionRequest {
+                    expected_root_identity_hex: vault.expected_root_identity_hex(),
+                    session_id: &session_id,
+                },
+            );
+        }
+        read_result
     }
 
     /// Creates a new SAF document without intentionally replacing an existing
@@ -497,37 +644,126 @@ impl<R: Runtime> VaultSaf<R> {
         {
             return Err(SafTransferError::InvalidRequest);
         }
-        let response: NativeSave = self
-            .0
-            .run_mobile_plugin(
-                "createBinary",
-                BinaryWriteRequest {
-                    expected_root_identity_hex: vault.expected_root_identity_hex(),
-                    path,
-                    bytes_base64: encode_base64(bytes),
-                    sha256_hex,
-                    byte_len: bytes.len() as u64,
-                },
-            )
-            .map_err(|_| SafTransferError::NativeBridge)?;
-        match response.outcome.as_str() {
-            "saved" => Ok(SafSave {
-                revision_hex: response
-                    .revision_hex
-                    .ok_or(SafTransferError::NativeBridge)?,
-                byte_len: response.byte_len.ok_or(SafTransferError::NativeBridge)?,
-            }),
-            "staleRevision" => Err(SafTransferError::StaleRevision),
-            "alreadyExists" => Err(SafTransferError::AlreadyExists),
-            "notFound" => Err(SafTransferError::NotFound),
-            "digestMismatch" => Err(SafTransferError::DigestMismatch),
-            "resourceLimit" => Err(SafTransferError::ResourceLimit),
-            "vaultUnavailable" => Err(SafTransferError::VaultUnavailable),
-            "unsupportedReplace" => Err(SafTransferError::UnsupportedReplace),
-            "invalidRequest" => Err(SafTransferError::InvalidRequest),
-            "writeOutcomeUnknown" => Err(SafTransferError::WriteOutcomeUnknown),
-            _ => Err(SafTransferError::NativeBridge),
+        if digest_sha256_hex(bytes) != sha256_hex {
+            return Err(SafTransferError::DigestMismatch);
         }
+        let session_id = Uuid::new_v4().to_string();
+        let begin: Result<NativeWriteProgress, _> = self.0.run_mobile_plugin(
+            "beginBinaryCreate",
+            BinaryWriteBeginRequest {
+                expected_root_identity_hex: vault.expected_root_identity_hex(),
+                path,
+                sha256_hex,
+                session_id: &session_id,
+                byte_len: bytes.len() as u64,
+            },
+        );
+        let begin = match begin {
+            Ok(begin) => begin,
+            Err(_) => {
+                let _: Result<NativeWriteProgress, _> = self.0.run_mobile_plugin(
+                    "abortBinaryCreate",
+                    BinarySessionRequest {
+                        expected_root_identity_hex: vault.expected_root_identity_hex(),
+                        session_id: &session_id,
+                    },
+                );
+                return Err(SafTransferError::WriteOutcomeUnknown);
+            }
+        };
+        let begin_decision = classify_native_begin_response(
+            &begin.outcome,
+            begin.session_id.as_deref(),
+            &session_id,
+            &[
+                "alreadyExists",
+                "resourceLimit",
+                "vaultUnavailable",
+                "busy",
+                "invalidRequest",
+            ],
+        );
+        if begin_decision != NativeBeginDecision::Proceed {
+            if begin_decision == NativeBeginDecision::RejectAndAbort {
+                let _: Result<NativeWriteProgress, _> = self.0.run_mobile_plugin(
+                    "abortBinaryCreate",
+                    BinarySessionRequest {
+                        expected_root_identity_hex: vault.expected_root_identity_hex(),
+                        session_id: &session_id,
+                    },
+                );
+            }
+            return Err(match begin.outcome.as_str() {
+                "alreadyExists" => SafTransferError::AlreadyExists,
+                "resourceLimit" => SafTransferError::ResourceLimit,
+                "vaultUnavailable" | "busy" => SafTransferError::VaultUnavailable,
+                "invalidRequest" => SafTransferError::InvalidRequest,
+                _ => SafTransferError::WriteOutcomeUnknown,
+            });
+        };
+
+        let write_result = (|| {
+            let mut offset = 0_u64;
+            for chunk in bytes.chunks(MAX_NATIVE_BRIDGE_CHUNK_BYTES) {
+                let response: NativeWriteProgress = self
+                    .0
+                    .run_mobile_plugin(
+                        "appendBinaryChunk",
+                        BinaryWriteChunkRequest {
+                            expected_root_identity_hex: vault.expected_root_identity_hex(),
+                            session_id: &session_id,
+                            bytes_base64: encode_base64(chunk),
+                            offset,
+                        },
+                    )
+                    .map_err(|_| SafTransferError::WriteOutcomeUnknown)?;
+                let chunk_len = u64::try_from(chunk.len())
+                    .map_err(|_| SafTransferError::WriteOutcomeUnknown)?;
+                offset = offset
+                    .checked_add(chunk_len)
+                    .ok_or(SafTransferError::WriteOutcomeUnknown)?;
+                if response.outcome != "accepted" || response.next_offset != Some(offset) {
+                    return Err(SafTransferError::WriteOutcomeUnknown);
+                }
+            }
+            let response: NativeSave = self
+                .0
+                .run_mobile_plugin(
+                    "finishBinaryCreate",
+                    BinarySessionRequest {
+                        expected_root_identity_hex: vault.expected_root_identity_hex(),
+                        session_id: &session_id,
+                    },
+                )
+                .map_err(|_| SafTransferError::WriteOutcomeUnknown)?;
+            match response.outcome.as_str() {
+                "saved" => {
+                    let revision_hex = response
+                        .revision_hex
+                        .filter(|value| is_canonical_digest(value) && value == sha256_hex)
+                        .ok_or(SafTransferError::WriteOutcomeUnknown)?;
+                    let byte_len = response
+                        .byte_len
+                        .filter(|value| *value == bytes.len() as u64)
+                        .ok_or(SafTransferError::WriteOutcomeUnknown)?;
+                    Ok(SafSave {
+                        revision_hex,
+                        byte_len,
+                    })
+                }
+                _ => Err(SafTransferError::WriteOutcomeUnknown),
+            }
+        })();
+        if write_result.is_err() {
+            let _: Result<NativeWriteProgress, _> = self.0.run_mobile_plugin(
+                "abortBinaryCreate",
+                BinarySessionRequest {
+                    expected_root_identity_hex: vault.expected_root_identity_hex(),
+                    session_id: &session_id,
+                },
+            );
+        }
+        write_result
     }
 }
 
@@ -535,7 +771,34 @@ impl<R: Runtime> VaultSaf<R> {
 const MAX_NATIVE_TRANSFER_BYTES: usize = 16 * 1024 * 1024;
 
 #[cfg(any(target_os = "android", test))]
+const MAX_NATIVE_BRIDGE_CHUNK_BYTES: usize = 192 * 1024;
+
+#[cfg(any(target_os = "android", test))]
 const MAX_SAFE_CHANGE_GENERATION: u64 = 9_007_199_254_740_991;
+
+#[cfg(any(target_os = "android", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeBeginDecision {
+    Proceed,
+    RejectWithoutAbort,
+    RejectAndAbort,
+}
+
+#[cfg(any(target_os = "android", test))]
+fn classify_native_begin_response(
+    outcome: &str,
+    echoed_session_id: Option<&str>,
+    requested_session_id: &str,
+    explicit_rejections: &[&str],
+) -> NativeBeginDecision {
+    if outcome == "ready" && echoed_session_id == Some(requested_session_id) {
+        NativeBeginDecision::Proceed
+    } else if explicit_rejections.contains(&outcome) {
+        NativeBeginDecision::RejectWithoutAbort
+    } else {
+        NativeBeginDecision::RejectAndAbort
+    }
+}
 
 #[cfg(any(target_os = "android", test))]
 fn validate_change_generation(generation: u64) -> Result<(), SafError> {
@@ -587,6 +850,14 @@ fn is_canonical_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(any(target_os = "android", test))]
+fn digest_sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -750,6 +1021,11 @@ mod transfer_tests {
     fn native_base64_and_digest_validation_are_strict_and_bounded() {
         assert!(is_canonical_digest(&"a".repeat(64)));
         assert!(!is_canonical_digest(&"A".repeat(64)));
+        assert_eq!(
+            digest_sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(Uuid::new_v4().get_version_num(), 4);
         assert!(matches!(
             decode_base64_bounded("AA==", 0),
             Err(SafTransferError::ResourceLimit)
@@ -757,6 +1033,75 @@ mod transfer_tests {
         for malformed in ["A", "AA=A", "AA==AAAA", "****"] {
             assert!(decode_base64_bounded(malformed, 16).is_err(), "{malformed}");
         }
+    }
+
+    #[test]
+    fn native_begin_abort_decision_preserves_foreign_busy_sessions() {
+        let requested = "123e4567-e89b-42d3-a456-426614174000";
+        let foreign = "223e4567-e89b-42d3-a456-426614174000";
+        let read_rejections = [
+            "notFound",
+            "resourceLimit",
+            "vaultUnavailable",
+            "busy",
+            "invalidRequest",
+        ];
+        let write_rejections = [
+            "alreadyExists",
+            "resourceLimit",
+            "vaultUnavailable",
+            "busy",
+            "invalidRequest",
+        ];
+
+        assert_eq!(
+            classify_native_begin_response("ready", Some(requested), requested, &read_rejections),
+            NativeBeginDecision::Proceed,
+        );
+        for outcome in read_rejections {
+            assert_eq!(
+                classify_native_begin_response(outcome, None, requested, &read_rejections),
+                NativeBeginDecision::RejectWithoutAbort,
+            );
+        }
+        for outcome in write_rejections {
+            assert_eq!(
+                classify_native_begin_response(outcome, None, requested, &write_rejections),
+                NativeBeginDecision::RejectWithoutAbort,
+            );
+        }
+        for echoed in [None, Some(foreign)] {
+            assert_eq!(
+                classify_native_begin_response("ready", echoed, requested, &read_rejections),
+                NativeBeginDecision::RejectAndAbort,
+            );
+        }
+        assert_eq!(
+            classify_native_begin_response(
+                "unknown",
+                Some(requested),
+                requested,
+                &write_rejections
+            ),
+            NativeBeginDecision::RejectAndAbort,
+        );
+    }
+
+    #[test]
+    fn native_bridge_chunks_cover_the_exact_transfer_limit_without_large_messages() {
+        let body = vec![0x5a; 16 * 1024 * 1024];
+        let chunks = body
+            .chunks(MAX_NATIVE_BRIDGE_CHUNK_BYTES)
+            .collect::<Vec<_>>();
+        assert_eq!(chunks.len(), 86);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.len() <= MAX_NATIVE_BRIDGE_CHUNK_BYTES));
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.len()).sum::<usize>(),
+            body.len()
+        );
+        assert!(encode_base64(chunks[0]).len() <= 256 * 1024);
     }
 
     #[test]

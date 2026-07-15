@@ -37,6 +37,7 @@ internal class DisconnectArgs {
 @TauriPlugin
 class GoogleAuthPlugin(private val activity: Activity) : Plugin(activity) {
     private val allowedScope = "https://www.googleapis.com/auth/drive"
+    private val redundantMetadataScope = "https://www.googleapis.com/auth/drive.metadata.readonly"
     private val authorizationClient = Identity.getAuthorizationClient(activity)
     private val operationInFlight = AtomicBoolean(false)
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -181,13 +182,14 @@ class GoogleAuthPlugin(private val activity: Activity) : Plugin(activity) {
     private fun resolveAuthorization(invoke: Invoke, result: AuthorizationResult) {
         if (!operationInFlight.get()) return
         val token = result.accessToken
+        val grantedScopeUris = result.grantedScopes.toSet()
         if (token.isNullOrBlank()) {
             reject(invoke, "AUTH_TOKEN_MISSING", "Google did not return an access token")
             return
         }
 
-        val grantedScopeUris = result.grantedScopes.toSet()
-        if (grantedScopeUris != requestedScopes) {
+        val redundantProviderGrant = setOf(allowedScope, redundantMetadataScope)
+        if (grantedScopeUris != requestedScopes && grantedScopeUris != redundantProviderGrant) {
             reject(invoke, "AUTH_SCOPES_MISSING", "Google did not grant exactly the requested scope")
             return
         }

@@ -6,10 +6,12 @@ R2 is complete only when every applicable checkbox below is backed by evidence
 from one exact candidate HEADค่ะ Mock, compile, emulator, native runtime, and
 live evidence must remain explicitly distinguishedค่ะ
 
-Current status: `IMPLEMENTATION CANDIDATE — LIVE PENDING` ค่ะ The checklist
-records the completed offline contract separately from the exact disposable
-fixture, live-native, PR-ready, and merge gates that remain openค่ะ Platform CI
-has passed on Draft PR #27 candidate `ed90bfb`ค่ะ
+Current status: `FINAL CANDIDATE — LIVE ACCEPTANCE PASSED; FINAL HEAD/CI PENDING`
+ค่ะ The exact disposable macOS round trip and Android emulator journey now pass,
+while the remaining macOS lifecycle and latest fixes still require completion,
+a clean committed HEAD, fresh CI, final review, PR readiness, and mergeค่ะ
+Earlier platform CI passed on Draft PR #27 candidate
+`ed90bfb`; it is historical evidence and not the final-head gateค่ะ
 Evidence and external blockers are recorded in [RESULTS.md](RESULTS.md)ค่ะ
 
 ## Gate 0 — Baseline and contract
@@ -18,7 +20,7 @@ Evidence and external blockers are recorded in [RESULTS.md](RESULTS.md)ค่ะ
   from that merge commitค่ะ
 - [x] R2 scope, non-goals, Drive mutation allowlist, retry taxonomy, content
   policy, size limits, platform claims, and fault matrix are frozenค่ะ
-- [ ] The exact disposable Drive test account/root and two disposable local
+- [x] The exact disposable Drive test account/root and two disposable local
   Vaults are recorded without exposing credentials or personal pathsค่ะ
 - [x] Dependency and schema migration plans receive security/data-loss reviewค่ะ
 
@@ -112,6 +114,8 @@ Evidence and external blockers are recorded in [RESULTS.md](RESULTS.md)ค่ะ
 
 - [x] `pnpm quality:r2:offline` passes frontend typecheck/tests/build plus Rust
   format, strict Clippy, unit, integration, migration, fault, and doc testsค่ะ
+- [x] Final deterministic counts include Tauri 56, Android private-root 18, and
+  Rust Vault SAF 10 tests, plus the Gradle Vault SAF unit suiteค่ะ
 - [x] Quality CI covers app-service, core, private-fs, snapshots, sync-engine,
   drive, transfer, desktop-auth, Google auth, private-root, vault-saf, and Tauriค่ะ
 - [x] Static and captured-request audits prove the exact R2 method/endpoint
@@ -125,15 +129,20 @@ Evidence and external blockers are recorded in [RESULTS.md](RESULTS.md)ค่ะ
 
 ## Gate 7 — Native and platform acceptance
 
-- [ ] A fresh macOS app completes disposable Local Vault A → exact Drive root →
+- [x] A fresh macOS app completes disposable Local Vault A → exact Drive root →
   Local Vault B for Markdown, Unicode, zero-byte, and binary >5 MiB content with
   a byte-exact recursive manifestค่ะ
 - [ ] macOS restart during upload and download, offline pause/resume, auth expiry,
   credential restoration, and idempotent disconnect preserve durable truthค่ะ
-- [ ] Android API 36 emulator installs a fresh aligned APK and completes the
+- [x] Android API 36 emulator installs a fresh aligned APK and completes the
   supported SAF Markdown/binary round trip, cold restart, offline, and auth
   reacquisition scenariosค่ะ
-- [ ] Android evidence remains labeled emulator-only; physical-device acceptance
+- [x] The final 304,052,519-byte APK with SHA-256
+  `a3a1cef9b2a4e3e08118cef2ce4209d76578e6fb366edbc395e566369070bd4a`
+  passes 16 KiB `zipalign`; empty Vault D downloads all 10 files with an exact
+  per-path SHA-256 manifest match to Vault C, and cold restart reconnects at
+  `ready` with every queue counter zeroค่ะ
+- [x] Android evidence remains labeled emulator-only; physical-device acceptance
   remains R7 of the product roadmapค่ะ
 - [x] Ubuntu AppImage and Windows NSIS build/test/package jobs pass on Draft PR
   #27 candidate `ed90bfb` without being mislabeled as native UI acceptanceค่ะ
@@ -143,9 +152,9 @@ Evidence and external blockers are recorded in [RESULTS.md](RESULTS.md)ค่ะ
 - [ ] The live disposable round trip, deterministic offline aggregate, platform
   CI, security review, diff review, documentation review, and scope-drift review
   all pass on one exact candidate HEADค่ะ
-- [ ] Evidence records HEAD, dirty state, environment, commands/jobs, outcomes,
+- [x] Evidence records HEAD, dirty state, environment, commands/jobs, outcomes,
   classifications, and deliberately untested behaviorค่ะ
-- [ ] `PROJECT_PLAN.md`, `SESSION_HANDOFF.md`, `docs/sync/RESULTS.md`, README as
+- [x] `PROJECT_PLAN.md`, `SESSION_HANDOFF.md`, `docs/sync/RESULTS.md`, README as
   applicable, and `CHANGELOG.md` agree on the R2 outcome and remaining R3 workค่ะ
 - [ ] The R2 PR is ready, checks are green, final review finds no blocker, and the
   approved merge completesค่ะ

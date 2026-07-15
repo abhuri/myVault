@@ -4,8 +4,9 @@
 //!
 //! Concrete SAF and private-root plugins deliberately do not appear here. An
 //! adapter must bind each trait object to one exact vault capability before it
-//! constructs this executor. Bodies stay native `Vec<u8>` values and never
-//! cross a serializable or base64 boundary.
+//! constructs this executor. Whole bodies never cross the frontend boundary;
+//! the Android plugin adapter moves native bytes over a bounded, transcript-
+//! checked chunk bridge before constructing these `Vec<u8>` values.
 
 use crate::android_transfer_policy::{
     prepare_saf_transfer, AndroidTransferDirection, AndroidTransferPolicyError,
@@ -677,8 +678,10 @@ mod native_adapters {
                 .vault_saf()
                 .read_binary(&self.vault, portable_path, max_bytes)
                 .map_err(map_saf_error)?;
-            let revision = FileRevision::from_bytes(&binary.bytes);
-            if binary.byte_len != binary.bytes.len() as u64 || binary.revision_hex != revision.hex {
+            let digest = myvault_core::Sha256Digest::from_bytes(&binary.bytes);
+            if binary.byte_len != binary.bytes.len() as u64
+                || binary.revision_hex != digest.as_str()
+            {
                 return Err(AndroidVaultIoError::PublicationUnknown);
             }
             Ok(binary.bytes)
@@ -693,14 +696,13 @@ mod native_adapters {
             if body.len() > max_bytes {
                 return Err(AndroidVaultIoError::ResourceLimit);
             }
-            let revision = FileRevision::from_bytes(&body);
             let digest = myvault_core::Sha256Digest::from_bytes(&body);
             let saved = self
                 .app
                 .vault_saf()
                 .create_binary(&self.vault, portable_path, &body, digest.as_str())
                 .map_err(map_saf_error)?;
-            if saved.byte_len != body.len() as u64 || saved.revision_hex != revision.hex {
+            if saved.byte_len != body.len() as u64 || saved.revision_hex != digest.as_str() {
                 return Err(AndroidVaultIoError::PublicationUnknown);
             }
             Ok(())

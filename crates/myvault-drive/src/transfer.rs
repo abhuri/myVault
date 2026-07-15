@@ -587,7 +587,8 @@ impl TransferDrive {
     /// Proves that a completed create is still unique by both its operation
     /// marker and exact display name before callers publish durable completion.
     /// Both queries must return exactly the just-created file, and a final
-    /// metadata read must preserve its revision, parent, content, and marker.
+    /// metadata read must preserve its parent, content, and marker. The provider
+    /// version may advance between exact reads, but it must never regress.
     ///
     /// # Errors
     /// Fails closed when either identity is absent, duplicated, points at a
@@ -618,9 +619,10 @@ impl TransferDrive {
             .recheck_existing(created.file_id(), intent, true)?
             .ok_or_else(|| Error::new(ErrorCode::RevisionMismatch))?;
         let final_object = remote_object(&verified, intent)?;
-        if final_object.provider_version != created.provider_version {
-            return Err(Error::new(ErrorCode::RevisionMismatch));
-        }
+        require_provider_version_not_regressed(
+            &created.provider_version,
+            &final_object.provider_version,
+        )?;
         Ok(final_object)
     }
 
@@ -1042,9 +1044,11 @@ impl TransferDrive {
         let verified = self
             .recheck_existing(&file.id, &session.intent, true)?
             .ok_or_else(|| Error::new(ErrorCode::RevisionMismatch))?;
-        if verified.version.as_deref() != Some(response_version) {
-            return Err(Error::new(ErrorCode::RevisionMismatch));
-        }
+        let verified_version = verified
+            .version
+            .as_deref()
+            .ok_or_else(|| Error::new(ErrorCode::MalformedResponse))?;
+        require_provider_version_not_regressed(response_version, verified_version)?;
         session.next_offset = session.intent.size;
         Ok(UploadProgress::Complete(remote_object(
             &verified,
@@ -1364,6 +1368,21 @@ fn validate_version(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn require_provider_version_not_regressed(previous: &str, current: &str) -> Result<()> {
+    validate_version(previous).map_err(|_| Error::new(ErrorCode::MalformedResponse))?;
+    validate_version(current).map_err(|_| Error::new(ErrorCode::MalformedResponse))?;
+    let previous = previous
+        .parse::<u64>()
+        .map_err(|_| Error::new(ErrorCode::MalformedResponse))?;
+    let current = current
+        .parse::<u64>()
+        .map_err(|_| Error::new(ErrorCode::MalformedResponse))?;
+    if current < previous {
+        return Err(Error::new(ErrorCode::RevisionMismatch));
+    }
+    Ok(())
+}
+
 fn provider_version_from_sync_revision(sync_revision: &str) -> Result<String> {
     if sync_revision.len() != 64
         || !sync_revision
@@ -1430,6 +1449,10 @@ mod tests {
         format!(
             r#"{{"id":"file_1","name":"note.md","mimeType":"text/markdown","parents":["root_1"],"trashed":false,"version":"2","size":"3","sha256Checksum":"{SHA}","appProperties":{{"myvaultOperation":"operation_1","myvaultSha256":"{SHA}","myvaultSize":"3"}}}}"#
         )
+    }
+
+    fn complete_file_json_with_version(version: u64) -> String {
+        complete_file_json().replace("\"version\":\"2\"", &format!("\"version\":\"{version}\""))
     }
 
     fn complete_file_json_for_size(size: u64) -> String {
@@ -1771,6 +1794,88 @@ mod tests {
     }
 
     #[test]
+    fn post_create_verification_accepts_only_advancing_provider_versions() {
+        let mut advancing = Server::new();
+        binding_mocks(&mut advancing, 3);
+        let marker = advancing
+            .mock("GET", "/drive/v3/files")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("pageSize".into(), "2".into()),
+                Matcher::Regex("myvaultOperation.*operation_1".into()),
+            ]))
+            .with_body(format!(
+                r#"{{"files":[{}]}}"#,
+                complete_file_json_with_version(3)
+            ))
+            .create();
+        let name = advancing
+            .mock("GET", "/drive/v3/files")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("pageSize".into(), "2".into()),
+                Matcher::Regex("name.*note%2Emd|name.*note.md".into()),
+            ]))
+            .with_body(format!(
+                r#"{{"files":[{}]}}"#,
+                complete_file_json_with_version(3)
+            ))
+            .create();
+        let metadata = advancing
+            .mock("GET", "/drive/v3/files/file_1")
+            .match_query(Matcher::Regex("fields".into()))
+            .with_body(complete_file_json_with_version(4))
+            .create();
+        let create_intent = intent();
+        let created_file: TransferFile =
+            serde_json::from_str(&complete_file_json_with_version(2)).unwrap();
+        let created = remote_object(&created_file, &create_intent).unwrap();
+
+        let verified = TransferDrive::for_test(&advancing, 1024)
+            .verify_created_upload(&create_intent, &created)
+            .unwrap();
+
+        assert_eq!(verified.provider_version, "4");
+        assert_eq!(verified.sync_revision, format!("{:064x}", 4));
+        marker.assert();
+        name.assert();
+        metadata.assert();
+
+        let mut regressing = Server::new();
+        binding_mocks(&mut regressing, 3);
+        regressing
+            .mock("GET", "/drive/v3/files")
+            .match_query(Matcher::Regex("myvaultOperation.*operation_1".into()))
+            .with_body(format!(
+                r#"{{"files":[{}]}}"#,
+                complete_file_json_with_version(3)
+            ))
+            .create();
+        regressing
+            .mock("GET", "/drive/v3/files")
+            .match_query(Matcher::Regex("name.*note%2Emd|name.*note.md".into()))
+            .with_body(format!(
+                r#"{{"files":[{}]}}"#,
+                complete_file_json_with_version(3)
+            ))
+            .create();
+        regressing
+            .mock("GET", "/drive/v3/files/file_1")
+            .match_query(Matcher::Regex("fields".into()))
+            .with_body(complete_file_json_with_version(2))
+            .create();
+        let created_file: TransferFile =
+            serde_json::from_str(&complete_file_json_with_version(3)).unwrap();
+        let created = remote_object(&created_file, &create_intent).unwrap();
+
+        assert_eq!(
+            TransferDrive::for_test(&regressing, 1024)
+                .verify_created_upload(&create_intent, &created)
+                .unwrap_err()
+                .code(),
+            ErrorCode::RevisionMismatch
+        );
+    }
+
+    #[test]
     fn post_create_verification_rejects_concurrent_duplicate_marker() {
         let mut server = Server::new();
         binding_mocks(&mut server, 1);
@@ -2056,6 +2161,58 @@ mod tests {
                 .code(),
             ErrorCode::RangeRejected
         );
+    }
+
+    #[test]
+    fn final_upload_response_accepts_only_advancing_provider_versions() {
+        for (response_version, verified_version, expected) in [
+            (2, 3, Ok(format!("{:064x}", 3))),
+            (3, 2, Err(ErrorCode::RevisionMismatch)),
+        ] {
+            let mut server = Server::new();
+            binding_mocks(&mut server, 2);
+            let drive = TransferDrive::for_test(&server, 1024);
+            let upload = server
+                .mock("PUT", "/upload/drive/v3/files")
+                .match_query(Matcher::Any)
+                .with_status(200)
+                .with_body(complete_file_json_with_version(response_version))
+                .create();
+            let recheck = server
+                .mock("GET", "/drive/v3/files/file_1")
+                .match_query(Matcher::Regex("fields".into()))
+                .with_body(complete_file_json_with_version(verified_version))
+                .create();
+            let mut session = UploadSession {
+                uri: SecretString::from(format!(
+                    "{}/upload/drive/v3/files?upload_id=session",
+                    server.url()
+                )),
+                intent: intent(),
+                next_offset: 0,
+            };
+
+            match expected {
+                Ok(expected_revision) => {
+                    let UploadProgress::Complete(remote) =
+                        drive.upload_chunk(&mut session, b"abc").unwrap()
+                    else {
+                        panic!("final chunk must complete");
+                    };
+                    assert_eq!(remote.sync_revision(), expected_revision);
+                    assert_eq!(session.next_offset(), 3);
+                }
+                Err(expected_code) => {
+                    assert_eq!(
+                        drive.upload_chunk(&mut session, b"abc").unwrap_err().code(),
+                        expected_code
+                    );
+                    assert_eq!(session.next_offset(), 0);
+                }
+            }
+            upload.assert();
+            recheck.assert();
+        }
     }
 
     #[test]
