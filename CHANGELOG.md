@@ -4,9 +4,10 @@
 
 Built from the R1 merge checkpoint `681271a` on
 `codex/r2-guarded-transfer`ค่ะ Disposable macOS byte-exact round trip และ
-Android API 36 live acceptance ผ่านแล้วค่ะ This milestone remains a final
-candidate until the evidence head, fresh CI, review, PR readiness, and merge
-pass on one exact clean HEADค่ะ
+Android API 36 live acceptance ผ่านแล้วค่ะ Evidence head `cba94d1` ผ่าน fresh
+Quality, Android, Ubuntu และ Windows CI แล้วค่ะ This milestone remains a final
+candidate until the final evidence update, review, PR readiness, and merge pass
+on one exact clean HEADค่ะ
 
 - เพิ่ม schema v3 durable upload/download evidence, create-only operation
   markers, retry scheduling, `AuthRequired`, `NeedsReconcile`, restart recovery,
@@ -48,9 +49,10 @@ pass on one exact clean HEADค่ะ
 - Local final aggregate, Android cross-target Clippy, Kotlin tests, APK build และ
   16 KiB alignment ผ่านค่ะ Final APK คือ 304,163,423 bytes, SHA-256
   `cfb77292713957e245889c564ba6d1717303c0eca26f014b58696506bea02f1c`
-  และผ่าน v2 signatureค่ะ Earlier Draft PR CI เป็น historical evidence; ต้อง
-  รัน fresh exact-HEAD CI จาก source candidate `82669dc` และ evidence-head ที่
-  ตามมาก่อน mergeค่ะ
+  และผ่าน v2 signatureค่ะ Evidence head `cba94d1` ผ่าน Quality run
+  `29424661478` และ platform run `29424659698` ครบทั้ง Quality, Android,
+  Ubuntu AppImage และ Windows NSIS ค่ะ Quality attempt แรกล้มจาก GitHub runner
+  disk-full และ clean rerun ผ่านโดยไม่แก้ sourceค่ะ
 
 ## Unreleased — R1 native auth and read-only binding — 2026-07-14
 

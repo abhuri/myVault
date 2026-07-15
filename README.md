@@ -19,8 +19,9 @@ The first release targets macOS, Windows, Ubuntu, and Android through Tauri 2 wi
   ผ่านแล้ว โดย macOS รวม restart upload/download, offline pause/resume,
   credential restoration และ disconnect/reconnect ส่วน Android รวม offline,
   auth reacquisition และ cold restart recoveryค่ะ Final source fixes ถูก commit
-  ที่ `82669dc` แล้วค่ะ R2 ยังรอ evidence commit, fresh exact-HEAD CI, review
-  และ merge ก่อนประกาศ completeค่ะ
+  ที่ `82669dc` และ evidence head `cba94d1` ผ่าน fresh exact-HEAD Quality,
+  Android, Ubuntu และ Windows CI แล้วค่ะ R2 ยังรอ final evidence update,
+  review, PR readiness และ merge ก่อนประกาศ completeค่ะ
 - Roadmap ถูกล็อกเป็น `R1 → R2 → R3 → R4 → R5 → R6 → R7 → R8` จนถึง Personal First Release โดยรายละเอียด scope และ exit gates อยู่ใน [PROJECT_PLAN.md](PROJECT_PLAN.md) ค่ะ
 
 สถานะโดยประมาณคือ 40–45% ของ personal first release เมื่อวัดจาก user-visible outcome ค่ะ รายละเอียดทิศทางและ capability gaps อยู่ใน [PROJECT_PLAN.md](PROJECT_PLAN.md) ส่วน Git checkpoint, verification ล่าสุด และงานถัดไปอยู่ใน [SESSION_HANDOFF.md](SESSION_HANDOFF.md) ค่ะ

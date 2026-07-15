@@ -6,11 +6,13 @@ R2 is complete only when every applicable checkbox below is backed by evidence
 from one exact candidate HEADค่ะ Mock, compile, emulator, native runtime, and
 live evidence must remain explicitly distinguishedค่ะ
 
-Current status: `SOURCE + LIVE ACCEPTANCE PASSED; FINAL EVIDENCE HEAD/CI PENDING`
+Current status: `EVIDENCE-HEAD CI PASSED; FINAL DOCS-HEAD CI/REVIEW PENDING`
 ค่ะ The exact disposable macOS round trip, restart upload/download,
 offline pause/resume, credential restoration, disconnect/reconnect, and Android
-emulator journey now passค่ะ Source fixes are committed at `82669dc`; fresh
-exact-head CI, final review, PR readiness, and merge remainค่ะ
+emulator journey now passค่ะ Source fixes are committed at `82669dc`; evidence
+head `cba94d1` passed Quality run `29424661478` and platform run `29424659698`
+across Quality, Android, Ubuntu and Windowsค่ะ Final documentation-head CI,
+review, PR readiness, and merge remainค่ะ
 Earlier CI passed on Draft PR #27 candidates `ed90bfb` and `5d203aa`; it is
 historical evidence and not the final-head gateค่ะ
 Evidence and external blockers are recorded in [RESULTS.md](RESULTS.md)ค่ะ
@@ -150,7 +152,8 @@ Evidence and external blockers are recorded in [RESULTS.md](RESULTS.md)ค่ะ
 - [x] Android evidence remains labeled emulator-only; physical-device acceptance
   remains R7 of the product roadmapค่ะ
 - [x] Ubuntu AppImage and Windows NSIS build/test/package jobs pass on Draft PR
-  #27 candidate `ed90bfb` without being mislabeled as native UI acceptanceค่ะ
+  #27 evidence head `cba94d1` in platform run `29424659698` without being
+  mislabeled as native UI acceptanceค่ะ
 
 ## Gate 8 — Final integrated gate
 

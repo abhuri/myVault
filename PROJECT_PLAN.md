@@ -117,7 +117,7 @@ Planning range รวมที่เหลือจากผลรวม milesto
 | Milestone | Outcome | Dependency | Planning range | Status |
 |---|---|---|---|---|
 | R1 — Native Auth + Read-only Binding | แอปเชื่อม account, bind exact root และอ่าน remote state โดยไม่เขียน Drive ค่ะ | Phase 3A | 1–2 weeks | Complete — merged via PR #26 |
-| R2 — Guarded Transfer | Markdown และ attachment upload/download แบบ verified และ restart-safe ค่ะ | R1 | 2–3 weeks | Source + live passed — final evidence HEAD/CI pending |
+| R2 — Guarded Transfer | Markdown และ attachment upload/download แบบ verified และ restart-safe ค่ะ | R1 | 2–3 weeks | Evidence-head CI passed — final docs-head CI/review pending |
 | R3 — Mutations + Conflict Safety | Rename/move/Trash และ two-sided conflicts ปลอดภัยข้ามอุปกรณ์ค่ะ | R2 | 2–3 weeks | Locked planned |
 | R4 — Sync Control Plane + Safe Sync Alpha | ผู้ใช้ควบคุมและเข้าใจ Sync ได้ พร้อม end-to-end alpha acceptance ค่ะ | R3 | 1–2 weeks | Locked planned |
 | R5 — Local Product Completion | Local CRUD, attachment และ remaining editor/reader journey เชื่อม UI ครบค่ะ | R4 | 1–2 weeks | Locked planned |
@@ -407,7 +407,8 @@ Milestone จะถือว่า complete เมื่อครบทุกข
   [R2 acceptance](docs/sync/R2_ACCEPTANCE.md) ค่ะ
 - macOS disposable byte-exact round trip และ Android API 36 live acceptance
   ผ่านแล้วค่ะ macOS restart upload/download, offline pause/resume, credential
-  restoration และ disconnect/reconnect ผ่านแล้วค่ะ R2 ยังไม่ complete จน final
-  evidence HEAD ผ่าน fresh CI, review และ merge PR #27ค่ะ
+  restoration และ disconnect/reconnect ผ่านแล้วค่ะ Evidence head `cba94d1`
+  ผ่าน fresh Quality, Android, Ubuntu และ Windows CI แล้วค่ะ R2 ยังไม่ complete
+  จน final evidence update ผ่าน exact-head CI, review และ merge PR #27ค่ะ
 - คุณโออนุมัติ one-time execution ครอบคลุม implementation, bounded subagents,
   disposable Drive fixture, tests, CI, PR และ merge เมื่อ R2 gate ผ่านค่ะ

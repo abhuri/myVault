@@ -4,17 +4,17 @@ Updated 2026-07-15 Asia/Bangkok ค่ะ
 
 ## R2 — Guarded Transfer
 
-Status: `SOURCE + LIVE ACCEPTANCE PASSED; FINAL EVIDENCE HEAD/CI PENDING` ค่ะ
+Status: `EVIDENCE-HEAD CI PASSED; FINAL DOCS-HEAD CI/REVIEW PENDING` ค่ะ
 
 R2 started from the merged R1 checkpoint `681271a` on branch
 `codex/r2-guarded-transfer` after one-time execution approval from คุณโอค่ะ The
 candidate implements durable byte-verified upload/download and Android SAF
 runtime integrationค่ะ Live macOS byte-exact round trip, restart upload/download,
 offline pause/resume, credential restoration, disconnect/reconnect, and API 36
-emulator acceptance now passค่ะ R2 is not complete until fresh exact-HEAD CI,
-final review, Draft PR #27 readiness and merge ตาม
-[R2_ACCEPTANCE.md](R2_ACCEPTANCE.md)ค่ะ Final source fixes are committed as
-`82669dc`; the following evidence-alignment commit becomes the PR/CI headค่ะ
+emulator acceptance now passค่ะ Evidence head `cba94d1` passed fresh exact-head
+CI; R2 is not complete until final documentation-head CI, final review, Draft
+PR #27 readiness and merge ตาม [R2_ACCEPTANCE.md](R2_ACCEPTANCE.md)ค่ะ Final
+source fixes are committed as `82669dc`ค่ะ
 
 ### Implemented candidate scope
 
@@ -134,12 +134,16 @@ final review, Draft PR #27 readiness and merge ตาม
 - Later evidence candidate `5d203aa` passed Quality run `29394211918` and
   platform run `29394211922`ค่ะ These are also historical because final source
   fixes and this evidence record follow that commitค่ะ
+- Evidence head `cba94d1` passed Quality run `29424661478` and platform run
+  `29424659698` across Quality, Android compile/alignment, Ubuntu AppImage and
+  Windows NSISค่ะ The first Quality attempt ended from GitHub-hosted runner
+  disk exhaustion; a clean rerun passed without source changesค่ะ
 
-### Deliberately pending / finalization work
+### Finalization work
 
-- The final source fixes are committed at `82669dc` and this evidence-alignment
-  update follows themค่ะ Earlier green CI on `ed90bfb` and `5d203aa` cannot
-  satisfy the exact-head gateค่ะ
+- The final source fixes are committed at `82669dc` and evidence head `cba94d1`
+  passed the fresh exact-head gateค่ะ Earlier green CI on `ed90bfb` and
+  `5d203aa` remains historical evidence onlyค่ะ
 - Evidence-authoring snapshot was clean source HEAD `82669dc` plus exactly six
   modified documentation files: README, changelog, project plan, handoff,
   acceptance, and resultsค่ะ The evidence commit replaces that dirty snapshot
@@ -152,9 +156,8 @@ final review, Draft PR #27 readiness and merge ตาม
   until wall time catches up; this cannot duplicate a side effect or lose dataค่ะ
 - No personal Drive item, personal Vault, raw credential, 2FA flow, or physical
   Android device was accessedค่ะ Physical-device acceptance remains R7ค่ะ
-- Draft PR #27 must remain Draft until the evidence head is pushed, fresh Quality,
-  Android, Ubuntu, and Windows checks pass, and final security/diff review finds
-  no blockerค่ะ
+- Draft PR #27 must remain Draft until this final documentation update passes
+  Quality, Android, Ubuntu and Windows checks and final review finds no blockerค่ะ
 
 ## R1 — Native Auth + Read-only Existing Drive Binding
 
