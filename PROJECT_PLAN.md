@@ -57,10 +57,10 @@ Demo, compile-only, mock-only, emulator-only หรือ foundation-only ไม
 | Create, rename, move, Trash และ Restore | Foundation only | Core/mutation services มี safety tests แต่ Tauri commands และ UI journey ยังไม่ครบค่ะ |
 | Editor และ Reader | Partially usable | CodeMirror, autosave, GFM, sanitized Reader, code และ Mermaid ใช้งานได้ค่ะ Attachment workflow, properties และ embeds ยังไม่ครบค่ะ |
 | Search, backlinks และ graph | Prototype | Filter/quick switcher และ opened-note backlinks/graph มีใน Demo ค่ะ ยังไม่มี persistent full-vault content index ค่ะ |
-| Native Google authorization | Foundation only | Desktop OAuth/Keyring primitives และ Android bridge มีแล้วค่ะ Desktop ยังไม่ต่อเข้า runtime และ Android ยังขาด physical-device evidence ค่ะ |
-| Drive REST behavior | Spike only | Live disposable fixture, pagination, resumable upload และ trash-only cleanup เคยผ่านค่ะ ยังไม่ใช่ production adapter ในแอปค่ะ |
-| Sync state foundation | Complete เฉพาะ 3A | Private SQLite, exact binding, lease, scan state, queue, cursor และ reconciliation ผ่าน 17 tests และ merge แล้วค่ะ Crate ยังไม่เป็น dependency ของ Tauri app ค่ะ |
-| Production Drive Sync | Missing | ยังไม่มี Existing Drive binding, production scan, transfer, conflict handling หรือ Sync UI ในแอปค่ะ |
+| Native Google authorization | Runtime integrated (R1) | Desktop OAuth/Keyring และ Android bridge เชื่อม runtime แล้วค่ะ Android physical-device evidence ยัง deferred ไป R7 ค่ะ |
+| Drive REST behavior | Runtime integrated, guarded (R1–R2) | Exact-root binding/read plus create-only resumable upload และ bounded verified download ผ่าน disposable live acceptance แล้วค่ะ Rename/move/Trash/conflict mutation ยังไม่อยู่ใน scope ค่ะ |
+| Sync state foundation | Runtime integrated (R1–R2) | Private SQLite, exact binding, lease, scan state, queue, cursor, reconciliation และ durable transfer evidence เชื่อม Tauri runtime แล้วค่ะ |
+| Production Drive Sync | Guarded transfer implemented (R1–R2) | Existing Drive binding และ verified transfer อยู่ใน runtime แล้วค่ะ ยังไม่มี conflict handling, full Sync control plane หรือ two-sided mutation UI ค่ะ |
 | Packaging และ release | Partial | Demo artifacts และ CI builds มีแล้วค่ะ Native acceptance, recovery guide และ Personal First Release gate ยังไม่ครบค่ะ |
 
 คำว่า `Complete` หมายถึง complete ตามขอบเขต milestone เท่านั้น และไม่แปลว่าผลิตภัณฑ์ทั้งเส้นทางเสร็จแล้วค่ะ
@@ -117,7 +117,7 @@ Planning range รวมที่เหลือจากผลรวม milesto
 | Milestone | Outcome | Dependency | Planning range | Status |
 |---|---|---|---|---|
 | R1 — Native Auth + Read-only Binding | แอปเชื่อม account, bind exact root และอ่าน remote state โดยไม่เขียน Drive ค่ะ | Phase 3A | 1–2 weeks | Complete — merged via PR #26 |
-| R2 — Guarded Transfer | Markdown และ attachment upload/download แบบ verified และ restart-safe ค่ะ | R1 | 2–3 weeks | Evidence-head CI passed — final docs-head CI/review pending |
+| R2 — Guarded Transfer | Markdown และ attachment upload/download แบบ verified และ restart-safe ค่ะ | R1 | 2–3 weeks | Complete — merged via PR #27 |
 | R3 — Mutations + Conflict Safety | Rename/move/Trash และ two-sided conflicts ปลอดภัยข้ามอุปกรณ์ค่ะ | R2 | 2–3 weeks | Locked planned |
 | R4 — Sync Control Plane + Safe Sync Alpha | ผู้ใช้ควบคุมและเข้าใจ Sync ได้ พร้อม end-to-end alpha acceptance ค่ะ | R3 | 1–2 weeks | Locked planned |
 | R5 — Local Product Completion | Local CRUD, attachment และ remaining editor/reader journey เชื่อม UI ครบค่ะ | R4 | 1–2 weeks | Locked planned |
@@ -400,15 +400,13 @@ Milestone จะถือว่า complete เมื่อครบทุกข
 - R1 ถูก merge เข้า `main` ผ่าน PR #26 ที่ merge commit `681271a` หลัง live
   read-only acceptance, final review, Quality, Android compile, Ubuntu AppImage,
   และ Windows NSIS ผ่านค่ะ
-- Canonical R2 baseline คือ `origin/main` ที่ `681271a` และ active branch คือ
-  `codex/r2-guarded-transfer` ค่ะ
-- Active implementation milestone คือ R2 — Guarded Upload and Download ตาม
-  [R2 implementation plan](docs/sync/R2_PLAN.md) และ
-  [R2 acceptance](docs/sync/R2_ACCEPTANCE.md) ค่ะ
+- R2 ถูก merge เข้า `origin/main` ที่ `94db388` ผ่าน PR #27 ค่ะ
+- ไม่มี active implementation milestone ค่ะ R3 — Mutations + Conflict Safety
+  ยังคง Locked planned และต้องมี plan/transition approval ใหม่ก่อนเริ่มค่ะ
 - macOS disposable byte-exact round trip และ Android API 36 live acceptance
   ผ่านแล้วค่ะ macOS restart upload/download, offline pause/resume, credential
-  restoration และ disconnect/reconnect ผ่านแล้วค่ะ Evidence head `cba94d1`
-  ผ่าน fresh Quality, Android, Ubuntu และ Windows CI แล้วค่ะ R2 ยังไม่ complete
-  จน final evidence update ผ่าน exact-head CI, review และ merge PR #27ค่ะ
-- คุณโออนุมัติ one-time execution ครอบคลุม implementation, bounded subagents,
-  disposable Drive fixture, tests, CI, PR และ merge เมื่อ R2 gate ผ่านค่ะ
+  restoration และ disconnect/reconnect ผ่านแล้วค่ะ Final documentation head
+  `b08bb20` ผ่าน exact-head Quality/Android/Ubuntu/Windows CI และ post-merge
+  Quality บน `main` ผ่านแล้วค่ะ R2 complete ตาม locked scope ค่ะ
+- คุณโออนุมัติ one-time execution สำหรับ R2 แล้วและ execution ปิดสมบูรณ์ค่ะ
+  Approval นี้ไม่ครอบคลุม R3 rename/move/Trash/conflict work ค่ะ

@@ -1,13 +1,13 @@
 # Changelog
 
-## Unreleased — R2 guarded transfer final candidate — 2026-07-15
+## Unreleased — R2 guarded transfer completed — 2026-07-15
 
-Built from the R1 merge checkpoint `681271a` on
-`codex/r2-guarded-transfer`ค่ะ Disposable macOS byte-exact round trip และ
-Android API 36 live acceptance ผ่านแล้วค่ะ Evidence head `cba94d1` ผ่าน fresh
-Quality, Android, Ubuntu และ Windows CI แล้วค่ะ This milestone remains a final
-candidate until the final evidence update, review, PR readiness, and merge pass
-on one exact clean HEADค่ะ
+Built from the R1 merge checkpoint `681271a` and merged into `main` via PR #27
+at `94db388`ค่ะ Disposable macOS byte-exact round trip และ Android API 36 live
+acceptance ผ่านแล้วค่ะ Final documentation head `b08bb20` passed Quality run
+`29427668835` and platform run `29427668933`ค่ะ Post-merge Quality run
+`29429364407` passed on `main`ค่ะ R2 is complete for its locked milestone scope
+onlyค่ะ
 
 - เพิ่ม schema v3 durable upload/download evidence, create-only operation
   markers, retry scheduling, `AuthRequired`, `NeedsReconcile`, restart recovery,

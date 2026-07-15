@@ -6,13 +6,13 @@ R2 is complete only when every applicable checkbox below is backed by evidence
 from one exact candidate HEADค่ะ Mock, compile, emulator, native runtime, and
 live evidence must remain explicitly distinguishedค่ะ
 
-Current status: `EVIDENCE-HEAD CI PASSED; FINAL DOCS-HEAD CI/REVIEW PENDING`
+Current status: `COMPLETE — MERGED VIA PR #27`
 ค่ะ The exact disposable macOS round trip, restart upload/download,
 offline pause/resume, credential restoration, disconnect/reconnect, and Android
-emulator journey now passค่ะ Source fixes are committed at `82669dc`; evidence
-head `cba94d1` passed Quality run `29424661478` and platform run `29424659698`
-across Quality, Android, Ubuntu and Windowsค่ะ Final documentation-head CI,
-review, PR readiness, and merge remainค่ะ
+emulator journey now passค่ะ Source fixes are committed at `82669dc`; final
+documentation head `b08bb20` passed Quality run `29427668835` and platform run
+`29427668933` across Quality, Android, Ubuntu and Windowsค่ะ PR #27 merged into
+`main` at `94db388` and post-merge Quality run `29429364407` passedค่ะ
 Earlier CI passed on Draft PR #27 candidates `ed90bfb` and `5d203aa`; it is
 historical evidence and not the final-head gateค่ะ
 Evidence and external blockers are recorded in [RESULTS.md](RESULTS.md)ค่ะ
@@ -151,20 +151,21 @@ Evidence and external blockers are recorded in [RESULTS.md](RESULTS.md)ค่ะ
   exact per-path SHA-256 match to Vault C and zero queue counters after restartค่ะ
 - [x] Android evidence remains labeled emulator-only; physical-device acceptance
   remains R7 of the product roadmapค่ะ
-- [x] Ubuntu AppImage and Windows NSIS build/test/package jobs pass on Draft PR
-  #27 evidence head `cba94d1` in platform run `29424659698` without being
-  mislabeled as native UI acceptanceค่ะ
+- [x] Ubuntu AppImage and Windows NSIS build/test/package jobs pass on final PR
+  #27 documentation head `b08bb20` in platform run `29427668933` without being
+  mislabeled as native UI acceptanceค่ะ Earlier `cba94d1` evidence remains
+  historicalค่ะ
 
 ## Gate 8 — Final integrated gate
 
-- [ ] The live disposable round trip, deterministic offline aggregate, platform
+- [x] The live disposable round trip, deterministic offline aggregate, platform
   CI, security review, diff review, documentation review, and scope-drift review
   all pass on one exact candidate HEADค่ะ
 - [x] Evidence records HEAD, dirty state, environment, commands/jobs, outcomes,
   classifications, and deliberately untested behaviorค่ะ
 - [x] `PROJECT_PLAN.md`, `SESSION_HANDOFF.md`, `docs/sync/RESULTS.md`, README as
   applicable, and `CHANGELOG.md` agree on the R2 outcome and remaining R3 workค่ะ
-- [ ] The R2 PR is ready, checks are green, final review finds no blocker, and the
+- [x] The R2 PR is ready, checks are green, final review finds no blocker, and the
   approved merge completesค่ะ
 
 R3 must not start until this gate is complete and the roadmap transition is

@@ -12,16 +12,13 @@ The first release targets macOS, Windows, Ubuntu, and Android through Tauri 2 wi
 - R1 Native Auth + Read-only Existing Drive Binding ถูก merge ผ่าน PR #26 ที่
   `681271a` แล้วค่ะ Production OAuth, exact account/root binding, read-only
   scan, Changes drain และ redacted Tauri status เชื่อม runtime แล้วค่ะ
-- R2 Guarded Transfer อยู่ในสถานะ final candidate บน
-  `codex/r2-guarded-transfer` ค่ะ Upload/download แบบ byte-verified,
-  create-no-replace, durable retry/reconciliation และ Android SAF runtime ถูก
-  implement แล้วค่ะ Locked macOS และ Android API 36 disposable live round trip
-  ผ่านแล้ว โดย macOS รวม restart upload/download, offline pause/resume,
-  credential restoration และ disconnect/reconnect ส่วน Android รวม offline,
-  auth reacquisition และ cold restart recoveryค่ะ Final source fixes ถูก commit
-  ที่ `82669dc` และ evidence head `cba94d1` ผ่าน fresh exact-HEAD Quality,
-  Android, Ubuntu และ Windows CI แล้วค่ะ R2 ยังรอ final evidence update,
-  review, PR readiness และ merge ก่อนประกาศ completeค่ะ
+- R2 Guarded Transfer ถูก merge ผ่าน PR #27 เข้า `main` ที่ `94db388` แล้วค่ะ
+  Upload/download แบบ byte-verified, create-no-replace, durable
+  retry/reconciliation และ Android SAF runtime ผ่าน locked macOS กับ Android API
+  36 disposable live acceptance แล้วค่ะ Final documentation head `b08bb20`
+  ผ่าน Quality, Android, Ubuntu และ Windows CI และ post-merge Quality บน `main`
+  ผ่านแล้วค่ะ R2 complete เฉพาะขอบเขต milestone ค่ะ R3 ยังต้องเสนอแผนและขอ
+  transition approval แยกต่างหากค่ะ
 - Roadmap ถูกล็อกเป็น `R1 → R2 → R3 → R4 → R5 → R6 → R7 → R8` จนถึง Personal First Release โดยรายละเอียด scope และ exit gates อยู่ใน [PROJECT_PLAN.md](PROJECT_PLAN.md) ค่ะ
 
 สถานะโดยประมาณคือ 40–45% ของ personal first release เมื่อวัดจาก user-visible outcome ค่ะ รายละเอียดทิศทางและ capability gaps อยู่ใน [PROJECT_PLAN.md](PROJECT_PLAN.md) ส่วน Git checkpoint, verification ล่าสุด และงานถัดไปอยู่ใน [SESSION_HANDOFF.md](SESSION_HANDOFF.md) ค่ะ
