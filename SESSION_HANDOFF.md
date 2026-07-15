@@ -22,8 +22,9 @@ Updated 2026-07-15 Asia/Bangkok ค่ะ
   และ Windows NSIS ผ่านบน candidate เดียวก่อน mergeค่ะ
 - Active implementation milestone คือ R2 และ shared workspace อยู่บน
   `codex/r2-guarded-transfer` ซึ่งเริ่มจาก `681271a` ค่ะ
-- Current branch HEAD คือ `e39d131` และ working tree ยัง dirty ด้วย final live
-  Android fixes/evidenceค่ะ ห้ามใช้ earlier green CI แทน final-head CIค่ะ
+- R2 source candidate ถูก commit ที่ `e87759d` พร้อม final live Android
+  fixes/evidenceค่ะ Evidence-alignment commit ที่ตามมาคือ exact PR/CI head และ
+  ห้ามใช้ earlier green CI แทนค่ะ
 
 ## 3. Current Truth
 
@@ -44,15 +45,15 @@ Updated 2026-07-15 Asia/Bangkok ค่ะ
   mutation boundary, desktop local observation และ Android SAF guarded runtime
   แล้วค่ะ macOS disposable byte-exact round trip และ Android API 36 disposable
   live acceptance ผ่านแล้วค่ะ งานค้างคือ macOS restart/offline/auth lifecycle,
-  commit current fixes, push, fresh exact-HEAD CI, final review, เปลี่ยน Draft PR
-  #27 เป็น Ready และ mergeค่ะ
+  push evidence head, fresh exact-HEAD CI, final review, เปลี่ยน Draft PR #27
+  เป็น Ready และ mergeค่ะ
 - Conflict engine และ full Sync control-plane UI ยังเป็นงาน R3–R4 ค่ะ
 
 ## 4. Verification — R2 Candidate Audit
 
-สถานะนี้เป็น post-live local integration evidenceบน dirty working tree ที่
-branch HEAD `e39d131` ค่ะ Draft PR #27 เคยผ่าน quality, Android, Ubuntu
-AppImage และ Windows NSIS บน earlier candidate แต่ต้องรันใหม่หลัง final commitค่ะ
+สถานะนี้เป็น post-live local integration evidence จาก source candidate
+`e87759d` ค่ะ Draft PR #27 เคยผ่าน quality, Android, Ubuntu AppImage และ Windows
+NSIS บน earlier candidate แต่ต้องรันใหม่บน evidence head ที่มีเอกสารชุดนี้ค่ะ
 
 - `pnpm typecheck` ผ่านค่ะ
 - Frontend Vitest ผ่าน 5 files / 40 tests ค่ะ
@@ -142,7 +143,7 @@ Ignored-by-default tests คือ live Drive fixture และ OS keyring mutat
 1. ปิด macOS restart/offline lifecycle บน disposable Vault/root และขอ
    action-time confirmation ก่อนทดสอบ Disconnect Google Drive/credential
    restorationค่ะ
-2. ตรวจ final diff/secret/docs, commit current R2 fixes และ push branchค่ะ
+2. Push evidence head หลัง final diff/secret/docs audit ค่ะ
 3. รอ fresh Quality, Android compile, Ubuntu AppImage และ Windows NSIS บน exact
    final HEAD แล้วบันทึก run IDs กับผลค่ะ
 4. เปลี่ยน PR เป็น Ready และ merge เมื่อ Gate 0–8 ผ่านครบเท่านั้นค่ะ ห้ามแตะ

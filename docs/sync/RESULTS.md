@@ -11,8 +11,9 @@ R2 started from the merged R1 checkpoint `681271a` on branch
 candidate implements durable byte-verified upload/download and Android SAF
 runtime integrationค่ะ Live macOS byte-exact round trip and API 36 emulator
 acceptance now pass, but R2 is not complete until the remaining macOS lifecycle,
-current dirty working tree, fresh exact-HEAD CI, final review, Draft PR #27
-readiness and merge close ตาม [R2_ACCEPTANCE.md](R2_ACCEPTANCE.md)ค่ะ
+fresh exact-HEAD CI, final review, Draft PR #27 readiness and merge close ตาม
+[R2_ACCEPTANCE.md](R2_ACCEPTANCE.md)ค่ะ Source candidate is committed as
+`e87759d`; the following evidence-alignment commit is the PR/CI headค่ะ
 
 ### Implemented candidate scope
 
@@ -111,16 +112,16 @@ readiness and merge close ตาม [R2_ACCEPTANCE.md](R2_ACCEPTANCE.md)ค่�
 
 ### Deliberately pending / finalization work
 
-- The current evidence is from a dirty working tree based on branch HEAD
-  `e39d131`; the final candidate commit does not exist yetค่ะ Earlier green CI
-  on `ed90bfb` cannot satisfy the final-head gateค่ะ
+- The source candidate is committed at `e87759d` and this evidence-alignment
+  update follows itค่ะ Earlier green CI on `ed90bfb` cannot satisfy the
+  exact-head gateค่ะ
 - Live desktop auth-expiry/disconnect was not forced because disconnecting the
   native credential requires a fresh action-time confirmationค่ะ Deterministic
   auth-expiry, refresh, retry, and idempotent disconnect suites pass, while the
   broader macOS scenario checkbox remains open and must be described honestlyค่ะ
 - No personal Drive item, personal Vault, raw credential, 2FA flow, or physical
   Android device was accessedค่ะ Physical-device acceptance remains R7ค่ะ
-- Draft PR #27 must remain Draft until the final commit is pushed, fresh Quality,
+- Draft PR #27 must remain Draft until the evidence head is pushed, fresh Quality,
   Android, Ubuntu, and Windows checks pass, and final security/diff review finds
   no blockerค่ะ
 

@@ -39,7 +39,8 @@ fixes, fresh CI, review, PR readiness, and merge pass on one exact clean HEADค
   pending/reconcile state จนกลับ readyค่ะ Physical Android ยัง deferred ไป R7ค่ะ
 - Local final aggregate, Android cross-target Clippy, Kotlin tests, APK build และ
   16 KiB alignment ผ่านค่ะ Earlier Draft PR CI เป็น historical evidence; ต้อง
-  รัน fresh exact-HEAD CI หลัง final commit ก่อน mergeค่ะ
+  รัน fresh exact-HEAD CI จาก source candidate `e87759d` และ evidence-head ที่
+  ตามมาก่อน mergeค่ะ
 
 ## Unreleased — R1 native auth and read-only binding — 2026-07-14
 
