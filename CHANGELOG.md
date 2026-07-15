@@ -5,8 +5,8 @@
 Built from the R1 merge checkpoint `681271a` on
 `codex/r2-guarded-transfer`ค่ะ Disposable macOS byte-exact round trip และ
 Android API 36 live acceptance ผ่านแล้วค่ะ This milestone remains a final
-candidate until the remaining macOS restart/offline/auth lifecycle, current
-fixes, fresh CI, review, PR readiness, and merge pass on one exact clean HEADค่ะ
+candidate until the evidence head, fresh CI, review, PR readiness, and merge
+pass on one exact clean HEADค่ะ
 
 - เพิ่ม schema v3 durable upload/download evidence, create-only operation
   markers, retry scheduling, `AuthRequired`, `NeedsReconcile`, restart recovery,
@@ -30,6 +30,11 @@ fixes, fresh CI, review, PR readiness, and merge pass on one exact clean HEADค
   syncable reopen และคง private state/stage durability แบบ fail-closedค่ะ
 - เพิ่ม single-owned guarded worker, bounded 100-page/1,000-operation runs,
   resumable 8 MiB chunks, desktop 512 MiB payload cap และ Android 16 MiB capค่ะ
+- แก้ restart upload ให้ restage ได้เฉพาะ partial private stage ที่พิสูจน์ว่า
+  operation/source ตรงครบ และเก็บ wrong/full/hardlinked/replaced evidence แบบ
+  fail-closedค่ะ
+- แก้ offline retry storm ด้วย immutable eligibility snapshot ต่อ guarded run
+  และ post-execution retry clock ที่ใช้เหมือนกันบน native กับ Androidค่ะ
 - ขยาย R2 offline aggregate และ CI ให้ครอบคลุม regression crates,
   Android-target strict Clippy, Kotlin policy tests, APK build/alignment และ
   platform packagesค่ะ
@@ -37,9 +42,14 @@ fixes, fresh CI, review, PR readiness, and merge pass on one exact clean HEADค
   journeys รวมไฟล์ Unicode, zero-byte, 6 MiB + 1, 12 MiB และ 15 MiBค่ะ Android
   offline injection ไม่สร้าง remote duplicate และ cold restart ฟื้น durable
   pending/reconcile state จนกลับ readyค่ะ Physical Android ยัง deferred ไป R7ค่ะ
+- macOS restart upload/download, offline pause/resume, Keychain restoration และ
+  confirmed disconnect/reconnect ผ่านค่ะ Disconnect เก็บ exact binding กับ
+  durable transfer history ไว้ครบ และ reconnect บัญชี/รากเดิมกลับ readyค่ะ
 - Local final aggregate, Android cross-target Clippy, Kotlin tests, APK build และ
-  16 KiB alignment ผ่านค่ะ Earlier Draft PR CI เป็น historical evidence; ต้อง
-  รัน fresh exact-HEAD CI จาก source candidate `e87759d` และ evidence-head ที่
+  16 KiB alignment ผ่านค่ะ Final APK คือ 304,163,423 bytes, SHA-256
+  `cfb77292713957e245889c564ba6d1717303c0eca26f014b58696506bea02f1c`
+  และผ่าน v2 signatureค่ะ Earlier Draft PR CI เป็น historical evidence; ต้อง
+  รัน fresh exact-HEAD CI จาก source candidate `82669dc` และ evidence-head ที่
   ตามมาก่อน mergeค่ะ
 
 ## Unreleased — R1 native auth and read-only binding — 2026-07-14

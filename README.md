@@ -16,10 +16,11 @@ The first release targets macOS, Windows, Ubuntu, and Android through Tauri 2 wi
   `codex/r2-guarded-transfer` ค่ะ Upload/download แบบ byte-verified,
   create-no-replace, durable retry/reconciliation และ Android SAF runtime ถูก
   implement แล้วค่ะ Locked macOS และ Android API 36 disposable live round trip
-  ผ่านแล้ว โดย Android รวม offline pause/resume, auth reacquisition และ cold
-  restart recoveryค่ะ Source candidate ถูก commit ที่ `e87759d` แล้วค่ะ R2
-  ยังรอ fresh exact-HEAD CI, macOS lifecycle, review และ merge ก่อนประกาศ
-  completeค่ะ
+  ผ่านแล้ว โดย macOS รวม restart upload/download, offline pause/resume,
+  credential restoration และ disconnect/reconnect ส่วน Android รวม offline,
+  auth reacquisition และ cold restart recoveryค่ะ Final source fixes ถูก commit
+  ที่ `82669dc` แล้วค่ะ R2 ยังรอ evidence commit, fresh exact-HEAD CI, review
+  และ merge ก่อนประกาศ completeค่ะ
 - Roadmap ถูกล็อกเป็น `R1 → R2 → R3 → R4 → R5 → R6 → R7 → R8` จนถึง Personal First Release โดยรายละเอียด scope และ exit gates อยู่ใน [PROJECT_PLAN.md](PROJECT_PLAN.md) ค่ะ
 
 สถานะโดยประมาณคือ 40–45% ของ personal first release เมื่อวัดจาก user-visible outcome ค่ะ รายละเอียดทิศทางและ capability gaps อยู่ใน [PROJECT_PLAN.md](PROJECT_PLAN.md) ส่วน Git checkpoint, verification ล่าสุด และงานถัดไปอยู่ใน [SESSION_HANDOFF.md](SESSION_HANDOFF.md) ค่ะ

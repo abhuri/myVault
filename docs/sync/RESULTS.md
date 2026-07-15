@@ -4,16 +4,17 @@ Updated 2026-07-15 Asia/Bangkok ค่ะ
 
 ## R2 — Guarded Transfer
 
-Status: `FINAL CANDIDATE — LIVE ACCEPTANCE PASSED; FINAL HEAD/CI PENDING` ค่ะ
+Status: `SOURCE + LIVE ACCEPTANCE PASSED; FINAL EVIDENCE HEAD/CI PENDING` ค่ะ
 
 R2 started from the merged R1 checkpoint `681271a` on branch
 `codex/r2-guarded-transfer` after one-time execution approval from คุณโอค่ะ The
 candidate implements durable byte-verified upload/download and Android SAF
-runtime integrationค่ะ Live macOS byte-exact round trip and API 36 emulator
-acceptance now pass, but R2 is not complete until the remaining macOS lifecycle,
-fresh exact-HEAD CI, final review, Draft PR #27 readiness and merge close ตาม
-[R2_ACCEPTANCE.md](R2_ACCEPTANCE.md)ค่ะ Source candidate is committed as
-`e87759d`; the following evidence-alignment commit is the PR/CI headค่ะ
+runtime integrationค่ะ Live macOS byte-exact round trip, restart upload/download,
+offline pause/resume, credential restoration, disconnect/reconnect, and API 36
+emulator acceptance now passค่ะ R2 is not complete until fresh exact-HEAD CI,
+final review, Draft PR #27 readiness and merge ตาม
+[R2_ACCEPTANCE.md](R2_ACCEPTANCE.md)ค่ะ Final source fixes are committed as
+`82669dc`; the following evidence-alignment commit becomes the PR/CI headค่ะ
 
 ### Implemented candidate scope
 
@@ -55,29 +56,50 @@ fresh exact-HEAD CI, final review, Draft PR #27 readiness and merge close ตา
 - Frontend receives opaque sessions/operation IDs and redacted status onlyค่ะ
   Tokens, resumable session URIs, provider bodies, content bodies and ambient
   Vault paths remain outside frontend DTOs, logs and SQLiteค่ะ
+- Restarted uploads now discard and restage only a proven-short,
+  operation-scoped, unlinked private stage after exact current source
+  revision/hash/length proofค่ะ Fresh attempts, complete wrong-digest evidence,
+  hardlinks, replacements, or changed sources remain fail-closedค่ะ
+- Native and Android guarded workers use one immutable eligibility snapshot per
+  invocation and schedule retries from post-execution timeค่ะ An offline job can
+  therefore run at most once per invocation without starving unrelated workค่ะ
 
 ### Integrated deterministic and native evidence
 
 - The post-live integrated working tree passed `pnpm quality:r2:offline` on
   2026-07-15 Asia/Bangkokค่ะ This includes frontend typecheck, 5 files/40 tests,
   production build, Rustfmt, strict Clippy, and all expanded R2/regression testsค่ะ
-- A final macOS debug application and DMG bundle built successfully from the
-  same working tree after the live fixesค่ะ
+- A final macOS debug application bundle built successfully from the same
+  source tree after the live fixesค่ะ
 - Key final Rust counts include Drive 53, private-root 18, Vault SAF 10,
-  transfer 14, and Tauri 56 testsค่ะ The matrix includes real SQLite transaction
+  transfer 15, and Tauri 59 testsค่ะ The matrix includes real SQLite transaction
   aborts, exact staged/base durability failures, restart recovery, and every
   emitted 8 MiB resumable upload/status boundary for 0, 1, 8 MiB, 8 MiB + 1,
   and 16 MiB payloadsค่ะ
 - Android aarch64 strict Clippy and Gradle Vault SAF unit tests passedค่ะ The
-  final API 36 debug APK is 304,052,519 bytes, passed `zipalign` verification
-  for 16 KiB page alignment, and built successfully after the final source
-  fixesค่ะ
+  final API 36 debug APK is 304,163,423 bytes, passed `zipalign` verification
+  for 16 KiB page alignment and APK Signature Scheme v2, installed over the
+  accepted emulator state, and cold-launched the retained Vault at `Ready`ค่ะ
 - Final local APK SHA-256 is
-  `a3a1cef9b2a4e3e08118cef2ce4209d76578e6fb366edbc395e566369070bd4a`ค่ะ
+  `cfb77292713957e245889c564ba6d1717303c0eca26f014b58696506bea02f1c`ค่ะ
 - macOS live acceptance used only disposable Local Vaults and one exact
   disposable Drive rootค่ะ Markdown, Thai Unicode paths, zero-byte files,
   6 MiB + 1 byte and two 15 MiB restart fixtures completed a byte-exact
   Local A → Drive → Local B journeyค่ะ
+- macOS was terminated during a 15 MiB upload after a partial private stage and
+  during a 15 MiB download after partial stagingค่ะ Restart recovered both
+  without blind side-effect replay; the download Vault matched the source
+  manifest byte-for-byte across 11 filesค่ะ
+- A final 15 MiB upload was claimed while online, then its process-only proxy
+  was cut before remote mutationค่ะ It settled once at `retry_scheduled` with
+  `attempt_count = 0`, retained the full private stage, did not storm within the
+  invocation, and completed exactly once after network restorationค่ะ All queue
+  counters returned to zeroค่ะ
+- Live disconnect deleted the native refresh credential while preserving the
+  exact root binding and all 17 durable transfer-history recordsค่ะ OAuth
+  reconnect to the same account/root returned to `ready` with every queue
+  counter zeroค่ะ Deterministic native suites cover auth expiry/refresh and
+  repeated idempotent disconnect without corrupting a live tokenค่ะ
 - Android API 36 Vault A converged to `ready` with 9 files and no active,
   pending, retry, auth-required, or reconcile workค่ะ Vault B downloaded the
   same 9-file manifest byte-exactly; its recursive manifest SHA-256 was
@@ -109,16 +131,25 @@ fresh exact-HEAD CI, final review, Draft PR #27 readiness and merge close ตา
 - Platform run `29357617372` passed Ubuntu 22.04 AppImage in 11m27s and Windows
   2022 NSIS in 12m19s on the same candidateค่ะ These are package/build claims,
   not native UI acceptance claimsค่ะ
+- Later evidence candidate `5d203aa` passed Quality run `29394211918` and
+  platform run `29394211922`ค่ะ These are also historical because final source
+  fixes and this evidence record follow that commitค่ะ
 
 ### Deliberately pending / finalization work
 
-- The source candidate is committed at `e87759d` and this evidence-alignment
-  update follows itค่ะ Earlier green CI on `ed90bfb` cannot satisfy the
-  exact-head gateค่ะ
-- Live desktop auth-expiry/disconnect was not forced because disconnecting the
-  native credential requires a fresh action-time confirmationค่ะ Deterministic
-  auth-expiry, refresh, retry, and idempotent disconnect suites pass, while the
-  broader macOS scenario checkbox remains open and must be described honestlyค่ะ
+- The final source fixes are committed at `82669dc` and this evidence-alignment
+  update follows themค่ะ Earlier green CI on `ed90bfb` and `5d203aa` cannot
+  satisfy the exact-head gateค่ะ
+- Evidence-authoring snapshot was clean source HEAD `82669dc` plus exactly six
+  modified documentation files: README, changelog, project plan, handoff,
+  acceptance, and resultsค่ะ The evidence commit replaces that dirty snapshot
+  before fresh CIค่ะ
+- Live desktop auth-expiry was not forced by corrupting or expiring a real tokenค่ะ
+  Deterministic auth-expiry/refresh suites pass, while live credential
+  restoration and confirmed disconnect/reconnect passค่ะ
+- Final audit found no P0/P1ค่ะ One non-blocking P2 remains: if the wall clock is
+  adjusted backward during an operation, post-execution auth timing can wait
+  until wall time catches up; this cannot duplicate a side effect or lose dataค่ะ
 - No personal Drive item, personal Vault, raw credential, 2FA flow, or physical
   Android device was accessedค่ะ Physical-device acceptance remains R7ค่ะ
 - Draft PR #27 must remain Draft until the evidence head is pushed, fresh Quality,

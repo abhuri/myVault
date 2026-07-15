@@ -22,8 +22,8 @@ Updated 2026-07-15 Asia/Bangkok ค่ะ
   และ Windows NSIS ผ่านบน candidate เดียวก่อน mergeค่ะ
 - Active implementation milestone คือ R2 และ shared workspace อยู่บน
   `codex/r2-guarded-transfer` ซึ่งเริ่มจาก `681271a` ค่ะ
-- R2 source candidate ถูก commit ที่ `e87759d` พร้อม final live Android
-  fixes/evidenceค่ะ Evidence-alignment commit ที่ตามมาคือ exact PR/CI head และ
+- R2 final source fixes ถูก commit ที่ `82669dc` ค่ะ Live macOS/Android evidence
+  ถูกบันทึกใน evidence-alignment commit ที่ตามมา ซึ่งเป็น exact PR/CI head และ
   ห้ามใช้ earlier green CI แทนค่ะ
 
 ## 3. Current Truth
@@ -44,32 +44,39 @@ Updated 2026-07-15 Asia/Bangkok ค่ะ
   transfer state, create-no-replace local publication, exact-root Drive
   mutation boundary, desktop local observation และ Android SAF guarded runtime
   แล้วค่ะ macOS disposable byte-exact round trip และ Android API 36 disposable
-  live acceptance ผ่านแล้วค่ะ งานค้างคือ macOS restart/offline/auth lifecycle,
-  push evidence head, fresh exact-HEAD CI, final review, เปลี่ยน Draft PR #27
+  live acceptance ผ่านแล้วค่ะ macOS restart upload/download, offline
+  pause/resume, credential restoration และ disconnect/reconnect ผ่านแล้วค่ะ
+  งานค้างคือ push evidence head, fresh exact-HEAD CI, final review, เปลี่ยน Draft PR #27
   เป็น Ready และ mergeค่ะ
 - Conflict engine และ full Sync control-plane UI ยังเป็นงาน R3–R4 ค่ะ
 
 ## 4. Verification — R2 Candidate Audit
 
 สถานะนี้เป็น post-live local integration evidence จาก source candidate
-`e87759d` ค่ะ Draft PR #27 เคยผ่าน quality, Android, Ubuntu AppImage และ Windows
+`82669dc` ค่ะ Draft PR #27 เคยผ่าน quality, Android, Ubuntu AppImage และ Windows
 NSIS บน earlier candidate แต่ต้องรันใหม่บน evidence head ที่มีเอกสารชุดนี้ค่ะ
 
 - `pnpm typecheck` ผ่านค่ะ
 - Frontend Vitest ผ่าน 5 files / 40 tests ค่ะ
 - `pnpm build` ผ่านค่ะ Main chunk ประมาณ 1.06 MB และมี non-blocking chunk-size warning ค่ะ
 - `pnpm quality:r2:offline` ผ่านหลังรวม final audit fixes ทั้งหมดค่ะ
-- Final macOS debug `.app` และ `.dmg` bundle build ผ่านจาก working tree เดียวกันค่ะ
+- Final macOS debug `.app` bundle build ผ่านจาก source tree เดียวกันค่ะ
 - Rust R2 matrix ครอบคลุม Core, platform ACL/FS, private FS, recovery,
   mutations, snapshots, app service, desktop auth, Drive spike, Google auth,
   private root, Vault SAF, Sync engine, Drive, transfer และ Tauriค่ะ
 - `cargo fmt --manifest-path apps/tauri/src-tauri/Cargo.toml --all -- --check` ผ่านค่ะ
 - Android aarch64 strict Clippy, Kotlin Vault SAF unit tests, full debug APK
   build และ 16 KiB alignment ผ่านหลัง final source fixesค่ะ Final APK มีขนาด
-  304,052,519 bytes และ SHA-256 คือ
-  `a3a1cef9b2a4e3e08118cef2ce4209d76578e6fb366edbc395e566369070bd4a`ค่ะ
+  304,163,423 bytes และ SHA-256 คือ
+  `cfb77292713957e245889c564ba6d1717303c0eca26f014b58696506bea02f1c`ค่ะ
 - macOS disposable A → exact Drive root → B ผ่าน Markdown, Unicode, zero-byte,
   6 MiB + 1 และ 15 MiB restart fixtures แบบ byte-exactค่ะ
+- macOS restart ระหว่าง upload/download ผ่านค่ะ Offline upload หยุดหนึ่งครั้งที่
+  `retry_scheduled`/attempt 0 โดยไม่เกิด request storm แล้ว resume สำเร็จเมื่อ
+  network กลับมา และทุก queue counter กลับเป็นศูนย์ค่ะ
+- Keychain credential restoration กับ confirmed disconnect/reconnect ผ่านค่ะ
+  Disconnect ลบ credential แต่คง exact binding และ durable history 17 รายการ
+  จากนั้น reconnect บัญชี/รากเดิมกลับ ready/zero countersค่ะ
 - Android API 36 A/B ผ่าน 9-file byte-exact round tripค่ะ Offline injection
   หลัง private durable stage กลับมา complete โดย remote มี fixture เดียวค่ะ
   Cold restart ของ C ฟื้นจาก 1 completed / 8 pending / 1 reconcile ไปเป็น
@@ -78,12 +85,17 @@ NSIS บน earlier candidate แต่ต้องรันใหม่บน e
   transcript ครบ 10/10 files และ per-path SHA-256 manifest ตรงกับ Vault Cค่ะ
   Cold restart แล้ว reconnect binding เดิม กลับสู่ ready โดยทุก queue counter
   เป็นศูนย์ค่ะ
+- APK SHA ข้างต้นติดตั้งทับ accepted API 36 state และ cold-launch retained Vault
+  ที่ `Ready` สำเร็จค่ะ
 - Static R2 mutation/token audit ผ่าน, production dependency tree ไม่มี
   `drive-sync-spike` และ `pnpm audit --prod` ไม่พบ known vulnerabilityค่ะ
 
 Filesystem watcher และ Unix-socket fixture ล้มเมื่อรันใน restricted sandbox แต่กรณีเดียวกันผ่านเมื่อรันด้วย native filesystem permissions ค่ะ จึงจัดเป็น environment restriction ไม่ใช่ product regression ในรอบนี้ค่ะ
 
-Ignored-by-default tests คือ live Drive fixture และ OS keyring mutation เพราะแตะ external account/credential store ค่ะ รอบ audit นี้ไม่ได้รันสองรายการดังกล่าวค่ะ
+Ignored-by-default test binaries คือ live Drive fixture และ OS keyring mutation
+เพราะแตะ external account/credential store ค่ะ รอบ aggregate ไม่ได้เปิดสอง test
+binaries นี้ แต่ manual disposable live journey, Keychain restoration และ
+confirmed disconnect/reconnect ถูกทดสอบแยกและบันทึกไว้ด้านบนค่ะ
 
 ## 5. Completed Through R2 Integration
 
@@ -121,8 +133,8 @@ Ignored-by-default tests คือ live Drive fixture และ OS keyring mutat
 ### Product blockers
 
 - Production guarded Drive transfer path และ locked disposable macOS/Android
-  round-trip evidence ผ่านแล้วค่ะ macOS restart/offline/auth lifecycle และ final
-  clean HEAD/CI/PR merge ยังไม่ผ่านค่ะ
+  round-trip/lifecycle evidence ผ่านแล้วค่ะ Final evidence HEAD/CI/PR merge
+  ยังไม่ผ่านค่ะ
 - ไม่มี user-visible Sync status/retry/conflict recovery ค่ะ
 - Local mutation services ยังไม่ถูก expose ถึง UI ครบค่ะ
 
@@ -140,13 +152,10 @@ Ignored-by-default tests คือ live Drive fixture และ OS keyring mutat
 
 ## 8. Next Actions
 
-1. ปิด macOS restart/offline lifecycle บน disposable Vault/root และขอ
-   action-time confirmation ก่อนทดสอบ Disconnect Google Drive/credential
-   restorationค่ะ
-2. Push evidence head หลัง final diff/secret/docs audit ค่ะ
-3. รอ fresh Quality, Android compile, Ubuntu AppImage และ Windows NSIS บน exact
+1. Commit และ push evidence head หลัง final diff/secret/docs audit ค่ะ
+2. รอ fresh Quality, Android compile, Ubuntu AppImage และ Windows NSIS บน exact
    final HEAD แล้วบันทึก run IDs กับผลค่ะ
-4. เปลี่ยน PR เป็น Ready และ merge เมื่อ Gate 0–8 ผ่านครบเท่านั้นค่ะ ห้ามแตะ
+3. เปลี่ยน PR เป็น Ready และ merge เมื่อ Gate 0–8 ผ่านครบเท่านั้นค่ะ ห้ามแตะ
    personal Vault/Drive หรือเริ่ม R3 rename/move/Trash/conflict workค่ะ
 
 ## 9. Approval State
