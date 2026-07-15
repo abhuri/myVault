@@ -611,6 +611,28 @@ where
     /// Returns a store or timestamp error without discarding the claimed
     /// operation's durable evidence.
     pub fn run_once(&mut self, now_unix_ms: u64) -> Result<WorkOutcome> {
+        self.run_once_with_completion_clock(now_unix_ms, || now_unix_ms)
+    }
+
+    /// Claims and advances at most one durable transfer operation, scheduling
+    /// any disposition from a clock sampled after execution finishes.
+    ///
+    /// `eligibility_cutoff_unix_ms` is an immutable snapshot cutoff: only work
+    /// due at or before it may be claimed. The completion clock must use the
+    /// same Unix-millisecond epoch. Values earlier than the cutoff are clamped
+    /// so a wall-clock correction cannot violate durable ordering.
+    ///
+    /// # Errors
+    /// Returns a store or timestamp error without discarding the claimed
+    /// operation's durable evidence.
+    pub fn run_once_with_completion_clock<F>(
+        &mut self,
+        eligibility_cutoff_unix_ms: u64,
+        completion_clock: F,
+    ) -> Result<WorkOutcome>
+    where
+        F: FnOnce() -> u64,
+    {
         if self.auth_refresh_required.is_some() {
             // A single executor owns one immutable access token. Do not claim
             // another operation after that token is proven expired. Returning
@@ -618,7 +640,7 @@ where
             // remains available through `auth_refresh_required`.
             return Ok(WorkOutcome::Idle);
         }
-        let Some(intent) = self.store.claim_due(now_unix_ms)? else {
+        let Some(intent) = self.store.claim_due(eligibility_cutoff_unix_ms)? else {
             return Ok(WorkOutcome::Idle);
         };
         let operation_id = intent.operation_id();
@@ -626,7 +648,7 @@ where
         let execution = {
             let (store, executor) = (&mut self.store, &mut self.executor);
             let mut before_local_publish = || {
-                let result = store.begin_local_publish(operation_id, now_unix_ms);
+                let result = store.begin_local_publish(operation_id, eligibility_cutoff_unix_ms);
                 if let Err(error) = result {
                     gate_error = Some(error);
                 }
@@ -637,22 +659,27 @@ where
         if let Some(error) = gate_error {
             return Err(error);
         }
+        let completion_now_unix_ms = completion_clock().max(eligibility_cutoff_unix_ms);
         match execution {
             Ok(verified) => {
                 if !verified.matches(&intent) {
                     self.store.mark_needs_reconcile(
                         operation_id,
                         "verified_evidence_mismatch",
-                        now_unix_ms,
+                        completion_now_unix_ms,
                     )?;
                     return Ok(WorkOutcome::NeedsReconcile(operation_id));
                 }
-                self.store.complete_verified(&verified, now_unix_ms)?;
+                self.store
+                    .complete_verified(&verified, completion_now_unix_ms)?;
                 Ok(WorkOutcome::Completed(operation_id))
             }
-            Err(failure) => {
-                self.handle_failure(operation_id, now_unix_ms, intent.attempt_count(), &failure)
-            }
+            Err(failure) => self.handle_failure(
+                operation_id,
+                completion_now_unix_ms,
+                intent.attempt_count(),
+                &failure,
+            ),
         }
     }
 
@@ -1220,6 +1247,112 @@ mod tests {
         let (store, _) = worker.into_parts();
         assert_eq!(store.offline_pauses, [(id, 3_000, "network_offline")]);
         assert!(store.retries.is_empty());
+    }
+
+    #[test]
+    fn slow_offline_execution_cannot_immediately_reclaim_the_same_operation() {
+        struct DurableRetryStore {
+            intent: TransferIntent,
+            next_attempt_at_unix_ms: u64,
+            claims: u32,
+            offline_pauses: Vec<(Uuid, u64, &'static str)>,
+        }
+
+        impl TransferStore for DurableRetryStore {
+            fn claim_due(&mut self, now_unix_ms: u64) -> Result<Option<TransferIntent>> {
+                if now_unix_ms < self.next_attempt_at_unix_ms {
+                    return Ok(None);
+                }
+                self.claims += 1;
+                Ok(Some(self.intent.clone()))
+            }
+
+            fn begin_local_publish(
+                &mut self,
+                _operation_id: Uuid,
+                _now_unix_ms: u64,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            fn complete_verified(
+                &mut self,
+                _verified: &VerifiedTransfer,
+                _now_unix_ms: u64,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            fn schedule_retry(
+                &mut self,
+                _operation_id: Uuid,
+                _next_attempt_at_unix_ms: u64,
+                _code: &'static str,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            fn pause_offline(
+                &mut self,
+                operation_id: Uuid,
+                next_attempt_at_unix_ms: u64,
+                code: &'static str,
+            ) -> Result<()> {
+                self.next_attempt_at_unix_ms = next_attempt_at_unix_ms;
+                self.offline_pauses
+                    .push((operation_id, next_attempt_at_unix_ms, code));
+                Ok(())
+            }
+
+            fn mark_auth_required(
+                &mut self,
+                _operation_id: Uuid,
+                _code: &'static str,
+                _now_unix_ms: u64,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            fn mark_needs_reconcile(
+                &mut self,
+                _operation_id: Uuid,
+                _code: &'static str,
+                _now_unix_ms: u64,
+            ) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let id = Uuid::new_v4();
+        let store = DurableRetryStore {
+            intent: intent(id),
+            next_attempt_at_unix_ms: 1_000,
+            claims: 0,
+            offline_pauses: Vec::new(),
+        };
+        let failure =
+            ExecutionFailure::new(ExecutionFailureKind::Offline, "drive_transport", None).unwrap();
+        let executor = ScriptedExecutor {
+            results: VecDeque::from([Err(failure)]),
+        };
+        let mut worker = Worker::new(store, executor);
+
+        assert_eq!(
+            worker
+                .run_once_with_completion_clock(1_000, || 5_000)
+                .unwrap(),
+            WorkOutcome::RetryScheduled(id)
+        );
+        assert_eq!(worker.run_once(5_000).unwrap(), WorkOutcome::Idle);
+
+        let (store, executor) = worker.into_parts();
+        assert_eq!(store.claims, 1);
+        assert_eq!(
+            store.offline_pauses,
+            [(id, 5_000 + BASE_BACKOFF_MS, "drive_transport")]
+        );
+        assert_eq!(store.intent.attempt_count(), 0);
+        assert!(executor.results.is_empty());
     }
 
     #[derive(Clone, Copy, Debug)]

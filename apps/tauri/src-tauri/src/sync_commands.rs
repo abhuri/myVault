@@ -7,8 +7,9 @@ use myvault_sync_engine::{
     InitialSyncProgress, RemoteEntryKind, RemotePreviewCursor, RemotePreviewPage, SyncPhase,
     TransferSummary,
 };
+use myvault_transfer::{TransferExecutor, TransferStore, WorkOutcome, Worker};
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_PREVIEW_LIMIT: usize = 100;
 const MAX_CURSOR_BYTES: usize = 4 * 1024;
@@ -310,6 +311,43 @@ fn now_unix_ms() -> Result<u64, SyncCommandError> {
     u64::try_from(duration.as_millis()).map_err(|_| SyncCommandError::internal())
 }
 
+fn completion_unix_ms(claim_now_unix_ms: u64, claim_instant: Instant) -> u64 {
+    let elapsed_ms = u64::try_from(claim_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
+    claim_now_unix_ms.saturating_add(elapsed_ms)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GuardedWorkerOutcome {
+    Drained,
+    AuthRequired,
+}
+
+fn drain_guarded_snapshot<S, E, F, C>(
+    worker: &mut Worker<S, E>,
+    eligibility_cutoff_unix_ms: u64,
+    max_operations: usize,
+    mut completion_clock: F,
+) -> myvault_transfer::Result<GuardedWorkerOutcome>
+where
+    S: TransferStore,
+    E: TransferExecutor,
+    F: FnMut() -> C,
+    C: FnOnce() -> u64,
+{
+    for _ in 0..max_operations {
+        match worker
+            .run_once_with_completion_clock(eligibility_cutoff_unix_ms, completion_clock())?
+        {
+            WorkOutcome::Idle => return Ok(GuardedWorkerOutcome::Drained),
+            WorkOutcome::Completed(_)
+            | WorkOutcome::RetryScheduled(_)
+            | WorkOutcome::NeedsReconcile(_) => {}
+            WorkOutcome::AuthRequired(_) => return Ok(GuardedWorkerOutcome::AuthRequired),
+        }
+    }
+    Ok(GuardedWorkerOutcome::Drained)
+}
+
 const fn phase_name(phase: SyncPhase) -> &'static str {
     match phase {
         SyncPhase::NeedStartToken => "needStartToken",
@@ -442,7 +480,7 @@ mod platform {
         TransferDirection, TransferMimeClass, TransferPhase, TransferRecord,
         TransferRegistrationOutcome, VaultSyncState,
     };
-    use myvault_transfer::{WorkOutcome, Worker, MAX_TRANSFER_BYTES};
+    use myvault_transfer::MAX_TRANSFER_BYTES;
     use std::{
         collections::{BTreeMap, BTreeSet},
         process::{Command, Stdio},
@@ -1318,12 +1356,6 @@ mod platform {
         Ok(())
     }
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum GuardedWorkerOutcome {
-        Drained,
-        AuthRequired,
-    }
-
     fn run_guarded_worker(
         service: &AppService,
         session_id: VaultSessionId,
@@ -1332,19 +1364,18 @@ mod platform {
     ) -> Result<GuardedWorkerOutcome, SyncCommandError> {
         let executor = NativeTransferExecutor::new(service, session_id, drive);
         let mut worker = Worker::new(store, executor);
-        for _ in 0..MAX_GUARDED_OPERATIONS {
-            match worker
-                .run_once(now_unix_ms()?)
-                .map_err(|_| SyncCommandError::internal())?
-            {
-                WorkOutcome::Idle => return Ok(GuardedWorkerOutcome::Drained),
-                WorkOutcome::Completed(_)
-                | WorkOutcome::RetryScheduled(_)
-                | WorkOutcome::NeedsReconcile(_) => {}
-                WorkOutcome::AuthRequired(_) => return Ok(GuardedWorkerOutcome::AuthRequired),
-            }
-        }
-        Ok(GuardedWorkerOutcome::Drained)
+        // One guarded invocation drains only work that was already eligible at
+        // entry. A retry scheduled while draining cannot become eligible again
+        // merely because unrelated operations took longer than its backoff.
+        let eligibility_cutoff_unix_ms = now_unix_ms()?;
+        let eligibility_instant = Instant::now();
+        drain_guarded_snapshot(
+            &mut worker,
+            eligibility_cutoff_unix_ms,
+            MAX_GUARDED_OPERATIONS,
+            || || completion_unix_ms(eligibility_cutoff_unix_ms, eligibility_instant),
+        )
+        .map_err(|_| SyncCommandError::internal())
     }
 
     fn run_guarded_worker_with_auth_refresh(
@@ -3078,7 +3109,6 @@ mod platform {
         TransferDirection, TransferMimeClass, TransferPhase, TransferRecord,
         TransferRegistrationOutcome, VaultSyncState,
     };
-    use myvault_transfer::{WorkOutcome, Worker};
     use std::{
         collections::{BTreeMap, BTreeSet},
         sync::{Arc, Mutex},
@@ -3889,12 +3919,6 @@ mod platform {
         Ok(())
     }
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum GuardedWorkerOutcome {
-        Drained,
-        AuthRequired,
-    }
-
     fn run_guarded_worker(
         app: &tauri::AppHandle,
         vault: &SafVaultCapability,
@@ -3922,21 +3946,18 @@ mod platform {
             drive,
         );
         let mut worker = Worker::new(store, executor);
-        for _ in 0..MAX_GUARDED_OPERATIONS {
-            match worker
-                .run_once(now_unix_ms()?)
-                .map_err(|_| SyncCommandError::internal())?
-            {
-                WorkOutcome::Idle => return Ok(GuardedWorkerOutcome::Drained),
-                WorkOutcome::Completed(_)
-                | WorkOutcome::RetryScheduled(_)
-                | WorkOutcome::NeedsReconcile(_) => {}
-                WorkOutcome::AuthRequired(_) => {
-                    return Ok(GuardedWorkerOutcome::AuthRequired);
-                }
-            }
-        }
-        Ok(GuardedWorkerOutcome::Drained)
+        // Match native semantics: this invocation owns one immutable snapshot
+        // of eligible operations while each operation gets a fresh completion
+        // clock for post-execution retry timing.
+        let eligibility_cutoff_unix_ms = now_unix_ms()?;
+        let eligibility_instant = Instant::now();
+        drain_guarded_snapshot(
+            &mut worker,
+            eligibility_cutoff_unix_ms,
+            MAX_GUARDED_OPERATIONS,
+            || || completion_unix_ms(eligibility_cutoff_unix_ms, eligibility_instant),
+        )
+        .map_err(|_| SyncCommandError::internal())
     }
 
     fn refresh_run_authorization_once(
@@ -4657,6 +4678,218 @@ pub use platform::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use myvault_transfer::{
+        ContentKind, ExecutionFailure, ExecutionFailureKind, TransferDirection as WorkerDirection,
+        TransferIntent, VerifiedTransfer,
+    };
+    use std::collections::VecDeque;
+    use uuid::Uuid;
+
+    const WORKER_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    struct SnapshotJob {
+        intent: TransferIntent,
+        next_attempt_at_unix_ms: u64,
+        running: bool,
+        completed: bool,
+    }
+
+    struct SnapshotStore {
+        jobs: Vec<SnapshotJob>,
+        claims: Vec<Uuid>,
+        offline_pauses: Vec<(Uuid, u64)>,
+    }
+
+    impl TransferStore for SnapshotStore {
+        fn claim_due(
+            &mut self,
+            eligibility_cutoff_unix_ms: u64,
+        ) -> myvault_transfer::Result<Option<TransferIntent>> {
+            let Some(index) = self.jobs.iter().position(|job| {
+                !job.running
+                    && !job.completed
+                    && job.next_attempt_at_unix_ms <= eligibility_cutoff_unix_ms
+            }) else {
+                return Ok(None);
+            };
+            self.jobs[index].running = true;
+            let intent = self.jobs[index].intent.clone();
+            self.claims.push(intent.operation_id());
+            Ok(Some(intent))
+        }
+
+        fn begin_local_publish(
+            &mut self,
+            _operation_id: Uuid,
+            _now_unix_ms: u64,
+        ) -> myvault_transfer::Result<()> {
+            Ok(())
+        }
+
+        fn complete_verified(
+            &mut self,
+            verified: &VerifiedTransfer,
+            _now_unix_ms: u64,
+        ) -> myvault_transfer::Result<()> {
+            let job = self
+                .jobs
+                .iter_mut()
+                .find(|job| job.intent.operation_id() == verified.operation_id())
+                .expect("completed job");
+            job.running = false;
+            job.completed = true;
+            Ok(())
+        }
+
+        fn schedule_retry(
+            &mut self,
+            operation_id: Uuid,
+            next_attempt_at_unix_ms: u64,
+            _code: &'static str,
+        ) -> myvault_transfer::Result<()> {
+            let job = self
+                .jobs
+                .iter_mut()
+                .find(|job| job.intent.operation_id() == operation_id)
+                .expect("retry job");
+            job.running = false;
+            job.next_attempt_at_unix_ms = next_attempt_at_unix_ms;
+            Ok(())
+        }
+
+        fn pause_offline(
+            &mut self,
+            operation_id: Uuid,
+            next_attempt_at_unix_ms: u64,
+            _code: &'static str,
+        ) -> myvault_transfer::Result<()> {
+            self.schedule_retry(operation_id, next_attempt_at_unix_ms, "offline")?;
+            self.offline_pauses
+                .push((operation_id, next_attempt_at_unix_ms));
+            Ok(())
+        }
+
+        fn mark_auth_required(
+            &mut self,
+            operation_id: Uuid,
+            _code: &'static str,
+            _now_unix_ms: u64,
+        ) -> myvault_transfer::Result<()> {
+            self.mark_needs_reconcile(operation_id, "auth", 0)
+        }
+
+        fn mark_needs_reconcile(
+            &mut self,
+            operation_id: Uuid,
+            _code: &'static str,
+            _now_unix_ms: u64,
+        ) -> myvault_transfer::Result<()> {
+            let job = self
+                .jobs
+                .iter_mut()
+                .find(|job| job.intent.operation_id() == operation_id)
+                .expect("stopped job");
+            job.running = false;
+            job.completed = true;
+            Ok(())
+        }
+    }
+
+    struct SnapshotExecutor {
+        results: VecDeque<std::result::Result<VerifiedTransfer, ExecutionFailure>>,
+    }
+
+    impl TransferExecutor for SnapshotExecutor {
+        fn execute(
+            &mut self,
+            _intent: &TransferIntent,
+            _before_local_publish: &mut dyn FnMut() -> myvault_transfer::Result<()>,
+        ) -> std::result::Result<VerifiedTransfer, ExecutionFailure> {
+            self.results.pop_front().expect("scripted execution")
+        }
+    }
+
+    fn worker_intent(operation_id: Uuid, path: &str) -> TransferIntent {
+        TransferIntent::new(
+            operation_id,
+            WorkerDirection::Upload,
+            path,
+            "parent",
+            None,
+            Some("local-revision".to_owned()),
+            None,
+            WORKER_HASH,
+            1,
+            ContentKind::Blob,
+            format!("operation-{operation_id}"),
+            Some(format!("stage-{operation_id}")),
+            None,
+            0,
+        )
+        .expect("intent")
+    }
+
+    fn worker_verified(operation_id: Uuid) -> VerifiedTransfer {
+        VerifiedTransfer::new(
+            operation_id,
+            "remote",
+            "remote-revision",
+            Some("local-revision".to_owned()),
+            WORKER_HASH,
+            1,
+            "base",
+            "upload_verified",
+        )
+        .expect("verified")
+    }
+
+    #[test]
+    fn guarded_snapshot_attempts_each_initially_due_operation_at_most_once() {
+        let offline_id = Uuid::new_v4();
+        let unrelated_id = Uuid::new_v4();
+        let store = SnapshotStore {
+            jobs: vec![
+                SnapshotJob {
+                    intent: worker_intent(offline_id, "offline.bin"),
+                    next_attempt_at_unix_ms: 1_000,
+                    running: false,
+                    completed: false,
+                },
+                SnapshotJob {
+                    intent: worker_intent(unrelated_id, "unrelated.bin"),
+                    next_attempt_at_unix_ms: 1_000,
+                    running: false,
+                    completed: false,
+                },
+            ],
+            claims: Vec::new(),
+            offline_pauses: Vec::new(),
+        };
+        let offline = ExecutionFailure::new(ExecutionFailureKind::Offline, "drive_transport", None)
+            .expect("offline failure");
+        let executor = SnapshotExecutor {
+            results: VecDeque::from([Err(offline), Ok(worker_verified(unrelated_id))]),
+        };
+        let mut worker = Worker::new(store, executor);
+        let mut completion_times = VecDeque::from([5_000, 8_000, 10_000]);
+
+        assert_eq!(
+            drain_guarded_snapshot(&mut worker, 1_000, 10, || {
+                let completion = completion_times.pop_front().expect("completion clock");
+                move || completion
+            })
+            .expect("guarded drain"),
+            GuardedWorkerOutcome::Drained
+        );
+
+        let (store, executor) = worker.into_parts();
+        assert_eq!(store.claims, [offline_id, unrelated_id]);
+        assert_eq!(store.offline_pauses, [(offline_id, 6_000)]);
+        assert_eq!(store.jobs[0].intent.attempt_count(), 0);
+        assert!(!store.jobs[0].completed);
+        assert!(store.jobs[1].completed);
+        assert!(executor.results.is_empty());
+    }
 
     #[test]
     fn frontend_errors_are_camel_case_and_redacted() {

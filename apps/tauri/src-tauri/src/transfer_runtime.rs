@@ -71,6 +71,53 @@ impl<'a> NativeTransferExecutor<'a> {
                     MAX_TRANSFER_BYTES_USIZE,
                 )
                 .map_err(local_failure)?,
+            Err(NativeTransferError::DigestMismatch) => {
+                // A process can die while copying the local source into its
+                // operation-scoped private stage. Replay is safe only while
+                // the durable source evidence still matches exactly. Remove
+                // only a proven-short, unlinked stage; complete/corrupt or
+                // replaced evidence remains fail-closed in the app-service.
+                if intent.attempt_count() == 0 {
+                    return Err(local_failure(NativeTransferError::DigestMismatch));
+                }
+                let mut sink = std::io::sink();
+                let current_source = self
+                    .service
+                    .stream_transfer_source(
+                        self.session_id,
+                        intent.path(),
+                        &mut sink,
+                        MAX_TRANSFER_BYTES_USIZE,
+                    )
+                    .map_err(local_failure)?;
+                if current_source.revision.hex != expected_local_revision
+                    || current_source.sha256.as_str() != intent.sha256_hex()
+                    || current_source.byte_len != intent.byte_len()
+                {
+                    return Err(failure(
+                        ExecutionFailureKind::NeedsReconcile,
+                        "local_source_changed",
+                        None,
+                    ));
+                }
+                self.service
+                    .discard_incomplete_transfer_stage(
+                        self.session_id,
+                        intent.operation_id(),
+                        intent.sha256_hex(),
+                        intent.byte_len(),
+                        MAX_TRANSFER_BYTES_USIZE,
+                    )
+                    .map_err(local_failure)?;
+                self.service
+                    .stage_transfer_source(
+                        self.session_id,
+                        intent.operation_id(),
+                        intent.path(),
+                        MAX_TRANSFER_BYTES_USIZE,
+                    )
+                    .map_err(local_failure)?
+            }
             Err(error) => return Err(local_failure(error)),
         };
         validate_stage(intent, &stage)?;
@@ -880,6 +927,289 @@ mod tests {
         );
         assert_eq!(verified.outcome_code(), "upload_verified");
         post.assert();
+    }
+
+    #[test]
+    fn restarted_upload_recreates_partial_stage_after_exact_source_proof() {
+        let temporary = tempfile::tempdir().expect("temporary roots");
+        let base = temporary
+            .path()
+            .canonicalize()
+            .expect("canonical temporary root");
+        let app_data = base.join("app-data");
+        let vault_root = base.join("vault");
+        fs::create_dir(&app_data).expect("app data");
+        fs::create_dir(&vault_root).expect("vault root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&app_data, fs::Permissions::from_mode(0o700))
+                .expect("private app data");
+        }
+        fs::write(vault_root.join("restart.bin"), b"complete upload").expect("source");
+        let operation_id = Uuid::new_v4();
+        let interrupted = AppService::with_app_data_root(&app_data);
+        let interrupted_session = interrupted
+            .activate_trusted_vault(Vault::open(&vault_root).expect("open vault"))
+            .expect("activate")
+            .session_id
+            .expect("session");
+        let mut sink = std::io::sink();
+        let snapshot = interrupted
+            .stream_transfer_source(
+                interrupted_session,
+                "restart.bin",
+                &mut sink,
+                MAX_TRANSFER_BYTES_USIZE,
+            )
+            .expect("snapshot");
+        let mut partial = interrupted
+            .begin_transfer_stage(interrupted_session, operation_id, MAX_TRANSFER_BYTES_USIZE)
+            .expect("partial stage");
+        partial.write_all(b"partial").expect("partial bytes");
+        drop(partial);
+        drop(interrupted);
+
+        let intent = TransferIntent::new(
+            operation_id,
+            TransferDirection::Upload,
+            "restart.bin",
+            "root_1",
+            None,
+            Some(snapshot.revision.hex.clone()),
+            None,
+            snapshot.sha256.as_str(),
+            snapshot.byte_len,
+            ContentKind::Blob,
+            format!("r2-{}", operation_id.simple()),
+            Some(format!("stage-{operation_id}")),
+            None,
+            1,
+        )
+        .expect("intent");
+        let fresh_intent = TransferIntent::new(
+            operation_id,
+            TransferDirection::Upload,
+            "restart.bin",
+            "root_1",
+            None,
+            Some(snapshot.revision.hex.clone()),
+            None,
+            snapshot.sha256.as_str(),
+            snapshot.byte_len,
+            ContentKind::Blob,
+            format!("r2-{}", operation_id.simple()),
+            Some(format!("stage-{operation_id}")),
+            None,
+            0,
+        )
+        .expect("fresh intent");
+        let service = AppService::with_app_data_root(&app_data);
+        let session_id = service
+            .activate_trusted_vault(Vault::open(&vault_root).expect("reopen vault"))
+            .expect("reactivate")
+            .session_id
+            .expect("new session");
+
+        let mut no_remote_server = Server::new();
+        let no_get = no_remote_server
+            .mock("GET", Matcher::Any)
+            .expect(0)
+            .create();
+        let no_post = no_remote_server
+            .mock("POST", Matcher::Any)
+            .expect(0)
+            .create();
+        let no_put = no_remote_server
+            .mock("PUT", Matcher::Any)
+            .expect(0)
+            .create();
+        let no_remote_origin = no_remote_server.url();
+        let no_remote_drive = TransferDrive::for_test_origins(
+            &format!("{no_remote_origin}/drive/v3/"),
+            &format!("{no_remote_origin}/upload/drive/v3/"),
+            "account_1",
+            "root_1",
+            MAX_TRANSFER_BYTES,
+        )
+        .expect("test Drive");
+        let mut fresh_executor = NativeTransferExecutor::new(&service, session_id, no_remote_drive);
+
+        let fresh_error = fresh_executor
+            .execute(&fresh_intent, &mut || Ok(()))
+            .expect_err("fresh intent must preserve unexplained partial evidence");
+        assert_eq!(fresh_error.kind(), ExecutionFailureKind::NeedsReconcile);
+        assert_eq!(fresh_error.code(), "local_digest_mismatch");
+        assert!(matches!(
+            service.load_transfer_stage(
+                session_id,
+                operation_id,
+                snapshot.sha256.as_str(),
+                snapshot.byte_len,
+                MAX_TRANSFER_BYTES_USIZE,
+            ),
+            Err(NativeTransferError::DigestMismatch)
+        ));
+        no_get.assert();
+        no_post.assert();
+        no_put.assert();
+
+        let mut server = Server::new();
+        server
+            .mock("GET", "/drive/v3/about")
+            .match_query(Matcher::Any)
+            .with_body(r#"{"user":{"permissionId":"account_1"}}"#)
+            .expect(2)
+            .create();
+        server
+            .mock("GET", "/drive/v3/files/root_1")
+            .match_query(Matcher::Any)
+            .with_body(r#"{"id":"root_1","name":"Root","mimeType":"application/vnd.google-apps.folder","parents":[],"trashed":false,"version":"1"}"#)
+            .expect(2)
+            .create();
+        let remote = format!(
+            r#"{{"id":"file_1","name":"restart.bin","mimeType":"application/octet-stream","parents":["root_1"],"trashed":false,"version":"2","size":"{}","sha256Checksum":"{}","appProperties":{{"myvaultOperation":"{}","myvaultSha256":"{}","myvaultSize":"{}"}}}}"#,
+            snapshot.byte_len,
+            snapshot.sha256.as_str(),
+            intent.operation_marker(),
+            snapshot.sha256.as_str(),
+            snapshot.byte_len,
+        );
+        server
+            .mock("GET", "/drive/v3/files")
+            .match_query(Matcher::Any)
+            .with_body(format!(r#"{{"files":[{remote}]}}"#))
+            .expect(1)
+            .create();
+        server
+            .mock("GET", "/drive/v3/files/file_1")
+            .match_query(Matcher::Any)
+            .with_body(remote)
+            .expect(1)
+            .create();
+        let post = server
+            .mock("POST", "/upload/drive/v3/files")
+            .match_query(Matcher::Any)
+            .expect(0)
+            .create();
+        let origin = server.url();
+        let drive = TransferDrive::for_test_origins(
+            &format!("{origin}/drive/v3/"),
+            &format!("{origin}/upload/drive/v3/"),
+            "account_1",
+            "root_1",
+            MAX_TRANSFER_BYTES,
+        )
+        .expect("test Drive");
+        let mut executor = NativeTransferExecutor::new(&service, session_id, drive);
+
+        let verified = executor
+            .execute(&intent, &mut || Ok(()))
+            .expect("recovered upload");
+
+        assert_eq!(verified.remote_file_id(), "file_1");
+        assert_eq!(verified.sha256_hex(), snapshot.sha256.as_str());
+        assert_eq!(verified.outcome_code(), "upload_verified");
+        post.assert();
+    }
+
+    #[test]
+    fn restarted_upload_preserves_partial_stage_when_source_changed() {
+        let temporary = tempfile::tempdir().expect("temporary roots");
+        let base = temporary
+            .path()
+            .canonicalize()
+            .expect("canonical temporary root");
+        let app_data = base.join("app-data");
+        let vault_root = base.join("vault");
+        fs::create_dir(&app_data).expect("app data");
+        fs::create_dir(&vault_root).expect("vault root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&app_data, fs::Permissions::from_mode(0o700))
+                .expect("private app data");
+        }
+        fs::write(vault_root.join("restart.bin"), b"expected").expect("source");
+        let operation_id = Uuid::new_v4();
+        let interrupted = AppService::with_app_data_root(&app_data);
+        let interrupted_session = interrupted
+            .activate_trusted_vault(Vault::open(&vault_root).expect("open vault"))
+            .expect("activate")
+            .session_id
+            .expect("session");
+        let mut sink = std::io::sink();
+        let snapshot = interrupted
+            .stream_transfer_source(
+                interrupted_session,
+                "restart.bin",
+                &mut sink,
+                MAX_TRANSFER_BYTES_USIZE,
+            )
+            .expect("snapshot");
+        let mut partial = interrupted
+            .begin_transfer_stage(interrupted_session, operation_id, MAX_TRANSFER_BYTES_USIZE)
+            .expect("partial stage");
+        partial.write_all(b"part").expect("partial bytes");
+        drop(partial);
+        drop(interrupted);
+        fs::write(vault_root.join("restart.bin"), b"modified").expect("changed source");
+
+        let intent = TransferIntent::new(
+            operation_id,
+            TransferDirection::Upload,
+            "restart.bin",
+            "root_1",
+            None,
+            Some(snapshot.revision.hex.clone()),
+            None,
+            snapshot.sha256.as_str(),
+            snapshot.byte_len,
+            ContentKind::Blob,
+            format!("r2-{}", operation_id.simple()),
+            Some(format!("stage-{operation_id}")),
+            None,
+            1,
+        )
+        .expect("intent");
+        let service = AppService::with_app_data_root(&app_data);
+        let session_id = service
+            .activate_trusted_vault(Vault::open(&vault_root).expect("reopen vault"))
+            .expect("reactivate")
+            .session_id
+            .expect("new session");
+        let server = Server::new();
+        let origin = server.url();
+        let drive = TransferDrive::for_test_origins(
+            &format!("{origin}/drive/v3/"),
+            &format!("{origin}/upload/drive/v3/"),
+            "account_1",
+            "root_1",
+            MAX_TRANSFER_BYTES,
+        )
+        .expect("test Drive");
+        let mut executor = NativeTransferExecutor::new(&service, session_id, drive);
+
+        let error = executor
+            .execute(&intent, &mut || Ok(()))
+            .expect_err("changed source must fail closed");
+
+        assert_eq!(error.kind(), ExecutionFailureKind::NeedsReconcile);
+        assert_eq!(error.code(), "local_source_changed");
+        assert!(matches!(
+            service.load_transfer_stage(
+                session_id,
+                operation_id,
+                snapshot.sha256.as_str(),
+                snapshot.byte_len,
+                MAX_TRANSFER_BYTES_USIZE,
+            ),
+            Err(NativeTransferError::DigestMismatch)
+        ));
+        assert!(matches!(
+            service.begin_transfer_stage(session_id, operation_id, MAX_TRANSFER_BYTES_USIZE),
+            Err(NativeTransferError::StageAlreadyExists)
+        ));
     }
 
     #[test]
