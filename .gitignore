@@ -30,6 +30,8 @@ crates/*/Cargo.lock
 key.properties
 secrets.properties
 google-services.json
+google-desktop-client.json
+google-desktop.env
 client_secret*.json
 credentials*.json
 token*.json

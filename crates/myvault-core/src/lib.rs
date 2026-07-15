@@ -9,6 +9,7 @@ mod error;
 mod index;
 mod path;
 mod revision;
+mod transfer;
 mod trash;
 mod vault;
 mod watcher;
@@ -17,6 +18,7 @@ pub use error::{CoreError, Result};
 pub use index::{DerivedIndex, NoteRecord, SCHEMA_VERSION, SQLITE_OPEN_RESIDUAL_RISK};
 pub use path::VaultPath;
 pub use revision::FileRevision;
+pub use transfer::{stream_content_snapshot, ContentPublishOutcome, ContentSnapshot, Sha256Digest};
 pub use trash::{
     ManifestDigest, PayloadKind, PrepareManifestOutcome, PublishItemOutcome, RestoreItemOutcome,
     StagePayloadOutcome, TrashArea, TrashId, TrashListEvidence, TrashListPage, TrashManifestV1,

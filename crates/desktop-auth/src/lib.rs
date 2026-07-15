@@ -32,7 +32,7 @@ const GOOGLE_AUTHORIZATION_ENDPOINT: &str = "https://accounts.google.com/o/oauth
 const GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 const MAX_REQUEST_BYTES: usize = 16 * 1024;
 const MAX_TOKEN_RESPONSE_BYTES: usize = 64 * 1024;
-pub const GOOGLE_DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.metadata.readonly";
+pub const GOOGLE_DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive";
 
 /// OAuth errors are intentionally free of secret-bearing response bodies.
 #[derive(Debug)]
@@ -935,7 +935,7 @@ mod tests {
     fn native_boundary_rejects_scopes_outside_exact_drive_allowlist() {
         let wrong_scope = DesktopOAuth::bind(
             "test-client",
-            &["https://www.googleapis.com/auth/drive.file"],
+            &["https://www.googleapis.com/auth/drive.metadata.readonly"],
         )
         .err()
         .unwrap();
@@ -1253,7 +1253,7 @@ mod tests {
             .mock("POST", "/token")
             .with_status(200)
             .with_body(
-                r#"{"access_token":"secret","token_type":"Bearer","scope":"https://www.googleapis.com/auth/drive"}"#,
+                r#"{"access_token":"secret","token_type":"Bearer","scope":"https://www.googleapis.com/auth/drive.metadata.readonly"}"#,
             )
             .create();
         let scope_client = GoogleTokenClient::with_endpoint(

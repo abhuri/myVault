@@ -19,10 +19,18 @@ pub enum ErrorCode {
     CursorAmbiguous,
     IncompleteSearch,
     RateLimited,
+    TransientProvider,
     ProviderRejected,
     InvalidAccount,
     InvalidRoot,
     UnexpectedOrigin,
+    HashMismatch,
+    RevisionMismatch,
+    SessionExpired,
+    RangeRejected,
+    ExistingDifferentContent,
+    AmbiguousRemote,
+    LocalIo,
 }
 
 impl ErrorCode {
@@ -42,10 +50,18 @@ impl ErrorCode {
             Self::CursorAmbiguous => "cursor_ambiguous",
             Self::IncompleteSearch => "drive_incomplete_search",
             Self::RateLimited => "drive_rate_limited",
+            Self::TransientProvider => "drive_transient_provider",
             Self::ProviderRejected => "drive_provider_rejected",
             Self::InvalidAccount => "drive_invalid_account",
             Self::InvalidRoot => "drive_invalid_root",
             Self::UnexpectedOrigin => "drive_unexpected_origin",
+            Self::HashMismatch => "drive_hash_mismatch",
+            Self::RevisionMismatch => "drive_revision_mismatch",
+            Self::SessionExpired => "drive_session_expired",
+            Self::RangeRejected => "drive_range_rejected",
+            Self::ExistingDifferentContent => "drive_existing_different_content",
+            Self::AmbiguousRemote => "drive_ambiguous_remote",
+            Self::LocalIo => "drive_local_io",
         }
     }
 }
@@ -54,16 +70,34 @@ impl ErrorCode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Error {
     code: ErrorCode,
+    retry_after_seconds: Option<u64>,
 }
 
 impl Error {
     pub(crate) const fn new(code: ErrorCode) -> Self {
-        Self { code }
+        Self {
+            code,
+            retry_after_seconds: None,
+        }
+    }
+
+    pub(crate) const fn with_retry_after(code: ErrorCode, seconds: u64) -> Self {
+        Self {
+            code,
+            retry_after_seconds: Some(seconds),
+        }
     }
 
     #[must_use]
     pub const fn code(self) -> ErrorCode {
         self.code
+    }
+
+    /// Returns a bounded provider retry hint without exposing response bodies
+    /// or headers. Values above one hour are rejected during parsing.
+    #[must_use]
+    pub const fn retry_after_seconds(self) -> Option<u64> {
+        self.retry_after_seconds
     }
 
     /// Converts this adapter failure into the sync engine's bounded error type.
@@ -80,11 +114,7 @@ impl Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "read-only Drive request failed ({})",
-            self.code.as_str()
-        )
+        write!(formatter, "Drive request failed ({})", self.code.as_str())
     }
 }
 

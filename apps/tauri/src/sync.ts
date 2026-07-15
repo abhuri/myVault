@@ -9,6 +9,12 @@ export type SyncStatus = {
   bound: boolean;
   phase: string;
   rescanRequired: boolean;
+  active: number;
+  pending: number;
+  retryScheduled: number;
+  authRequired: number;
+  needsReconcile: number;
+  completed: number;
   accountId: string | null;
   rootId: string | null;
   rootName: string | null;
@@ -40,7 +46,7 @@ export type PreviewPage = {
   hasMore: boolean;
 };
 
-export type SyncBusy = "status" | "connect" | "folders" | "bind" | "scan" | "preview" | "disconnect" | null;
+export type SyncBusy = "status" | "connect" | "folders" | "bind" | "scan" | "preview" | "transfer" | "disconnect" | null;
 
 export type SyncUiState = {
   sessionId: string;
@@ -71,10 +77,35 @@ export type SyncAction =
 const MAX_TEXT = 4096;
 export const MAX_ACCUMULATED_FOLDERS = 2000;
 export const MAX_ACCUMULATED_PREVIEW_ENTRIES = 1000;
-export const SYNC_BUSY_VAULT_MESSAGE = "Finish or cancel the read-only Drive metadata operation before opening another Vault.";
+export const SYNC_BUSY_VAULT_MESSAGE = "Finish or cancel the active Google Drive operation before opening another Vault.";
+export const LOCAL_SYNC_HINT_EVENT = "myvault-local-sync-hint";
 
 export function canOpenAnotherVault(syncBusy: boolean): boolean {
   return !syncBusy;
+}
+
+export function requestLocalSyncHint(sessionId: string): void {
+  window.dispatchEvent(new CustomEvent(LOCAL_SYNC_HINT_EVENT, { detail: { sessionId } }));
+}
+
+export function isLocalSyncHintForSession(event: Event, sessionId: string): boolean {
+  if (!(event instanceof CustomEvent) || typeof event.detail !== "object" || event.detail === null) return false;
+  return (event.detail as Record<string, unknown>).sessionId === sessionId;
+}
+
+export function canRunLocalObservation(
+  status: SyncStatus | null,
+  busy: SyncBusy,
+  pending: boolean,
+): boolean {
+  return pending
+    && busy === null
+    && status?.supported === true
+    && status.bindingAvailable
+    && status.connected
+    && status.bound
+    && !status.rescanRequired
+    && status.phase.toLocaleLowerCase("en-US") === "ready";
 }
 
 function recordOf(value: unknown, label: string): Record<string, unknown> {
@@ -100,6 +131,13 @@ function booleanOf(value: unknown, label: string): boolean {
   return value;
 }
 
+function countOf(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${label} response is invalid`);
+  }
+  return value;
+}
+
 function assertSession(value: unknown, expectedSessionId: string): string {
   const sessionId = textOf(value, "session identity");
   if (sessionId !== expectedSessionId) throw new Error("Sync response identity mismatch");
@@ -108,6 +146,14 @@ function assertSession(value: unknown, expectedSessionId: string): string {
 
 export function mapSyncStatus(value: unknown, expectedSessionId: string): SyncStatus {
   const raw = recordOf(value, "Sync status");
+  const active = countOf(raw.active, "active transfer count");
+  const pending = countOf(raw.pending, "pending transfer count");
+  const retryScheduled = countOf(raw.retryScheduled, "scheduled retry count");
+  const authRequired = countOf(raw.authRequired, "authorization-required transfer count");
+  const needsReconcile = countOf(raw.needsReconcile, "reconciliation-required transfer count");
+  if (active < pending + retryScheduled + authRequired + needsReconcile) {
+    throw new Error("Transfer status response is inconsistent");
+  }
   return {
     sessionId: assertSession(raw.sessionId, expectedSessionId),
     supported: booleanOf(raw.supported, "platform support"),
@@ -117,6 +163,12 @@ export function mapSyncStatus(value: unknown, expectedSessionId: string): SyncSt
     bound: booleanOf(raw.bound, "bound"),
     phase: textOf(raw.phase, "phase", true),
     rescanRequired: booleanOf(raw.rescanRequired, "rescan"),
+    active,
+    pending,
+    retryScheduled,
+    authRequired,
+    needsReconcile,
+    completed: countOf(raw.completed, "completed transfer count"),
     accountId: optionalTextOf(raw.accountId, "account id"),
     rootId: optionalTextOf(raw.rootId, "root id"),
     rootName: optionalTextOf(raw.rootName, "root name"),
@@ -257,11 +309,11 @@ export function safeSyncFailure(reason: unknown): string {
     cursorExpired: "Drive metadata changed too far back. A fresh read-only scan is required.",
     cursorAmbiguous: "A Drive move could not be mapped safely. A fresh read-only scan is required.",
     rescanRequired: "Drive metadata must be scanned again before the preview can continue.",
-    notConfigured: "Google Drive metadata access is not configured on this device.",
-    unconfigured: "Google Drive metadata access is not configured on this device.",
+    notConfigured: "Google Drive access is not configured on this device.",
+    unconfigured: "Google Drive access is not configured on this device.",
     staleSession: "The active Vault changed. Reopen this panel for the current Vault.",
   };
-  return messages[code] ?? "The read-only Drive metadata request could not be completed.";
+  return messages[code] ?? "The Google Drive operation could not be completed.";
 }
 
 export const syncApi = {
@@ -293,6 +345,12 @@ export const syncApi = {
       await invoke<unknown>("sync_preview", { sessionId, after, limit }),
       sessionId,
       after,
+    );
+  },
+  async runGuarded(sessionId: string): Promise<SyncStatus> {
+    return mapSyncStatus(
+      await invoke<unknown>("sync_run_guarded", { sessionId }),
+      sessionId,
     );
   },
   async disconnect(sessionId: string): Promise<SyncStatus> {

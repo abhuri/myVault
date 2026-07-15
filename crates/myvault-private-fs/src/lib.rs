@@ -40,6 +40,8 @@ pub enum AndroidAclInspection {
 #[cfg(target_os = "android")]
 pub struct InspectedAndroidPrivateRoot {
     directory: Dir,
+    canonical_path: PathBuf,
+    identity: HeldDirectoryIdentity,
     acl: AndroidAclInspection,
 }
 
@@ -73,6 +75,17 @@ pub struct PrivateDisjointRoots {
     private_root: Dir,
     other_root: Dir,
     other_identity: UnixRootIdentity,
+}
+
+/// A race-checked private root capability retaining its canonical location and
+/// the identity of the held directory.
+///
+/// Private fields prevent downstream code from assembling this capability
+/// from an arbitrary ambient path.
+pub struct HeldPrivateRoot {
+    directory: Dir,
+    canonical_path: PathBuf,
+    identity: HeldDirectoryIdentity,
 }
 
 /// Opaque identity of a held directory, suitable for detecting replacement
@@ -199,6 +212,42 @@ impl PrivateDisjointRoots {
     }
 }
 
+impl HeldPrivateRoot {
+    /// Revalidates privacy and the exact held/canonical directory identity.
+    ///
+    /// # Errors
+    /// Rejects replacement, rename, symlink substitution, permission drift,
+    /// extended ACLs, and platforms without a complete privacy proof.
+    pub fn revalidate(&self) -> Result<(), Error> {
+        let canonical = self.canonical_path.canonicalize()?;
+        if canonical != self.canonical_path {
+            return Err(Error::ExternalMutation);
+        }
+        require_private_directory(&self.directory)?;
+        verify_root_identity(&self.directory, &self.canonical_path)?;
+        if held_directory_identity(&self.directory)? != self.identity {
+            return Err(Error::ExternalMutation);
+        }
+        Ok(())
+    }
+
+    /// Clones the held directory capability without performing an ambient open.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the descriptor can no longer be cloned.
+    #[doc(hidden)]
+    pub fn try_clone_directory(&self) -> Result<Dir, Error> {
+        Ok(self.directory.try_clone()?)
+    }
+
+    /// Returns the canonical location retained by the validated capability.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+}
+
 #[cfg(target_os = "android")]
 impl InspectedAndroidPrivateRoot {
     /// Returns whether ACL xattrs were proven absent or unsupported.
@@ -207,12 +256,38 @@ impl InspectedAndroidPrivateRoot {
         self.acl
     }
 
-    /// Consumes the untrusted inspection wrapper for use by a native adapter.
-    /// This does not itself confer no-backup provenance.
+    /// Revalidates exact mode/owner/ACL facts and held/canonical identity.
+    ///
+    /// # Errors
+    /// Rejects path replacement, symlinks, ownership/mode drift, or ACL drift.
+    pub fn revalidate(&self) -> Result<(), Error> {
+        let canonical = self.canonical_path.canonicalize()?;
+        if canonical != self.canonical_path {
+            return Err(Error::ExternalMutation);
+        }
+        verify_root_identity(&self.directory, &self.canonical_path)?;
+        if held_directory_identity(&self.directory)? != self.identity
+            || inspect_android_held_directory(&self.directory)? != self.acl
+        {
+            return Err(Error::ExternalMutation);
+        }
+        Ok(())
+    }
+
+    /// Clones the inspected held directory for a native-provenance adapter.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the descriptor can no longer be cloned.
+    #[doc(hidden)]
+    pub fn try_clone_directory(&self) -> Result<Dir, Error> {
+        Ok(self.directory.try_clone()?)
+    }
+
+    /// Returns the canonical path retained during inspection.
     #[doc(hidden)]
     #[must_use]
-    pub fn into_untrusted_directory(self) -> Dir {
-        self.directory
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical_path
     }
 }
 
@@ -265,17 +340,79 @@ pub fn harden_android_new_file(file: &File) -> Result<(), Error> {
 /// Rejects wrong type, owner, exact mode, nlink other than one, or present ACL xattrs.
 #[cfg(target_os = "android")]
 pub fn inspect_android_held_file(file: &File) -> Result<AndroidAclInspection, Error> {
+    inspect_android_held_file_links(file, 1)
+}
+
+/// Inspects a held Android private file with an exact bounded link count.
+///
+/// This is used only while atomically publishing a fully fsynced private stage
+/// through a temporary second hard link. Ordinary private files require one
+/// link through [`inspect_android_held_file`].
+///
+/// # Errors
+/// Rejects wrong type, owner, exact mode/link count, or present ACL xattrs.
+#[cfg(target_os = "android")]
+pub fn inspect_android_held_file_links(
+    file: &File,
+    expected_links: u64,
+) -> Result<AndroidAclInspection, Error> {
     use std::os::unix::fs::MetadataExt;
+    if !(1..=2).contains(&expected_links) {
+        return Err(Error::ExternalMutation);
+    }
     let held = file.try_clone()?.into_std();
     let metadata = held.metadata()?;
     if !metadata.is_file()
         || metadata.uid() != rustix::process::geteuid().as_raw()
         || metadata.mode() & 0o777 != 0o600
-        || metadata.nlink() != 1
+        || metadata.nlink() != expected_links
     {
         return Err(Error::ExternalMutation);
     }
     inspect_android_acl(&held)
+}
+
+/// Creates or opens one private child below a native-proven Android no-backup
+/// capability. Existing children are validated and never repaired.
+///
+/// # Errors
+/// Rejects invalid names, links, wrong type/mode/owner, ACLs, and sync failures.
+#[cfg(target_os = "android")]
+pub fn create_or_open_android_private_dir(
+    parent: &Dir,
+    name: impl AsRef<Path>,
+) -> Result<Dir, Error> {
+    let name = name.as_ref();
+    validate_child_name(name)?;
+    let created = match parent.create_dir(name) {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+        Err(error) => return Err(error.into()),
+    };
+    let directory = open_child_dir_nofollow(parent, name)?;
+    if created {
+        harden_android_new_directory(&directory)?;
+    }
+    inspect_android_held_directory(&directory)?;
+    sync_directory(&directory)?;
+    sync_directory(parent)?;
+    Ok(directory)
+}
+
+/// Opens one existing private file below a native-proven Android no-backup
+/// capability without following links.
+///
+/// # Errors
+/// Rejects invalid names, links, wrong type/mode/owner, ACLs, or nlink != 1.
+#[cfg(target_os = "android")]
+pub fn open_android_private_file(parent: &Dir, name: impl AsRef<Path>) -> Result<File, Error> {
+    let name = name.as_ref();
+    validate_child_name(name)?;
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let file = parent.open_with(name, &options)?;
+    inspect_android_held_file(&file)?;
+    Ok(file)
 }
 
 /// Inspects a candidate Android private root without granting trust. Only a
@@ -289,20 +426,41 @@ pub fn inspect_android_private_root(
     candidate: &Path,
     other_root: &Path,
 ) -> Result<InspectedAndroidPrivateRoot, Error> {
+    let inspected = inspect_android_no_backup_root(candidate)?;
+    let other_before = other_root.canonicalize()?;
+    let other = open_absolute_dir_nofollow(other_root)?;
+    let other_after = other_root.canonicalize()?;
+    if other_before != other_after {
+        return Err(Error::InvalidRoot("root changed while it was opened"));
+    }
+    verify_root_identity(&other, &other_after)?;
+    validate_disjoint_canonical(inspected.canonical_path(), &other_after)?;
+    inspected.revalidate()?;
+    Ok(inspected)
+}
+
+/// Inspects an Android private root without requiring an ambient Vault path.
+/// This is the SAF-compatible validation lane.
+///
+/// The returned inspection does not itself prove `getNoBackupFilesDir()`
+/// provenance. A native adapter must obtain the candidate directly from
+/// Android and retain it inside an opaque native capability.
+///
+/// # Errors
+/// Fails for unstable, symlinked, incorrectly owned, non-0700, or ACL-bearing roots.
+#[cfg(target_os = "android")]
+pub fn inspect_android_no_backup_root(
+    candidate: &Path,
+) -> Result<InspectedAndroidPrivateRoot, Error> {
     use std::os::unix::fs::MetadataExt;
 
     let candidate_before = candidate.canonicalize()?;
-    let other_before = other_root.canonicalize()?;
-    let directory = open_absolute_dir_nofollow(candidate)?;
-    let other = open_absolute_dir_nofollow(other_root)?;
+    let directory = open_android_native_dir_nofollow(candidate)?;
     let candidate_after = candidate.canonicalize()?;
-    let other_after = other_root.canonicalize()?;
-    if candidate_before != candidate_after || other_before != other_after {
+    if candidate_before != candidate_after {
         return Err(Error::InvalidRoot("root changed while it was opened"));
     }
     verify_root_identity(&directory, &candidate_after)?;
-    verify_root_identity(&other, &other_after)?;
-    validate_disjoint_canonical(&candidate_after, &other_after)?;
     let held = directory.try_clone()?.into_std_file();
     let metadata = held.metadata()?;
     if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o777 != 0o700 {
@@ -311,7 +469,28 @@ pub fn inspect_android_private_root(
         ));
     }
     let acl = inspect_android_acl(&held)?;
-    Ok(InspectedAndroidPrivateRoot { directory, acl })
+    let identity = held_directory_identity(&directory)?;
+    Ok(InspectedAndroidPrivateRoot {
+        directory,
+        canonical_path: candidate_after,
+        identity,
+        acl,
+    })
+}
+
+#[cfg(target_os = "android")]
+fn open_android_native_dir_nofollow(candidate: &Path) -> Result<Dir, Error> {
+    // Android app sandboxes permit traversing private parent directories but
+    // deny opening those parents for enumeration. Open the exact native-proven
+    // leaf directly, while rejecting a final symlink before and after open.
+    if fs::symlink_metadata(candidate)?.file_type().is_symlink() {
+        return Err(Error::InvalidRoot("root contains a symlink component"));
+    }
+    let directory = Dir::open_ambient_dir(candidate, ambient_authority())?;
+    if fs::symlink_metadata(candidate)?.file_type().is_symlink() {
+        return Err(Error::InvalidRoot("root contains a symlink component"));
+    }
+    Ok(directory)
 }
 
 #[cfg(target_os = "android")]
@@ -322,10 +501,7 @@ fn inspect_android_acl(file: &std::fs::File) -> Result<AndroidAclInspection, Err
         match file.get_xattr(name) {
             Ok(Some(_)) => return Err(Error::ExtendedAcl),
             Ok(None) => {}
-            Err(error)
-                if error.kind() == io::ErrorKind::Unsupported
-                    || error.raw_os_error() == Some(rustix::io::Errno::NOTSUP.raw_os_error()) =>
-            {
+            Err(error) if android_acl_query_unavailable(&error) => {
                 unsupported = true;
             }
             Err(error) => return Err(Error::Io(error)),
@@ -336,6 +512,13 @@ fn inspect_android_acl(file: &std::fs::File) -> Result<AndroidAclInspection, Err
     } else {
         AndroidAclInspection::Clean
     })
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_acl_query_unavailable(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Unsupported
+        || error.raw_os_error() == Some(rustix::io::Errno::NOTSUP.raw_os_error())
+        || error.raw_os_error() == Some(rustix::io::Errno::ACCESS.raw_os_error())
 }
 
 impl fmt::Display for Error {
@@ -386,8 +569,28 @@ impl From<io::Error> for Error {
 /// Fails for I/O errors, invalid or overlapping roots, insecure permissions or
 /// ACLs, and platforms without complete privacy validation.
 pub fn open_private_disjoint_root(app_data_root: &Path, other_root: &Path) -> Result<Dir, Error> {
-    let (private_root, _) = open_validated_disjoint_roots(app_data_root, other_root)?;
-    Ok(private_root)
+    open_private_disjoint_held_root(app_data_root, other_root)?.try_clone_directory()
+}
+
+/// Opens the standard desktop private/disjoint boundary while retaining the
+/// canonical path and held directory identity for later revalidation.
+///
+/// # Errors
+/// Fails for the same reasons as [`open_private_disjoint_root`].
+pub fn open_private_disjoint_held_root(
+    app_data_root: &Path,
+    other_root: &Path,
+) -> Result<HeldPrivateRoot, Error> {
+    let canonical_path = app_data_root.canonicalize()?;
+    let (directory, _) = open_validated_disjoint_roots(app_data_root, other_root)?;
+    let identity = held_directory_identity(&directory)?;
+    let root = HeldPrivateRoot {
+        directory,
+        canonical_path,
+        identity,
+    };
+    root.revalidate()?;
+    Ok(root)
 }
 
 /// Opens the same private/disjoint boundary as [`open_private_disjoint_root`]
@@ -569,6 +772,26 @@ pub fn verify_private_file(file: &File, max_links: u64) -> Result<(), Error> {
 ///
 /// Returns the operating-system error when the held directory cannot be synced.
 pub fn sync_directory(directory: &Dir) -> Result<(), Error> {
+    #[cfg(target_os = "android")]
+    {
+        use std::os::fd::AsFd;
+
+        let reopened = rustix::fs::openat(
+            directory.as_fd(),
+            ".",
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| Error::Io(io::Error::from_raw_os_error(error.raw_os_error())))?;
+        rustix::fs::fsync(&reopened)
+            .map_err(|error| Error::Io(io::Error::from_raw_os_error(error.raw_os_error())))?;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "android"))]
     match directory.try_clone()?.into_std_file().sync_all() {
         Ok(()) => Ok(()),
         #[cfg(windows)]
@@ -908,6 +1131,25 @@ mod tests {
         fs::create_dir(&other).expect("other root");
         fs::set_permissions(&app, fs::Permissions::from_mode(0o700)).expect("private app root");
         (temporary, app, other)
+    }
+
+    #[test]
+    fn android_acl_unavailable_accepts_eacces_but_not_eperm() {
+        assert!(android_acl_query_unavailable(&io::Error::from(
+            io::ErrorKind::Unsupported
+        )));
+        assert!(android_acl_query_unavailable(
+            &io::Error::from_raw_os_error(rustix::io::Errno::ACCESS.raw_os_error())
+        ));
+        assert!(android_acl_query_unavailable(
+            &io::Error::from_raw_os_error(rustix::io::Errno::NOTSUP.raw_os_error())
+        ));
+        assert!(!android_acl_query_unavailable(
+            &io::Error::from_raw_os_error(rustix::io::Errno::PERM.raw_os_error())
+        ));
+        assert!(!android_acl_query_unavailable(&io::Error::from(
+            io::ErrorKind::InvalidData
+        )));
     }
 
     #[test]

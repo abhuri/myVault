@@ -26,6 +26,9 @@ myvault-drive = { path = "../../../crates/myvault-drive" }
 myvault-core = { path = "../../../crates/myvault-core" }
 myvault-app-service = { path = "../../../crates/myvault-app-service" }
 myvault-sync-engine = { path = "../../../crates/myvault-sync-engine" }
+myvault-transfer = { path = "../../../crates/myvault-transfer" }
+uuid = { version = "=1.20.0", features = ["v4", "v5"] }
+unicode-normalization = "=0.1.25"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 myvault-desktop-auth = { path = "../../../crates/desktop-auth" }
@@ -39,3 +42,5 @@ tauri-plugin-vault-saf = { path = "../../../crates/tauri-plugin-vault-saf" }
 
 [dev-dependencies]
 tempfile = "3.23.0"
+mockito = "=1.7.0"
+myvault-drive = { path = "../../../crates/myvault-drive", features = ["test-support"] }

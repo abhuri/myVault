@@ -28,6 +28,9 @@ pub enum CoreError {
         cause: Box<CoreError>,
     },
     InvalidRevision,
+    InvalidSha256Digest,
+    ContentDigestMismatch,
+    ExistingContentReplaceUnsupported,
     RevisionTargetNotFile(PathBuf),
     StaleRevision {
         path: PathBuf,
@@ -148,6 +151,9 @@ impl fmt::Display for CoreError {
             | Self::TrashManifestOutcomeUnknown { .. }
             | Self::TrashPayloadOutcomeUnknown { .. }
             | Self::InvalidRevision
+            | Self::InvalidSha256Digest
+            | Self::ContentDigestMismatch
+            | Self::ExistingContentReplaceUnsupported
             | Self::RevisionTargetNotFile(_)
             | Self::StaleRevision { .. }
             | Self::MoveDurabilitySyncFailed
@@ -304,6 +310,15 @@ impl CoreError {
                 destination_path.display()
             )),
             Self::InvalidRevision => Some(formatter.write_str("invalid BLAKE3 file revision")),
+            Self::InvalidSha256Digest => {
+                Some(formatter.write_str("invalid canonical SHA-256 digest"))
+            }
+            Self::ContentDigestMismatch => {
+                Some(formatter.write_str("transfer content digest or length does not match"))
+            }
+            Self::ExistingContentReplaceUnsupported => Some(formatter.write_str(
+                "guarded replacement of existing content is unsupported",
+            )),
             Self::RevisionTargetNotFile(path) => Some(write!(
                 formatter,
                 "revision target is not a regular file: {}",

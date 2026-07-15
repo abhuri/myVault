@@ -15,7 +15,9 @@ mod store;
 
 pub use store::{
     BindOutcome, ChangeBatch, EnqueueOutcome, JobState, LocalMutationState, LocalMutationStatus,
-    QueueJob, QueueJobKind, RemotePreviewCursor, RemotePreviewEntry, RemotePreviewPage, SyncStore,
+    QueueJob, QueueJobKind, RemoteBaseEvidence, RemotePreviewCursor, RemotePreviewEntry,
+    RemotePreviewPage, SyncStore, TransferCompletion, TransferCompletionOutcome, TransferDirection,
+    TransferMimeClass, TransferPhase, TransferRecord, TransferRegistrationOutcome, TransferSummary,
     VaultSyncState, MAX_REMOTE_PREVIEW_PAGE_SIZE, SCHEMA_VERSION, SQLITE_OPEN_RESIDUAL_RISK,
 };
 
@@ -46,6 +48,9 @@ pub enum Error {
     UnsupportedSchema(i64),
     QueueCollision,
     JobNotFound,
+    InvalidTransferEvidence,
+    TransferCollision,
+    TransferNotFound,
     CursorMismatch,
     RescanRequired,
     InvalidPreviewCursor,
@@ -55,6 +60,8 @@ pub enum Error {
     UnknownMutation,
     LocalMutationIncomplete,
     MutationNeedsReconcile,
+    UnsupportedTransferChange,
+    TransferChangeMismatch,
     Remote(RemoteError),
 }
 
@@ -96,6 +103,13 @@ impl fmt::Display for Error {
                 formatter.write_str("the queue operation identifier has conflicting content")
             }
             Self::JobNotFound => formatter.write_str("the sync queue job was not found"),
+            Self::InvalidTransferEvidence => {
+                formatter.write_str("the durable transfer evidence is invalid")
+            }
+            Self::TransferCollision => {
+                formatter.write_str("the transfer operation identifier has conflicting evidence")
+            }
+            Self::TransferNotFound => formatter.write_str("the durable transfer was not found"),
             Self::CursorMismatch => formatter.write_str("the durable cursor changed unexpectedly"),
             Self::RescanRequired => formatter.write_str("the remote cursor requires a full rescan"),
             Self::InvalidPreviewCursor => {
@@ -116,6 +130,11 @@ impl fmt::Display for Error {
             }
             Self::MutationNeedsReconcile => formatter
                 .write_str("a local mutation has an unknown outcome and needs reconciliation"),
+            Self::UnsupportedTransferChange => {
+                formatter.write_str("the remote change requires an unsupported local mutation")
+            }
+            Self::TransferChangeMismatch => formatter
+                .write_str("the transfer does not exactly match its resolved remote change"),
             Self::Remote(error) => error.fmt(formatter),
         }
     }
@@ -552,6 +571,13 @@ pub(crate) fn validate_content_path(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Returns whether a portable path is eligible for ordinary sync content.
+/// Protected metadata/trash roots and non-canonical paths are rejected.
+#[must_use]
+pub fn is_valid_sync_content_path(value: &str) -> bool {
+    validate_content_path(value).is_ok()
+}
+
 pub(crate) fn validate_revision(value: &str) -> Result<()> {
     if is_lower_hex_hash(value) {
         Ok(())
@@ -569,6 +595,19 @@ pub(crate) fn validate_redacted_code(value: &str) -> Result<()> {
         Ok(())
     } else {
         Err(Error::InvalidErrorCode)
+    }
+}
+
+pub(crate) fn validate_private_reference(value: &str) -> Result<()> {
+    if (1..=256).contains(&value.len())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        })
+        && !matches!(value, "." | "..")
+    {
+        Ok(())
+    } else {
+        Err(Error::InvalidTransferEvidence)
     }
 }
 

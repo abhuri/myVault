@@ -1,6 +1,9 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import {
+  canRunLocalObservation,
   initialSyncState,
+  isLocalSyncHintForSession,
+  LOCAL_SYNC_HINT_EVENT,
   safeSyncFailure,
   scanCanContinue,
   syncApi,
@@ -27,6 +30,8 @@ export function SyncPanel({ sessionId, onBusyChange }: { sessionId: string; onBu
   const [bindTarget, setBindTarget] = useState<BindTarget | null>(null);
   const generation = useRef(0);
   const cancelScan = useRef(false);
+  const localObservationPending = useRef(true);
+  const [localHintGeneration, setLocalHintGeneration] = useState(0);
 
   const isCurrent = (expectedGeneration: number) =>
     generation.current === expectedGeneration && state.sessionId === sessionId;
@@ -36,6 +41,16 @@ export function SyncPanel({ sessionId, onBusyChange }: { sessionId: string; onBu
   }, [onBusyChange, state.busy]);
 
   useEffect(() => () => onBusyChange(false), [onBusyChange]);
+
+  useEffect(() => {
+    const receiveHint = (event: Event) => {
+      if (!isLocalSyncHintForSession(event, sessionId)) return;
+      localObservationPending.current = true;
+      setLocalHintGeneration((value) => value + 1);
+    };
+    window.addEventListener(LOCAL_SYNC_HINT_EVENT, receiveHint);
+    return () => window.removeEventListener(LOCAL_SYNC_HINT_EVENT, receiveHint);
+  }, [sessionId]);
 
   useEffect(() => {
     const requestGeneration = ++generation.current;
@@ -69,6 +84,22 @@ export function SyncPanel({ sessionId, onBusyChange }: { sessionId: string; onBu
       if (isCurrent(requestGeneration)) dispatch({ type: "failure", sessionId, message: safeSyncFailure(reason) });
     }
   };
+
+  useEffect(() => {
+    if (!canRunLocalObservation(state.status, state.busy, localObservationPending.current)) return;
+    localObservationPending.current = false;
+    const requestGeneration = generation.current;
+    dispatch({ type: "busy", sessionId, busy: "transfer" });
+    void syncApi.runGuarded(sessionId)
+      .then((status) => {
+        if (isCurrent(requestGeneration)) dispatch({ type: "status", sessionId, status });
+      })
+      .catch((reason) => {
+        if (isCurrent(requestGeneration)) {
+          dispatch({ type: "failure", sessionId, message: safeSyncFailure(reason) });
+        }
+      });
+  }, [localHintGeneration, sessionId, state.busy, state.status]);
 
   const loadFolders = async (
     parentId: string | null,
@@ -180,15 +211,17 @@ export function SyncPanel({ sessionId, onBusyChange }: { sessionId: string; onBu
   const disabled = state.busy !== null;
 
   return (
-    <section className="sync-panel" aria-labelledby="drive-metadata-title">
+    <section className="sync-panel" aria-labelledby="drive-sync-title">
       <header>
         <div>
           <p className="section-label">GOOGLE DRIVE</p>
-          <h2 id="drive-metadata-title">Read-only metadata</h2>
+          <h2 id="drive-sync-title">Guarded sync</h2>
         </div>
         {status?.rescanRequired && <span className="sync-warning">Rescan required</span>}
       </header>
-      <p className="sync-scope">Folder names, paths and IDs only. No file content transfer or remote changes.</p>
+      <p className="sync-scope">
+        Verified uploads may create remote files only. Downloads may create local files only when absent. Metadata browsing stays read-only.
+      </p>
 
       {state.error && (
         <div className="sync-error" role="alert">
@@ -206,6 +239,32 @@ export function SyncPanel({ sessionId, onBusyChange }: { sessionId: string; onBu
         <div><dt>Phase</dt><dd>{status?.phase || (state.busy === "status" ? "Checking…" : "Unavailable")}</dd></div>
         <div><dt>Rescan</dt><dd><StateValue active={status?.rescanRequired === false}>{status?.rescanRequired ? "Required" : "No"}</StateValue></dd></div>
       </dl>
+
+      {status && (
+        <section className="sync-section" aria-labelledby="transfer-status-title">
+          <div className="sync-section-heading">
+            <h3 id="transfer-status-title">Transfer status</h3>
+            <span>{status.active} active</span>
+          </div>
+          <dl className="sync-status" aria-live="polite">
+            <div><dt>Pending</dt><dd>{status.pending}</dd></div>
+            <div><dt>Retry scheduled</dt><dd>{status.retryScheduled}</dd></div>
+            <div><dt>Authorization required</dt><dd>{status.authRequired}</dd></div>
+            <div><dt>Needs reconcile</dt><dd>{status.needsReconcile}</dd></div>
+            <div><dt>Completed</dt><dd>{status.completed}</dd></div>
+          </dl>
+          {status.supported && status.bindingAvailable && status.connected && status.bound && (
+            <button
+              className="sync-primary"
+              type="button"
+              disabled={disabled || status.rescanRequired || status.phase.toLocaleLowerCase("en-US") !== "ready"}
+              onClick={() => void runStatusOperation("transfer", () => syncApi.runGuarded(sessionId))}
+            >
+              {state.busy === "transfer" ? "Running guarded sync…" : "Run guarded sync"}
+            </button>
+          )}
+        </section>
+      )}
 
       {status?.accountId && <p className="sync-identity">Account ID <code>{status.accountId}</code></p>}
       {status?.rootId && <p className="sync-identity">Exact root <strong>{status.rootName ?? "Drive folder"}</strong><code>{status.rootId}</code></p>}
@@ -227,7 +286,7 @@ export function SyncPanel({ sessionId, onBusyChange }: { sessionId: string; onBu
           disabled={disabled || !status.configured}
           onClick={() => void runStatusOperation("connect", () => syncApi.connect(sessionId))}
         >
-          {state.busy === "connect" ? "Connecting…" : "Connect for metadata access"}
+          {state.busy === "connect" ? "Connecting…" : "Connect Google Drive"}
         </button>
       )}
 
@@ -339,7 +398,7 @@ export function SyncPanel({ sessionId, onBusyChange }: { sessionId: string; onBu
 
       {status?.supported && status.connected && (
         <button className="sync-disconnect" type="button" disabled={disabled} onClick={() => void disconnect()}>
-          {state.busy === "disconnect" ? "Disconnecting…" : "Disconnect Drive metadata"}
+          {state.busy === "disconnect" ? "Disconnecting…" : "Disconnect Google Drive"}
         </button>
       )}
     </section>

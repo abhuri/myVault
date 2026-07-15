@@ -15,10 +15,11 @@ use crate::capability::{open_absolute_dir_nofollow, open_child_dir_nofollow};
 use crate::path::{classify_component, component_collision_key, VaultPathClass};
 use crate::trash::{item_directory_path, manifest_path, payload_path};
 use crate::{
-    CoreError, FileRevision, ManifestDigest, PrepareManifestOutcome, PublishItemOutcome,
-    RestoreItemOutcome, Result, StagePayloadOutcome, TrashArea, TrashId, TrashListEvidence,
-    TrashListPage, TrashManifestV1, TrashStore, VaultPath, MAX_TRASH_LIST_SCAN,
-    MAX_TRASH_MANIFEST_BYTES, MAX_TRASH_PAGE_SIZE,
+    stream_content_snapshot, ContentPublishOutcome, ContentSnapshot, CoreError, FileRevision,
+    ManifestDigest, PrepareManifestOutcome, PublishItemOutcome, RestoreItemOutcome, Result,
+    Sha256Digest, StagePayloadOutcome, TrashArea, TrashId, TrashListEvidence, TrashListPage,
+    TrashManifestV1, TrashStore, VaultPath, MAX_TRASH_LIST_SCAN, MAX_TRASH_MANIFEST_BYTES,
+    MAX_TRASH_PAGE_SIZE,
 };
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -368,6 +369,190 @@ impl Vault {
     ) -> Result<()> {
         Self::validate_generic_access(relative)?;
         self.verify_expected_inner(relative, expected, max_bytes)
+    }
+
+    /// Streams one protected-path-safe content file to a native sink while
+    /// binding its local revision, SHA-256 digest, and byte length to the exact
+    /// bytes emitted from the same held descriptor.
+    ///
+    /// # Errors
+    /// Rejects protected, linked, nonregular, oversized, or inaccessible files
+    /// and propagates native sink failures.
+    pub fn stream_content_snapshot(
+        &self,
+        relative: &VaultPath,
+        writer: &mut impl Write,
+        max_bytes: usize,
+    ) -> Result<ContentSnapshot> {
+        Self::require_content_path(relative)?;
+        let _guard = self.lock_mutations()?;
+        let (parent, name) = self.open_parent_checked(relative)?;
+        self.reject_final_symlink(&parent, &name, relative)?;
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let mut file = parent.open_with(&name, &options)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(CoreError::RevisionTargetNotFile(
+                relative.as_path().to_owned(),
+            ));
+        }
+        if metadata.len() > u64::try_from(max_bytes).unwrap_or(u64::MAX) {
+            return Err(CoreError::ResourceLimitExceeded {
+                resource: "transfer bytes",
+                limit: max_bytes,
+            });
+        }
+        let snapshot = stream_content_snapshot(&mut file, writer, max_bytes)?;
+        let final_metadata = file.metadata()?;
+        if !final_metadata.is_file()
+            || final_metadata.nlink() != 1
+            || final_metadata.len() != snapshot.byte_len
+        {
+            return Err(CoreError::InvalidRevision);
+        }
+        Ok(snapshot)
+    }
+
+    /// Streams and durably creates a new content file without replacing any
+    /// existing portable path. The expected digest and length are checked
+    /// before the no-replace publication point and again by readback.
+    ///
+    /// # Errors
+    /// Rejects protected paths, collisions, malformed evidence, oversized or
+    /// mismatched streams, durability failures, and unknown publications.
+    pub fn create_content_from_reader(
+        &self,
+        relative: &VaultPath,
+        reader: &mut impl Read,
+        expected_sha256: &Sha256Digest,
+        expected_byte_len: u64,
+        max_bytes: usize,
+    ) -> Result<ContentPublishOutcome> {
+        let _guard = self.lock_mutations()?;
+        Self::require_content_path(relative)?;
+        if expected_byte_len > u64::try_from(max_bytes).unwrap_or(u64::MAX) {
+            return Err(CoreError::ResourceLimitExceeded {
+                resource: "transfer bytes",
+                limit: max_bytes,
+            });
+        }
+        let components: Vec<_> = relative.as_path().components().collect();
+        if components.len() > 1 {
+            let parent_path = components[..components.len() - 1]
+                .iter()
+                .map(|component| component.as_os_str())
+                .collect::<PathBuf>();
+            self.create_directories_inner(&VaultPath::new(parent_path)?)?;
+        }
+        let (parent, destination_name) = self.open_parent_checked(relative)?;
+        let destination_utf8 = destination_name
+            .to_str()
+            .ok_or_else(|| CoreError::InvalidRelativePath(relative.as_path().to_owned()))?;
+        self.reject_sibling_collision(&parent, destination_utf8, relative)?;
+        self.reject_final_symlink(&parent, &destination_name, relative)?;
+        if parent.symlink_metadata(&destination_name).is_ok() {
+            return Err(CoreError::AlreadyExists(relative.as_path().to_owned()));
+        }
+
+        let (temp_name, mut temporary) = Self::create_temp(&parent)?;
+        let staged = match stream_content_snapshot(reader, &mut temporary, max_bytes) {
+            Ok(snapshot)
+                if snapshot.sha256 == *expected_sha256
+                    && snapshot.byte_len == expected_byte_len =>
+            {
+                snapshot
+            }
+            Ok(_) => {
+                let _ = parent.remove_file(&temp_name);
+                return Err(CoreError::ContentDigestMismatch);
+            }
+            Err(error) => {
+                let _ = parent.remove_file(&temp_name);
+                return Err(error);
+            }
+        };
+        if let Err(error) = temporary.sync_all() {
+            let _ = parent.remove_file(&temp_name);
+            return Err(error.into());
+        }
+        drop(temporary);
+        self.verify_expected_from_parent(
+            &parent,
+            &temp_name,
+            relative,
+            &staged.revision,
+            max_bytes,
+        )?;
+        self.verify_single_link_from_parent(&parent, &temp_name, relative)?;
+        if let Err(error) = parent.hard_link(&temp_name, &parent, &destination_name) {
+            let _ = parent.remove_file(&temp_name);
+            return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+                CoreError::AlreadyExists(relative.as_path().to_owned())
+            } else {
+                error.into()
+            });
+        }
+        let durability =
+            sync_directory_for_move(&parent).map_err(|source| CoreError::CommitOutcomeUnknown {
+                path: relative.as_path().to_owned(),
+                source,
+            })?;
+        if let Err(error) = parent.remove_file(&temp_name) {
+            return Err(Self::cleanup_pending(
+                relative.as_path().to_owned(),
+                &temp_name,
+                error,
+            ));
+        }
+        sync_directory_for_move(&parent).map_err(|source| {
+            Self::cleanup_pending(relative.as_path().to_owned(), &temp_name, source)
+        })?;
+        self.verify_transfer_readback(relative, &staged, max_bytes)
+            .map_err(|source| CoreError::CommitOutcomeUnknown {
+                path: relative.as_path().to_owned(),
+                source: std::io::Error::other(source.to_string()),
+            })?;
+        Ok(ContentPublishOutcome::Created(durability))
+    }
+
+    /// Validates that a destination still has the exact expected local revision,
+    /// then rejects replacement without consuming or publishing the stream.
+    /// R2 deliberately fails closed because the supported native filesystems do
+    /// not provide a trustworthy atomic compare-and-swap primitive.
+    ///
+    /// # Errors
+    /// Rejects stale revisions, protected or linked targets, oversized streams,
+    /// and every existing-target replacement as unsupported.
+    pub fn replace_content_from_reader_if_revision(
+        &self,
+        relative: &VaultPath,
+        expected_revision: &FileRevision,
+        reader: &mut impl Read,
+        expected_sha256: &Sha256Digest,
+        expected_byte_len: u64,
+        max_bytes: usize,
+    ) -> Result<ContentPublishOutcome> {
+        Self::require_content_path(relative)?;
+        expected_revision.validate()?;
+        let _ = (reader, expected_sha256);
+        if expected_byte_len > u64::try_from(max_bytes).unwrap_or(u64::MAX) {
+            return Err(CoreError::ResourceLimitExceeded {
+                resource: "transfer bytes",
+                limit: max_bytes,
+            });
+        }
+        let _guard = self.lock_mutations()?;
+        let (parent, destination_name) = self.open_parent_checked(relative)?;
+        self.verify_expected_from_parent(
+            &parent,
+            &destination_name,
+            relative,
+            expected_revision,
+            max_bytes,
+        )?;
+        self.verify_single_link_from_parent(&parent, &destination_name, relative)?;
+        Err(CoreError::ExistingContentReplaceUnsupported)
     }
 
     /// Inventories regular vault files without following symbolic links.
@@ -1492,6 +1677,32 @@ impl Vault {
             hex: hasher.finalize().to_hex().to_string(),
             byte_len: u64::try_from(total).unwrap_or(u64::MAX),
         })
+    }
+
+    fn verify_transfer_readback(
+        &self,
+        relative: &VaultPath,
+        expected: &ContentSnapshot,
+        max_bytes: usize,
+    ) -> Result<()> {
+        let (parent, name) = self.open_parent_checked(relative)?;
+        self.reject_final_symlink(&parent, &name, relative)?;
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let mut file = parent.open_with(&name, &options)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(CoreError::RevisionTargetNotFile(
+                relative.as_path().to_owned(),
+            ));
+        }
+        let mut sink = std::io::sink();
+        let actual = stream_content_snapshot(&mut file, &mut sink, max_bytes)?;
+        if &actual == expected {
+            Ok(())
+        } else {
+            Err(CoreError::ContentDigestMismatch)
+        }
     }
 
     fn verify_expected_inner(

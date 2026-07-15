@@ -10,6 +10,12 @@ use std::{
 };
 use uuid::Uuid;
 
+mod transfer;
+pub use transfer::{
+    NativeTransferError, NativeTransferPublication, TransferBaseRef, TransferStageRef,
+    TransferStageWriter,
+};
+
 pub const EXPLORER_MAX_DEPTH: usize = 64;
 pub const EXPLORER_MAX_SCAN: usize = 5_000;
 pub const EXPLORER_DEFAULT_PAGE_SIZE: usize = 100;
@@ -438,6 +444,428 @@ impl AppService {
     /// Rejects absent or stale session identifiers.
     pub fn confirm_active_session(&self, session_id: VaultSessionId) -> Result<(), AppError> {
         self.with_session(session_id, |_| Ok(()))
+    }
+
+    /// Streams a binary-safe source snapshot to a native sink. The returned
+    /// evidence is computed from the exact descriptor stream and is never
+    /// serialized through a frontend DTO.
+    ///
+    /// # Errors
+    /// Rejects stale sessions, protected paths, unsafe files, size limits, and
+    /// native read or sink failures.
+    pub fn stream_transfer_source(
+        &self,
+        session_id: VaultSessionId,
+        portable_path: &str,
+        writer: &mut impl std::io::Write,
+        max_bytes: usize,
+    ) -> Result<myvault_core::ContentSnapshot, NativeTransferError> {
+        let path = VaultPath::from_portable(portable_path)
+            .map_err(|_| NativeTransferError::ProtectedPath)?;
+        let current = self
+            .session
+            .read()
+            .map_err(|_| NativeTransferError::VaultUnavailable)?;
+        let session = current
+            .as_ref()
+            .filter(|active| active.id == session_id)
+            .ok_or(NativeTransferError::VaultUnavailable)?;
+        session
+            .vault
+            .stream_content_snapshot(&path, writer, max_bytes)
+            .map_err(transfer::map_core_error)
+    }
+
+    /// Streams a downloaded body into a private per-Vault stage and verifies
+    /// its exact SHA-256 digest and length before returning an opaque handle.
+    ///
+    /// # Errors
+    /// Rejects stale sessions, malformed evidence, size or digest mismatches,
+    /// unsafe private storage, and interrupted native streams.
+    pub fn stage_transfer_download(
+        &self,
+        session_id: VaultSessionId,
+        operation_id: Uuid,
+        reader: &mut impl std::io::Read,
+        expected_sha256_hex: &str,
+        expected_byte_len: u64,
+        max_bytes: usize,
+    ) -> Result<TransferStageRef, NativeTransferError> {
+        let expected_sha256 = myvault_core::Sha256Digest::parse(expected_sha256_hex)
+            .map_err(|_| NativeTransferError::InvalidRequest)?;
+        let mut writer = match self.begin_transfer_stage(session_id, operation_id, max_bytes) {
+            Ok(writer) => writer,
+            Err(NativeTransferError::StageAlreadyExists) => {
+                return self.load_transfer_stage(
+                    session_id,
+                    operation_id,
+                    expected_sha256.as_str(),
+                    expected_byte_len,
+                    max_bytes,
+                );
+            }
+            Err(error) => return Err(error),
+        };
+        std::io::copy(reader, &mut writer).map_err(|_| NativeTransferError::StageUnavailable)?;
+        self.finish_transfer_stage(
+            session_id,
+            writer,
+            expected_sha256_hex,
+            expected_byte_len,
+            max_bytes,
+        )
+    }
+
+    /// Opens a bounded private native sink without retaining a Vault/session
+    /// lock while a network client streams bytes into it.
+    ///
+    /// # Errors
+    /// Rejects stale sessions, nil/colliding operation IDs, unavailable private
+    /// storage, and invalid byte limits.
+    pub fn begin_transfer_stage(
+        &self,
+        session_id: VaultSessionId,
+        operation_id: Uuid,
+        max_bytes: usize,
+    ) -> Result<TransferStageWriter, NativeTransferError> {
+        let app_data_root = self
+            .app_data_root
+            .as_deref()
+            .ok_or(NativeTransferError::PrivateStoreUnavailable)?;
+        let current = self
+            .session
+            .read()
+            .map_err(|_| NativeTransferError::VaultUnavailable)?;
+        let session = current
+            .as_ref()
+            .filter(|active| active.id == session_id)
+            .ok_or(NativeTransferError::VaultUnavailable)?;
+        let store = transfer::PrivateTransferStore::open(
+            app_data_root,
+            session.vault.root(),
+            session.vault_id,
+        )?;
+        store.begin_stage(operation_id, max_bytes)
+    }
+
+    /// Revalidates the session, flushes a completed stage, and verifies its
+    /// complete SHA-256/length evidence before returning an opaque reference.
+    ///
+    /// # Errors
+    /// Rejects stale sessions, malformed evidence, incomplete/mismatched
+    /// stages, unsafe private storage, and durability failures.
+    pub fn finish_transfer_stage(
+        &self,
+        session_id: VaultSessionId,
+        writer: TransferStageWriter,
+        expected_sha256_hex: &str,
+        expected_byte_len: u64,
+        max_bytes: usize,
+    ) -> Result<TransferStageRef, NativeTransferError> {
+        let expected_sha256 = myvault_core::Sha256Digest::parse(expected_sha256_hex)
+            .map_err(|_| NativeTransferError::InvalidRequest)?;
+        let app_data_root = self
+            .app_data_root
+            .as_deref()
+            .ok_or(NativeTransferError::PrivateStoreUnavailable)?;
+        let current = self
+            .session
+            .read()
+            .map_err(|_| NativeTransferError::VaultUnavailable)?;
+        let session = current
+            .as_ref()
+            .filter(|active| active.id == session_id)
+            .ok_or(NativeTransferError::VaultUnavailable)?;
+        let store = transfer::PrivateTransferStore::open(
+            app_data_root,
+            session.vault.root(),
+            session.vault_id,
+        )?;
+        store.finish_stage(writer, &expected_sha256, expected_byte_len, max_bytes)
+    }
+
+    /// Rehydrates a private stage after process restart using only durable
+    /// operation identity and expected digest/length evidence.
+    ///
+    /// # Errors
+    /// Rejects stale sessions, malformed evidence, missing/changed stages,
+    /// unsafe private storage, and size-limit violations.
+    pub fn load_transfer_stage(
+        &self,
+        session_id: VaultSessionId,
+        operation_id: Uuid,
+        expected_sha256_hex: &str,
+        expected_byte_len: u64,
+        max_bytes: usize,
+    ) -> Result<TransferStageRef, NativeTransferError> {
+        let expected_sha256 = myvault_core::Sha256Digest::parse(expected_sha256_hex)
+            .map_err(|_| NativeTransferError::InvalidRequest)?;
+        let app_data_root = self
+            .app_data_root
+            .as_deref()
+            .ok_or(NativeTransferError::PrivateStoreUnavailable)?;
+        let current = self
+            .session
+            .read()
+            .map_err(|_| NativeTransferError::VaultUnavailable)?;
+        let session = current
+            .as_ref()
+            .filter(|active| active.id == session_id)
+            .ok_or(NativeTransferError::VaultUnavailable)?;
+        let store = transfer::PrivateTransferStore::open(
+            app_data_root,
+            session.vault.root(),
+            session.vault_id,
+        )?;
+        store.load_stage(operation_id, &expected_sha256, expected_byte_len, max_bytes)
+    }
+
+    /// Removes only a private stage whose exact operation-scoped byte length is
+    /// strictly shorter than the durable download length after interruption.
+    ///
+    /// The removal is descriptor-relative and identity checked. An exact
+    /// verified stage, a hardlinked stage, a missing stage, a stale session,
+    /// and every file outside the operation's private staging entry are
+    /// preserved and rejected.
+    ///
+    /// # Errors
+    /// Rejects stale sessions, nil operation IDs, malformed evidence, exact
+    /// verified stages, complete wrong-digest evidence, missing/replaced/
+    /// hardlinked stages, unsafe private storage, and size-limit violations.
+    pub fn discard_incomplete_transfer_stage(
+        &self,
+        session_id: VaultSessionId,
+        operation_id: Uuid,
+        expected_sha256_hex: &str,
+        expected_byte_len: u64,
+        max_bytes: usize,
+    ) -> Result<(), NativeTransferError> {
+        let expected_sha256 = myvault_core::Sha256Digest::parse(expected_sha256_hex)
+            .map_err(|_| NativeTransferError::InvalidRequest)?;
+        let app_data_root = self
+            .app_data_root
+            .as_deref()
+            .ok_or(NativeTransferError::PrivateStoreUnavailable)?;
+        let current = self
+            .session
+            .read()
+            .map_err(|_| NativeTransferError::VaultUnavailable)?;
+        let session = current
+            .as_ref()
+            .filter(|active| active.id == session_id)
+            .ok_or(NativeTransferError::VaultUnavailable)?;
+        let store = transfer::PrivateTransferStore::open(
+            app_data_root,
+            session.vault.root(),
+            session.vault_id,
+        )?;
+        store.discard_incomplete_stage(operation_id, &expected_sha256, expected_byte_len, max_bytes)
+    }
+
+    /// Copies one local source into a verified private stage before any network
+    /// upload starts, so the Vault lock is not held during remote I/O.
+    ///
+    /// # Errors
+    /// Rejects stale sessions, protected or unsafe sources, size limits,
+    /// unavailable private storage, and interrupted local copies.
+    pub fn stage_transfer_source(
+        &self,
+        session_id: VaultSessionId,
+        operation_id: Uuid,
+        portable_path: &str,
+        max_bytes: usize,
+    ) -> Result<TransferStageRef, NativeTransferError> {
+        self.stage_transfer_source_with_hook(
+            session_id,
+            operation_id,
+            portable_path,
+            max_bytes,
+            || {},
+        )
+    }
+
+    fn stage_transfer_source_with_hook(
+        &self,
+        session_id: VaultSessionId,
+        operation_id: Uuid,
+        portable_path: &str,
+        max_bytes: usize,
+        after_stage: impl FnOnce(),
+    ) -> Result<TransferStageRef, NativeTransferError> {
+        let mut writer = match self.begin_transfer_stage(session_id, operation_id, max_bytes) {
+            Ok(writer) => writer,
+            Err(NativeTransferError::StageAlreadyExists) => {
+                let mut sink = std::io::sink();
+                let snapshot =
+                    self.stream_transfer_source(session_id, portable_path, &mut sink, max_bytes)?;
+                let stage = self.load_transfer_stage(
+                    session_id,
+                    operation_id,
+                    snapshot.sha256.as_str(),
+                    snapshot.byte_len,
+                    max_bytes,
+                )?;
+                let current =
+                    self.stream_transfer_source(session_id, portable_path, &mut sink, max_bytes)?;
+                return if current == *stage.snapshot() {
+                    Ok(stage)
+                } else {
+                    Err(NativeTransferError::DigestMismatch)
+                };
+            }
+            Err(error) => return Err(error),
+        };
+        let snapshot =
+            self.stream_transfer_source(session_id, portable_path, &mut writer, max_bytes)?;
+        let stage = self.finish_transfer_stage(
+            session_id,
+            writer,
+            snapshot.sha256.as_str(),
+            snapshot.byte_len,
+            max_bytes,
+        )?;
+        after_stage();
+        let mut sink = std::io::sink();
+        let current =
+            self.stream_transfer_source(session_id, portable_path, &mut sink, max_bytes)?;
+        if current != *stage.snapshot() {
+            return Err(NativeTransferError::DigestMismatch);
+        }
+        Ok(stage)
+    }
+
+    /// Reads one verified upload chunk without exposing an ambient private path.
+    /// The returned body is capped at 8 MiB and no lock is retained after return.
+    ///
+    /// # Errors
+    /// Rejects stale sessions, invalid offsets/chunk sizes, changed stages,
+    /// unavailable private storage, and total-size limit violations.
+    pub fn read_verified_stage_chunk(
+        &self,
+        session_id: VaultSessionId,
+        stage: &TransferStageRef,
+        offset: u64,
+        max_chunk: usize,
+        max_total: usize,
+    ) -> Result<Vec<u8>, NativeTransferError> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        const MAX_UPLOAD_CHUNK: usize = 8 * 1024 * 1024;
+        if max_chunk == 0
+            || max_chunk > MAX_UPLOAD_CHUNK
+            || stage.snapshot().byte_len > max_total as u64
+            || offset > stage.snapshot().byte_len
+        {
+            return Err(NativeTransferError::InvalidRequest);
+        }
+        let app_data_root = self
+            .app_data_root
+            .as_deref()
+            .ok_or(NativeTransferError::PrivateStoreUnavailable)?;
+        let current = self
+            .session
+            .read()
+            .map_err(|_| NativeTransferError::VaultUnavailable)?;
+        let session = current
+            .as_ref()
+            .filter(|active| active.id == session_id)
+            .ok_or(NativeTransferError::VaultUnavailable)?;
+        let store = transfer::PrivateTransferStore::open(
+            app_data_root,
+            session.vault.root(),
+            session.vault_id,
+        )?;
+        let mut file = store.open_verified_stage(stage, max_total)?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|_| NativeTransferError::StageUnavailable)?;
+        let remaining = stage.snapshot().byte_len.saturating_sub(offset);
+        let length = max_chunk.min(usize::try_from(remaining).unwrap_or(max_chunk));
+        let mut bytes = vec![0_u8; length];
+        file.read_exact(&mut bytes)
+            .map_err(|_| NativeTransferError::StageUnavailable)?;
+        Ok(bytes)
+    }
+
+    /// Publishes a verified upload stage as an immutable private base object
+    /// without mutating the local Vault.
+    ///
+    /// # Errors
+    /// Rejects stale sessions, changed stages, unsafe private storage, and
+    /// ambiguous base-object publication outcomes.
+    pub fn publish_verified_stage_as_base(
+        &self,
+        session_id: VaultSessionId,
+        stage: &TransferStageRef,
+        max_bytes: usize,
+    ) -> Result<TransferBaseRef, NativeTransferError> {
+        let app_data_root = self
+            .app_data_root
+            .as_deref()
+            .ok_or(NativeTransferError::PrivateStoreUnavailable)?;
+        let current = self
+            .session
+            .read()
+            .map_err(|_| NativeTransferError::VaultUnavailable)?;
+        let session = current
+            .as_ref()
+            .filter(|active| active.id == session_id)
+            .ok_or(NativeTransferError::VaultUnavailable)?;
+        let store = transfer::PrivateTransferStore::open(
+            app_data_root,
+            session.vault.root(),
+            session.vault_id,
+        )?;
+        drop(store.open_verified_stage(stage, max_bytes)?);
+        store
+            .publish_base(stage, max_bytes)
+            .map_err(|_| NativeTransferError::PublicationUnknown)
+    }
+
+    /// Publishes an immutable content-addressed base object, then creates a new
+    /// Vault file with no replacement and verifies readback. If an expected
+    /// revision is supplied, the existing target is validated and replacement
+    /// fails closed as unsupported.
+    ///
+    /// # Errors
+    /// Rejects stale sessions/revisions, protected paths, unsafe or mismatched
+    /// stages, and any ambiguous local or base-object publication.
+    pub fn publish_staged_transfer(
+        &self,
+        session_id: VaultSessionId,
+        portable_path: &str,
+        stage: &TransferStageRef,
+        expected_revision: Option<&myvault_core::FileRevision>,
+        max_bytes: usize,
+    ) -> Result<NativeTransferPublication, NativeTransferError> {
+        let path = VaultPath::from_portable(portable_path)
+            .map_err(|_| NativeTransferError::ProtectedPath)?;
+        let app_data_root = self
+            .app_data_root
+            .as_deref()
+            .ok_or(NativeTransferError::PrivateStoreUnavailable)?;
+        let current = self
+            .session
+            .read()
+            .map_err(|_| NativeTransferError::VaultUnavailable)?;
+        let session = current
+            .as_ref()
+            .ok_or(NativeTransferError::VaultUnavailable)?;
+        if session.id != session_id {
+            return Err(NativeTransferError::VaultUnavailable);
+        }
+        let store = transfer::PrivateTransferStore::open(
+            app_data_root,
+            session.vault.root(),
+            session.vault_id,
+        )?;
+        transfer::publish_stage(
+            &session.vault,
+            &store,
+            stage,
+            &path,
+            expected_revision,
+            max_bytes,
+        )
     }
 
     /// Runs one native operation while preventing the active Vault capability
@@ -1123,5 +1551,38 @@ mod tests {
                 "ใหม่".as_bytes()
             );
         }
+    }
+
+    #[test]
+    fn source_stage_recheck_rejects_same_length_external_change() {
+        let temporary = tempfile::tempdir().expect("fixture");
+        let vault_root = temporary.path().join("vault-transfer-recheck");
+        let app_data = temporary.path().join("private-transfer-recheck");
+        fs::create_dir(&vault_root).expect("vault");
+        fs::create_dir(&app_data).expect("app data");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&app_data, fs::Permissions::from_mode(0o700)).expect("mode");
+        }
+        fs::write(vault_root.join("note.bin"), b"first-value").expect("source");
+        let canonical = fs::canonicalize(&vault_root).expect("canonical");
+        let app_data = fs::canonicalize(&app_data).expect("canonical app data");
+        let service = AppService::with_app_data_root(&app_data);
+        let session = service
+            .activate_trusted_vault(Vault::open(&canonical).expect("open"))
+            .expect("activate")
+            .session_id
+            .expect("session");
+        let error = service
+            .stage_transfer_source_with_hook(session, Uuid::new_v4(), "note.bin", 128, || {
+                fs::write(canonical.join("note.bin"), b"other-value").expect("race");
+            })
+            .expect_err("second snapshot detects same-length change");
+        assert!(matches!(error, NativeTransferError::DigestMismatch));
+        assert_eq!(
+            fs::read(canonical.join("note.bin")).unwrap(),
+            b"other-value"
+        );
     }
 }

@@ -1,6 +1,6 @@
 # myVault — Latest Session Handoff
 
-Updated 2026-07-14 Asia/Bangkok ค่ะ
+Updated 2026-07-15 Asia/Bangkok ค่ะ
 
 ไฟล์นี้เป็นเจ้าของ Git checkpoint, verification ล่าสุด, งานถัดไป และ approval state ค่ะ ทิศทางผลิตภัณฑ์อยู่ที่ [PROJECT_PLAN.md](PROJECT_PLAN.md) ค่ะ
 
@@ -16,11 +16,15 @@ Updated 2026-07-14 Asia/Bangkok ค่ะ
 ## 2. Repository Checkpoint
 
 - Physical path คือ `/Volumes/AWB-Apps/My Apps/myVault` และ compatibility path คือ `/Users/awb/My Apps/myVault` ค่ะ
-- Canonical branch คือ `main` และ canonical checkpoint คือ merge commit `5160882` จาก PR #24 ค่ะ
-- Phase 3A source head `7f5b8d6` ถูก merge ผ่าน PR #23 ที่ `db85177` และ locked roadmap commit `f5fba4d` ถูก merge ผ่าน PR #24 ที่ `5160882` ค่ะ
-- PR #24 ผ่าน Final Merge Review, Quality, Android compile, Ubuntu AppImage และ Windows NSIS ก่อน merge ค่ะ
-- Post-merge Quality run `29295471872` บน `5160882` ผ่านทั้ง `quality` และ `android-compile` ค่ะ
-- Active implementation milestone คือ R1 ค่ะ Shared workspace ล่าสุดอยู่บน `codex/r1-readonly-binding` ซึ่งแตกจาก `5160882` และมีงานที่ต้องรักษาไว้ค่ะ Session ใหม่ต้องตรวจ Git state จริงเพราะ active branch อาจเดินหน้าจาก checkpoint นี้แล้วค่ะ
+- Canonical branch คือ `main` และ canonical checkpoint คือ R1 merge commit
+  `681271a` จาก PR #26 ค่ะ
+- R1 live acceptance, final review, Quality, Android compile, Ubuntu AppImage,
+  และ Windows NSIS ผ่านบน candidate เดียวก่อน mergeค่ะ
+- Active implementation milestone คือ R2 และ shared workspace อยู่บน
+  `codex/r2-guarded-transfer` ซึ่งเริ่มจาก `681271a` ค่ะ
+- R2 final source fixes ถูก commit ที่ `82669dc` ค่ะ Live macOS/Android evidence
+  ถูกบันทึกใน evidence-alignment commit `cba94d1` ซึ่งผ่าน fresh exact-head CI
+  แล้วค่ะ Final documentation update ต้องผ่าน CI บน head ใหม่ก่อน mergeค่ะ
 
 ## 3. Current Truth
 
@@ -31,27 +35,74 @@ Updated 2026-07-14 Asia/Bangkok ค่ะ
 - Create/Rename/Move/Trash/Restore มี core/mutation foundation แต่ยังไม่มี Tauri/UI journey ครบค่ะ
 - Editor/Reader ใช้งานได้บางส่วน ส่วน attachments, properties และ embeds ยังไม่ครบค่ะ
 - Search/backlinks/graph ที่เห็นใน Demo เป็น filter หรือ opened-note prototype ไม่ใช่ persistent full-vault index ค่ะ
-- Desktop OAuth/Keyring primitives, Android auth bridge และ Drive fixture harness มีจริง แต่ยังไม่รวมเป็น production authorization/Drive runtime เดียวกันค่ะ
-- Phase 3A Sync Foundation complete ตาม slice และผ่าน 17 tests แต่ `myvault-sync-engine` ยังไม่เป็น dependency ของ Tauri app ค่ะ
-- แอปยังไม่มี production Existing Drive binding, read-only scan, upload/download, conflict engine หรือ Sync UI ค่ะ
-- UI ยังแสดงข้อความตามจริงว่า Demo ไม่เชื่อม Google Drive ค่ะ
+- R1 production Desktop OAuth/Keyring, Android auth bridge, exact account/root
+  binding, recursive read-only scan, Changes drain, restart restoration และ
+  bounded preview เชื่อม Tauri runtime แล้วค่ะ
+- `myvault-sync-engine` และ production GET-only Drive adapter เป็น Tauri
+  dependencies แล้ว โดย token/body/ambient path ไม่ออกสู่ frontend/SQLite/logค่ะ
+- R2 final candidate มี guarded content upload/download, durable
+  transfer state, create-no-replace local publication, exact-root Drive
+  mutation boundary, desktop local observation และ Android SAF guarded runtime
+  แล้วค่ะ macOS disposable byte-exact round trip และ Android API 36 disposable
+  live acceptance ผ่านแล้วค่ะ macOS restart upload/download, offline
+  pause/resume, credential restoration และ disconnect/reconnect ผ่านแล้วค่ะ
+  Evidence head `cba94d1` ผ่าน exact-HEAD CI แล้วค่ะ งานค้างคือ commit/push final
+  evidence update, รอ CI บน head สุดท้าย, final review, เปลี่ยน Draft PR #27
+  เป็น Ready และ mergeค่ะ
+- Conflict engine และ full Sync control-plane UI ยังเป็นงาน R3–R4 ค่ะ
 
-## 4. Verification — Current Audit
+## 4. Verification — R2 Candidate Audit
 
-รันเมื่อ 2026-07-14 บน macOS workspace ปัจจุบันค่ะ
+สถานะนี้เป็น post-live local integration evidence จาก source candidate
+`82669dc` และ evidence head `cba94d1` ค่ะ Draft PR #27 ผ่าน Quality run
+`29424661478` และ platform run `29424659698` ครบทั้ง Quality, Android, Ubuntu
+AppImage และ Windows NSIS ค่ะ Quality attempt แรกล้มจาก GitHub-hosted runner
+disk-full; clean rerun ผ่านโดยไม่แก้ sourceค่ะ
 
 - `pnpm typecheck` ผ่านค่ะ
-- Frontend Vitest ผ่าน 4 files / 24 tests ค่ะ
+- Frontend Vitest ผ่าน 5 files / 40 tests ค่ะ
 - `pnpm build` ผ่านค่ะ Main chunk ประมาณ 1.06 MB และมี non-blocking chunk-size warning ค่ะ
-- Rust native test matrix ผ่าน 399 tests, 0 failed และ 2 ignored-by-default tests ค่ะ Matrix ครอบคลุม Tauri, Core, platform ACL/FS, private FS, recovery, mutations, snapshots, app service, desktop auth, Drive spike และ Sync Foundation ค่ะ
+- `pnpm quality:r2:offline` ผ่านหลังรวม final audit fixes ทั้งหมดค่ะ
+- Final macOS debug `.app` bundle build ผ่านจาก source tree เดียวกันค่ะ
+- Rust R2 matrix ครอบคลุม Core, platform ACL/FS, private FS, recovery,
+  mutations, snapshots, app service, desktop auth, Drive spike, Google auth,
+  private root, Vault SAF, Sync engine, Drive, transfer และ Tauriค่ะ
 - `cargo fmt --manifest-path apps/tauri/src-tauri/Cargo.toml --all -- --check` ผ่านค่ะ
-- `git diff --check` ผ่านหลัง documentation alignment ค่ะ
+- Android aarch64 strict Clippy, Kotlin Vault SAF unit tests, full debug APK
+  build และ 16 KiB alignment ผ่านหลัง final source fixesค่ะ Final APK มีขนาด
+  304,163,423 bytes และ SHA-256 คือ
+  `cfb77292713957e245889c564ba6d1717303c0eca26f014b58696506bea02f1c`ค่ะ
+- macOS disposable A → exact Drive root → B ผ่าน Markdown, Unicode, zero-byte,
+  6 MiB + 1 และ 15 MiB restart fixtures แบบ byte-exactค่ะ
+- macOS restart ระหว่าง upload/download ผ่านค่ะ Offline upload หยุดหนึ่งครั้งที่
+  `retry_scheduled`/attempt 0 โดยไม่เกิด request storm แล้ว resume สำเร็จเมื่อ
+  network กลับมา และทุก queue counter กลับเป็นศูนย์ค่ะ
+- Keychain credential restoration กับ confirmed disconnect/reconnect ผ่านค่ะ
+  Disconnect ลบ credential แต่คง exact binding และ durable history 17 รายการ
+  จากนั้น reconnect บัญชี/รากเดิมกลับ ready/zero countersค่ะ
+- Android API 36 A/B ผ่าน 9-file byte-exact round tripค่ะ Offline injection
+  หลัง private durable stage กลับมา complete โดย remote มี fixture เดียวค่ะ
+  Cold restart ของ C ฟื้นจาก 1 completed / 8 pending / 1 reconcile ไปเป็น
+  ready/zero counters และ B/C ตรงกัน 10 files แบบ byte-exactค่ะ
+- Final APK ดาวน์โหลด exact-root fixture เข้า empty Vault D ผ่าน stateful SAF
+  transcript ครบ 10/10 files และ per-path SHA-256 manifest ตรงกับ Vault Cค่ะ
+  Cold restart แล้ว reconnect binding เดิม กลับสู่ ready โดยทุก queue counter
+  เป็นศูนย์ค่ะ
+- APK SHA ข้างต้นติดตั้งทับ accepted API 36 state และ cold-launch retained Vault
+  ที่ `Ready` สำเร็จค่ะ
+- Static R2 mutation/token audit ผ่าน, production dependency tree ไม่มี
+  `drive-sync-spike` และ `pnpm audit --prod` ไม่พบ known vulnerabilityค่ะ
+- Fresh evidence-head CI ที่ `cba94d1` ผ่าน Quality, Android compile/alignment,
+  Ubuntu AppImage และ Windows NSIS ค่ะ
 
 Filesystem watcher และ Unix-socket fixture ล้มเมื่อรันใน restricted sandbox แต่กรณีเดียวกันผ่านเมื่อรันด้วย native filesystem permissions ค่ะ จึงจัดเป็น environment restriction ไม่ใช่ product regression ในรอบนี้ค่ะ
 
-Ignored-by-default tests คือ live Drive fixture และ OS keyring mutation เพราะแตะ external account/credential store ค่ะ รอบ audit นี้ไม่ได้รันสองรายการดังกล่าวค่ะ
+Ignored-by-default test binaries คือ live Drive fixture และ OS keyring mutation
+เพราะแตะ external account/credential store ค่ะ รอบ aggregate ไม่ได้เปิดสอง test
+binaries นี้ แต่ manual disposable live journey, Keychain restoration และ
+confirmed disconnect/reconnect ถูกทดสอบแยกและบันทึกไว้ด้านบนค่ะ
 
-## 5. Completed in This Alignment Round
+## 5. Completed Through R2 Integration
 
 - แยกหน้าที่เอกสารให้ `PROJECT_PLAN.md` เป็น direction/roadmap และไฟล์นี้เป็น operational handoff ค่ะ
 - เปลี่ยน MVP checklist ที่กำกวมเป็น capability matrix ซึ่งแยก Usable, Prototype, Foundation only และ Missing ค่ะ
@@ -62,6 +113,12 @@ Ignored-by-default tests คือ live Drive fixture และ OS keyring mutat
 - ติดป้าย Demo/Phase 0 evidence เก่าให้เป็น historical หรือ pre-commit ตามจริงค่ะ
 - ล็อก Personal First Release scope, Post-release scope และ execution order R1–R8 ตาม approval `Approve lock roadmap` ค่ะ
 - เพิ่ม milestone dependencies, exit gates, verification matrix และ change-control rules ใน `PROJECT_PLAN.md` ค่ะ
+- เพิ่ม schema v3 durable transfer queue/evidence, retry taxonomy, cursor-gated
+  change batches และ restart reconciliationค่ะ
+- เพิ่ม exact-root create-only Drive transfer capability, resumable upload,
+  bounded blob download และ lost-response reconciliationค่ะ
+- เพิ่ม private staged/base publication, guarded desktop/Android adapters,
+  bounded local observation และ redacted runtime statusค่ะ
 
 ## 6. Locked Roadmap Checkpoint
 
@@ -71,7 +128,7 @@ Ignored-by-default tests คือ live Drive fixture และ OS keyring mutat
 - R6 ปิด Persistent Knowledge Core ค่ะ
 - R7 บังคับ native runtime acceptance บน macOS, Windows, Ubuntu และ physical Android ค่ะ
 - R8 ทำ recovery drill, release verification และ Personal First Release ค่ะ
-- Active implementation milestone คือ R1 — Native Auth + Read-only Existing Drive Binding ค่ะ
+- Active implementation milestone คือ R2 — Guarded Upload and Download ค่ะ
 - เปิด implementation milestone ได้ครั้งละหนึ่ง milestone และต้องผ่าน exit gate พร้อม approval ก่อน transition ค่ะ
 - Planning range ที่เหลือจากผลรวม milestone คือ 10–19 focused engineering weeks โดยไม่รวมเวลารอ environment, device, external review หรือ account approval ค่ะ
 - Scope, order และ exit gates ถูกล็อกค่ะ Planning range ไม่ใช่ deadline lock ค่ะ
@@ -80,8 +137,9 @@ Ignored-by-default tests คือ live Drive fixture และ OS keyring mutat
 
 ### Product blockers
 
-- ไม่มี production native auth integration และ exact Existing Drive binding ค่ะ
-- ไม่มี production Drive read/write path หรือ cross-device end-to-end journey ค่ะ
+- Production guarded Drive transfer path และ locked disposable macOS/Android
+  round-trip/lifecycle evidence กับ evidence-head CI ผ่านแล้วค่ะ Final
+  documentation-head CI/PR readiness/merge ยังไม่ผ่านค่ะ
 - ไม่มี user-visible Sync status/retry/conflict recovery ค่ะ
 - Local mutation services ยังไม่ถูก expose ถึง UI ครบค่ะ
 
@@ -99,18 +157,21 @@ Ignored-by-default tests คือ live Drive fixture และ OS keyring mutat
 
 ## 8. Next Actions
 
-1. รักษา active R1 branch และ uncommitted work ทั้งหมดก่อนแก้ไฟล์ค่ะ
-2. ตรวจว่า R1 implementation plan และ approval state ใน active session ครอบคลุม read-only fixture/root, native credential boundary, production adapter boundary, rollback/cleanup และ acceptance ค่ะ
-3. เดิน R1 ตาม locked scope โดยแยก approval ก่อนเปิด OAuth browser หรือใช้ live Google Drive fixture ค่ะ
-4. ปิด R1 ด้วย exit-gate evidence บน source head เดียวกันและขอ approval ก่อน transition ค่ะ
-5. ห้ามเริ่ม R2 upload/download, remote mutation หรือแตะ personal Existing Vault ก่อน R1 exit gate ผ่านค่ะ
+1. Commit และ push final evidence update หลัง diff/secret/docs audit ค่ะ
+2. รอ Quality, Android compile, Ubuntu AppImage และ Windows NSIS บน exact final
+   documentation HEAD ค่ะ
+3. เปลี่ยน PR เป็น Ready และ merge เมื่อ Gate 0–8 ผ่านครบเท่านั้นค่ะ ห้ามแตะ
+   personal Vault/Drive หรือเริ่ม R3 rename/move/Trash/conflict workค่ะ
 
 ## 9. Approval State
 
-- Documentation audit, alignment, roadmap lock, PR review และ merge เข้า `main` ได้รับอนุมัติและดำเนินการแล้วค่ะ
+- Documentation audit, alignment และ roadmap lock ดำเนินการแล้วค่ะ Final PR
+  review, readiness และ merge เข้า `main` ได้รับอนุมัติแต่ยังรอ final gateค่ะ
 - Locked scope/order/gates ได้รับ approval ด้วยข้อความ `Approve lock roadmap` เมื่อ 2026-07-14 และอยู่บน `main` ที่ `5160882` ค่ะ
-- Active R1 branch มี implementation work แล้วค่ะ Session ที่ทำ R1 ต้องถือ approval state ของตัวเองเป็น source of truth และห้ามตีความ roadmap merge ว่าอนุมัติ live external access ค่ะ
-- OAuth browser และ live Google Drive access ยังต้องมี explicit approval ตาม R1 plan ค่ะ
+- R1 ถูก merge ผ่าน PR #26 และ R2 transition ได้รับ approval แล้วค่ะ
+- คุณโออนุมัติ R2 one-time execution ครอบคลุม code/docs/tests, subagents,
+  browser OAuth, restricted full Drive re-consent, read/write เฉพาะ disposable
+  R2 root, emulator, CI, commit, PR และ merge เมื่อทุก gate ผ่านค่ะ
 - ไม่มี approval ด้าน User Data Policy ค้างอยู่ค่ะ OAuth credential และ token ต้องอยู่ภายนอก repository และห้ามแสดงใน log ค่ะ
 - งาน implementation ใหม่ต้องเสนอแผนและขออนุมัติคุณโอก่อนลงมือค่ะ
 
