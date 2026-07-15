@@ -118,7 +118,7 @@ Planning range รวมที่เหลือจากผลรวม milesto
 |---|---|---|---|---|
 | R1 — Native Auth + Read-only Binding | แอปเชื่อม account, bind exact root และอ่าน remote state โดยไม่เขียน Drive ค่ะ | Phase 3A | 1–2 weeks | Complete — merged via PR #26 |
 | R2 — Guarded Transfer | Markdown และ attachment upload/download แบบ verified และ restart-safe ค่ะ | R1 | 2–3 weeks | Complete — merged via PR #27 |
-| R3 — Mutations + Conflict Safety | Rename/move/Trash และ two-sided conflicts ปลอดภัยข้ามอุปกรณ์ค่ะ | R2 | 2–3 weeks | Locked planned |
+| R3 — Mutations + Conflict Safety | Rename/move/Trash และ two-sided conflicts ปลอดภัยข้ามอุปกรณ์ค่ะ | R2 | 2–3 weeks | Planning prepared — implementation locked |
 | R4 — Sync Control Plane + Safe Sync Alpha | ผู้ใช้ควบคุมและเข้าใจ Sync ได้ พร้อม end-to-end alpha acceptance ค่ะ | R3 | 1–2 weeks | Locked planned |
 | R5 — Local Product Completion | Local CRUD, attachment และ remaining editor/reader journey เชื่อม UI ครบค่ะ | R4 | 1–2 weeks | Locked planned |
 | R6 — Knowledge Core | Persistent index, search, links, backlinks และ basic graphs ใช้ full-vault truth ค่ะ | R5 | 1–2 weeks | Locked planned |
@@ -195,6 +195,13 @@ Exit gate มีดังนี้ค่ะ
 - Remote Trash ต้องยืนยัน exact identity และไม่มี permanent-delete API ค่ะ
 - Two-device disposable fixture journey ผ่านพร้อม restart ระหว่าง mutation ค่ะ
 - ทุก unknown outcome จบที่ verified completion, retry-safe state หรือ Needs Reconcile ค่ะ
+
+R3 แบ่ง execution เป็น `R3.0 → R3.1 → {R3.2, R3.3, R3.4} → R3.5 →
+R3.6 → R3.7` ค่ะ รายละเอียด outcome, dependency, owner, exit gate, AI staffing
+และ usage contract อยู่ที่ [R3 plan](docs/sync/R3_PLAN.md),
+[R3 acceptance](docs/sync/R3_ACCEPTANCE.md) และ
+[R3 usage ledger](docs/sync/R3_USAGE.md) ค่ะ Planning pack นี้ไม่ใช่
+transition approval และยังห้าม R3 source implementation ค่ะ
 
 ### R4 — Sync Control Plane and Safe Sync Alpha
 
@@ -392,6 +399,12 @@ Milestone จะถือว่า complete เมื่อครบทุกข
 - ไฟล์นี้เป็นเจ้าของ locked direction, release scope, roadmap, gates และ risks ค่ะ
 - [SESSION_HANDOFF.md](SESSION_HANDOFF.md) เป็นเจ้าของ branch, dirty diff, verification ล่าสุด, active milestone และ approval state ค่ะ
 - [CHANGELOG.md](CHANGELOG.md) เก็บการเปลี่ยนแปลงตาม release/engineering milestone โดยไม่ทำหน้าที่เป็น handoff ค่ะ
+- [docs/sync/R3_PLAN.md](docs/sync/R3_PLAN.md) เป็นเจ้าของ R3.x execution,
+  safety contract, parallel ownership และ AI staffing methodology ค่ะ
+- [docs/sync/R3_ACCEPTANCE.md](docs/sync/R3_ACCEPTANCE.md) เป็นเจ้าของ R3 gate
+  checklist ค่ะ
+- [docs/sync/R3_USAGE.md](docs/sync/R3_USAGE.md) เป็นเจ้าของ AI usage vocabulary,
+  per-run ledger และ efficiency review ค่ะ
 - `docs/*/RESULTS.md` เก็บ evidence พร้อมวันที่และ commit โดยข้อมูลเก่าต้องติดป้าย historical หรือ superseded ค่ะ
 - Git และผล command ปัจจุบันเป็น source of truth เมื่อขัดกับ checkpoint ค่ะ
 
@@ -401,8 +414,13 @@ Milestone จะถือว่า complete เมื่อครบทุกข
   read-only acceptance, final review, Quality, Android compile, Ubuntu AppImage,
   และ Windows NSIS ผ่านค่ะ
 - R2 ถูก merge เข้า `origin/main` ที่ `94db388` ผ่าน PR #27 ค่ะ
-- ไม่มี active implementation milestone ค่ะ R3 — Mutations + Conflict Safety
-  ยังคง Locked planned และต้องมี plan/transition approval ใหม่ก่อนเริ่มค่ะ
+- R2 documentation closure baseline คือ `f7a0d7c` บน
+  `codex/r2-closure` ค่ะ Baseline นี้ยังต้อง merge เข้า canonical `main` พร้อม
+  planning pack นี้หรือ equivalent reviewed diff ค่ะ `f7a0d7c` เป็น post-merge
+  narrative เท่านั้นค่ะ R2 source checkpoint ยังคงเป็น merge commit `94db388` ค่ะ
+- ไม่มี active implementation milestone ค่ะ R3 — Mutations + Conflict Safety มี
+  planning pack `R3.0–R3.7` แล้ว แต่ implementation ยัง locked จน R3.0 gate
+  ผ่านและคุณโออนุมัติ transition ใหม่ค่ะ
 - macOS disposable byte-exact round trip และ Android API 36 live acceptance
   ผ่านแล้วค่ะ macOS restart upload/download, offline pause/resume, credential
   restoration และ disconnect/reconnect ผ่านแล้วค่ะ Final documentation head
@@ -410,3 +428,7 @@ Milestone จะถือว่า complete เมื่อครบทุกข
   Quality บน `main` ผ่านแล้วค่ะ R2 complete ตาม locked scope ค่ะ
 - คุณโออนุมัติ one-time execution สำหรับ R2 แล้วและ execution ปิดสมบูรณ์ค่ะ
   Approval นี้ไม่ครอบคลุม R3 rename/move/Trash/conflict work ค่ะ
+- คำขอวันที่ 2026-07-15 อนุญาตให้ทบทวนและบันทึก R3 planning methodology
+  ค่ะ คุณโออนุมัติ commit, push และ Draft PR สำหรับ planning/closure documents
+  เพิ่มเติมในวันเดียวกันค่ะ Approval นี้ไม่ครอบคลุม R3 source implementation,
+  live Drive mutation, PR merge หรือ R3 transition ค่ะ

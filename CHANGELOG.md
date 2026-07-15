@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased — R3 planning prepared — 2026-07-15
+
+- ยืนยัน R2 implementation, PR #27 merge `94db388` และ post-merge Quality run
+  `29429364407` ว่า complete ตาม locked milestone scope ค่ะ
+- เพิ่ม planning pack `R3.0–R3.7` พร้อม safety boundary, dependencies, component
+  gates, conflict matrix, parallel file ownership และ exact-head closure ค่ะ
+- เพิ่ม GPT/Antigravity model routing, usage vocabulary, per-run ledger และ
+  efficiency review โดยไม่อ้าง token/model pin ที่ execution surface ไม่รายงานค่ะ
+- R3 source implementation ยังไม่ active ค่ะ ต้อง merge planning/closure checkpoint
+  และได้รับ transition approval แยกต่างหากก่อนค่ะ
+
 ## Unreleased — R2 guarded transfer completed — 2026-07-15
 
 Built from the R1 merge checkpoint `681271a` and merged into `main` via PR #27

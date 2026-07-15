@@ -17,8 +17,13 @@ The first release targets macOS, Windows, Ubuntu, and Android through Tauri 2 wi
   retry/reconciliation และ Android SAF runtime ผ่าน locked macOS กับ Android API
   36 disposable live acceptance แล้วค่ะ Final documentation head `b08bb20`
   ผ่าน Quality, Android, Ubuntu และ Windows CI และ post-merge Quality บน `main`
-  ผ่านแล้วค่ะ R2 complete เฉพาะขอบเขต milestone ค่ะ R3 ยังต้องเสนอแผนและขอ
-  transition approval แยกต่างหากค่ะ
+  ผ่านแล้วค่ะ R2 complete เฉพาะขอบเขต milestone ค่ะ R3 implementation ยังไม่ได้
+  รับ transition approval ค่ะ
+- R3 planning pack ถูกแบ่งเป็น `R3.0–R3.7` แล้วค่ะ รายละเอียดอยู่ที่
+  [R3 plan](docs/sync/R3_PLAN.md), [R3 acceptance](docs/sync/R3_ACCEPTANCE.md)
+  และ [R3 usage ledger](docs/sync/R3_USAGE.md) ค่ะ R3 implementation ยังไม่ active
+  จนกว่า R3.0 planning checkpoint, full safety/provider contract และ fixture bounds
+  ผ่าน review แล้วคุณโออนุมัติ transition ค่ะ
 - Roadmap ถูกล็อกเป็น `R1 → R2 → R3 → R4 → R5 → R6 → R7 → R8` จนถึง Personal First Release โดยรายละเอียด scope และ exit gates อยู่ใน [PROJECT_PLAN.md](PROJECT_PLAN.md) ค่ะ
 
 สถานะโดยประมาณคือ 40–45% ของ personal first release เมื่อวัดจาก user-visible outcome ค่ะ รายละเอียดทิศทางและ capability gaps อยู่ใน [PROJECT_PLAN.md](PROJECT_PLAN.md) ส่วน Git checkpoint, verification ล่าสุด และงานถัดไปอยู่ใน [SESSION_HANDOFF.md](SESSION_HANDOFF.md) ค่ะ
@@ -42,7 +47,8 @@ pnpm install --frozen-lockfile
 pnpm --dir apps/tauri tauri dev
 ```
 
-Run the current R2 offline verification contractค่ะ
+Run the current completed R2 offline verification contractค่ะ R3 aggregate จะถูก
+เพิ่มหลัง R3 activation และ contract freeze เท่านั้นค่ะ
 
 ```bash
 pnpm quality:r2:offline
@@ -56,4 +62,6 @@ Historical Phase 0 platform gates and environment gaps are documented in
 and exit gates are defined by [docs/sync/R2_PLAN.md](docs/sync/R2_PLAN.md) and
 [docs/sync/R2_ACCEPTANCE.md](docs/sync/R2_ACCEPTANCE.md)ค่ะ Live tests are opt-in
 and may touch only the exact recorded disposable R2 account/root and disposable
-local Vaultsค่ะ Physical Android acceptance remains deferred to R7ค่ะ
+local Vaultsค่ะ R3 planning อยู่ที่ [docs/sync/R3_PLAN.md](docs/sync/R3_PLAN.md)
+และยังไม่อนุญาต R3 live mutation ค่ะ Physical Android acceptance remains deferred
+to R7ค่ะ
