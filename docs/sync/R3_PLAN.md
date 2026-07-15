@@ -338,7 +338,7 @@ context pollution แต่ใช้ token รวมมากกว่า single
 
 | Role | Recommended model/effort | Work class |
 |---|---|---|
-| Main Sunday integrator | GPT-5.6 Sol High หรือ Extra High ค่ะ | Contract freeze, conflict semantics, integration, security และ final gate ค่ะ |
+| Main Sunday integrator | ใช้ phase-matrix default ค่ะ Terra Medium/High สำหรับ bounded execution, Sol High สำหรับ high-risk judgment และ Extra High เฉพาะ planned escalation ค่ะ | Contract freeze, conflict semantics, integration, security และ final gate ค่ะ |
 | Safety/conflict reviewer | GPT-5.6 Sol High ค่ะ | Independent deep review, data-loss reasoning และ adversarial matrix ค่ะ |
 | Bounded implementation worker | GPT-5.6 Terra Medium หรือ High ค่ะ | One owned lane, explicit files และ deterministic tests ค่ะ |
 | Explorer/test/log worker | GPT-5.6 Terra Low/Medium ค่ะ | Read-heavy scan, test execution, triage และ concise evidence ค่ะ |
@@ -364,6 +364,27 @@ Drive mutation, access OAuth/keyring/personal Vault, merge/commit/push หรื
 shared integration files โดยตรงค่ะ ทุก run ใช้ fresh temporary workspace ที่มี
 เฉพาะ allowlisted files, `--mode plan`, `--sandbox`, explicit model, output cap
 และ direct-response contract ค่ะ
+
+### Phase model quick reference
+
+[R3_USAGE.md section 7](R3_USAGE.md#7-phase-model-routing-and-session-bootstrap)
+เป็น canonical source ของ routing และ session declaration ค่ะ ตารางนี้เป็น
+quick-reference เท่านั้นค่ะ
+
+| Phase | Main Sunday route | `agy` route |
+|---|---|---|
+| `R3.0` | Terra Medium → Sol High ที่ Gate 0 ค่ะ | Gemini 3.5 Flash (Medium) ค่ะ |
+| `R3.1` | Sol High → Terra High หลัง contract freeze ค่ะ | Gemini 3.5 Flash (Medium) ค่ะ |
+| `R3.2` | Terra High → Sol High ที่ conflict-policy gate ค่ะ | Gemini 3.5 Flash (Medium/High) ค่ะ |
+| `R3.3` | Sol High ค่ะ | Gemini 3.5 Flash (High) ค่ะ |
+| `R3.4` | Terra High → Sol High ที่ SAF safety gate ค่ะ | Gemini 3.5 Flash (Medium) ค่ะ |
+| `R3.5` | Sol High → Extra High เฉพาะ final adversarial/P0/P1 ค่ะ | Gemini 3.5 Flash (Medium) ค่ะ |
+| `R3.6` | Terra Medium → Sol High เมื่อมี unexplained safety failure ค่ะ | Gemini 3.5 Flash (Low/Medium) ค่ะ |
+| `R3.7` | Sol High ค่ะ | Gemini 3.5 Flash (Medium) ค่ะ |
+
+ทุก R3 session ต้องประกาศ phase, Main model/effort, gate model, `agy` tier,
+เหตุผล, allowed scope และ approval state ก่อน source write, worker spawn หรือ
+`agy` run ค่ะ
 
 ### Parallel ownership
 
@@ -409,6 +430,7 @@ review minutes, failed runs และ quota delta มากกว่าจำน
 
 - [OpenAI Codex subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents.md) ค่ะ
 - [OpenAI Codex models](https://learn.chatgpt.com/docs/models.md) ค่ะ
+- [OpenAI latest GPT-5.6 model guidance](https://developers.openai.com/api/docs/guides/latest-model.md) ค่ะ
 - [OpenAI API model catalog](https://developers.openai.com/api/docs/models) ค่ะ
 - [OpenAI Codex CLI commands](https://learn.chatgpt.com/docs/developer-commands.md?surface=cli) ค่ะ
 - [OpenAI Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode.md) ค่ะ
