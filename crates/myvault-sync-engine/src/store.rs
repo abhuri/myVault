@@ -10,6 +10,7 @@ use cap_std::fs::{Dir, OpenOptions};
 use fs2::FileExt;
 use myvault_private_fs as private_fs;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -103,12 +104,25 @@ const CHANGE_BATCH_SCHEMA: &str = "CREATE TABLE change_batch (
     expected_cursor TEXT NOT NULL,
     next_cursor TEXT NOT NULL
 )";
-const CHANGE_BATCH_MUTATIONS_SCHEMA: &str = "CREATE TABLE change_batch_mutations (
+const CHANGE_BATCH_MUTATIONS_SCHEMA_V3: &str = "CREATE TABLE change_batch_mutations (
     batch_id TEXT NOT NULL,
     mutation_id TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('pending', 'applying', 'committed')),
     PRIMARY KEY (batch_id, mutation_id),
     FOREIGN KEY (batch_id) REFERENCES change_batch(batch_id) ON DELETE CASCADE
+)";
+const CHANGE_BATCH_MUTATIONS_SCHEMA: &str = "CREATE TABLE change_batch_mutations (
+    batch_id TEXT NOT NULL,
+    mutation_id TEXT NOT NULL,
+    dependency_kind TEXT NOT NULL CHECK (dependency_kind IN ('mutation', 'merge_publication', 'conflict_copy_publication', 'base_publication', 'legacy_v3')),
+    operation_id TEXT,
+    committed_evidence_id TEXT,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'applying', 'needs_reconcile', 'committed')),
+    PRIMARY KEY (batch_id, mutation_id),
+    FOREIGN KEY (batch_id) REFERENCES change_batch(batch_id) ON DELETE CASCADE,
+    FOREIGN KEY (operation_id) REFERENCES mutation_intents(operation_id),
+    FOREIGN KEY (committed_evidence_id) REFERENCES mutation_verification_evidence(evidence_id),
+    CHECK ((dependency_kind = 'legacy_v3' AND operation_id IS NULL AND committed_evidence_id IS NULL) OR (dependency_kind != 'legacy_v3' AND operation_id IS NOT NULL))
 )";
 const TRANSFERS_SCHEMA: &str = "CREATE TABLE transfers (
     operation_id TEXT PRIMARY KEY NOT NULL,
@@ -143,6 +157,159 @@ const TRANSFER_HISTORY_SCHEMA: &str = "CREATE TABLE transfer_history (
     occurred_at_unix_ms INTEGER NOT NULL CHECK (occurred_at_unix_ms >= 0),
     FOREIGN KEY (operation_id) REFERENCES transfers(operation_id)
 )";
+const MUTATION_INTENTS_SCHEMA: &str = "CREATE TABLE mutation_intents (
+    operation_id TEXT PRIMARY KEY NOT NULL,
+    operation_kind TEXT NOT NULL CHECK (operation_kind IN ('local_publish', 'merge_publish', 'conflict_copy_publish', 'base_publish', 'remote_existing_blocked')),
+    account_id TEXT,
+    remote_root_id TEXT,
+    remote_file_id TEXT,
+    source_parent_id TEXT,
+    destination_parent_id TEXT,
+    local_object_id TEXT,
+    source_path TEXT,
+    destination_path TEXT,
+    expected_local_revision TEXT,
+    expected_remote_revision TEXT,
+    base_reference TEXT,
+    base_local_revision TEXT,
+    base_remote_revision TEXT,
+    base_sha256 TEXT,
+    base_byte_length INTEGER CHECK (base_byte_length >= 0),
+    expected_local_sha256 TEXT,
+    expected_local_byte_length INTEGER CHECK (expected_local_byte_length >= 0),
+    expected_remote_sha256 TEXT,
+    expected_remote_byte_length INTEGER CHECK (expected_remote_byte_length >= 0),
+    operation_marker TEXT NOT NULL UNIQUE,
+    intent_fingerprint TEXT NOT NULL,
+    registered_at_unix_ms INTEGER NOT NULL CHECK (registered_at_unix_ms >= 0),
+    CHECK ((base_sha256 IS NULL AND base_byte_length IS NULL) OR (base_sha256 IS NOT NULL AND base_byte_length IS NOT NULL)),
+    CHECK ((expected_local_sha256 IS NULL AND expected_local_byte_length IS NULL) OR (expected_local_sha256 IS NOT NULL AND expected_local_byte_length IS NOT NULL)),
+    CHECK ((expected_remote_sha256 IS NULL AND expected_remote_byte_length IS NULL) OR (expected_remote_sha256 IS NOT NULL AND expected_remote_byte_length IS NOT NULL))
+)";
+const MUTATION_STATE_SCHEMA: &str = "CREATE TABLE mutation_state (
+    operation_id TEXT PRIMARY KEY NOT NULL,
+    phase TEXT NOT NULL CHECK (phase IN ('intent_durable', 'running', 'retry_scheduled', 'needs_reconcile', 'completed')),
+    attempt_number INTEGER NOT NULL CHECK (attempt_number >= 0),
+    state_version INTEGER NOT NULL CHECK (state_version >= 0),
+    disposition TEXT CHECK (disposition IN ('verified_applied', 'verified_not_applied', 'retry_safe', 'needs_reconcile')),
+    next_attempt_at_unix_ms INTEGER CHECK (next_attempt_at_unix_ms >= 0),
+    retry_mode TEXT CHECK (retry_mode IN ('restart_exact', 'resume_exact')),
+    resume_reference TEXT,
+    last_evidence_id TEXT,
+    outcome_code TEXT,
+    updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= 0),
+    FOREIGN KEY (operation_id) REFERENCES mutation_intents(operation_id),
+    FOREIGN KEY (last_evidence_id) REFERENCES mutation_verification_evidence(evidence_id),
+    CHECK ((phase = 'retry_scheduled') = (next_attempt_at_unix_ms IS NOT NULL)),
+    CHECK ((retry_mode IS NULL AND resume_reference IS NULL) OR (retry_mode = 'restart_exact' AND resume_reference IS NULL) OR (retry_mode = 'resume_exact' AND resume_reference IS NOT NULL))
+)";
+const MUTATION_EVENTS_SCHEMA: &str = "CREATE TABLE mutation_events (
+    event_id INTEGER PRIMARY KEY NOT NULL,
+    operation_id TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL CHECK (attempt_number >= 0),
+    state_version INTEGER NOT NULL CHECK (state_version >= 0),
+    phase TEXT NOT NULL CHECK (phase IN ('intent_durable', 'running', 'retry_scheduled', 'needs_reconcile', 'completed')),
+    disposition TEXT CHECK (disposition IN ('verified_applied', 'verified_not_applied', 'retry_safe', 'needs_reconcile')),
+    evidence_id TEXT,
+    outcome_code TEXT,
+    occurred_at_unix_ms INTEGER NOT NULL CHECK (occurred_at_unix_ms >= 0),
+    FOREIGN KEY (operation_id) REFERENCES mutation_intents(operation_id),
+    FOREIGN KEY (evidence_id) REFERENCES mutation_verification_evidence(evidence_id)
+)";
+const MUTATION_VERIFICATION_EVIDENCE_SCHEMA: &str = "CREATE TABLE mutation_verification_evidence (
+    evidence_id TEXT PRIMARY KEY NOT NULL,
+    operation_id TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL CHECK (attempt_number >= 0),
+    capture_phase TEXT NOT NULL CHECK (capture_phase IN ('preflight', 'post_verify', 'reconcile')),
+    disposition TEXT NOT NULL CHECK (disposition IN ('verified_applied', 'verified_not_applied', 'retry_safe', 'needs_reconcile')),
+    outcome_code TEXT,
+    observed_account_id TEXT,
+    observed_remote_root_id TEXT,
+    observed_remote_file_id TEXT,
+    observed_parent_id TEXT,
+    observed_path TEXT,
+    observed_local_revision TEXT,
+    observed_remote_revision TEXT,
+    observed_sha256 TEXT,
+    observed_byte_length INTEGER CHECK (observed_byte_length >= 0),
+    observed_operation_marker TEXT,
+    forbidden_side_effect INTEGER NOT NULL CHECK (forbidden_side_effect IN (0, 1)),
+    verified_received_byte_offset INTEGER CHECK (verified_received_byte_offset >= 0),
+    resume_reference TEXT,
+    evidence_fingerprint TEXT NOT NULL,
+    captured_at_unix_ms INTEGER NOT NULL CHECK (captured_at_unix_ms >= 0),
+    FOREIGN KEY (operation_id) REFERENCES mutation_intents(operation_id),
+    CHECK ((observed_sha256 IS NULL AND observed_byte_length IS NULL) OR (observed_sha256 IS NOT NULL AND observed_byte_length IS NOT NULL))
+)";
+const CONFLICT_EVIDENCE_SCHEMA: &str = "CREATE TABLE conflict_evidence (
+    conflict_id TEXT PRIMARY KEY NOT NULL,
+    operation_id TEXT NOT NULL,
+    stable_cell_id TEXT NOT NULL,
+    local_state_code TEXT NOT NULL,
+    remote_state_code TEXT NOT NULL,
+    content_class TEXT NOT NULL,
+    lineage_state TEXT NOT NULL,
+    classification_code TEXT NOT NULL,
+    ambiguity_reason TEXT NOT NULL,
+    evidence_sufficiency TEXT NOT NULL,
+    conflict_copy_operation_id TEXT,
+    base_evidence_id TEXT,
+    local_evidence_id TEXT,
+    remote_evidence_id TEXT,
+    base_sha256 TEXT,
+    base_byte_length INTEGER CHECK (base_byte_length >= 0),
+    local_sha256 TEXT,
+    local_byte_length INTEGER CHECK (local_byte_length >= 0),
+    remote_sha256 TEXT,
+    remote_byte_length INTEGER CHECK (remote_byte_length >= 0),
+    naming_version TEXT NOT NULL,
+    normalized_collision_key TEXT NOT NULL,
+    target_parent_id TEXT NOT NULL,
+    expected_conflict_copy_sha256 TEXT,
+    expected_conflict_copy_byte_length INTEGER CHECK (expected_conflict_copy_byte_length >= 0),
+    explanation_code TEXT,
+    device_alias TEXT,
+    evidence_fingerprint TEXT NOT NULL,
+    captured_at_unix_ms INTEGER NOT NULL CHECK (captured_at_unix_ms >= 0),
+    FOREIGN KEY (operation_id) REFERENCES mutation_intents(operation_id),
+    FOREIGN KEY (conflict_copy_operation_id) REFERENCES mutation_intents(operation_id),
+    FOREIGN KEY (base_evidence_id) REFERENCES mutation_verification_evidence(evidence_id),
+    FOREIGN KEY (local_evidence_id) REFERENCES mutation_verification_evidence(evidence_id),
+    FOREIGN KEY (remote_evidence_id) REFERENCES mutation_verification_evidence(evidence_id),
+    CHECK ((base_sha256 IS NULL AND base_byte_length IS NULL) OR (base_sha256 IS NOT NULL AND base_byte_length IS NOT NULL)),
+    CHECK ((local_sha256 IS NULL AND local_byte_length IS NULL) OR (local_sha256 IS NOT NULL AND local_byte_length IS NOT NULL)),
+    CHECK ((remote_sha256 IS NULL AND remote_byte_length IS NULL) OR (remote_sha256 IS NOT NULL AND remote_byte_length IS NOT NULL)),
+    CHECK ((expected_conflict_copy_sha256 IS NULL AND expected_conflict_copy_byte_length IS NULL) OR (expected_conflict_copy_sha256 IS NOT NULL AND expected_conflict_copy_byte_length IS NOT NULL))
+)";
+const MUTATION_STATE_CLAIM_INDEX_SCHEMA: &str = "CREATE INDEX mutation_state_claim_idx
+    ON mutation_state(phase, next_attempt_at_unix_ms, operation_id)";
+const MUTATION_EVENTS_OPERATION_ATTEMPT_INDEX_SCHEMA: &str =
+    "CREATE INDEX mutation_events_operation_attempt_idx
+    ON mutation_events(operation_id, attempt_number, event_id)";
+const MUTATION_EVIDENCE_OPERATION_ATTEMPT_INDEX_SCHEMA: &str =
+    "CREATE INDEX mutation_evidence_operation_attempt_idx
+    ON mutation_verification_evidence(operation_id, attempt_number, evidence_id)";
+const CONFLICT_EVIDENCE_STABLE_CELL_INDEX_SCHEMA: &str =
+    "CREATE UNIQUE INDEX conflict_evidence_stable_cell_idx
+    ON conflict_evidence(stable_cell_id, conflict_id)";
+const CONFLICT_EVIDENCE_COPY_INDEX_SCHEMA: &str = "CREATE UNIQUE INDEX conflict_evidence_copy_idx
+    ON conflict_evidence(conflict_copy_operation_id) WHERE conflict_copy_operation_id IS NOT NULL";
+const MUTATION_INTENTS_NO_UPDATE_TRIGGER: &str = "CREATE TRIGGER mutation_intents_no_update
+    BEFORE UPDATE ON mutation_intents BEGIN SELECT RAISE(ABORT, 'mutation_intents_immutable'); END";
+const MUTATION_INTENTS_NO_DELETE_TRIGGER: &str = "CREATE TRIGGER mutation_intents_no_delete
+    BEFORE DELETE ON mutation_intents BEGIN SELECT RAISE(ABORT, 'mutation_intents_immutable'); END";
+const MUTATION_EVENTS_NO_UPDATE_TRIGGER: &str = "CREATE TRIGGER mutation_events_no_update
+    BEFORE UPDATE ON mutation_events BEGIN SELECT RAISE(ABORT, 'mutation_events_immutable'); END";
+const MUTATION_EVENTS_NO_DELETE_TRIGGER: &str = "CREATE TRIGGER mutation_events_no_delete
+    BEFORE DELETE ON mutation_events BEGIN SELECT RAISE(ABORT, 'mutation_events_immutable'); END";
+const MUTATION_EVIDENCE_NO_UPDATE_TRIGGER: &str = "CREATE TRIGGER mutation_evidence_no_update
+    BEFORE UPDATE ON mutation_verification_evidence BEGIN SELECT RAISE(ABORT, 'mutation_evidence_immutable'); END";
+const MUTATION_EVIDENCE_NO_DELETE_TRIGGER: &str = "CREATE TRIGGER mutation_evidence_no_delete
+    BEFORE DELETE ON mutation_verification_evidence BEGIN SELECT RAISE(ABORT, 'mutation_evidence_immutable'); END";
+const CONFLICT_EVIDENCE_NO_UPDATE_TRIGGER: &str = "CREATE TRIGGER conflict_evidence_no_update
+    BEFORE UPDATE ON conflict_evidence BEGIN SELECT RAISE(ABORT, 'conflict_evidence_immutable'); END";
+const CONFLICT_EVIDENCE_NO_DELETE_TRIGGER: &str = "CREATE TRIGGER conflict_evidence_no_delete
+    BEFORE DELETE ON conflict_evidence BEGIN SELECT RAISE(ABORT, 'conflict_evidence_immutable'); END";
 
 const SCHEMA_OBJECTS_V1: [(&str, &str, &str); 8] = [
     ("table", "vault_state", VAULT_STATE_SCHEMA_V1),
@@ -159,7 +326,7 @@ const SCHEMA_OBJECTS_V1: [(&str, &str, &str); 8] = [
     (
         "table",
         "change_batch_mutations",
-        CHANGE_BATCH_MUTATIONS_SCHEMA,
+        CHANGE_BATCH_MUTATIONS_SCHEMA_V3,
     ),
 ];
 
@@ -184,11 +351,11 @@ const SCHEMA_OBJECTS_V2: [(&str, &str, &str); 10] = [
     (
         "table",
         "change_batch_mutations",
-        CHANGE_BATCH_MUTATIONS_SCHEMA,
+        CHANGE_BATCH_MUTATIONS_SCHEMA_V3,
     ),
 ];
 
-const SCHEMA_OBJECTS: [(&str, &str, &str); 13] = [
+const SCHEMA_OBJECTS_V3: [(&str, &str, &str); 13] = [
     ("table", "vault_state", VAULT_STATE_SCHEMA),
     ("table", "remote_entries", REMOTE_ENTRIES_SCHEMA),
     (
@@ -209,14 +376,116 @@ const SCHEMA_OBJECTS: [(&str, &str, &str); 13] = [
     (
         "table",
         "change_batch_mutations",
-        CHANGE_BATCH_MUTATIONS_SCHEMA,
+        CHANGE_BATCH_MUTATIONS_SCHEMA_V3,
     ),
     ("table", "transfers", TRANSFERS_SCHEMA),
     ("index", "transfers_due_idx", TRANSFERS_DUE_INDEX_SCHEMA),
     ("table", "transfer_history", TRANSFER_HISTORY_SCHEMA),
 ];
 
-pub const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_OBJECTS: [(&str, &str, &str); 31] = [
+    ("table", "vault_state", VAULT_STATE_SCHEMA),
+    ("table", "remote_entries", REMOTE_ENTRIES_SCHEMA),
+    (
+        "index",
+        "remote_entries_path_idx",
+        REMOTE_ENTRIES_INDEX_SCHEMA,
+    ),
+    (
+        "index",
+        "remote_entries_preview_idx",
+        REMOTE_ENTRIES_PREVIEW_INDEX_SCHEMA,
+    ),
+    ("table", "scan_frontier", SCAN_FRONTIER_SCHEMA),
+    ("table", "sync_jobs", SYNC_JOBS_SCHEMA),
+    ("index", "sync_jobs_due_idx", SYNC_JOBS_INDEX_SCHEMA),
+    ("table", "sync_history", SYNC_HISTORY_SCHEMA),
+    ("table", "change_batch", CHANGE_BATCH_SCHEMA),
+    ("table", "mutation_intents", MUTATION_INTENTS_SCHEMA),
+    (
+        "table",
+        "mutation_verification_evidence",
+        MUTATION_VERIFICATION_EVIDENCE_SCHEMA,
+    ),
+    ("table", "mutation_state", MUTATION_STATE_SCHEMA),
+    ("table", "mutation_events", MUTATION_EVENTS_SCHEMA),
+    ("table", "conflict_evidence", CONFLICT_EVIDENCE_SCHEMA),
+    (
+        "table",
+        "change_batch_mutations",
+        CHANGE_BATCH_MUTATIONS_SCHEMA,
+    ),
+    ("table", "transfers", TRANSFERS_SCHEMA),
+    ("index", "transfers_due_idx", TRANSFERS_DUE_INDEX_SCHEMA),
+    ("table", "transfer_history", TRANSFER_HISTORY_SCHEMA),
+    (
+        "index",
+        "mutation_state_claim_idx",
+        MUTATION_STATE_CLAIM_INDEX_SCHEMA,
+    ),
+    (
+        "index",
+        "mutation_events_operation_attempt_idx",
+        MUTATION_EVENTS_OPERATION_ATTEMPT_INDEX_SCHEMA,
+    ),
+    (
+        "index",
+        "mutation_evidence_operation_attempt_idx",
+        MUTATION_EVIDENCE_OPERATION_ATTEMPT_INDEX_SCHEMA,
+    ),
+    (
+        "index",
+        "conflict_evidence_stable_cell_idx",
+        CONFLICT_EVIDENCE_STABLE_CELL_INDEX_SCHEMA,
+    ),
+    (
+        "index",
+        "conflict_evidence_copy_idx",
+        CONFLICT_EVIDENCE_COPY_INDEX_SCHEMA,
+    ),
+    (
+        "trigger",
+        "mutation_intents_no_update",
+        MUTATION_INTENTS_NO_UPDATE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "mutation_intents_no_delete",
+        MUTATION_INTENTS_NO_DELETE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "mutation_events_no_update",
+        MUTATION_EVENTS_NO_UPDATE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "mutation_events_no_delete",
+        MUTATION_EVENTS_NO_DELETE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "mutation_evidence_no_update",
+        MUTATION_EVIDENCE_NO_UPDATE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "mutation_evidence_no_delete",
+        MUTATION_EVIDENCE_NO_DELETE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "conflict_evidence_no_update",
+        CONFLICT_EVIDENCE_NO_UPDATE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "conflict_evidence_no_delete",
+        CONFLICT_EVIDENCE_NO_DELETE_TRIGGER,
+    ),
+];
+
+pub const SCHEMA_VERSION: i64 = 4;
 pub const MAX_REMOTE_PREVIEW_PAGE_SIZE: usize = 200;
 
 /// Exact residual risk inherited from bundled `SQLite`'s ambient-path VFS.
@@ -828,6 +1097,7 @@ impl TransferSummary {
 pub enum LocalMutationState {
     Pending,
     Applying,
+    NeedsReconcile,
     Committed,
 }
 
@@ -836,6 +1106,7 @@ impl LocalMutationState {
         match self {
             Self::Pending => "pending",
             Self::Applying => "applying",
+            Self::NeedsReconcile => "needs_reconcile",
             Self::Committed => "committed",
         }
     }
@@ -844,6 +1115,7 @@ impl LocalMutationState {
         match value {
             "pending" => Ok(Self::Pending),
             "applying" => Ok(Self::Applying),
+            "needs_reconcile" => Ok(Self::NeedsReconcile),
             "committed" => Ok(Self::Committed),
             _ => Err(Error::InvalidSchema),
         }
@@ -854,6 +1126,510 @@ impl LocalMutationState {
 pub struct LocalMutationStatus {
     pub mutation_id: String,
     pub state: LocalMutationState,
+}
+
+/// Typed R3 cursor dependency; this is not a provider capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChangeBatchDependencyKind {
+    Mutation,
+    MergePublication,
+    ConflictCopyPublication,
+    BasePublication,
+}
+
+impl ChangeBatchDependencyKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mutation => "mutation",
+            Self::MergePublication => "merge_publication",
+            Self::ConflictCopyPublication => "conflict_copy_publication",
+            Self::BasePublication => "base_publication",
+        }
+    }
+
+    const fn required_operation_kind(self) -> MutationOperationKind {
+        match self {
+            Self::Mutation => MutationOperationKind::LocalPublish,
+            Self::MergePublication => MutationOperationKind::MergePublish,
+            Self::ConflictCopyPublication => MutationOperationKind::ConflictCopyPublish,
+            Self::BasePublication => MutationOperationKind::BasePublish,
+        }
+    }
+}
+
+/// One immutable operation required before a typed R3 cursor batch may commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChangeBatchDependency {
+    pub operation_id: Uuid,
+    pub kind: ChangeBatchDependencyKind,
+}
+
+/// Immutable R3 mutation kind; this enum does not grant provider capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationOperationKind {
+    LocalPublish,
+    MergePublish,
+    ConflictCopyPublish,
+    BasePublish,
+    RemoteExistingBlocked,
+}
+
+impl MutationOperationKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalPublish => "local_publish",
+            Self::MergePublish => "merge_publish",
+            Self::ConflictCopyPublish => "conflict_copy_publish",
+            Self::BasePublish => "base_publish",
+            Self::RemoteExistingBlocked => "remote_existing_blocked",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "local_publish" => Ok(Self::LocalPublish),
+            "merge_publish" => Ok(Self::MergePublish),
+            "conflict_copy_publish" => Ok(Self::ConflictCopyPublish),
+            "base_publish" => Ok(Self::BasePublish),
+            "remote_existing_blocked" => Ok(Self::RemoteExistingBlocked),
+            _ => Err(Error::InvalidSchema),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationPhase {
+    IntentDurable,
+    Running,
+    RetryScheduled,
+    NeedsReconcile,
+    Completed,
+}
+
+impl MutationPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::IntentDurable => "intent_durable",
+            Self::Running => "running",
+            Self::RetryScheduled => "retry_scheduled",
+            Self::NeedsReconcile => "needs_reconcile",
+            Self::Completed => "completed",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "intent_durable" => Ok(Self::IntentDurable),
+            "running" => Ok(Self::Running),
+            "retry_scheduled" => Ok(Self::RetryScheduled),
+            "needs_reconcile" => Ok(Self::NeedsReconcile),
+            "completed" => Ok(Self::Completed),
+            _ => Err(Error::InvalidSchema),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationDisposition {
+    VerifiedApplied,
+    VerifiedNotApplied,
+    RetrySafe,
+    NeedsReconcile,
+}
+
+impl MutationDisposition {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::VerifiedApplied => "verified_applied",
+            Self::VerifiedNotApplied => "verified_not_applied",
+            Self::RetrySafe => "retry_safe",
+            Self::NeedsReconcile => "needs_reconcile",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "verified_applied" => Ok(Self::VerifiedApplied),
+            "verified_not_applied" => Ok(Self::VerifiedNotApplied),
+            "retry_safe" => Ok(Self::RetrySafe),
+            "needs_reconcile" => Ok(Self::NeedsReconcile),
+            _ => Err(Error::InvalidSchema),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationRetryMode {
+    RestartExact,
+    ResumeExact,
+}
+
+impl MutationRetryMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RestartExact => "restart_exact",
+            Self::ResumeExact => "resume_exact",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "restart_exact" => Ok(Self::RestartExact),
+            "resume_exact" => Ok(Self::ResumeExact),
+            _ => Err(Error::InvalidSchema),
+        }
+    }
+}
+
+/// Immutable fields that identify one R3 operation without provider credentials.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MutationIntent {
+    pub operation_id: Uuid,
+    pub operation_kind: MutationOperationKind,
+    pub account_id: Option<String>,
+    pub remote_root_id: Option<String>,
+    pub remote_file_id: Option<String>,
+    pub source_parent_id: Option<String>,
+    pub destination_parent_id: Option<String>,
+    pub local_object_id: Option<String>,
+    pub source_path: Option<String>,
+    pub destination_path: Option<String>,
+    pub expected_local_revision: Option<String>,
+    pub expected_remote_revision: Option<String>,
+    pub base_reference: Option<String>,
+    pub base_local_revision: Option<String>,
+    pub base_remote_revision: Option<String>,
+    pub base_sha256: Option<String>,
+    pub base_byte_length: Option<u64>,
+    pub expected_local_sha256: Option<String>,
+    pub expected_local_byte_length: Option<u64>,
+    pub expected_remote_sha256: Option<String>,
+    pub expected_remote_byte_length: Option<u64>,
+    pub operation_marker: String,
+    pub intent_fingerprint: String,
+    pub registered_at_unix_ms: u64,
+}
+
+impl MutationIntent {
+    /// Returns the engine-defined fingerprint for immutable correctness fields.
+    #[must_use]
+    pub fn canonical_fingerprint(&self) -> String {
+        canonical_fingerprint(
+            "r3-mutation-intent-v1",
+            [
+                (
+                    "operation_kind",
+                    Some(self.operation_kind.as_str().to_owned()),
+                ),
+                ("account_id", self.account_id.clone()),
+                ("remote_root_id", self.remote_root_id.clone()),
+                ("remote_file_id", self.remote_file_id.clone()),
+                ("source_parent_id", self.source_parent_id.clone()),
+                ("destination_parent_id", self.destination_parent_id.clone()),
+                ("local_object_id", self.local_object_id.clone()),
+                ("source_path", self.source_path.clone()),
+                ("destination_path", self.destination_path.clone()),
+                (
+                    "expected_local_revision",
+                    self.expected_local_revision.clone(),
+                ),
+                (
+                    "expected_remote_revision",
+                    self.expected_remote_revision.clone(),
+                ),
+                ("base_reference", self.base_reference.clone()),
+                ("base_local_revision", self.base_local_revision.clone()),
+                ("base_remote_revision", self.base_remote_revision.clone()),
+                ("base_sha256", self.base_sha256.clone()),
+                (
+                    "base_byte_length",
+                    self.base_byte_length.map(|value| value.to_string()),
+                ),
+                ("expected_local_sha256", self.expected_local_sha256.clone()),
+                (
+                    "expected_local_byte_length",
+                    self.expected_local_byte_length
+                        .map(|value| value.to_string()),
+                ),
+                (
+                    "expected_remote_sha256",
+                    self.expected_remote_sha256.clone(),
+                ),
+                (
+                    "expected_remote_byte_length",
+                    self.expected_remote_byte_length
+                        .map(|value| value.to_string()),
+                ),
+                ("operation_marker", Some(self.operation_marker.clone())),
+            ],
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MutationState {
+    pub operation_id: Uuid,
+    pub phase: MutationPhase,
+    pub attempt_number: u32,
+    pub state_version: u64,
+    pub disposition: Option<MutationDisposition>,
+    pub next_attempt_at_unix_ms: Option<u64>,
+    pub retry_mode: Option<MutationRetryMode>,
+    pub resume_reference: Option<String>,
+    pub last_evidence_id: Option<Uuid>,
+    pub outcome_code: Option<String>,
+    pub updated_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MutationVerificationEvidence {
+    pub evidence_id: Uuid,
+    pub operation_id: Uuid,
+    pub attempt_number: u32,
+    pub capture_phase: MutationEvidenceCapturePhase,
+    pub disposition: MutationDisposition,
+    pub outcome_code: Option<String>,
+    pub observed_account_id: Option<String>,
+    pub observed_remote_root_id: Option<String>,
+    pub observed_remote_file_id: Option<String>,
+    pub observed_parent_id: Option<String>,
+    pub observed_path: Option<String>,
+    pub observed_local_revision: Option<String>,
+    pub observed_remote_revision: Option<String>,
+    pub observed_sha256: Option<String>,
+    pub observed_byte_length: Option<u64>,
+    pub observed_operation_marker: Option<String>,
+    pub forbidden_side_effect: bool,
+    pub verified_received_byte_offset: Option<u64>,
+    pub resume_reference: Option<String>,
+    pub evidence_fingerprint: String,
+    pub captured_at_unix_ms: u64,
+}
+
+impl MutationVerificationEvidence {
+    /// Returns the engine-defined fingerprint excluding explanatory capture time.
+    #[must_use]
+    pub fn canonical_fingerprint(&self) -> String {
+        canonical_fingerprint(
+            "r3-mutation-evidence-v1",
+            [
+                ("operation_id", Some(self.operation_id.to_string())),
+                ("attempt_number", Some(self.attempt_number.to_string())),
+                (
+                    "capture_phase",
+                    Some(self.capture_phase.as_str().to_owned()),
+                ),
+                ("disposition", Some(self.disposition.as_str().to_owned())),
+                ("outcome_code", self.outcome_code.clone()),
+                ("observed_account_id", self.observed_account_id.clone()),
+                (
+                    "observed_remote_root_id",
+                    self.observed_remote_root_id.clone(),
+                ),
+                (
+                    "observed_remote_file_id",
+                    self.observed_remote_file_id.clone(),
+                ),
+                ("observed_parent_id", self.observed_parent_id.clone()),
+                ("observed_path", self.observed_path.clone()),
+                (
+                    "observed_local_revision",
+                    self.observed_local_revision.clone(),
+                ),
+                (
+                    "observed_remote_revision",
+                    self.observed_remote_revision.clone(),
+                ),
+                ("observed_sha256", self.observed_sha256.clone()),
+                (
+                    "observed_byte_length",
+                    self.observed_byte_length.map(|value| value.to_string()),
+                ),
+                (
+                    "observed_operation_marker",
+                    self.observed_operation_marker.clone(),
+                ),
+                (
+                    "forbidden_side_effect",
+                    Some(u8::from(self.forbidden_side_effect).to_string()),
+                ),
+                (
+                    "verified_received_byte_offset",
+                    self.verified_received_byte_offset
+                        .map(|value| value.to_string()),
+                ),
+                ("resume_reference", self.resume_reference.clone()),
+            ],
+        )
+    }
+}
+
+/// Immutable conflict-classification envelope; R3.1 persists it but does not classify content.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConflictEvidence {
+    pub conflict_id: String,
+    pub operation_id: Uuid,
+    pub stable_cell_id: String,
+    pub local_state_code: String,
+    pub remote_state_code: String,
+    pub content_class: String,
+    pub lineage_state: String,
+    pub classification_code: String,
+    pub ambiguity_reason: String,
+    pub evidence_sufficiency: String,
+    pub conflict_copy_operation_id: Option<Uuid>,
+    pub base_evidence_id: Option<Uuid>,
+    pub local_evidence_id: Option<Uuid>,
+    pub remote_evidence_id: Option<Uuid>,
+    pub base_sha256: Option<String>,
+    pub base_byte_length: Option<u64>,
+    pub local_sha256: Option<String>,
+    pub local_byte_length: Option<u64>,
+    pub remote_sha256: Option<String>,
+    pub remote_byte_length: Option<u64>,
+    pub naming_version: String,
+    pub normalized_collision_key: String,
+    pub target_parent_id: String,
+    pub expected_conflict_copy_sha256: Option<String>,
+    pub expected_conflict_copy_byte_length: Option<u64>,
+    pub explanation_code: Option<String>,
+    pub device_alias: Option<String>,
+    pub evidence_fingerprint: String,
+    pub captured_at_unix_ms: u64,
+}
+
+impl ConflictEvidence {
+    /// Returns the engine-defined fingerprint excluding explanatory device/time metadata.
+    #[must_use]
+    pub fn canonical_fingerprint(&self) -> String {
+        canonical_fingerprint(
+            "r3-conflict-evidence-v1",
+            [
+                ("conflict_id", Some(self.conflict_id.clone())),
+                ("operation_id", Some(self.operation_id.to_string())),
+                ("stable_cell_id", Some(self.stable_cell_id.clone())),
+                ("local_state_code", Some(self.local_state_code.clone())),
+                ("remote_state_code", Some(self.remote_state_code.clone())),
+                ("content_class", Some(self.content_class.clone())),
+                ("lineage_state", Some(self.lineage_state.clone())),
+                (
+                    "classification_code",
+                    Some(self.classification_code.clone()),
+                ),
+                ("ambiguity_reason", Some(self.ambiguity_reason.clone())),
+                (
+                    "evidence_sufficiency",
+                    Some(self.evidence_sufficiency.clone()),
+                ),
+                (
+                    "conflict_copy_operation_id",
+                    self.conflict_copy_operation_id
+                        .map(|value| value.to_string()),
+                ),
+                (
+                    "base_evidence_id",
+                    self.base_evidence_id.map(|value| value.to_string()),
+                ),
+                (
+                    "local_evidence_id",
+                    self.local_evidence_id.map(|value| value.to_string()),
+                ),
+                (
+                    "remote_evidence_id",
+                    self.remote_evidence_id.map(|value| value.to_string()),
+                ),
+                ("base_sha256", self.base_sha256.clone()),
+                (
+                    "base_byte_length",
+                    self.base_byte_length.map(|value| value.to_string()),
+                ),
+                ("local_sha256", self.local_sha256.clone()),
+                (
+                    "local_byte_length",
+                    self.local_byte_length.map(|value| value.to_string()),
+                ),
+                ("remote_sha256", self.remote_sha256.clone()),
+                (
+                    "remote_byte_length",
+                    self.remote_byte_length.map(|value| value.to_string()),
+                ),
+                ("naming_version", Some(self.naming_version.clone())),
+                (
+                    "normalized_collision_key",
+                    Some(self.normalized_collision_key.clone()),
+                ),
+                ("target_parent_id", Some(self.target_parent_id.clone())),
+                (
+                    "expected_conflict_copy_sha256",
+                    self.expected_conflict_copy_sha256.clone(),
+                ),
+                (
+                    "expected_conflict_copy_byte_length",
+                    self.expected_conflict_copy_byte_length
+                        .map(|value| value.to_string()),
+                ),
+                ("explanation_code", self.explanation_code.clone()),
+            ],
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConflictEvidenceRegistrationOutcome {
+    Registered,
+    AlreadyPresent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationEvidenceCapturePhase {
+    Preflight,
+    PostVerify,
+    Reconcile,
+}
+
+impl MutationEvidenceCapturePhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preflight => "preflight",
+            Self::PostVerify => "post_verify",
+            Self::Reconcile => "reconcile",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MutationEvent {
+    pub event_id: u64,
+    pub operation_id: Uuid,
+    pub attempt_number: u32,
+    pub state_version: u64,
+    pub phase: MutationPhase,
+    pub disposition: Option<MutationDisposition>,
+    pub evidence_id: Option<Uuid>,
+    pub outcome_code: Option<String>,
+    pub occurred_at_unix_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationRegistrationOutcome {
+    Registered,
+    AlreadyPresent,
+    AlreadyCompleted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MutationOutcomeTransition {
+    VerifiedApplied,
+    /// Reserved until an approved executor can revalidate exact retry preconditions.
+    VerifiedNotApplied {
+        next_attempt_at_unix_ms: u64,
+    },
+    /// Reserved until an approved executor can revalidate exact resumable state.
+    RetrySafe {
+        next_attempt_at_unix_ms: u64,
+        resume_reference: String,
+    },
+    NeedsReconcile,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1020,6 +1796,330 @@ impl SyncStore {
         Ok(self
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))?)
+    }
+
+    /// Registers one immutable R3 intent with its initial durable state and event.
+    ///
+    /// `RemoteExistingBlocked` requires exact initial `NeedsReconcile` evidence and
+    /// never enters an executable phase.
+    ///
+    /// # Errors
+    /// Returns validation, immutable-identity, state-transition, or database errors.
+    #[allow(clippy::too_many_lines)]
+    pub fn register_mutation_intent(
+        &mut self,
+        intent: &MutationIntent,
+        initial_evidence: Option<&MutationVerificationEvidence>,
+    ) -> Result<MutationRegistrationOutcome> {
+        validate_mutation_intent(intent)?;
+        if let Some(evidence) = initial_evidence {
+            validate_mutation_evidence(evidence)?;
+            if evidence.operation_id != intent.operation_id {
+                return Err(Error::MutationCollision);
+            }
+        }
+        let blocked = intent.operation_kind == MutationOperationKind::RemoteExistingBlocked;
+        if blocked {
+            let evidence = initial_evidence.ok_or(Error::InvalidTransferEvidence)?;
+            if evidence.disposition != MutationDisposition::NeedsReconcile
+                || evidence.capture_phase == MutationEvidenceCapturePhase::PostVerify
+                || evidence.outcome_code.is_none()
+                || evidence.observed_account_id != intent.account_id
+                || evidence.observed_remote_root_id != intent.remote_root_id
+                || evidence.observed_remote_file_id != intent.remote_file_id
+                || evidence.observed_parent_id != intent.source_parent_id
+                || evidence.observed_path != intent.source_path
+                || evidence.observed_remote_revision != intent.expected_remote_revision
+            {
+                return Err(Error::InvalidTransferEvidence);
+            }
+        } else if initial_evidence.is_some() {
+            return Err(Error::InvalidStateTransition);
+        }
+
+        let transaction = self.connection.transaction()?;
+        if let Some((fingerprint, marker)) =
+            load_mutation_identity(&transaction, intent.operation_id)?
+        {
+            if fingerprint != intent.intent_fingerprint || marker != intent.operation_marker {
+                return Err(Error::MutationCollision);
+            }
+            let state = load_mutation_state(&transaction, intent.operation_id)?
+                .ok_or(Error::InvalidSchema)?;
+            transaction.commit()?;
+            return Ok(if state.phase == MutationPhase::Completed {
+                MutationRegistrationOutcome::AlreadyCompleted
+            } else {
+                MutationRegistrationOutcome::AlreadyPresent
+            });
+        }
+        if mutation_marker_exists(&transaction, &intent.operation_marker)? {
+            return Err(Error::MutationCollision);
+        }
+
+        insert_mutation_intent(&transaction, intent)?;
+        let initial_state = MutationState {
+            operation_id: intent.operation_id,
+            phase: MutationPhase::IntentDurable,
+            attempt_number: 0,
+            state_version: 0,
+            disposition: None,
+            next_attempt_at_unix_ms: None,
+            retry_mode: None,
+            resume_reference: None,
+            last_evidence_id: None,
+            outcome_code: None,
+            updated_at_unix_ms: intent.registered_at_unix_ms,
+        };
+        insert_mutation_state(&transaction, &initial_state)?;
+        insert_mutation_event(
+            &transaction,
+            intent.operation_id,
+            0,
+            0,
+            MutationPhase::IntentDurable,
+            None,
+            None,
+            None,
+            intent.registered_at_unix_ms,
+        )?;
+
+        if let Some(evidence) = initial_evidence {
+            insert_mutation_evidence(&transaction, evidence)?;
+            let changed = transaction.execute(
+                "UPDATE mutation_state
+                 SET phase = 'needs_reconcile', state_version = 1,
+                     disposition = 'needs_reconcile', last_evidence_id = ?1,
+                     outcome_code = ?2, updated_at_unix_ms = ?3
+                 WHERE operation_id = ?4 AND state_version = 0 AND phase = 'intent_durable'",
+                params![
+                    evidence.evidence_id.to_string(),
+                    evidence.outcome_code,
+                    u64_to_i64(evidence.captured_at_unix_ms)?,
+                    intent.operation_id.to_string()
+                ],
+            )?;
+            if changed != 1 {
+                return Err(Error::MutationStateVersionMismatch);
+            }
+            insert_mutation_event(
+                &transaction,
+                intent.operation_id,
+                0,
+                1,
+                MutationPhase::NeedsReconcile,
+                Some(MutationDisposition::NeedsReconcile),
+                Some(evidence.evidence_id),
+                evidence.outcome_code.as_deref(),
+                evidence.captured_at_unix_ms,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(MutationRegistrationOutcome::Registered)
+    }
+
+    /// Reads one current R3 mutation state without exposing private capabilities.
+    ///
+    /// # Errors
+    /// Returns an invalid-operation or database error.
+    pub fn mutation_state(&self, operation_id: Uuid) -> Result<Option<MutationState>> {
+        if operation_id.is_nil() {
+            return Err(Error::MutationNotFound);
+        }
+        load_mutation_state(&self.connection, operation_id)
+    }
+
+    /// Reads append-only state-transition history for one mutation.
+    ///
+    /// # Errors
+    /// Returns an invalid-operation, malformed-record, or database error.
+    pub fn mutation_events(&self, operation_id: Uuid) -> Result<Vec<MutationEvent>> {
+        if operation_id.is_nil() {
+            return Err(Error::MutationNotFound);
+        }
+        load_mutation_events(&self.connection, operation_id)
+    }
+
+    /// Claims a durable intent or due retry using the caller's expected state version.
+    ///
+    /// # Errors
+    /// Returns an unknown-operation, stale-version, invalid-transition, or database error.
+    pub fn claim_mutation(
+        &mut self,
+        operation_id: Uuid,
+        expected_state_version: u64,
+        now_unix_ms: u64,
+    ) -> Result<MutationState> {
+        u64_to_i64(now_unix_ms)?;
+        let transaction = self.connection.transaction()?;
+        let (_, operation_kind) =
+            load_mutation_kind(&transaction, operation_id)?.ok_or(Error::MutationNotFound)?;
+        if operation_kind == MutationOperationKind::RemoteExistingBlocked {
+            return Err(Error::MutationNeedsReconcile);
+        }
+        let state =
+            load_mutation_state(&transaction, operation_id)?.ok_or(Error::MutationNotFound)?;
+        if state.state_version != expected_state_version {
+            return Err(Error::MutationStateVersionMismatch);
+        }
+        let retry = state.phase == MutationPhase::RetryScheduled;
+        if !matches!(
+            state.phase,
+            MutationPhase::IntentDurable | MutationPhase::RetryScheduled
+        ) || state
+            .next_attempt_at_unix_ms
+            .is_some_and(|due| due > now_unix_ms)
+        {
+            return Err(Error::InvalidStateTransition);
+        }
+        let next = MutationState {
+            operation_id,
+            phase: MutationPhase::Running,
+            attempt_number: state.attempt_number + u32::from(retry),
+            state_version: state.state_version + 1,
+            disposition: None,
+            next_attempt_at_unix_ms: None,
+            retry_mode: None,
+            resume_reference: None,
+            last_evidence_id: state.last_evidence_id,
+            outcome_code: None,
+            updated_at_unix_ms: now_unix_ms,
+        };
+        update_mutation_state(&transaction, &next, state.state_version)?;
+        insert_mutation_event(
+            &transaction,
+            operation_id,
+            next.attempt_number,
+            next.state_version,
+            next.phase,
+            None,
+            None,
+            None,
+            now_unix_ms,
+        )?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    /// Persists exact outcome evidence, the resulting state, and one event atomically.
+    ///
+    /// # Errors
+    /// Returns invalid evidence, stale-version, invalid-transition, or database errors.
+    pub fn record_mutation_outcome(
+        &mut self,
+        operation_id: Uuid,
+        expected_state_version: u64,
+        evidence: &MutationVerificationEvidence,
+        transition: &MutationOutcomeTransition,
+    ) -> Result<MutationState> {
+        validate_mutation_evidence(evidence)?;
+        if evidence.operation_id != operation_id {
+            return Err(Error::MutationCollision);
+        }
+        let transaction = self.connection.transaction()?;
+        let state =
+            load_mutation_state(&transaction, operation_id)?.ok_or(Error::MutationNotFound)?;
+        if state.state_version != expected_state_version {
+            return Err(Error::MutationStateVersionMismatch);
+        }
+        if evidence.attempt_number != state.attempt_number
+            || !matches!(
+                state.phase,
+                MutationPhase::Running | MutationPhase::NeedsReconcile
+            )
+        {
+            return Err(Error::InvalidStateTransition);
+        }
+        if matches!(transition, MutationOutcomeTransition::VerifiedApplied) {
+            validate_verified_applied_evidence(&transaction, evidence)?;
+        }
+        let (phase, disposition, next_attempt, retry_mode, resume_reference) =
+            transition_target(state.phase, evidence, transition)?;
+        insert_mutation_evidence(&transaction, evidence)?;
+        let next = MutationState {
+            operation_id,
+            phase,
+            attempt_number: state.attempt_number,
+            state_version: state.state_version + 1,
+            disposition: Some(disposition),
+            next_attempt_at_unix_ms: next_attempt,
+            retry_mode,
+            resume_reference,
+            last_evidence_id: Some(evidence.evidence_id),
+            outcome_code: evidence.outcome_code.clone(),
+            updated_at_unix_ms: evidence.captured_at_unix_ms,
+        };
+        update_mutation_state(&transaction, &next, state.state_version)?;
+        insert_mutation_event(
+            &transaction,
+            operation_id,
+            next.attempt_number,
+            next.state_version,
+            next.phase,
+            next.disposition,
+            Some(evidence.evidence_id),
+            evidence.outcome_code.as_deref(),
+            evidence.captured_at_unix_ms,
+        )?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    /// Persists one immutable R3.1 conflict-evidence envelope without classifying content.
+    ///
+    /// Exact reruns return `AlreadyPresent`; any differing durable identity fails closed.
+    ///
+    /// # Errors
+    /// Returns validation, ownership, immutable-identity, or database errors.
+    pub fn record_conflict_evidence(
+        &mut self,
+        evidence: &ConflictEvidence,
+    ) -> Result<ConflictEvidenceRegistrationOutcome> {
+        validate_conflict_evidence(evidence)?;
+        let transaction = self.connection.transaction()?;
+        if load_mutation_kind(&transaction, evidence.operation_id)?.is_none() {
+            return Err(Error::MutationNotFound);
+        }
+        if let Some(existing) =
+            load_conflict_evidence_fingerprint(&transaction, &evidence.conflict_id)?
+        {
+            if existing == evidence.evidence_fingerprint {
+                transaction.commit()?;
+                return Ok(ConflictEvidenceRegistrationOutcome::AlreadyPresent);
+            }
+            return Err(Error::MutationCollision);
+        }
+        if let Some(operation_id) = evidence.conflict_copy_operation_id {
+            let (_, kind) =
+                load_mutation_kind(&transaction, operation_id)?.ok_or(Error::MutationNotFound)?;
+            if kind != MutationOperationKind::ConflictCopyPublish {
+                return Err(Error::MutationCollision);
+            }
+        }
+        for evidence_id in [
+            evidence.base_evidence_id,
+            evidence.local_evidence_id,
+            evidence.remote_evidence_id,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !evidence_belongs_to_operation(&transaction, evidence_id, evidence.operation_id)? {
+                return Err(Error::MutationCollision);
+            }
+        }
+        insert_conflict_evidence(&transaction, evidence)?;
+        transaction.commit()?;
+        Ok(ConflictEvidenceRegistrationOutcome::Registered)
+    }
+
+    /// Reads one immutable conflict-evidence envelope by its stable conflict identity.
+    ///
+    /// # Errors
+    /// Returns invalid identity, malformed durable rows, or database errors.
+    pub fn conflict_evidence(&self, conflict_id: &str) -> Result<Option<ConflictEvidence>> {
+        validate_redacted_code(conflict_id)?;
+        load_conflict_evidence(&self.connection, conflict_id)
     }
 
     /// Binds this local Vault to one exact remote root without silent rebinding.
@@ -2237,8 +3337,10 @@ impl SyncStore {
         )?;
         for mutation in declared {
             transaction.execute(
-                "INSERT INTO change_batch_mutations(batch_id, mutation_id, state)
-                 VALUES (?1, ?2, ?3)",
+                "INSERT INTO change_batch_mutations(
+                    batch_id, mutation_id, dependency_kind, operation_id,
+                    committed_evidence_id, state
+                 ) VALUES (?1, ?2, 'legacy_v3', NULL, NULL, ?3)",
                 params![
                     batch_id.to_string(),
                     mutation,
@@ -2313,8 +3415,10 @@ impl SyncStore {
         for transfer in downloads {
             register_transfer_in_transaction(&transaction, transfer)?;
             transaction.execute(
-                "INSERT INTO change_batch_mutations(batch_id, mutation_id, state)
-                 VALUES (?1, ?2, ?3)",
+                "INSERT INTO change_batch_mutations(
+                    batch_id, mutation_id, dependency_kind, operation_id,
+                    committed_evidence_id, state
+                 ) VALUES (?1, ?2, 'legacy_v3', NULL, NULL, ?3)",
                 params![
                     batch_id.to_string(),
                     transfer_mutation_id(transfer.operation_id),
@@ -2322,6 +3426,239 @@ impl SyncStore {
                 ],
             )?;
         }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Starts one typed R3 cursor batch without granting any provider capability.
+    ///
+    /// Every dependency is bound to an existing immutable intent whose operation
+    /// kind exactly matches the declared cursor-dependency kind. Legacy APIs
+    /// cannot complete this batch.
+    ///
+    /// # Errors
+    /// Returns cursor, duplicate-identity, missing-intent, or database errors.
+    pub fn begin_r3_change_batch(
+        &mut self,
+        batch_id: Uuid,
+        expected_cursor: &str,
+        next_cursor: &str,
+        dependencies: &[ChangeBatchDependency],
+    ) -> Result<()> {
+        if batch_id.is_nil() {
+            return Err(Error::InvalidStateTransition);
+        }
+        validate_remote_token(expected_cursor)?;
+        validate_remote_token(next_cursor)?;
+        let declared = dependencies
+            .iter()
+            .map(|dependency| dependency.operation_id)
+            .collect::<BTreeSet<_>>();
+        if declared.len() != dependencies.len() || declared.contains(&Uuid::nil()) {
+            return Err(Error::MutationCollision);
+        }
+
+        let transaction = self.connection.transaction()?;
+        let state = require_state(&transaction, self.vault_id)?;
+        if state.phase != SyncPhase::Ready
+            || state.durable_cursor.as_deref() != Some(expected_cursor)
+        {
+            return Err(Error::CursorMismatch);
+        }
+        if load_change_batch(&transaction)?.is_some() {
+            return Err(Error::BatchAlreadyActive);
+        }
+        for dependency in dependencies {
+            let (_, operation_kind) = load_mutation_kind(&transaction, dependency.operation_id)?
+                .ok_or(Error::MutationNotFound)?;
+            if operation_kind != dependency.kind.required_operation_kind()
+                || load_mutation_state(&transaction, dependency.operation_id)?.is_none()
+            {
+                return Err(Error::MutationCollision);
+            }
+        }
+        transaction.execute(
+            "INSERT INTO change_batch(singleton, batch_id, expected_cursor, next_cursor)
+             VALUES (1, ?1, ?2, ?3)",
+            params![batch_id.to_string(), expected_cursor, next_cursor],
+        )?;
+        for dependency in dependencies {
+            transaction.execute(
+                "INSERT INTO change_batch_mutations(
+                    batch_id, mutation_id, dependency_kind, operation_id,
+                    committed_evidence_id, state
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, 'pending')",
+                params![
+                    batch_id.to_string(),
+                    dependency.operation_id.to_string(),
+                    dependency.kind.as_str(),
+                    dependency.operation_id.to_string(),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Binds one completed R3 operation to the exact evidence required by its batch.
+    ///
+    /// The operation must have completed with exact post-verification evidence and
+    /// a matching immutable completion event. Repeating the same bind is idempotent.
+    ///
+    /// # Errors
+    /// Returns missing-batch, identity, incomplete-evidence, reconciliation, or database errors.
+    pub fn commit_r3_change_dependency(
+        &mut self,
+        batch_id: Uuid,
+        dependency: ChangeBatchDependency,
+        evidence_id: Uuid,
+    ) -> Result<()> {
+        if batch_id.is_nil() || dependency.operation_id.is_nil() || evidence_id.is_nil() {
+            return Err(Error::InvalidStateTransition);
+        }
+        let transaction = self.connection.transaction()?;
+        let batch = load_change_batch(&transaction)?.ok_or(Error::NoActiveBatch)?;
+        if batch.batch_id != batch_id {
+            return Err(Error::NoActiveBatch);
+        }
+        let row = transaction
+            .query_row(
+                "SELECT dependency_kind, operation_id, committed_evidence_id, state
+                 FROM change_batch_mutations
+                 WHERE batch_id = ?1 AND mutation_id = ?2",
+                params![batch_id.to_string(), dependency.operation_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(Error::UnknownMutation)?;
+        if row.0 != dependency.kind.as_str()
+            || row.1.as_deref() != Some(dependency.operation_id.to_string().as_str())
+        {
+            return Err(Error::MutationCollision);
+        }
+        let (_, operation_kind) = load_mutation_kind(&transaction, dependency.operation_id)?
+            .ok_or(Error::MutationNotFound)?;
+        if operation_kind != dependency.kind.required_operation_kind() {
+            return Err(Error::MutationCollision);
+        }
+        match LocalMutationState::parse(&row.3)? {
+            LocalMutationState::Committed => {
+                if row.2.as_deref() != Some(evidence_id.to_string().as_str()) {
+                    return Err(Error::MutationCollision);
+                }
+            }
+            LocalMutationState::Pending => {}
+            LocalMutationState::Applying | LocalMutationState::NeedsReconcile => {
+                return Err(Error::MutationNeedsReconcile);
+            }
+        }
+        require_exact_r3_completion_evidence(&transaction, dependency.operation_id, evidence_id)?;
+        if LocalMutationState::parse(&row.3)? == LocalMutationState::Committed {
+            transaction.commit()?;
+            return Ok(());
+        }
+        let changed = transaction.execute(
+            "UPDATE change_batch_mutations
+             SET state = 'committed', committed_evidence_id = ?1
+             WHERE batch_id = ?2 AND mutation_id = ?3 AND dependency_kind = ?4
+               AND operation_id = ?5 AND state = 'pending' AND committed_evidence_id IS NULL",
+            params![
+                evidence_id.to_string(),
+                batch_id.to_string(),
+                dependency.operation_id.to_string(),
+                dependency.kind.as_str(),
+                dependency.operation_id.to_string(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(Error::MutationStateVersionMismatch);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Advances the cursor only after every typed R3 dependency has exact evidence.
+    ///
+    /// # Errors
+    /// Returns missing-batch, incomplete-dependency, changed-cursor, or database errors.
+    pub fn commit_r3_change_batch(&mut self, batch_id: Uuid, now_unix_ms: u64) -> Result<()> {
+        let now = u64_to_i64(now_unix_ms)?;
+        let transaction = self.connection.transaction()?;
+        let batch = load_change_batch(&transaction)?.ok_or(Error::NoActiveBatch)?;
+        if batch.batch_id != batch_id {
+            return Err(Error::NoActiveBatch);
+        }
+        if legacy_v3_dependency_count(&transaction, batch_id)? != 0
+            || transfer_backed_mutation_count(&transaction, batch_id)? != 0
+        {
+            return Err(Error::InvalidStateTransition);
+        }
+        let incomplete: i64 = transaction.query_row(
+            "SELECT COUNT(*)
+             FROM change_batch_mutations AS dependency
+             LEFT JOIN mutation_intents AS intent
+               ON intent.operation_id = dependency.operation_id
+             LEFT JOIN mutation_state AS state
+               ON state.operation_id = dependency.operation_id
+             LEFT JOIN mutation_verification_evidence AS evidence
+               ON evidence.evidence_id = dependency.committed_evidence_id
+             WHERE dependency.batch_id = ?1 AND (
+               dependency.dependency_kind NOT IN (
+                 'mutation', 'merge_publication', 'conflict_copy_publication', 'base_publication'
+               )
+               OR dependency.operation_id IS NULL
+               OR dependency.committed_evidence_id IS NULL
+               OR dependency.state != 'committed'
+               OR intent.operation_id IS NULL
+               OR (dependency.dependency_kind = 'mutation' AND intent.operation_kind != 'local_publish')
+               OR (dependency.dependency_kind = 'merge_publication' AND intent.operation_kind != 'merge_publish')
+               OR (dependency.dependency_kind = 'conflict_copy_publication' AND intent.operation_kind != 'conflict_copy_publish')
+               OR (dependency.dependency_kind = 'base_publication' AND intent.operation_kind != 'base_publish')
+               OR state.phase != 'completed'
+               OR state.disposition != 'verified_applied'
+               OR state.last_evidence_id != dependency.committed_evidence_id
+               OR evidence.operation_id != dependency.operation_id
+               OR evidence.capture_phase != 'post_verify'
+               OR evidence.disposition != 'verified_applied'
+               OR evidence.forbidden_side_effect != 0
+               OR NOT EXISTS (
+                 SELECT 1 FROM mutation_events AS event
+               WHERE event.operation_id = dependency.operation_id
+                   AND event.evidence_id = dependency.committed_evidence_id
+                   AND event.attempt_number = state.attempt_number
+                   AND event.state_version = state.state_version
+                   AND event.phase = 'completed'
+                   AND event.disposition = 'verified_applied'
+                   AND event.outcome_code IS state.outcome_code
+               )
+             )",
+            [batch_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if incomplete != 0 {
+            return Err(Error::LocalMutationIncomplete);
+        }
+        let changed = transaction.execute(
+            "UPDATE vault_state SET durable_cursor = ?1, updated_at_unix_ms = ?2
+             WHERE singleton = 1 AND phase = ?3 AND durable_cursor = ?4",
+            params![
+                batch.next_cursor,
+                now,
+                SyncPhase::Ready.as_str(),
+                batch.expected_cursor
+            ],
+        )?;
+        if changed != 1 {
+            return Err(Error::CursorMismatch);
+        }
+        transaction.execute("DELETE FROM change_batch WHERE singleton = 1", [])?;
         transaction.commit()?;
         Ok(())
     }
@@ -2371,7 +3708,9 @@ impl SyncStore {
                     transaction.commit()?;
                     Ok(())
                 }
-                Some(LocalMutationState::Applying) => Err(Error::MutationNeedsReconcile),
+                Some(LocalMutationState::Applying | LocalMutationState::NeedsReconcile) => {
+                    Err(Error::MutationNeedsReconcile)
+                }
                 Some(LocalMutationState::Committed) => Err(Error::InvalidStateTransition),
                 Some(LocalMutationState::Pending) | None => Err(Error::UnknownMutation),
             };
@@ -2402,6 +3741,9 @@ impl SyncStore {
         if active.batch_id != batch_id {
             return Err(Error::NoActiveBatch);
         }
+        if !is_legacy_v3_dependency(&self.connection, batch_id, mutation_id)? {
+            return Err(Error::InvalidStateTransition);
+        }
         if is_transfer_backed_mutation(&self.connection, batch_id, mutation_id)? {
             return Err(Error::InvalidStateTransition);
         }
@@ -2419,7 +3761,9 @@ impl SyncStore {
             return Ok(());
         }
         match load_local_mutation_state(&self.connection, batch_id, mutation_id)? {
-            Some(LocalMutationState::Applying) => Err(Error::MutationNeedsReconcile),
+            Some(LocalMutationState::Applying | LocalMutationState::NeedsReconcile) => {
+                Err(Error::MutationNeedsReconcile)
+            }
             Some(LocalMutationState::Committed) => Err(Error::InvalidStateTransition),
             Some(LocalMutationState::Pending) | None => Err(Error::UnknownMutation),
         }
@@ -2439,6 +3783,9 @@ impl SyncStore {
         if active.batch_id != batch_id {
             return Err(Error::NoActiveBatch);
         }
+        if !is_legacy_v3_dependency(&self.connection, batch_id, mutation_id)? {
+            return Err(Error::InvalidStateTransition);
+        }
         if is_transfer_backed_mutation(&self.connection, batch_id, mutation_id)? {
             return Err(Error::InvalidStateTransition);
         }
@@ -2454,10 +3801,12 @@ impl SyncStore {
         )?;
         if changed != 1 {
             return match load_local_mutation_state(&self.connection, batch_id, mutation_id)? {
-                Some(LocalMutationState::Applying) => Err(Error::InvalidStateTransition),
-                Some(LocalMutationState::Pending | LocalMutationState::Committed) => {
-                    Err(Error::InvalidStateTransition)
-                }
+                Some(
+                    LocalMutationState::Applying
+                    | LocalMutationState::NeedsReconcile
+                    | LocalMutationState::Pending
+                    | LocalMutationState::Committed,
+                ) => Err(Error::InvalidStateTransition),
                 None => Err(Error::UnknownMutation),
             };
         }
@@ -2477,6 +3826,9 @@ impl SyncStore {
         let active = self.active_change_batch()?.ok_or(Error::NoActiveBatch)?;
         if active.batch_id != batch_id {
             return Err(Error::NoActiveBatch);
+        }
+        if !is_legacy_v3_dependency(&self.connection, batch_id, mutation_id)? {
+            return Err(Error::InvalidStateTransition);
         }
         let changed = self.connection.execute(
             "UPDATE change_batch_mutations SET state = ?1
@@ -2520,6 +3872,12 @@ impl SyncStore {
         if transfer_backed_mutation_count(&transaction, batch_id)? != 0 {
             return Err(Error::InvalidStateTransition);
         }
+        if typed_r3_dependency_count(&transaction, batch_id)? != 0 {
+            return Err(Error::InvalidStateTransition);
+        }
+        if legacy_v3_dependency_count(&transaction, batch_id)? != 0 {
+            return Err(Error::LocalMutationIncomplete);
+        }
         if batch.applying_mutations != 0 || batch.declared_mutations != batch.committed_mutations {
             return Err(Error::LocalMutationIncomplete);
         }
@@ -2555,6 +3913,12 @@ impl SyncStore {
         let batch = load_change_batch(&transaction)?.ok_or(Error::NoActiveBatch)?;
         if batch.batch_id != batch_id {
             return Err(Error::NoActiveBatch);
+        }
+        if typed_r3_dependency_count(&transaction, batch_id)? != 0 {
+            return Err(Error::InvalidStateTransition);
+        }
+        if legacy_v3_dependency_count(&transaction, batch_id)? != 0 {
+            return Err(Error::LocalMutationIncomplete);
         }
         if batch.applying_mutations != 0 || batch.declared_mutations != batch.committed_mutations {
             return Err(Error::LocalMutationIncomplete);
@@ -2650,7 +4014,8 @@ impl SyncStore {
     }
 
     fn recover_interrupted_jobs(&mut self) -> Result<()> {
-        self.connection.execute(
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
             "UPDATE sync_jobs SET state = ?1, last_error_code = 'interrupted_unknown_outcome'
              WHERE state = ?2",
             params![
@@ -2658,7 +4023,7 @@ impl SyncStore {
                 JobState::Running.as_str()
             ],
         )?;
-        self.connection.execute(
+        transaction.execute(
             "UPDATE transfers
              SET phase = ?1, last_error_code = 'interrupted_unknown_outcome'
              WHERE phase = ?2",
@@ -2667,8 +4032,1066 @@ impl SyncStore {
                 TransferPhase::Running.as_str()
             ],
         )?;
+        let running = {
+            let mut statement = transaction.prepare(
+                "SELECT operation_id, attempt_number, state_version, updated_at_unix_ms
+                 FROM mutation_state WHERE phase = 'running' ORDER BY operation_id",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        for (operation_id, attempt, version, updated_at) in running {
+            let operation_id = parse_uuid(&operation_id)?;
+            let attempt = u32::try_from(attempt).map_err(|_| Error::InvalidSchema)?;
+            let version = u64::try_from(version).map_err(|_| Error::InvalidSchema)?;
+            let occurred_at = u64::try_from(updated_at).map_err(|_| Error::InvalidSchema)?;
+            let evidence =
+                interrupted_mutation_evidence(operation_id, attempt, version, occurred_at);
+            insert_mutation_evidence(&transaction, &evidence)?;
+            let next = MutationState {
+                operation_id,
+                phase: MutationPhase::NeedsReconcile,
+                attempt_number: attempt,
+                state_version: version + 1,
+                disposition: Some(MutationDisposition::NeedsReconcile),
+                next_attempt_at_unix_ms: None,
+                retry_mode: None,
+                resume_reference: None,
+                last_evidence_id: Some(evidence.evidence_id),
+                outcome_code: evidence.outcome_code.clone(),
+                updated_at_unix_ms: occurred_at,
+            };
+            update_mutation_state(&transaction, &next, version)?;
+            insert_mutation_event(
+                &transaction,
+                operation_id,
+                attempt,
+                version + 1,
+                MutationPhase::NeedsReconcile,
+                Some(MutationDisposition::NeedsReconcile),
+                Some(evidence.evidence_id),
+                evidence.outcome_code.as_deref(),
+                occurred_at,
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
+}
+
+fn validate_mutation_intent(intent: &MutationIntent) -> Result<()> {
+    if intent.operation_id.is_nil() {
+        return Err(Error::MutationCollision);
+    }
+    validate_redacted_code(&intent.operation_marker)?;
+    validate_revision(&intent.intent_fingerprint)?;
+    if intent.intent_fingerprint != intent.canonical_fingerprint() {
+        return Err(Error::InvalidTransferEvidence);
+    }
+    for value in [
+        intent.account_id.as_deref(),
+        intent.remote_root_id.as_deref(),
+        intent.remote_file_id.as_deref(),
+        intent.source_parent_id.as_deref(),
+        intent.destination_parent_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        validate_remote_id(value)?;
+    }
+    for value in [
+        intent.source_path.as_deref(),
+        intent.destination_path.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        validate_content_path(value)?;
+    }
+    for value in [
+        intent.expected_local_revision.as_deref(),
+        intent.expected_remote_revision.as_deref(),
+        intent.base_local_revision.as_deref(),
+        intent.base_remote_revision.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        validate_remote_id(value)?;
+    }
+    for value in [
+        intent.local_object_id.as_deref(),
+        intent.base_reference.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        validate_private_reference(value)?;
+    }
+    validate_hash_size_pair(intent.base_sha256.as_deref(), intent.base_byte_length)?;
+    validate_hash_size_pair(
+        intent.expected_local_sha256.as_deref(),
+        intent.expected_local_byte_length,
+    )?;
+    validate_hash_size_pair(
+        intent.expected_remote_sha256.as_deref(),
+        intent.expected_remote_byte_length,
+    )?;
+    u64_to_i64(intent.registered_at_unix_ms)?;
+    if intent.account_id.is_some() != intent.remote_root_id.is_some() {
+        return Err(Error::InvalidTransferEvidence);
+    }
+    if intent.operation_kind == MutationOperationKind::RemoteExistingBlocked
+        && (intent.account_id.is_none()
+            || intent.remote_root_id.is_none()
+            || intent.remote_file_id.is_none()
+            || intent.source_parent_id.is_none()
+            || intent.source_path.is_none()
+            || intent.expected_remote_revision.is_none())
+    {
+        return Err(Error::InvalidTransferEvidence);
+    }
+    Ok(())
+}
+
+fn validate_hash_size_pair(hash: Option<&str>, size: Option<u64>) -> Result<()> {
+    match (hash, size) {
+        (None, None) => Ok(()),
+        (Some(hash), Some(size)) => {
+            validate_revision(hash)?;
+            u64_to_i64(size).map(|_| ())
+        }
+        _ => Err(Error::InvalidTransferEvidence),
+    }
+}
+
+fn canonical_fingerprint<const N: usize>(
+    domain: &str,
+    fields: [(&str, Option<String>); N],
+) -> String {
+    let mut digest = Sha256::new();
+    append_canonical_bytes(&mut digest, domain.as_bytes());
+    for (name, value) in fields {
+        append_canonical_bytes(&mut digest, name.as_bytes());
+        match value {
+            Some(value) => {
+                digest.update([1]);
+                append_canonical_bytes(&mut digest, value.as_bytes());
+            }
+            None => digest.update([0]),
+        }
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn append_canonical_bytes(digest: &mut Sha256, value: &[u8]) {
+    digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    digest.update(value);
+}
+
+struct MutationEvidenceExpectation {
+    account_id: Option<String>,
+    remote_root_id: Option<String>,
+    remote_file_id: Option<String>,
+    source_parent_id: Option<String>,
+    destination_parent_id: Option<String>,
+    source_path: Option<String>,
+    destination_path: Option<String>,
+    expected_local_revision: Option<String>,
+    expected_remote_revision: Option<String>,
+    expected_local_sha256: Option<String>,
+    expected_local_byte_length: Option<u64>,
+    expected_remote_sha256: Option<String>,
+    expected_remote_byte_length: Option<u64>,
+    operation_marker: String,
+}
+
+fn load_mutation_evidence_expectation(
+    connection: &Connection,
+    operation_id: Uuid,
+) -> Result<Option<MutationEvidenceExpectation>> {
+    connection
+        .query_row(
+            "SELECT account_id, remote_root_id, remote_file_id, source_parent_id,
+                    destination_parent_id, source_path, destination_path, expected_local_revision,
+                    expected_remote_revision, expected_local_sha256, expected_local_byte_length,
+                    expected_remote_sha256, expected_remote_byte_length, operation_marker
+             FROM mutation_intents WHERE operation_id = ?1",
+            [operation_id.to_string()],
+            |row| {
+                Ok(MutationEvidenceExpectation {
+                    account_id: row.get(0)?,
+                    remote_root_id: row.get(1)?,
+                    remote_file_id: row.get(2)?,
+                    source_parent_id: row.get(3)?,
+                    destination_parent_id: row.get(4)?,
+                    source_path: row.get(5)?,
+                    destination_path: row.get(6)?,
+                    expected_local_revision: row.get(7)?,
+                    expected_remote_revision: row.get(8)?,
+                    expected_local_sha256: row.get(9)?,
+                    expected_local_byte_length: row
+                        .get::<_, Option<i64>>(10)?
+                        .map(u64::try_from)
+                        .transpose()
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(10, 0))?,
+                    expected_remote_sha256: row.get(11)?,
+                    expected_remote_byte_length: row
+                        .get::<_, Option<i64>>(12)?
+                        .map(u64::try_from)
+                        .transpose()
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(12, 0))?,
+                    operation_marker: row.get(13)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn require_expected_match<T: Eq>(expected: Option<&T>, observed: Option<&T>) -> Result<()> {
+    if expected.is_some() && expected != observed {
+        return Err(Error::InvalidTransferEvidence);
+    }
+    Ok(())
+}
+
+fn validate_verified_applied_evidence(
+    connection: &Connection,
+    evidence: &MutationVerificationEvidence,
+) -> Result<()> {
+    if evidence.capture_phase != MutationEvidenceCapturePhase::PostVerify
+        || evidence.forbidden_side_effect
+    {
+        return Err(Error::InvalidTransferEvidence);
+    }
+    let intent = load_mutation_evidence_expectation(connection, evidence.operation_id)?
+        .ok_or(Error::MutationNotFound)?;
+    let expected_parent = intent
+        .destination_parent_id
+        .as_ref()
+        .or(intent.source_parent_id.as_ref());
+    let expected_path = intent
+        .destination_path
+        .as_ref()
+        .or(intent.source_path.as_ref());
+    require_expected_match(
+        intent.account_id.as_ref(),
+        evidence.observed_account_id.as_ref(),
+    )?;
+    require_expected_match(
+        intent.remote_root_id.as_ref(),
+        evidence.observed_remote_root_id.as_ref(),
+    )?;
+    require_expected_match(
+        intent.remote_file_id.as_ref(),
+        evidence.observed_remote_file_id.as_ref(),
+    )?;
+    require_expected_match(expected_parent, evidence.observed_parent_id.as_ref())?;
+    require_expected_match(expected_path, evidence.observed_path.as_ref())?;
+    require_expected_match(
+        intent.expected_local_revision.as_ref(),
+        evidence.observed_local_revision.as_ref(),
+    )?;
+    require_expected_match(
+        intent.expected_remote_revision.as_ref(),
+        evidence.observed_remote_revision.as_ref(),
+    )?;
+    require_expected_match(
+        intent.expected_local_sha256.as_ref(),
+        evidence.observed_sha256.as_ref(),
+    )?;
+    require_expected_match(
+        intent.expected_local_byte_length.as_ref(),
+        evidence.observed_byte_length.as_ref(),
+    )?;
+    require_expected_match(
+        intent.expected_remote_sha256.as_ref(),
+        evidence.observed_sha256.as_ref(),
+    )?;
+    require_expected_match(
+        intent.expected_remote_byte_length.as_ref(),
+        evidence.observed_byte_length.as_ref(),
+    )?;
+    if evidence.observed_operation_marker.as_deref() != Some(intent.operation_marker.as_str()) {
+        return Err(Error::InvalidTransferEvidence);
+    }
+    Ok(())
+}
+
+fn validate_mutation_evidence(evidence: &MutationVerificationEvidence) -> Result<()> {
+    if evidence.evidence_id.is_nil() || evidence.operation_id.is_nil() {
+        return Err(Error::InvalidTransferEvidence);
+    }
+    u64_to_i64(u64::from(evidence.attempt_number))?;
+    validate_revision(&evidence.evidence_fingerprint)?;
+    if evidence.evidence_fingerprint != evidence.canonical_fingerprint() {
+        return Err(Error::InvalidTransferEvidence);
+    }
+    u64_to_i64(evidence.captured_at_unix_ms)?;
+    if let Some(code) = &evidence.outcome_code {
+        validate_redacted_code(code)?;
+    }
+    if evidence.disposition == MutationDisposition::NeedsReconcile
+        && evidence.outcome_code.is_none()
+    {
+        return Err(Error::InvalidTransferEvidence);
+    }
+    for value in [
+        evidence.observed_account_id.as_deref(),
+        evidence.observed_remote_root_id.as_deref(),
+        evidence.observed_remote_file_id.as_deref(),
+        evidence.observed_parent_id.as_deref(),
+        evidence.observed_local_revision.as_deref(),
+        evidence.observed_remote_revision.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        validate_remote_id(value)?;
+    }
+    if let Some(path) = &evidence.observed_path {
+        validate_content_path(path)?;
+    }
+    validate_hash_size_pair(
+        evidence.observed_sha256.as_deref(),
+        evidence.observed_byte_length,
+    )?;
+    if let Some(marker) = &evidence.observed_operation_marker {
+        validate_redacted_code(marker)?;
+    }
+    if let Some(offset) = evidence.verified_received_byte_offset {
+        u64_to_i64(offset)?;
+    }
+    if let Some(reference) = &evidence.resume_reference {
+        validate_private_reference(reference)?;
+    }
+    Ok(())
+}
+
+fn validate_conflict_evidence(evidence: &ConflictEvidence) -> Result<()> {
+    if evidence.operation_id.is_nil() {
+        return Err(Error::MutationCollision);
+    }
+    for value in [
+        evidence.conflict_id.as_str(),
+        evidence.stable_cell_id.as_str(),
+        evidence.local_state_code.as_str(),
+        evidence.remote_state_code.as_str(),
+        evidence.content_class.as_str(),
+        evidence.lineage_state.as_str(),
+        evidence.classification_code.as_str(),
+        evidence.ambiguity_reason.as_str(),
+        evidence.evidence_sufficiency.as_str(),
+        evidence.naming_version.as_str(),
+        evidence.normalized_collision_key.as_str(),
+    ] {
+        validate_redacted_code(value)?;
+    }
+    validate_remote_id(&evidence.target_parent_id)?;
+    if let Some(value) = &evidence.explanation_code {
+        validate_redacted_code(value)?;
+    }
+    if let Some(value) = &evidence.device_alias {
+        validate_redacted_code(value)?;
+    }
+    if let Some(operation_id) = evidence.conflict_copy_operation_id {
+        if operation_id.is_nil() {
+            return Err(Error::MutationCollision);
+        }
+    }
+    for evidence_id in [
+        evidence.base_evidence_id,
+        evidence.local_evidence_id,
+        evidence.remote_evidence_id,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if evidence_id.is_nil() {
+            return Err(Error::InvalidTransferEvidence);
+        }
+    }
+    validate_hash_size_pair(evidence.base_sha256.as_deref(), evidence.base_byte_length)?;
+    validate_hash_size_pair(evidence.local_sha256.as_deref(), evidence.local_byte_length)?;
+    validate_hash_size_pair(
+        evidence.remote_sha256.as_deref(),
+        evidence.remote_byte_length,
+    )?;
+    validate_hash_size_pair(
+        evidence.expected_conflict_copy_sha256.as_deref(),
+        evidence.expected_conflict_copy_byte_length,
+    )?;
+    if evidence.conflict_copy_operation_id.is_some()
+        && evidence.expected_conflict_copy_sha256.is_none()
+    {
+        return Err(Error::InvalidTransferEvidence);
+    }
+    validate_revision(&evidence.evidence_fingerprint)?;
+    if evidence.evidence_fingerprint != evidence.canonical_fingerprint() {
+        return Err(Error::InvalidTransferEvidence);
+    }
+    u64_to_i64(evidence.captured_at_unix_ms)?;
+    Ok(())
+}
+
+type MutationTransitionTarget = (
+    MutationPhase,
+    MutationDisposition,
+    Option<u64>,
+    Option<MutationRetryMode>,
+    Option<String>,
+);
+
+fn transition_target(
+    current: MutationPhase,
+    evidence: &MutationVerificationEvidence,
+    transition: &MutationOutcomeTransition,
+) -> Result<MutationTransitionTarget> {
+    match transition {
+        MutationOutcomeTransition::VerifiedApplied
+            if matches!(
+                current,
+                MutationPhase::Running | MutationPhase::NeedsReconcile
+            ) && evidence.disposition == MutationDisposition::VerifiedApplied
+                && evidence.capture_phase == MutationEvidenceCapturePhase::PostVerify
+                && !evidence.forbidden_side_effect =>
+        {
+            Ok((
+                MutationPhase::Completed,
+                MutationDisposition::VerifiedApplied,
+                None,
+                None,
+                None,
+            ))
+        }
+        MutationOutcomeTransition::NeedsReconcile
+            if current == MutationPhase::Running
+                && evidence.disposition == MutationDisposition::NeedsReconcile
+                && evidence.outcome_code.is_some() =>
+        {
+            Ok((
+                MutationPhase::NeedsReconcile,
+                MutationDisposition::NeedsReconcile,
+                None,
+                None,
+                None,
+            ))
+        }
+        _ => Err(Error::InvalidStateTransition),
+    }
+}
+
+fn insert_mutation_intent(transaction: &Transaction<'_>, intent: &MutationIntent) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO mutation_intents(
+            operation_id, operation_kind, account_id, remote_root_id, remote_file_id,
+            source_parent_id, destination_parent_id, local_object_id, source_path,
+            destination_path, expected_local_revision, expected_remote_revision,
+            base_reference, base_local_revision, base_remote_revision, base_sha256,
+            base_byte_length, expected_local_sha256, expected_local_byte_length,
+            expected_remote_sha256, expected_remote_byte_length, operation_marker,
+            intent_fingerprint, registered_at_unix_ms
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+            ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+         )",
+        params![
+            intent.operation_id.to_string(),
+            intent.operation_kind.as_str(),
+            intent.account_id,
+            intent.remote_root_id,
+            intent.remote_file_id,
+            intent.source_parent_id,
+            intent.destination_parent_id,
+            intent.local_object_id,
+            intent.source_path,
+            intent.destination_path,
+            intent.expected_local_revision,
+            intent.expected_remote_revision,
+            intent.base_reference,
+            intent.base_local_revision,
+            intent.base_remote_revision,
+            intent.base_sha256,
+            intent.base_byte_length.map(u64_to_i64).transpose()?,
+            intent.expected_local_sha256,
+            intent
+                .expected_local_byte_length
+                .map(u64_to_i64)
+                .transpose()?,
+            intent.expected_remote_sha256,
+            intent
+                .expected_remote_byte_length
+                .map(u64_to_i64)
+                .transpose()?,
+            intent.operation_marker,
+            intent.intent_fingerprint,
+            u64_to_i64(intent.registered_at_unix_ms)?
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_mutation_state(transaction: &Transaction<'_>, state: &MutationState) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO mutation_state(
+            operation_id, phase, attempt_number, state_version, disposition,
+            next_attempt_at_unix_ms, retry_mode, resume_reference, last_evidence_id,
+            outcome_code, updated_at_unix_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            state.operation_id.to_string(),
+            state.phase.as_str(),
+            i64::from(state.attempt_number),
+            u64_to_i64(state.state_version)?,
+            state.disposition.map(MutationDisposition::as_str),
+            state.next_attempt_at_unix_ms.map(u64_to_i64).transpose()?,
+            state.retry_mode.map(MutationRetryMode::as_str),
+            state.resume_reference,
+            state.last_evidence_id.map(|id| id.to_string()),
+            state.outcome_code,
+            u64_to_i64(state.updated_at_unix_ms)?
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_mutation_state(
+    transaction: &Transaction<'_>,
+    state: &MutationState,
+    expected_version: u64,
+) -> Result<()> {
+    let changed = transaction.execute(
+        "UPDATE mutation_state
+         SET phase = ?1, attempt_number = ?2, state_version = ?3, disposition = ?4,
+             next_attempt_at_unix_ms = ?5, retry_mode = ?6, resume_reference = ?7,
+             last_evidence_id = ?8, outcome_code = ?9, updated_at_unix_ms = ?10
+         WHERE operation_id = ?11 AND state_version = ?12",
+        params![
+            state.phase.as_str(),
+            i64::from(state.attempt_number),
+            u64_to_i64(state.state_version)?,
+            state.disposition.map(MutationDisposition::as_str),
+            state.next_attempt_at_unix_ms.map(u64_to_i64).transpose()?,
+            state.retry_mode.map(MutationRetryMode::as_str),
+            state.resume_reference,
+            state.last_evidence_id.map(|id| id.to_string()),
+            state.outcome_code,
+            u64_to_i64(state.updated_at_unix_ms)?,
+            state.operation_id.to_string(),
+            u64_to_i64(expected_version)?
+        ],
+    )?;
+    if changed != 1 {
+        return Err(Error::MutationStateVersionMismatch);
+    }
+    Ok(())
+}
+
+fn insert_mutation_evidence(
+    transaction: &Transaction<'_>,
+    evidence: &MutationVerificationEvidence,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO mutation_verification_evidence(
+            evidence_id, operation_id, attempt_number, capture_phase, disposition, outcome_code,
+            observed_account_id, observed_remote_root_id, observed_remote_file_id,
+            observed_parent_id, observed_path, observed_local_revision, observed_remote_revision,
+            observed_sha256, observed_byte_length, observed_operation_marker,
+            forbidden_side_effect, verified_received_byte_offset, resume_reference,
+            evidence_fingerprint, captured_at_unix_ms
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+            ?15, ?16, ?17, ?18, ?19, ?20, ?21
+         )",
+        params![
+            evidence.evidence_id.to_string(),
+            evidence.operation_id.to_string(),
+            i64::from(evidence.attempt_number),
+            evidence.capture_phase.as_str(),
+            evidence.disposition.as_str(),
+            evidence.outcome_code,
+            evidence.observed_account_id,
+            evidence.observed_remote_root_id,
+            evidence.observed_remote_file_id,
+            evidence.observed_parent_id,
+            evidence.observed_path,
+            evidence.observed_local_revision,
+            evidence.observed_remote_revision,
+            evidence.observed_sha256,
+            evidence.observed_byte_length.map(u64_to_i64).transpose()?,
+            evidence.observed_operation_marker,
+            i64::from(evidence.forbidden_side_effect),
+            evidence
+                .verified_received_byte_offset
+                .map(u64_to_i64)
+                .transpose()?,
+            evidence.resume_reference,
+            evidence.evidence_fingerprint,
+            u64_to_i64(evidence.captured_at_unix_ms)?
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_conflict_evidence(
+    transaction: &Transaction<'_>,
+    evidence: &ConflictEvidence,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO conflict_evidence(
+            conflict_id, operation_id, stable_cell_id, local_state_code, remote_state_code,
+            content_class, lineage_state, classification_code, ambiguity_reason,
+            evidence_sufficiency, conflict_copy_operation_id, base_evidence_id,
+            local_evidence_id, remote_evidence_id, base_sha256, base_byte_length,
+            local_sha256, local_byte_length, remote_sha256, remote_byte_length,
+            naming_version, normalized_collision_key, target_parent_id,
+            expected_conflict_copy_sha256, expected_conflict_copy_byte_length,
+            explanation_code, device_alias, evidence_fingerprint, captured_at_unix_ms
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+            ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29
+         )",
+        params![
+            evidence.conflict_id,
+            evidence.operation_id.to_string(),
+            evidence.stable_cell_id,
+            evidence.local_state_code,
+            evidence.remote_state_code,
+            evidence.content_class,
+            evidence.lineage_state,
+            evidence.classification_code,
+            evidence.ambiguity_reason,
+            evidence.evidence_sufficiency,
+            evidence
+                .conflict_copy_operation_id
+                .map(|value| value.to_string()),
+            evidence.base_evidence_id.map(|value| value.to_string()),
+            evidence.local_evidence_id.map(|value| value.to_string()),
+            evidence.remote_evidence_id.map(|value| value.to_string()),
+            evidence.base_sha256,
+            evidence.base_byte_length.map(u64_to_i64).transpose()?,
+            evidence.local_sha256,
+            evidence.local_byte_length.map(u64_to_i64).transpose()?,
+            evidence.remote_sha256,
+            evidence.remote_byte_length.map(u64_to_i64).transpose()?,
+            evidence.naming_version,
+            evidence.normalized_collision_key,
+            evidence.target_parent_id,
+            evidence.expected_conflict_copy_sha256,
+            evidence
+                .expected_conflict_copy_byte_length
+                .map(u64_to_i64)
+                .transpose()?,
+            evidence.explanation_code,
+            evidence.device_alias,
+            evidence.evidence_fingerprint,
+            u64_to_i64(evidence.captured_at_unix_ms)?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_conflict_evidence_fingerprint(
+    connection: &Connection,
+    conflict_id: &str,
+) -> Result<Option<String>> {
+    connection
+        .query_row(
+            "SELECT evidence_fingerprint FROM conflict_evidence WHERE conflict_id = ?1",
+            [conflict_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn evidence_belongs_to_operation(
+    connection: &Connection,
+    evidence_id: Uuid,
+    operation_id: Uuid,
+) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT 1 FROM mutation_verification_evidence
+             WHERE evidence_id = ?1 AND operation_id = ?2",
+            params![evidence_id.to_string(), operation_id.to_string()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|row| row.is_some())
+        .map_err(Into::into)
+}
+
+#[allow(clippy::too_many_lines, clippy::type_complexity)]
+fn load_conflict_evidence(
+    connection: &Connection,
+    conflict_id: &str,
+) -> Result<Option<ConflictEvidence>> {
+    let row = connection
+        .query_row(
+            "SELECT conflict_id, operation_id, stable_cell_id, local_state_code, remote_state_code,
+                    content_class, lineage_state, classification_code, ambiguity_reason,
+                    evidence_sufficiency, conflict_copy_operation_id, base_evidence_id,
+                    local_evidence_id, remote_evidence_id, base_sha256, base_byte_length,
+                    local_sha256, local_byte_length, remote_sha256, remote_byte_length,
+                    naming_version, normalized_collision_key, target_parent_id,
+                    expected_conflict_copy_sha256, expected_conflict_copy_byte_length,
+                    explanation_code, device_alias, evidence_fingerprint, captured_at_unix_ms
+             FROM conflict_evidence WHERE conflict_id = ?1",
+            [conflict_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<i64>>(15)?,
+                    row.get::<_, Option<String>>(16)?,
+                    row.get::<_, Option<i64>>(17)?,
+                    row.get::<_, Option<String>>(18)?,
+                    row.get::<_, Option<i64>>(19)?,
+                    row.get::<_, String>(20)?,
+                    row.get::<_, String>(21)?,
+                    row.get::<_, String>(22)?,
+                    row.get::<_, Option<String>>(23)?,
+                    row.get::<_, Option<i64>>(24)?,
+                    row.get::<_, Option<String>>(25)?,
+                    row.get::<_, Option<String>>(26)?,
+                    row.get::<_, String>(27)?,
+                    row.get::<_, i64>(28)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(|row| {
+        let (
+            conflict_id,
+            operation_id,
+            stable_cell_id,
+            local_state_code,
+            remote_state_code,
+            content_class,
+            lineage_state,
+            classification_code,
+            ambiguity_reason,
+            evidence_sufficiency,
+            conflict_copy_operation_id,
+            base_evidence_id,
+            local_evidence_id,
+            remote_evidence_id,
+            base_sha256,
+            base_byte_length,
+            local_sha256,
+            local_byte_length,
+            remote_sha256,
+            remote_byte_length,
+            naming_version,
+            normalized_collision_key,
+            target_parent_id,
+            expected_conflict_copy_sha256,
+            expected_conflict_copy_byte_length,
+            explanation_code,
+            device_alias,
+            evidence_fingerprint,
+            captured_at_unix_ms,
+        ) = row;
+        Ok(ConflictEvidence {
+            conflict_id,
+            operation_id: parse_uuid(&operation_id)?,
+            stable_cell_id,
+            local_state_code,
+            remote_state_code,
+            content_class,
+            lineage_state,
+            classification_code,
+            ambiguity_reason,
+            evidence_sufficiency,
+            conflict_copy_operation_id: parse_optional_uuid(conflict_copy_operation_id)?,
+            base_evidence_id: parse_optional_uuid(base_evidence_id)?,
+            local_evidence_id: parse_optional_uuid(local_evidence_id)?,
+            remote_evidence_id: parse_optional_uuid(remote_evidence_id)?,
+            base_sha256,
+            base_byte_length: optional_i64_to_u64(base_byte_length)?,
+            local_sha256,
+            local_byte_length: optional_i64_to_u64(local_byte_length)?,
+            remote_sha256,
+            remote_byte_length: optional_i64_to_u64(remote_byte_length)?,
+            naming_version,
+            normalized_collision_key,
+            target_parent_id,
+            expected_conflict_copy_sha256,
+            expected_conflict_copy_byte_length: optional_i64_to_u64(
+                expected_conflict_copy_byte_length,
+            )?,
+            explanation_code,
+            device_alias,
+            evidence_fingerprint,
+            captured_at_unix_ms: u64::try_from(captured_at_unix_ms)
+                .map_err(|_| Error::InvalidSchema)?,
+        })
+    })
+    .transpose()
+}
+
+fn parse_optional_uuid(value: Option<String>) -> Result<Option<Uuid>> {
+    value.map(|value| parse_uuid(&value)).transpose()
+}
+
+fn optional_i64_to_u64(value: Option<i64>) -> Result<Option<u64>> {
+    value
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|_| Error::InvalidSchema)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_mutation_event(
+    transaction: &Transaction<'_>,
+    operation_id: Uuid,
+    attempt_number: u32,
+    state_version: u64,
+    phase: MutationPhase,
+    disposition: Option<MutationDisposition>,
+    evidence_id: Option<Uuid>,
+    outcome_code: Option<&str>,
+    occurred_at_unix_ms: u64,
+) -> Result<()> {
+    if let Some(code) = outcome_code {
+        validate_redacted_code(code)?;
+    }
+    transaction.execute(
+        "INSERT INTO mutation_events(
+            operation_id, attempt_number, state_version, phase, disposition, evidence_id,
+            outcome_code, occurred_at_unix_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            operation_id.to_string(),
+            i64::from(attempt_number),
+            u64_to_i64(state_version)?,
+            phase.as_str(),
+            disposition.map(MutationDisposition::as_str),
+            evidence_id.map(|id| id.to_string()),
+            outcome_code,
+            u64_to_i64(occurred_at_unix_ms)?
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_mutation_identity(
+    connection: &Connection,
+    operation_id: Uuid,
+) -> Result<Option<(String, String)>> {
+    connection
+        .query_row(
+            "SELECT intent_fingerprint, operation_marker FROM mutation_intents WHERE operation_id = ?1",
+            [operation_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn mutation_marker_exists(connection: &Connection, marker: &str) -> Result<bool> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM mutation_intents WHERE operation_marker = ?1",
+            [marker],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn load_mutation_kind(
+    connection: &Connection,
+    operation_id: Uuid,
+) -> Result<Option<(String, MutationOperationKind)>> {
+    let row = connection
+        .query_row(
+            "SELECT operation_id, operation_kind FROM mutation_intents WHERE operation_id = ?1",
+            [operation_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    row.map_or(Ok(None), |(id, kind)| {
+        Ok(Some((id, MutationOperationKind::parse(&kind)?)))
+    })
+}
+
+fn load_mutation_state(
+    connection: &Connection,
+    operation_id: Uuid,
+) -> Result<Option<MutationState>> {
+    connection
+        .query_row(
+            "SELECT operation_id, phase, attempt_number, state_version, disposition,
+                    next_attempt_at_unix_ms, retry_mode, resume_reference, last_evidence_id,
+                    outcome_code, updated_at_unix_ms
+             FROM mutation_state WHERE operation_id = ?1",
+            [operation_id.to_string()],
+            row_to_mutation_state,
+        )
+        .optional()?
+        .map_or(Ok(None), |state| Ok(Some(state?)))
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn row_to_mutation_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<MutationState>> {
+    Ok((|| -> Result<MutationState> {
+        let operation_id = parse_uuid(&row.get::<_, String>(0)?)?;
+        let phase = MutationPhase::parse(&row.get::<_, String>(1)?)?;
+        let attempt_number =
+            u32::try_from(row.get::<_, i64>(2)?).map_err(|_| Error::InvalidSchema)?;
+        let state_version =
+            u64::try_from(row.get::<_, i64>(3)?).map_err(|_| Error::InvalidSchema)?;
+        let disposition = match row.get::<_, Option<String>>(4)? {
+            Some(value) => Some(MutationDisposition::parse(&value)?),
+            None => None,
+        };
+        let next_attempt_at_unix_ms = match row.get::<_, Option<i64>>(5)? {
+            Some(value) => Some(u64::try_from(value).map_err(|_| Error::InvalidSchema)?),
+            None => None,
+        };
+        let retry_mode = match row.get::<_, Option<String>>(6)? {
+            Some(value) => Some(MutationRetryMode::parse(&value)?),
+            None => None,
+        };
+        let resume_reference = row.get(7)?;
+        let last_evidence_id = match row.get::<_, Option<String>>(8)? {
+            Some(value) => Some(parse_uuid(&value)?),
+            None => None,
+        };
+        let outcome_code: Option<String> = row.get(9)?;
+        if let Some(code) = &outcome_code {
+            validate_redacted_code(code)?;
+        }
+        let updated_at_unix_ms =
+            u64::try_from(row.get::<_, i64>(10)?).map_err(|_| Error::InvalidSchema)?;
+        Ok(MutationState {
+            operation_id,
+            phase,
+            attempt_number,
+            state_version,
+            disposition,
+            next_attempt_at_unix_ms,
+            retry_mode,
+            resume_reference,
+            last_evidence_id,
+            outcome_code,
+            updated_at_unix_ms,
+        })
+    })())
+}
+
+fn load_mutation_events(connection: &Connection, operation_id: Uuid) -> Result<Vec<MutationEvent>> {
+    let mut statement = connection.prepare(
+        "SELECT event_id, operation_id, attempt_number, state_version, phase, disposition,
+                evidence_id, outcome_code, occurred_at_unix_ms
+         FROM mutation_events WHERE operation_id = ?1 ORDER BY event_id",
+    )?;
+    let rows = statement.query_map([operation_id.to_string()], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, i64>(8)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (
+            event_id,
+            operation_id,
+            attempt_number,
+            state_version,
+            phase,
+            disposition,
+            evidence_id,
+            outcome_code,
+            occurred_at,
+        ) = row?;
+        if let Some(code) = &outcome_code {
+            validate_redacted_code(code)?;
+        }
+        Ok(MutationEvent {
+            event_id: u64::try_from(event_id).map_err(|_| Error::InvalidSchema)?,
+            operation_id: parse_uuid(&operation_id)?,
+            attempt_number: u32::try_from(attempt_number).map_err(|_| Error::InvalidSchema)?,
+            state_version: u64::try_from(state_version).map_err(|_| Error::InvalidSchema)?,
+            phase: MutationPhase::parse(&phase)?,
+            disposition: match disposition {
+                Some(value) => Some(MutationDisposition::parse(&value)?),
+                None => None,
+            },
+            evidence_id: match evidence_id {
+                Some(value) => Some(parse_uuid(&value)?),
+                None => None,
+            },
+            outcome_code,
+            occurred_at_unix_ms: u64::try_from(occurred_at).map_err(|_| Error::InvalidSchema)?,
+        })
+    })
+    .collect()
+}
+
+fn interrupted_mutation_evidence(
+    operation_id: Uuid,
+    attempt_number: u32,
+    _state_version: u64,
+    captured_at_unix_ms: u64,
+) -> MutationVerificationEvidence {
+    let mut evidence = MutationVerificationEvidence {
+        evidence_id: Uuid::new_v4(),
+        operation_id,
+        attempt_number,
+        capture_phase: MutationEvidenceCapturePhase::Reconcile,
+        disposition: MutationDisposition::NeedsReconcile,
+        outcome_code: Some("interrupted_unknown_outcome".into()),
+        observed_account_id: None,
+        observed_remote_root_id: None,
+        observed_remote_file_id: None,
+        observed_parent_id: None,
+        observed_path: None,
+        observed_local_revision: None,
+        observed_remote_revision: None,
+        observed_sha256: None,
+        observed_byte_length: None,
+        observed_operation_marker: None,
+        forbidden_side_effect: true,
+        verified_received_byte_offset: None,
+        resume_reference: None,
+        evidence_fingerprint: String::new(),
+        captured_at_unix_ms,
+    };
+    evidence.evidence_fingerprint = evidence.canonical_fingerprint();
+    evidence
 }
 
 fn create_or_open_storage_dir(
@@ -2799,7 +5222,14 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         }
         migrate_v2_to_v3(&transaction)?;
     }
-    if !schema_v3_is_valid(&transaction)? {
+    let after_v2: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if after_v2 == 3 {
+        if !schema_v3_is_valid(&transaction)? {
+            return Err(Error::InvalidSchema);
+        }
+        migrate_v3_to_v4(&transaction)?;
+    }
+    if !schema_v4_is_valid(&transaction)? {
         return Err(Error::InvalidSchema);
     }
     transaction.commit()?;
@@ -2818,6 +5248,52 @@ fn migrate_v2_to_v3(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(TRANSFERS_SCHEMA)?;
     transaction.execute_batch(TRANSFERS_DUE_INDEX_SCHEMA)?;
     transaction.execute_batch(TRANSFER_HISTORY_SCHEMA)?;
+    transaction.pragma_update(None, "user_version", 3)?;
+    Ok(())
+}
+
+fn migrate_v3_to_v4(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(MUTATION_INTENTS_SCHEMA)?;
+    transaction.execute_batch(MUTATION_VERIFICATION_EVIDENCE_SCHEMA)?;
+    transaction.execute_batch(MUTATION_STATE_SCHEMA)?;
+    transaction.execute_batch(MUTATION_EVENTS_SCHEMA)?;
+    transaction.execute_batch(CONFLICT_EVIDENCE_SCHEMA)?;
+    transaction.execute_batch(
+        "ALTER TABLE change_batch_mutations RENAME TO change_batch_mutations_v3;
+         CREATE TABLE change_batch_mutations (
+            batch_id TEXT NOT NULL,
+            mutation_id TEXT NOT NULL,
+            dependency_kind TEXT NOT NULL CHECK (dependency_kind IN ('mutation', 'merge_publication', 'conflict_copy_publication', 'base_publication', 'legacy_v3')),
+            operation_id TEXT,
+            committed_evidence_id TEXT,
+            state TEXT NOT NULL CHECK (state IN ('pending', 'applying', 'needs_reconcile', 'committed')),
+            PRIMARY KEY (batch_id, mutation_id),
+            FOREIGN KEY (batch_id) REFERENCES change_batch(batch_id) ON DELETE CASCADE,
+            FOREIGN KEY (operation_id) REFERENCES mutation_intents(operation_id),
+            FOREIGN KEY (committed_evidence_id) REFERENCES mutation_verification_evidence(evidence_id),
+            CHECK ((dependency_kind = 'legacy_v3' AND operation_id IS NULL AND committed_evidence_id IS NULL) OR (dependency_kind != 'legacy_v3' AND operation_id IS NOT NULL))
+         );
+         INSERT INTO change_batch_mutations(
+            batch_id, mutation_id, dependency_kind, operation_id, committed_evidence_id, state
+         )
+         SELECT batch_id, mutation_id, 'legacy_v3', NULL, NULL,
+                CASE state WHEN 'applying' THEN 'needs_reconcile' ELSE state END
+         FROM change_batch_mutations_v3;
+         DROP TABLE change_batch_mutations_v3;",
+    )?;
+    transaction.execute_batch(MUTATION_STATE_CLAIM_INDEX_SCHEMA)?;
+    transaction.execute_batch(MUTATION_EVENTS_OPERATION_ATTEMPT_INDEX_SCHEMA)?;
+    transaction.execute_batch(MUTATION_EVIDENCE_OPERATION_ATTEMPT_INDEX_SCHEMA)?;
+    transaction.execute_batch(CONFLICT_EVIDENCE_STABLE_CELL_INDEX_SCHEMA)?;
+    transaction.execute_batch(CONFLICT_EVIDENCE_COPY_INDEX_SCHEMA)?;
+    transaction.execute_batch(MUTATION_INTENTS_NO_UPDATE_TRIGGER)?;
+    transaction.execute_batch(MUTATION_INTENTS_NO_DELETE_TRIGGER)?;
+    transaction.execute_batch(MUTATION_EVENTS_NO_UPDATE_TRIGGER)?;
+    transaction.execute_batch(MUTATION_EVENTS_NO_DELETE_TRIGGER)?;
+    transaction.execute_batch(MUTATION_EVIDENCE_NO_UPDATE_TRIGGER)?;
+    transaction.execute_batch(MUTATION_EVIDENCE_NO_DELETE_TRIGGER)?;
+    transaction.execute_batch(CONFLICT_EVIDENCE_NO_UPDATE_TRIGGER)?;
+    transaction.execute_batch(CONFLICT_EVIDENCE_NO_DELETE_TRIGGER)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -2953,7 +5429,7 @@ fn schema_v2_is_valid(connection: &Connection) -> Result<bool> {
 }
 
 fn schema_v3_is_valid(connection: &Connection) -> Result<bool> {
-    if !schema_definitions_are_exact(connection, &SCHEMA_OBJECTS)? {
+    if !schema_definitions_are_exact(connection, &SCHEMA_OBJECTS_V3)? {
         return Ok(false);
     }
     let mut statement = connection.prepare(
@@ -3008,6 +5484,44 @@ fn schema_v3_is_valid(connection: &Connection) -> Result<bool> {
             ],
         )?
     {
+        return Ok(false);
+    }
+    let foreign_key_errors: i64 =
+        connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    Ok(foreign_key_errors == 0)
+}
+
+fn schema_v4_is_valid(connection: &Connection) -> Result<bool> {
+    if !schema_definitions_are_exact(connection, &SCHEMA_OBJECTS)? {
+        return Ok(false);
+    }
+    let mut statement = connection.prepare(
+        "SELECT name FROM sqlite_master
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+         ORDER BY name",
+    )?;
+    let tables = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let expected = [
+        "change_batch",
+        "change_batch_mutations",
+        "conflict_evidence",
+        "mutation_events",
+        "mutation_intents",
+        "mutation_state",
+        "mutation_verification_evidence",
+        "remote_entries",
+        "scan_frontier",
+        "sync_history",
+        "sync_jobs",
+        "transfer_history",
+        "transfers",
+        "vault_state",
+    ];
+    if tables.iter().map(String::as_str).ne(expected) {
         return Ok(false);
     }
     let foreign_key_errors: i64 =
@@ -3789,6 +6303,22 @@ fn is_transfer_backed_mutation(
     Ok(found)
 }
 
+fn is_legacy_v3_dependency(
+    connection: &Connection,
+    batch_id: Uuid,
+    mutation_id: &str,
+) -> Result<bool> {
+    Ok(connection
+        .query_row(
+            "SELECT dependency_kind FROM change_batch_mutations
+             WHERE batch_id = ?1 AND mutation_id = ?2",
+            params![batch_id.to_string(), mutation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .is_some_and(|kind| kind == "legacy_v3"))
+}
+
 fn transfer_backed_mutation_count(connection: &Connection, batch_id: Uuid) -> Result<u64> {
     let count: i64 = connection.query_row(
         "SELECT COUNT(*)
@@ -3799,6 +6329,91 @@ fn transfer_backed_mutation_count(connection: &Connection, batch_id: Uuid) -> Re
         |row| row.get(0),
     )?;
     u64::try_from(count).map_err(|_| Error::InvalidSchema)
+}
+
+fn legacy_v3_dependency_count(connection: &Connection, batch_id: Uuid) -> Result<u64> {
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM change_batch_mutations
+         WHERE batch_id = ?1 AND dependency_kind = 'legacy_v3'",
+        [batch_id.to_string()],
+        |row| row.get(0),
+    )?;
+    u64::try_from(count).map_err(|_| Error::InvalidSchema)
+}
+
+fn typed_r3_dependency_count(connection: &Connection, batch_id: Uuid) -> Result<u64> {
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM change_batch_mutations
+         WHERE batch_id = ?1 AND dependency_kind != 'legacy_v3'",
+        [batch_id.to_string()],
+        |row| row.get(0),
+    )?;
+    u64::try_from(count).map_err(|_| Error::InvalidSchema)
+}
+
+fn require_exact_r3_completion_evidence(
+    connection: &Connection,
+    operation_id: Uuid,
+    evidence_id: Uuid,
+) -> Result<()> {
+    let state = load_mutation_state(connection, operation_id)?.ok_or(Error::MutationNotFound)?;
+    if state.phase == MutationPhase::NeedsReconcile {
+        return Err(Error::MutationNeedsReconcile);
+    }
+    if state.phase != MutationPhase::Completed
+        || state.disposition != Some(MutationDisposition::VerifiedApplied)
+        || state.last_evidence_id != Some(evidence_id)
+    {
+        return Err(Error::LocalMutationIncomplete);
+    }
+    let evidence = connection
+        .query_row(
+            "SELECT capture_phase, disposition, forbidden_side_effect, attempt_number, outcome_code
+             FROM mutation_verification_evidence
+             WHERE evidence_id = ?1 AND operation_id = ?2",
+            params![evidence_id.to_string(), operation_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(Error::LocalMutationIncomplete)?;
+    if evidence.0 != "post_verify"
+        || evidence.1 != "verified_applied"
+        || evidence.2 != 0
+        || u32::try_from(evidence.3).ok() != Some(state.attempt_number)
+        || evidence.4 != state.outcome_code
+    {
+        return Err(Error::LocalMutationIncomplete);
+    }
+    let event_exists = connection
+        .query_row(
+            "SELECT 1 FROM mutation_events
+             WHERE operation_id = ?1 AND evidence_id = ?2
+               AND attempt_number = ?3 AND state_version = ?4
+               AND phase = 'completed' AND disposition = 'verified_applied'
+               AND outcome_code IS ?5",
+            params![
+                operation_id.to_string(),
+                evidence_id.to_string(),
+                i64::from(state.attempt_number),
+                u64_to_i64(state.state_version)?,
+                state.outcome_code,
+            ],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !event_exists {
+        return Err(Error::LocalMutationIncomplete);
+    }
+    Ok(())
 }
 
 fn insert_job(transaction: &Transaction<'_>, job: &QueueJob) -> Result<()> {

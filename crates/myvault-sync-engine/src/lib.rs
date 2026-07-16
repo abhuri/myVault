@@ -14,7 +14,11 @@ use uuid::Uuid;
 mod store;
 
 pub use store::{
-    BindOutcome, ChangeBatch, EnqueueOutcome, JobState, LocalMutationState, LocalMutationStatus,
+    BindOutcome, ChangeBatch, ChangeBatchDependency, ChangeBatchDependencyKind, ConflictEvidence,
+    ConflictEvidenceRegistrationOutcome, EnqueueOutcome, JobState, LocalMutationState,
+    LocalMutationStatus, MutationDisposition, MutationEvent, MutationEvidenceCapturePhase,
+    MutationIntent, MutationOperationKind, MutationOutcomeTransition, MutationPhase,
+    MutationRegistrationOutcome, MutationRetryMode, MutationState, MutationVerificationEvidence,
     QueueJob, QueueJobKind, RemoteBaseEvidence, RemotePreviewCursor, RemotePreviewEntry,
     RemotePreviewPage, SyncStore, TransferCompletion, TransferCompletionOutcome, TransferDirection,
     TransferMimeClass, TransferPhase, TransferRecord, TransferRegistrationOutcome, TransferSummary,
@@ -60,6 +64,9 @@ pub enum Error {
     UnknownMutation,
     LocalMutationIncomplete,
     MutationNeedsReconcile,
+    MutationNotFound,
+    MutationCollision,
+    MutationStateVersionMismatch,
     UnsupportedTransferChange,
     TransferChangeMismatch,
     Remote(RemoteError),
@@ -130,6 +137,12 @@ impl fmt::Display for Error {
             }
             Self::MutationNeedsReconcile => formatter
                 .write_str("a local mutation has an unknown outcome and needs reconciliation"),
+            Self::MutationNotFound => formatter.write_str("the durable mutation was not found"),
+            Self::MutationCollision => formatter
+                .write_str("the durable mutation identifier has conflicting immutable evidence"),
+            Self::MutationStateVersionMismatch => {
+                formatter.write_str("the durable mutation state version changed unexpectedly")
+            }
             Self::UnsupportedTransferChange => {
                 formatter.write_str("the remote change requires an unsupported local mutation")
             }

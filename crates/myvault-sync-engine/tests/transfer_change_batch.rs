@@ -228,9 +228,10 @@ fn transfer_batch_survives_restart_and_advances_only_after_verified_completion()
         LocalMutationState::Committed
     );
     assert_remote_base(&reopened, &entry);
-    reopened
-        .commit_transfer_change_batch(batch_id, 21)
-        .expect("commit cursor");
+    assert!(matches!(
+        reopened.commit_transfer_change_batch(batch_id, 21),
+        Err(Error::LocalMutationIncomplete)
+    ));
     assert_eq!(
         reopened
             .vault_state()
@@ -238,9 +239,9 @@ fn transfer_batch_survives_restart_and_advances_only_after_verified_completion()
             .unwrap()
             .durable_cursor
             .as_deref(),
-        Some("cursor-2")
+        Some("cursor-1")
     );
-    assert!(reopened.active_change_batch().unwrap().is_none());
+    assert!(reopened.active_change_batch().unwrap().is_some());
 }
 
 #[test]
@@ -455,5 +456,8 @@ fn completion_and_cursor_commit_reject_tampered_metadata_without_partial_writes(
             [hash(b'a')],
         )
         .unwrap();
-    store.commit_transfer_change_batch(batch_id, 22).unwrap();
+    assert!(matches!(
+        store.commit_transfer_change_batch(batch_id, 22),
+        Err(Error::LocalMutationIncomplete)
+    ));
 }

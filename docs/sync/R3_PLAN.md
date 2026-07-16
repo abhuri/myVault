@@ -2,19 +2,31 @@
 
 Owner: Sunday ค่ะ
 
-Planning status: `R3.0 CLOSED — TRANSITION PENDING` ค่ะ
+Planning status: `R3.1 CLOSURE CANDIDATE — GATE 1 PASSED LOCALLY — PUBLISH PENDING` ค่ะ
 
 R2 implementation ถูก merge เข้า `main` ผ่าน PR #27 ที่ `94db388` และ
 post-merge Quality run `29429364407` ผ่านแล้วค่ะ R2 complete ตาม locked
 milestone scope ค่ะ R2 documentation closure, R3 planning pack และ Option A
-contracts ถูก merge ผ่าน PR #28 ที่ canonical `main@eb6709c` หลัง Quality run
-`29461969032` ผ่านบน exact source head `f120679` ค่ะ
+contracts ถูก merge ผ่าน PR #28 ที่ `main@eb6709c` หลัง Quality run
+`29461969032` ผ่านบน exact source head `f120679` ค่ะ R3.0 closure ถูก merge
+ผ่าน PR #29 ที่ canonical
+`main@9a30ad9763b8a9503484f2a35e559b1c7ee800b6` หลัง run `29464396485`
+ผ่านทั้ง `quality` และ `android-compile` ค่ะ
 
-R3 source implementation ห้ามเริ่มจนกว่า R3.0 gate ผ่านและคุณโออนุมัติ
-transition เข้า R3 อย่างชัดเจนค่ะ คุณโออนุมัติ commit, push และเปิด Draft PR
-สำหรับ R2 closure/R3 planning documents เมื่อ 2026-07-15 ค่ะ Approval นี้ไม่
-ครอบคลุม rename, move, Trash, conflict mutation, live Drive mutation, R3 source
-implementation, PR merge หรือ R3 transition ค่ะ
+คุณโอให้ explicit `Approve R3 transition` เมื่อ 2026-07-16 ค่ะ Gate 0 จึงผ่าน
+บน canonical checkpoint ข้างต้นค่ะ คุณโออนุมัติ execute เฉพาะ R3.1 Step 1
+แบบ documentation-only contract/schema freeze ค่ะ Approval นี้ไม่ครอบคลุม
+Step 2, Rust/SQL implementation, worker/agy run, commit, push, PR, merge,
+live Drive mutation หรือ external action ค่ะ
+
+ภายหลังคุณโออนุมัติ Step 2 แบบ read-only inventory พร้อม agy ที่มี bounded scope
+และอนุมัติ Sol change-control findings A/B เมื่อ 2026-07-16 ค่ะ Approval ล่าสุดนี้
+ยังไม่ครอบคลุม Step 3 source write หรือ external action ค่ะ
+
+คุณโออนุมัติ R3.1 Step 3, Step 4, Sol change-control สำหรับ `outcome_code` และ
+Step 5 ตามลำดับค่ะ Step 5 ใช้ Terra High implementation ภายใต้ frozen contract
+และไม่มี Sol review ใหม่ในระหว่างงานค่ะ Sol High ถูกสงวนไว้สำหรับ audit หลัง
+bounded implementation ค่ะ
 
 ## 1. Outcome
 
@@ -145,6 +157,28 @@ Owner คือ main integrator เพียงคนเดียวค่ะ
 
 Outcome คือ mutation ทุกชนิด restart ได้โดยไม่เดาผลลัพธ์และ cursor ไม่ล้ำ side
 effect ค่ะ
+
+Step 1 schema/durable-state contract ถูก freeze ใน
+[R3_1_DURABLE_EVIDENCE_CONTRACT.md](R3_1_DURABLE_EVIDENCE_CONTRACT.md) ค่ะ
+Target schema คือ v4 ค่ะ
+
+Step 2 inventory และ Sol change-control findings A/B complete เมื่อ 2026-07-16
+ค่ะ Legacy R2 transfer timestamp guard ถูกจำกัดเป็น reject-only compatibility
+guard และห้ามเป็น R3 correctness proof ค่ะ Existing v3 `move`/`trash` queue rows
+เป็น dormant legacy records ที่ต้อง preserve แต่ห้าม backfill/execute เป็น R3
+intent ค่ะ R3.3 ยังคงเป็น owner ของ claim-path block enforcement ค่ะ Step 3
+transactional migration และ bounded tests complete แล้วค่ะ Immutable-intent/state
+API, evidence persistence และ R3 restart recovery complete แล้วค่ะ Step 5 เพิ่ม
+typed R3 change-batch registration, exact post-verify evidence/event binding,
+legacy API exclusion, atomic cursor commit และ SQLite fault coverage แล้วค่ะ
+Step 5 ไม่แตะ provider, UI, conflict classifier หรือ R3.2/R3.3 scope ค่ะ Step 6
+ผ่าน focused migration/state/cursor/fault tests, strict format/Clippy, full engine
+and transfer suites และ static schema/scope-drift audit แล้วค่ะ Closure audit เพิ่ม
+canonical fingerprints, destination-path binding, immutable conflict-envelope API และ
+exact cursor event equality ค่ะ Gate 1 local evidence ครบตาม package
+[R3_1_STEP6_EVIDENCE.md](R3_1_STEP6_EVIDENCE.md) ค่ะ Option A ยังคง reject retry
+transitions และจบที่ `NeedsReconcile` จนกว่า executor ที่ผ่าน approval จะมี exact
+revalidation proof ค่ะ
 
 งานหลักมีดังนี้ค่ะ
 

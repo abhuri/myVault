@@ -2,12 +2,12 @@
 
 Owner: Sunday ค่ะ
 
-Current status: `R3.0 CLOSED — TRANSITION PENDING` ค่ะ
+Current status: `R3.1 CLOSURE CANDIDATE — GATE 1 PASSED LOCALLY — PUBLISH PENDING` ค่ะ
 
 R3 ถือว่า complete เมื่อทุก applicable checkbox ด้านล่างมี evidence จาก exact
 candidate HEAD เดียวค่ะ Mock, compile, emulator, native runtime และ live evidence
-ต้องถูกแยกชื่ออย่างตรงไปตรงมาค่ะ Source implementation ห้ามเริ่มจนกว่า Gate 0
-ผ่านและคุณโออนุมัติ transition เข้า R3 ค่ะ
+ต้องถูกแยกชื่ออย่างตรงไปตรงมาค่ะ Gate 0 ผ่านแล้วค่ะ R3.1 action แต่ละช่วงยัง
+ต้องอยู่ภายใต้ approval และ stop conditions ที่ประกาศไว้ค่ะ
 
 ## Gate 0 — R3.0 activation and contract freeze
 
@@ -25,32 +25,72 @@ candidate HEAD เดียวค่ะ Mock, compile, emulator, native runtime 
 - [x] Disposable account/root และ two-device fixture schema, aliases, redaction
   และ privacy bounds ถูก freeze โดยไม่เปิดเผย credential หรือ personal path ค่ะ
   Exact runtime fingerprints ต้องอนุมัติก่อน R3.6 live regression ค่ะ
-- [ ] คุณโออนุมัติ transition เข้า R3 อย่างชัดเจนค่ะ
+- [x] คุณโออนุมัติ transition เข้า R3 อย่างชัดเจนด้วยข้อความ
+  `Approve R3 transition` เมื่อ 2026-07-16 บน canonical
+  `main@9a30ad9763b8a9503484f2a35e559b1c7ee800b6` ค่ะ
 
 คุณโออนุมัติ Option A change-control เมื่อ 2026-07-16 ค่ะ R3 scope จึง freeze เป็น
 Safe Conflict Core และแยก Provider-safe Remote Mutation Gate ออกจาก dependency
 หลักค่ะ Existing Drive item content update, rename, move และ Trash ยังคง blocked
 และ intent จบที่ `NeedsReconcile` ค่ะ R3.0 content freeze และ canonicalization
-complete แล้วค่ะ Gate 0 activation เหลือเพียง explicit `Approve R3 transition`
-ค่ะ
+complete แล้วค่ะ Gate 0 activation complete บน canonical checkpoint ข้างต้นค่ะ
 
 ## Gate 1 — R3.1 durable mutation and conflict evidence
 
-- [ ] Schema v3 migrate ไป schema รุ่น R3 แบบ transactional โดยรักษา binding,
+Step 1 contract/schema decisions ถูก freeze ใน
+[R3_1_DURABLE_EVIDENCE_CONTRACT.md](R3_1_DURABLE_EVIDENCE_CONTRACT.md) ค่ะ
+Checkbox implementation/evidence ด้านล่างผ่านบน source และ tests จาก candidate
+เดียวกันแล้วค่ะ Exact committed-head/CI evidence จะบันทึกหลัง publish ค่ะ
+
+Step 2 inventory ณ เวลานั้นยืนยันว่า production source ยังเป็น schema v3 ค่ะ Sol
+change-control A/B จำกัด legacy transfer timestamp เป็น reject-only compatibility
+guard ที่ไม่ใช่ R3 proof และจำกัด v3 `move`/`trash` queue rows เป็น dormant legacy
+records ที่ preserve ได้แต่ห้าม backfill/execute เป็น R3 intent ค่ะ คำตัดสินนี้ไม่
+ทำให้ Gate 1 checkbox ใดผ่าน และ R3.3 ยังเป็น owner ของ claim-path block
+enforcement ค่ะ
+
+Step 3 สร้าง/validate schema v4, immutable-record triggers และ transactional
+v3-to-v4 migration แล้วค่ะ Migration preserve legacy queue/transfer/batch facts,
+map `applying` batch row เป็น `needs_reconcile`, ห้าม fabricate R3 evidence และ
+gate cursor เมื่อพบ `legacy_v3` dependency ค่ะ
+
+Step 4 เพิ่ม immutable intent registration, state-version transition, append-only
+event/evidence persistence, `outcome_code` ที่ bind กับ evidence/state/event,
+remote-existing blocked registration และ restart recovery ของ `running` mutation
+ให้จบ `NeedsReconcile` พร้อม event/evidence ค่ะ Step 5 เพิ่ม typed dependency
+registration ที่ map immutable operation kind แบบ fail closed, exact
+`post_verify`/`VerifiedApplied` evidence-event bind, legacy API exclusion และ atomic
+cursor update/delete ค่ะ Tests ครอบคลุม mixed dependency, preflight rejection,
+restart boundary และ SQLite abort ก่อน evidence bind/cursor update ค่ะ Closure audit
+เพิ่ม canonical engine fingerprints, destination-path post verification, immutable
+conflict-envelope persistence/read API และ exact state/evidence/event cursor equality ค่ะ
+
+Step 6 รัน focused migration/state/cursor/fault tests, strict format/Clippy, final full
+`myvault-sync-engine` 61-test suite และ `myvault-transfer` 15-test compatibility
+suite รวมถึง diff check แล้วค่ะ Static schema/durable-field/scope-drift audit ไม่พบ provider capability,
+R3.2 classifier, UI หรือ local-materialization drift ค่ะ Evidence package อยู่ที่
+[R3_1_STEP6_EVIDENCE.md](R3_1_STEP6_EVIDENCE.md) ค่ะ ผลนี้เป็น local dirty-tree
+candidate evidence ค่ะ Sol audit ได้แก้ `VerifiedApplied` ให้ bind immutable intent
+และ reject preflight completion แล้วค่ะ คุณโออนุมัติ Option A ให้ R3.1 reject
+`VerifiedNotApplied`/`RetrySafe` transition และใช้ `NeedsReconcile` แทนจนกว่า
+approved executor จะพิสูจน์ exact revalidation ได้ค่ะ Gate 1 local evidence ครบแล้ว
+และไม่มี R3.2/provider scope drift ค่ะ
+
+- [x] Schema v3 migrate ไป schema รุ่น R3 แบบ transactional โดยรักษา binding,
   cursor, queue, history, transfer และ base evidence ค่ะ
-- [ ] Newer, negative, malformed, partial หรือ constraint-weakened schema ถูก
+- [x] Newer, negative, malformed, partial หรือ constraint-weakened schema ถูก
   preserve และ reject โดยไม่ repair อัตโนมัติค่ะ
-- [ ] Mutation evidence มี exact IDs/parents/paths, expected revisions, base ref,
+- [x] Mutation evidence มี exact IDs/parents/paths, expected revisions, base ref,
   operation marker, durable phase, retry state และ redacted outcome ค่ะ
-- [ ] Conflict evidence มี classification, conflict-copy operation identity และ
-  bounded explanation metadata โดยไม่ใช้ timestamp เป็น correctness input ค่ะ
-- [ ] SQLite ไม่มี credential, provider body, content body, ambient path หรือ
+- [x] Conflict evidence มี immutable envelope/API, conflict-copy operation identity
+  และ bounded explanation metadata โดยไม่ใช้ timestamp เป็น correctness input ค่ะ
+- [x] SQLite ไม่มี credential, provider body, content body, ambient path หรือ
   bearer-like capability ค่ะ
-- [ ] Restart หลัง durable-intent boundary จบเป็น verified completion,
+- [x] Restart หลัง durable-intent boundary จบเป็น verified completion,
   retry-safe state หรือ `NeedsReconcile` ค่ะ
-- [ ] Cursor ถูกกั้นจน mutation, merge/conflict publication และ base publication
+- [x] Cursor ถูกกั้นจน mutation, merge/conflict publication และ base publication
   commit ครบค่ะ
-- [ ] Exact operation retry idempotent และ mismatched ID reuse fail closed ค่ะ
+- [x] Exact operation retry idempotent และ mismatched ID reuse fail closed ค่ะ
 
 ## Gate 2 — R3.2 conflict classification and materialization
 

@@ -1,6 +1,9 @@
 use myvault_sync_engine::{
-    BindOutcome, ChangesPage, ScanPage, SyncStore, TransferCompletion, TransferDirection,
-    TransferMimeClass, TransferPhase, TransferRecord, VerifiedRemoteBinding,
+    BindOutcome, ChangeBatchDependency, ChangeBatchDependencyKind, ChangesPage,
+    MutationDisposition, MutationEvidenceCapturePhase, MutationIntent, MutationOperationKind,
+    MutationOutcomeTransition, MutationVerificationEvidence, ScanPage, SyncStore,
+    TransferCompletion, TransferDirection, TransferMimeClass, TransferPhase, TransferRecord,
+    VerifiedRemoteBinding,
 };
 use rusqlite::Connection;
 use std::fs;
@@ -116,6 +119,65 @@ fn completion(occurred_at: u64) -> TransferCompletion {
         occurred_at,
     )
     .expect("completion")
+}
+
+fn r3_intent(operation_id: Uuid) -> MutationIntent {
+    let mut intent = MutationIntent {
+        operation_id,
+        operation_kind: MutationOperationKind::LocalPublish,
+        account_id: None,
+        remote_root_id: None,
+        remote_file_id: None,
+        source_parent_id: None,
+        destination_parent_id: None,
+        local_object_id: None,
+        source_path: Some("notes/fault-matrix.md".into()),
+        destination_path: None,
+        expected_local_revision: Some("revision-a".into()),
+        expected_remote_revision: None,
+        base_reference: None,
+        base_local_revision: None,
+        base_remote_revision: None,
+        base_sha256: None,
+        base_byte_length: None,
+        expected_local_sha256: Some(hash(b'a')),
+        expected_local_byte_length: Some(1),
+        expected_remote_sha256: None,
+        expected_remote_byte_length: None,
+        operation_marker: format!("r3-fault-{operation_id}"),
+        intent_fingerprint: String::new(),
+        registered_at_unix_ms: 10,
+    };
+    intent.intent_fingerprint = intent.canonical_fingerprint();
+    intent
+}
+
+fn r3_evidence(evidence_id: Uuid, operation_id: Uuid) -> MutationVerificationEvidence {
+    let mut evidence = MutationVerificationEvidence {
+        evidence_id,
+        operation_id,
+        attempt_number: 0,
+        capture_phase: MutationEvidenceCapturePhase::PostVerify,
+        disposition: MutationDisposition::VerifiedApplied,
+        outcome_code: Some("verified_applied".into()),
+        observed_account_id: None,
+        observed_remote_root_id: None,
+        observed_remote_file_id: None,
+        observed_parent_id: None,
+        observed_path: Some("notes/fault-matrix.md".into()),
+        observed_local_revision: Some("revision-a".into()),
+        observed_remote_revision: None,
+        observed_sha256: Some(hash(b'a')),
+        observed_byte_length: Some(1),
+        observed_operation_marker: Some(format!("r3-fault-{operation_id}")),
+        forbidden_side_effect: false,
+        verified_received_byte_offset: None,
+        resume_reference: None,
+        evidence_fingerprint: String::new(),
+        captured_at_unix_ms: 20,
+    };
+    evidence.evidence_fingerprint = evidence.canonical_fingerprint();
+    evidence
 }
 
 fn install_abort_trigger(database_path: &Path, name: &str, body: &str) {
@@ -300,5 +362,87 @@ fn pre_cursor_fault_preserves_committed_local_evidence_without_advancing_cursor(
     assert_eq!(
         store.local_mutations(batch_id).unwrap()[0].state,
         myvault_sync_engine::LocalMutationState::Committed
+    );
+}
+
+#[test]
+fn r3_dependency_and_cursor_faults_preserve_exact_durable_boundaries() {
+    let fixture = Fixture::new();
+    let mut store = ready_store(&fixture);
+    let operation_id = Uuid::new_v4();
+    let dependency = ChangeBatchDependency {
+        operation_id,
+        kind: ChangeBatchDependencyKind::Mutation,
+    };
+    let batch_id = Uuid::new_v4();
+    store
+        .register_mutation_intent(&r3_intent(operation_id), None)
+        .unwrap();
+    store
+        .begin_r3_change_batch(batch_id, "cursor-1", "cursor-2", &[dependency])
+        .unwrap();
+    store.claim_mutation(operation_id, 0, 11).unwrap();
+    let evidence_id = Uuid::new_v4();
+    store
+        .record_mutation_outcome(
+            operation_id,
+            1,
+            &r3_evidence(evidence_id, operation_id),
+            &MutationOutcomeTransition::VerifiedApplied,
+        )
+        .unwrap();
+
+    install_abort_trigger(
+        store.database_path(),
+        "fault_r3_dependency_bind",
+        "BEFORE UPDATE OF committed_evidence_id ON change_batch_mutations",
+    );
+    assert!(store
+        .commit_r3_change_dependency(batch_id, dependency, evidence_id)
+        .is_err());
+    assert_eq!(
+        store.local_mutations(batch_id).unwrap()[0].state,
+        myvault_sync_engine::LocalMutationState::Pending
+    );
+    assert_eq!(
+        store
+            .vault_state()
+            .unwrap()
+            .unwrap()
+            .durable_cursor
+            .as_deref(),
+        Some("cursor-1")
+    );
+
+    let connection = Connection::open(store.database_path()).unwrap();
+    connection
+        .execute("DROP TRIGGER fault_r3_dependency_bind", [])
+        .unwrap();
+    drop(connection);
+    store
+        .commit_r3_change_dependency(batch_id, dependency, evidence_id)
+        .unwrap();
+    install_abort_trigger(
+        store.database_path(),
+        "fault_r3_cursor_commit",
+        "BEFORE UPDATE OF durable_cursor ON vault_state WHEN NEW.durable_cursor = 'cursor-2'",
+    );
+    assert!(store.commit_r3_change_batch(batch_id, 21).is_err());
+    assert_eq!(
+        store.local_mutations(batch_id).unwrap()[0].state,
+        myvault_sync_engine::LocalMutationState::Committed
+    );
+    assert_eq!(
+        store.active_change_batch().unwrap().unwrap().batch_id,
+        batch_id
+    );
+    assert_eq!(
+        store
+            .vault_state()
+            .unwrap()
+            .unwrap()
+            .durable_cursor
+            .as_deref(),
+        Some("cursor-1")
     );
 }

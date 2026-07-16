@@ -4,12 +4,13 @@ Owner: Sunday ค่ะ
 
 Review route: GPT-5.6 Sol High ค่ะ
 
-Status: `R3.0 CLOSED — OPTION A FROZEN — TRANSITION PENDING` ค่ะ
+Status: `R3.0 CLOSED — OPTION A FROZEN — R3 TRANSITION APPROVED` ค่ะ
 
 เอกสารนี้เป็น canonical R3.0 contract artifact สำหรับ conflict decisions,
 merge/preserve-both policy, conflict-copy identity, mutation boundary, provider
 semantics, unknown outcomes และ fixture/privacy bounds ค่ะ เอกสารนี้ไม่อนุญาต
-source implementation, live Drive mutation หรือ R3 transition ค่ะ
+source implementation หรือ live Drive mutation ด้วยตัวเองค่ะ R3 transition
+ได้รับ approval แยกเมื่อ 2026-07-16 ค่ะ
 
 ## 1. Gate decision summary
 
@@ -261,6 +262,9 @@ fixture schema/privacy bounds และ Safe Conflict Core scope แล้วค
 freeze และ canonicalization complete ผ่าน PR #28 ที่ `main@eb6709c` ค่ะ Quality
 run `29461969032` ผ่านบน exact source head `f120679` ก่อน merge ค่ะ
 
-Gate 0 เหลือ prerequisite เดียวคือยังไม่มี explicit `Approve R3 transition`
-ค่ะ ห้ามเริ่ม R3.1 จนได้รับ approval นี้และ Gate 0 ถูกประเมินบน exact canonical
-checkpoint ค่ะ
+คุณโอให้ explicit `Approve R3 transition` เมื่อ 2026-07-16 และ Gate 0 ถูก
+ประเมินผ่านบน canonical
+`main@9a30ad9763b8a9503484f2a35e559b1c7ee800b6` ค่ะ R3.1 Step 1 durable
+evidence/schema contract ถูก freeze แยกใน
+[R3_1_DURABLE_EVIDENCE_CONTRACT.md](R3_1_DURABLE_EVIDENCE_CONTRACT.md) ค่ะ
+Option A และ provider boundary ในเอกสารนี้ไม่เปลี่ยนค่ะ

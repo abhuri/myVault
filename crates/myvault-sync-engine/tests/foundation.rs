@@ -118,7 +118,34 @@ fn downgrade_database_to_v1(database_path: &Path) {
     let connection = rusqlite::Connection::open(database_path).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE transfer_history;
+            "PRAGMA foreign_keys = OFF;
+             DROP TRIGGER conflict_evidence_no_delete;
+             DROP TRIGGER conflict_evidence_no_update;
+             DROP TRIGGER mutation_evidence_no_delete;
+             DROP TRIGGER mutation_evidence_no_update;
+             DROP TRIGGER mutation_events_no_delete;
+             DROP TRIGGER mutation_events_no_update;
+             DROP TRIGGER mutation_intents_no_delete;
+             DROP TRIGGER mutation_intents_no_update;
+             DROP INDEX conflict_evidence_copy_idx;
+             DROP INDEX conflict_evidence_stable_cell_idx;
+             DROP INDEX mutation_evidence_operation_attempt_idx;
+             DROP INDEX mutation_events_operation_attempt_idx;
+             DROP INDEX mutation_state_claim_idx;
+             DROP TABLE change_batch_mutations;
+             DROP TABLE conflict_evidence;
+             DROP TABLE mutation_events;
+             DROP TABLE mutation_state;
+             DROP TABLE mutation_verification_evidence;
+             DROP TABLE mutation_intents;
+             CREATE TABLE change_batch_mutations (
+                batch_id TEXT NOT NULL,
+                mutation_id TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('pending', 'applying', 'committed')),
+                PRIMARY KEY (batch_id, mutation_id),
+                FOREIGN KEY (batch_id) REFERENCES change_batch(batch_id) ON DELETE CASCADE
+             );
+             DROP TABLE transfer_history;
              DROP INDEX transfers_due_idx;
              DROP TABLE transfers;
              DROP TABLE scan_frontier;
@@ -143,7 +170,8 @@ fn downgrade_database_to_v1(database_path: &Path) {
                     scan_page_token, changes_page_token, durable_cursor, updated_at_unix_ms
              FROM vault_state_v2;
              DROP TABLE vault_state_v2;
-             PRAGMA user_version = 1;",
+             PRAGMA user_version = 1;
+             PRAGMA foreign_keys = ON;",
         )
         .unwrap();
 }
@@ -1038,7 +1066,10 @@ fn cursor_batch_survives_restart_and_never_commits_partial_local_work() {
     reopened
         .mark_local_mutation_committed(batch_id, "write-attachment")
         .unwrap();
-    reopened.commit_change_batch(batch_id, 21).unwrap();
+    assert!(matches!(
+        reopened.commit_change_batch(batch_id, 21),
+        Err(Error::LocalMutationIncomplete)
+    ));
     assert_eq!(
         reopened
             .vault_state()
@@ -1046,9 +1077,9 @@ fn cursor_batch_survives_restart_and_never_commits_partial_local_work() {
             .unwrap()
             .durable_cursor
             .as_deref(),
-        Some("durable-2")
+        Some("durable-1")
     );
-    assert!(reopened.active_change_batch().unwrap().is_none());
+    assert!(reopened.active_change_batch().unwrap().is_some());
 }
 
 #[test]
@@ -1092,14 +1123,11 @@ fn applying_local_mutation_survives_restart_and_requires_reconciliation() {
     reopened
         .mark_local_mutation_committed(batch_id, "write-note")
         .unwrap();
-    reopened.commit_change_batch(batch_id, 21).unwrap();
-
-    let pending_batch = Uuid::new_v4();
-    reopened
-        .begin_change_batch(pending_batch, "durable-2", "durable-3", ["pending-only"])
-        .unwrap();
-    reopened.abort_change_batch(pending_batch).unwrap();
-    assert!(reopened.active_change_batch().unwrap().is_none());
+    assert!(matches!(
+        reopened.commit_change_batch(batch_id, 21),
+        Err(Error::LocalMutationIncomplete)
+    ));
+    assert!(reopened.active_change_batch().unwrap().is_some());
 }
 
 #[test]

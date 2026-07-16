@@ -2,7 +2,7 @@
 
 Owner: Sunday ค่ะ
 
-Status: `MEASUREMENT CONTRACT PREPARED — R3 RUNS NOT STARTED` ค่ะ
+Status: `MEASUREMENT CONTRACT ACTIVE — R3.1 CLOSURE CANDIDATE RECORDED` ค่ะ
 
 Phase routing baseline reviewed 2026-07-16 Asia/Bangkok ค่ะ Runtime availability
 ยังต้องตรวจซ้ำตอนเปิดทุก R3 session ค่ะ
@@ -158,9 +158,24 @@ agy \
 | `r3.0-gap-agy-01` | R3.0 | `agy-cli` | reviewer / Gemini 3.5 Flash (Medium) ค่ะ | Allowlisted R3 plan/acceptance/usage copies ใน temporary sandbox ค่ะ | Wall 21.1s; exact tokens/quota unavailable ค่ะ | Output accepted ค่ะ Wrapper exit `1` เกิดหลัง output จาก zsh reserved variable และ temporary workspace ถูกลบแล้วค่ะ |
 | `r3.0-option-a-consistency-02` | R3.0 | `codex-app-spawn` | reviewer / `runtime-selected/unobservable` ค่ะ | Option A contracts/plan/acceptance/project/readme/handoff consistency ค่ะ | Per-child tokens unavailable ค่ะ | Accepted ค่ะ P1 approval wording และ legacy matrix finding ถูกแก้และ re-review ผ่านค่ะ |
 | `r3.0-option-a-provider-02` | R3.0 | `codex-app-spawn` | reviewer / `runtime-selected/unobservable` ค่ะ | Option A provider boundary, R1/R2 create-only bound และ RM0 reopening rule ค่ะ | Per-child tokens unavailable ค่ะ | Accepted ค่ะ ไม่พบ P1 provider contradiction หลังแก้ค่ะ |
+| `r3.1-schema-inventory-agy-01` | R3.1 | `agy-cli` | reviewer / Gemini 3.5 Flash (Medium) ค่ะ | Allowlisted contract/store/test/adapter copies ใน isolated temporary sandbox ค่ะ | Wall approximately 12s; exact tokens/quota unavailable ค่ะ | Failed ค่ะ Tool confirmation ถูก soft-deny ก่อน inventory และไม่มี output ที่ยอมรับค่ะ |
+| `r3.1-schema-inventory-agy-02` | R3.1 | `agy-cli` | reviewer / Gemini 3.5 Flash (Medium) ค่ะ | Correction run ใน isolated temporary sandbox เดิมโดยไม่เปิด repository write ค่ะ | Wall approximately 34s; exact tokens/quota unavailable ค่ะ | Failed ค่ะ CLI พยายามอ่าน unavailable worktree/parent metadata และไม่มี output ที่ยอมรับค่ะ Temporary workspace/log ถูกลบแล้วค่ะ |
+| `r3.1-step3-schema-test-inventory-01` | R3.1 | `codex-app-spawn` | reviewer / `runtime-selected/unobservable` ค่ะ | Read-only migration/store/test inventory ใน allowlisted sync-engine files ค่ะ | Per-child tokens unavailable ค่ะ | Accepted hotspot and minimal-test inventory ค่ะ ไม่มี file write หรือ external action ค่ะ |
+| `r3.1-step3-terra-01` | R3.1 | `interactive-codex` | integrator / GPT-5.6 Terra High ค่ะ | Transactional v3-to-v4 schema migration, exact validation, immutable triggers และ bounded Rust tests ค่ะ | Exact tokens/quota unavailable ค่ะ | Accepted implementation work ค่ะ `myvault-sync-engine` suite ผ่าน 48 tests ค่ะ |
+| `r3.1-step4-state-inventory-01` | R3.1 | `codex-app-spawn` | reviewer / `runtime-selected/unobservable` ค่ะ | Read-only state/evidence/restart API and test inventory ใน allowlisted sync-engine files ค่ะ | Per-child tokens unavailable ค่ะ | Accepted inventory ค่ะ ไม่มี file write หรือ external action ค่ะ |
+| `r3.1-step4-terra-01` | R3.1 | `interactive-codex` | integrator / GPT-5.6 Terra High ค่ะ | Outcome-code change control, immutable ledger API, versioned transition, restart recovery และ bounded Rust tests ค่ะ | Exact tokens/quota unavailable ค่ะ | Accepted implementation work ค่ะ `myvault-sync-engine` suite ผ่าน 51 tests ค่ะ |
+| `r3.1-step5-cursor-inventory-01` | R3.1 | `codex-app-spawn` | reviewer / `runtime-selected/unobservable` ค่ะ | Read-only typed dependency/cursor/fault-test inventory ใน allowlisted sync-engine files ค่ะ | Per-child tokens unavailable ค่ะ | Accepted inventory ค่ะ ไม่มี file write หรือ external action ค่ะ |
+| `r3.1-step5-terra-01` | R3.1 | `interactive-codex` | integrator / GPT-5.6 Terra High ค่ะ | Typed R3 dependency registration, exact evidence/event cursor gate, legacy API exclusion, bounded SQLite fault tests และ lint cleanup ค่ะ | Exact tokens/quota unavailable ค่ะ | Accepted implementation work ค่ะ full `myvault-sync-engine` suite ผ่าน 55 tests และ strict Clippy ผ่านค่ะ |
+| `r3.1-step6-scope-audit-01` | R3.1 | `codex-app-spawn` | reviewer / `runtime-selected/unobservable` ค่ะ | Read-only adversarial scope/durable-field/cursor-bypass inventory ใน allowlisted diff and sync-engine files ค่ะ | Per-child tokens unavailable ค่ะ | Accepted audit report ค่ะ ไม่มี file write, test หรือ external action ค่ะ |
+| `r3.1-step6-terra-01` | R3.1 | `interactive-codex` | validator / GPT-5.6 Terra High ค่ะ | Focused migration/state/cursor/fault tests, full engine/transfer suites, strict lint and Gate 1 evidence mapping ค่ะ | Exact tokens/quota unavailable ค่ะ | Passed local candidate validation ค่ะ engine 55 tests, transfer 15 tests, format, strict Clippy และ diff check ผ่านค่ะ |
+| `r3.1-sol-audit-01` | R3.1 | `interactive-codex` | auditor / GPT-5.6 Sol High ค่ะ | Frozen-contract audit of durable evidence binding, cursor proof and unknown-outcome retry semantics ค่ะ | Exact tokens/quota unavailable ค่ะ | One evidence-binding finding fixed and revalidatedค่ะ One unknown-outcome semantic blocker requires explicit change-controlค่ะ |
+| `r3.1-option-a-terra-01` | R3.1 | `interactive-codex` | integrator / GPT-5.6 Terra High ค่ะ | Implement Sol-approved Option A by rejecting R3.1 retry transitions and adding atomic regression coverage ค่ะ | Exact tokens/quota unavailable ค่ะ | Full final validation passedค่ะ Engine 57 tests, transfer 15 tests, format, strict Clippy และ diff check ผ่านค่ะ |
+| `r3.1-closure-audit-01` | R3.1 | `codex-app-spawn` | reviewer / `runtime-selected/unobservable` ค่ะ | Read-only adversarial closure audit of schema, fingerprints, conflict envelope, cursor semantics and scope drift ค่ะ | Per-child tokens unavailable ค่ะ | Accepted report ค่ะ พบ 3 P1 และ 2 P2 โดยไม่มี P0 ค่ะ |
+| `r3.1-closure-main-01` | R3.1 | `interactive-codex` | integrator / current session ค่ะ | Engine-owned canonical fingerprints, post-destination verification, immutable conflict-envelope API, cursor semantic equality, regression suite and document closure ค่ะ | Exact tokens/quota unavailable ค่ะ | Candidate validated locallyค่ะ Engine 61 tests, transfer 15 tests, format, strict Clippy และ diff check pending final publish runค่ะ |
 
-Runs ข้างต้นเป็น R3.0 planning/contract evidence เท่านั้นค่ะ ไม่ใช่ R3 source
-implementation earned work และไม่มี provider-supported exact token record ค่ะ
+R3.0 rows ข้างต้นเป็น planning/contract evidence เท่านั้นค่ะ R3.1 agy rows เป็น
+failed bounded inventory attempts และไม่มี accepted work ค่ะ ทุก row ไม่ใช่ R3
+source implementation earned work และไม่มี provider-supported exact token record ค่ะ
 Smoke test และ planning pilots ที่ทำก่อน R3 activation ยังคงเป็น methodology
 evidence เท่านั้นค่ะ
 
