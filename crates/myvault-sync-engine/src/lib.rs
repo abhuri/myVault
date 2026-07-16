@@ -20,10 +20,11 @@ pub use store::{
     LocalMutationStatus, MutationDisposition, MutationEvent, MutationEvidenceCapturePhase,
     MutationIntent, MutationOperationKind, MutationOutcomeTransition, MutationPhase,
     MutationRegistrationOutcome, MutationRetryMode, MutationState, MutationVerificationEvidence,
-    QueueJob, QueueJobKind, RemoteBaseEvidence, RemotePreviewCursor, RemotePreviewEntry,
-    RemotePreviewPage, SyncStore, TransferCompletion, TransferCompletionOutcome, TransferDirection,
-    TransferMimeClass, TransferPhase, TransferRecord, TransferRegistrationOutcome, TransferSummary,
-    VaultSyncState, MAX_REMOTE_PREVIEW_PAGE_SIZE, SCHEMA_VERSION, SQLITE_OPEN_RESIDUAL_RISK,
+    QueueJob, QueueJobKind, RemoteBaseEvidence, RemoteExistingBlockedInput, RemotePreviewCursor,
+    RemotePreviewEntry, RemotePreviewPage, SyncStore, TransferCompletion,
+    TransferCompletionOutcome, TransferDirection, TransferMimeClass, TransferPhase, TransferRecord,
+    TransferRegistrationOutcome, TransferSummary, VaultSyncState, MAX_REMOTE_PREVIEW_PAGE_SIZE,
+    SCHEMA_VERSION, SQLITE_OPEN_RESIDUAL_RISK,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;

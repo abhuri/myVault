@@ -4,10 +4,7 @@ use crate::{
 };
 use reqwest::{
     blocking::Response,
-    header::{
-        ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE,
-        RETRY_AFTER,
-    },
+    header::{CONTENT_LENGTH, LOCATION, RANGE, RETRY_AFTER},
     StatusCode, Url,
 };
 use secrecy::{ExposeSecret, SecretString};
@@ -405,10 +402,7 @@ impl fmt::Debug for TransferDrive {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TransferDrive")
-            .field(
-                "api_origin",
-                &self.read_only.api_base.origin().ascii_serialization(),
-            )
+            .field("api_origin", &self.read_only.api_origin())
             .field(
                 "upload_origin",
                 &self.upload_base.origin().ascii_serialization(),
@@ -650,23 +644,13 @@ impl TransferDrive {
             }
         }))
         .map_err(|_| Error::new(ErrorCode::InvalidInput))?;
-        let response = self
-            .read_only
-            .client
-            .post(url)
-            .query(&[
-                ("uploadType", "resumable"),
-                ("supportsAllDrives", "true"),
-                ("fields", TRANSFER_FILE_FIELDS),
-            ])
-            .header(AUTHORIZATION, self.authorization())
-            .header(ACCEPT, "application/json")
-            .header(CONTENT_TYPE, "application/json; charset=utf-8")
-            .header("X-Upload-Content-Type", &permit.intent.mime_type)
-            .header("X-Upload-Content-Length", permit.intent.size)
-            .body(body)
-            .send()
-            .map_err(|error| map_transport(&error))?;
+        let response = self.read_only.post_resumable_create(
+            url,
+            TRANSFER_FILE_FIELDS,
+            &permit.intent.mime_type,
+            permit.intent.size,
+            body,
+        )?;
         let status = response.status();
         if status.is_redirection() {
             return Err(Error::new(ErrorCode::RedirectRejected));
@@ -832,17 +816,7 @@ impl TransferDrive {
             return Err(Error::new(ErrorCode::ResponseTooLarge));
         }
         let before = self.exact_download_metadata(intent)?;
-        let url = self
-            .read_only
-            .endpoint(&format!("files/{}", intent.file_id))?;
-        let mut response = self
-            .read_only
-            .client
-            .get(url)
-            .query(&[("alt", "media"), ("supportsAllDrives", "true")])
-            .header(AUTHORIZATION, self.authorization())
-            .send()
-            .map_err(|error| map_transport(&error))?;
+        let mut response = self.read_only.get_media(&intent.file_id)?;
         if response.status().is_redirection() {
             return Err(Error::new(ErrorCode::RedirectRejected));
         }
@@ -993,14 +967,7 @@ impl TransferDrive {
         self.ensure_session_url(&url)?;
         self.ensure_folder_below_root(&session.intent.parent_id)?;
         self.read_only
-            .client
-            .put(url)
-            .header(AUTHORIZATION, self.authorization())
-            .header(CONTENT_LENGTH, body.len())
-            .header(CONTENT_RANGE, content_range)
-            .body(body)
-            .send()
-            .map_err(|error| map_transport(&error))
+            .put_resumable_session(url, body, content_range)
     }
 
     fn decode_upload_response(
@@ -1066,10 +1033,6 @@ impl TransferDrive {
             return Err(Error::new(ErrorCode::HashMismatch));
         }
         Ok(observed)
-    }
-
-    fn authorization(&self) -> String {
-        format!("Bearer {}", self.read_only.token.expose())
     }
 
     fn transfer_file_metadata(&self, file_id: &str) -> Result<TransferFile> {
@@ -1282,16 +1245,6 @@ fn parse_resume_range(header: Option<&reqwest::header::HeaderValue>) -> Result<u
         .ok_or_else(|| Error::new(ErrorCode::RangeRejected))?;
     end.checked_add(1)
         .ok_or_else(|| Error::new(ErrorCode::RangeRejected))
-}
-
-fn map_transport(error: &reqwest::Error) -> Error {
-    if error.is_timeout() {
-        Error::new(ErrorCode::Timeout)
-    } else if error.is_redirect() {
-        Error::new(ErrorCode::RedirectRejected)
-    } else {
-        Error::new(ErrorCode::Transport)
-    }
 }
 
 fn map_status_response(response: &Response, session: bool) -> Error {
@@ -1693,6 +1646,32 @@ mod tests {
     }
 
     #[test]
+    fn production_http_surface_is_statically_allowlisted() {
+        let client_source = include_str!("client.rs");
+        let transfer_source = include_str!("transfer.rs");
+        for forbidden in [
+            concat!(".", "patch", "("),
+            concat!(".", "delete", "("),
+            concat!(".", "request", "("),
+        ] {
+            assert!(
+                !client_source.contains(forbidden),
+                "client must not expose a generic or existing-item mutation builder"
+            );
+            assert!(
+                !transfer_source.contains(forbidden),
+                "transfer must not construct a generic or existing-item mutation builder"
+            );
+        }
+        let post_builder = concat!(".", "post", "(");
+        let put_builder = concat!(".", "put", "(");
+        assert_eq!(client_source.matches(post_builder).count(), 1);
+        assert_eq!(client_source.matches(put_builder).count(), 1);
+        assert_eq!(transfer_source.matches(post_builder).count(), 0);
+        assert_eq!(transfer_source.matches(put_builder).count(), 0);
+    }
+
+    #[test]
     fn sync_revision_conversion_is_canonical_checked_and_round_trips() {
         let download_intent =
             DownloadIntent::from_sync_revision("file_1", "root_1", SYNC_REVISION_2, SHA, 3)
@@ -2046,6 +2025,24 @@ mod tests {
     fn resumable_init_is_create_only_and_session_url_is_redacted() {
         let mut server = Server::new();
         binding_mocks(&mut server, 3);
+        // Google encodes existing-item content updates, renames, moves, and
+        // trash as PATCH on this exact resource. Capture it as forbidden.
+        let existing_item_patch = server
+            .mock("PATCH", "/drive/v3/files/file_1")
+            .expect(0)
+            .create();
+        let existing_upload = server
+            .mock("POST", "/upload/drive/v3/files/file_1")
+            .expect(0)
+            .create();
+        let existing_trash_or_delete = server
+            .mock("DELETE", "/drive/v3/files/file_1")
+            .expect(0)
+            .create();
+        let permission_mutation = server
+            .mock("POST", "/drive/v3/files/file_1/permissions")
+            .expect(0)
+            .create();
         server
             .mock("GET", "/drive/v3/files")
             .match_query(Matcher::Any)
@@ -2081,6 +2078,10 @@ mod tests {
         assert!(!debug.contains("secret_session"));
         assert!(!debug.contains("operation_1"));
         init.assert();
+        existing_item_patch.assert();
+        existing_upload.assert();
+        existing_trash_or_delete.assert();
+        permission_mutation.assert();
     }
 
     #[test]

@@ -3,10 +3,10 @@ use myvault_sync_engine::{
     ConflictEvidenceRegistrationOutcome, EnqueueOutcome, Error, JobState, MutationDisposition,
     MutationEvidenceCapturePhase, MutationIntent, MutationOperationKind, MutationOutcomeTransition,
     MutationPhase, MutationRegistrationOutcome, MutationVerificationEvidence, QueueJob,
-    QueueJobKind, RemoteContentHash, RemoteEntry, RemoteEntryKind, RemoteHashAlgorithm, ScanPage,
-    SyncStore, TransferCompletion, TransferCompletionOutcome, TransferDirection, TransferMimeClass,
-    TransferPhase, TransferRecord, TransferRegistrationOutcome, VerifiedRemoteBinding,
-    SCHEMA_VERSION,
+    QueueJobKind, RemoteContentHash, RemoteEntry, RemoteEntryKind, RemoteExistingBlockedInput,
+    RemoteHashAlgorithm, ScanPage, SyncStore, TransferCompletion, TransferCompletionOutcome,
+    TransferDirection, TransferMimeClass, TransferPhase, TransferRecord,
+    TransferRegistrationOutcome, VerifiedRemoteBinding, SCHEMA_VERSION,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -322,6 +322,29 @@ fn downgrade_to_v2(database_path: &Path) {
              DROP TABLE transfer_history;
              DROP INDEX transfers_due_idx;
              DROP TABLE transfers;
+             DROP INDEX remote_entries_path_idx;
+             DROP INDEX remote_entries_preview_idx;
+             ALTER TABLE remote_entries RENAME TO remote_entries_v5;
+             CREATE TABLE remote_entries (
+                file_id TEXT PRIMARY KEY NOT NULL,
+                parent_id TEXT NOT NULL,
+                portable_path TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('file', 'folder')),
+                content_hash_algorithm TEXT CHECK (content_hash_algorithm IN ('md5', 'sha1', 'sha256')),
+                content_hash TEXT,
+                remote_revision TEXT NOT NULL,
+                base_local_revision TEXT,
+                base_remote_revision TEXT,
+                base_content_hash TEXT
+             );
+             INSERT INTO remote_entries
+             SELECT file_id, parent_id, portable_path, kind, content_hash_algorithm,
+                    content_hash, remote_revision, base_local_revision,
+                    base_remote_revision, base_content_hash
+             FROM remote_entries_v5;
+             DROP TABLE remote_entries_v5;
+             CREATE INDEX remote_entries_path_idx ON remote_entries(portable_path COLLATE BINARY);
+             CREATE INDEX remote_entries_preview_idx ON remote_entries(portable_path COLLATE BINARY, file_id COLLATE BINARY);
              PRAGMA user_version = 2;
              PRAGMA foreign_keys = ON;",
         )
@@ -364,10 +387,145 @@ fn downgrade_to_v3(database_path: &Path) {
              DROP TABLE mutation_state;
              DROP TABLE mutation_verification_evidence;
              DROP TABLE mutation_intents;
+             DROP INDEX remote_entries_path_idx;
+             DROP INDEX remote_entries_preview_idx;
+             ALTER TABLE remote_entries RENAME TO remote_entries_v5;
+             CREATE TABLE remote_entries (
+                file_id TEXT PRIMARY KEY NOT NULL,
+                parent_id TEXT NOT NULL,
+                portable_path TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('file', 'folder')),
+                content_hash_algorithm TEXT CHECK (content_hash_algorithm IN ('md5', 'sha1', 'sha256')),
+                content_hash TEXT,
+                remote_revision TEXT NOT NULL,
+                base_local_revision TEXT,
+                base_remote_revision TEXT,
+                base_content_hash TEXT
+             );
+             INSERT INTO remote_entries
+             SELECT file_id, parent_id, portable_path, kind, content_hash_algorithm,
+                    content_hash, remote_revision, base_local_revision,
+                    base_remote_revision, base_content_hash
+             FROM remote_entries_v5;
+             DROP TABLE remote_entries_v5;
+             CREATE INDEX remote_entries_path_idx ON remote_entries(portable_path COLLATE BINARY);
+             CREATE INDEX remote_entries_preview_idx ON remote_entries(portable_path COLLATE BINARY, file_id COLLATE BINARY);
              PRAGMA user_version = 3;
              PRAGMA foreign_keys = ON;",
         )
         .unwrap();
+}
+
+fn downgrade_to_v4_with_legacy_remote_base(database_path: &Path) {
+    let connection = rusqlite::Connection::open(database_path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP INDEX remote_entries_path_idx;
+             DROP INDEX remote_entries_preview_idx;
+             ALTER TABLE remote_entries RENAME TO remote_entries_v5;
+             CREATE TABLE remote_entries (
+                file_id TEXT PRIMARY KEY NOT NULL,
+                parent_id TEXT NOT NULL,
+                portable_path TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('file', 'folder')),
+                content_hash_algorithm TEXT CHECK (content_hash_algorithm IN ('md5', 'sha1', 'sha256')),
+                content_hash TEXT,
+                remote_revision TEXT NOT NULL,
+                base_local_revision TEXT,
+                base_remote_revision TEXT,
+                base_content_hash TEXT
+             );
+             INSERT INTO remote_entries
+             SELECT file_id, parent_id, portable_path, kind, content_hash_algorithm,
+                    content_hash, remote_revision, base_local_revision,
+                    base_remote_revision, base_content_hash
+             FROM remote_entries_v5;
+             DROP TABLE remote_entries_v5;
+             CREATE INDEX remote_entries_path_idx ON remote_entries(portable_path COLLATE BINARY);
+             CREATE INDEX remote_entries_preview_idx ON remote_entries(portable_path COLLATE BINARY, file_id COLLATE BINARY);
+             PRAGMA user_version = 4;
+             PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+}
+
+#[test]
+fn v4_to_v5_migration_clears_incomplete_remote_base_evidence() {
+    let fixture = Fixture::new();
+    let entry = RemoteEntry {
+        file_id: "remote-file".into(),
+        parent_id: "remote-root".into(),
+        path: "legacy-base.md".into(),
+        kind: RemoteEntryKind::File,
+        content_hash: Some(
+            RemoteContentHash::new(RemoteHashAlgorithm::Sha256, hash(b'a')).unwrap(),
+        ),
+        remote_revision: "remote-revision".into(),
+    };
+    let database_path;
+    {
+        let mut store = bound_store(&fixture);
+        store.begin_initial_scan("start-token", 2).unwrap();
+        store
+            .apply_scan_page(
+                None,
+                &ScanPage {
+                    entries: vec![entry.clone()],
+                    next_page_token: None,
+                },
+                3,
+            )
+            .unwrap();
+        let connection = rusqlite::Connection::open(store.database_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE remote_entries
+                 SET base_local_revision = 'legacy-local',
+                     base_remote_revision = 'legacy-remote',
+                     base_content_hash = ?1,
+                     base_byte_length = 42
+                 WHERE file_id = 'remote-file'",
+                [hash(b'b')],
+            )
+            .unwrap();
+        database_path = store.database_path().to_owned();
+    }
+
+    downgrade_to_v4_with_legacy_remote_base(&database_path);
+    let legacy = rusqlite::Connection::open(&database_path).unwrap();
+    let legacy_base: (Option<String>, Option<String>, Option<String>) = legacy
+        .query_row(
+            "SELECT base_local_revision, base_remote_revision, base_content_hash
+             FROM remote_entries WHERE file_id = 'remote-file'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        legacy_base,
+        (
+            Some("legacy-local".into()),
+            Some("legacy-remote".into()),
+            Some(hash(b'b'))
+        )
+    );
+    drop(legacy);
+
+    let reopened = fixture.open();
+    assert_eq!(reopened.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(reopened.remote_entry("remote-file").unwrap(), Some(entry));
+    assert_eq!(reopened.remote_base("remote-file").unwrap(), None);
+    let migrated = rusqlite::Connection::open(reopened.database_path()).unwrap();
+    let base_columns: (Option<String>, Option<String>, Option<String>, Option<i64>) = migrated
+        .query_row(
+            "SELECT base_local_revision, base_remote_revision, base_content_hash, base_byte_length
+             FROM remote_entries WHERE file_id = 'remote-file'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(base_columns, (None, None, None, None));
 }
 
 #[test]
@@ -1284,7 +1442,10 @@ fn remote_existing_blocked_is_durable_needs_reconcile_without_running() {
     evidence.observed_remote_file_id = intent.remote_file_id.clone();
     evidence.observed_parent_id = intent.source_parent_id.clone();
     evidence.observed_path = intent.source_path.clone();
+    evidence.observed_local_revision = intent.expected_local_revision.clone();
     evidence.observed_remote_revision = intent.expected_remote_revision.clone();
+    evidence.capture_phase = MutationEvidenceCapturePhase::Preflight;
+    evidence.forbidden_side_effect = true;
     evidence.evidence_fingerprint = evidence.canonical_fingerprint();
     let mut store = fixture.open();
     assert_eq!(
@@ -1300,6 +1461,135 @@ fn remote_existing_blocked_is_durable_needs_reconcile_without_running() {
     assert_eq!(store.mutation_events(operation_id).unwrap().len(), 2);
     assert!(matches!(
         store.claim_mutation(operation_id, 1, 11),
+        Err(Error::MutationNeedsReconcile)
+    ));
+
+    for tampered in [
+        MutationEvidenceCapturePhase::Reconcile,
+        MutationEvidenceCapturePhase::PostVerify,
+    ] {
+        let mut invalid = evidence.clone();
+        invalid.evidence_id = Uuid::new_v4();
+        invalid.capture_phase = tampered;
+        invalid.evidence_fingerprint = invalid.canonical_fingerprint();
+        let mut other = mutation_intent(Uuid::new_v4(), "blocked-invalid-phase");
+        other.operation_kind = MutationOperationKind::RemoteExistingBlocked;
+        other.account_id = Some("account-a".into());
+        other.remote_root_id = Some("remote-root".into());
+        other.remote_file_id = Some("remote-file".into());
+        other.source_parent_id = Some("remote-parent".into());
+        other.expected_remote_revision = Some("remote-revision".into());
+        other.intent_fingerprint = other.canonical_fingerprint();
+        invalid.operation_id = other.operation_id;
+        invalid.observed_operation_marker = Some(other.operation_marker.clone());
+        invalid.evidence_fingerprint = invalid.canonical_fingerprint();
+        assert!(matches!(
+            store.register_mutation_intent(&other, Some(&invalid)),
+            Err(Error::InvalidTransferEvidence)
+        ));
+    }
+    let mut side_effect = evidence.clone();
+    side_effect.evidence_id = Uuid::new_v4();
+    side_effect.forbidden_side_effect = false;
+    side_effect.evidence_fingerprint = side_effect.canonical_fingerprint();
+    let mut side_effect_intent = intent.clone();
+    side_effect_intent.operation_id = Uuid::new_v4();
+    side_effect_intent.operation_marker = "blocked-side-effect".into();
+    side_effect_intent.intent_fingerprint = side_effect_intent.canonical_fingerprint();
+    side_effect.operation_id = side_effect_intent.operation_id;
+    side_effect.observed_operation_marker = Some(side_effect_intent.operation_marker.clone());
+    side_effect.evidence_fingerprint = side_effect.canonical_fingerprint();
+    assert!(matches!(
+        store.register_mutation_intent(&side_effect_intent, Some(&side_effect)),
+        Err(Error::InvalidTransferEvidence)
+    ));
+}
+
+#[test]
+fn remote_existing_blocked_constructor_is_exact_deterministic_and_restart_idempotent() {
+    let fixture = Fixture::new();
+    let operation_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"r3-blocked-restart-proof");
+    let input = RemoteExistingBlockedInput {
+        account_id: "account-a".into(),
+        remote_root_id: "remote-root".into(),
+        remote_file_id: "remote-file".into(),
+        source_parent_id: "remote-parent".into(),
+        source_path: "notes/mutation.md".into(),
+        local_object_id: None,
+        expected_local_revision: "local-revision".into(),
+        expected_local_sha256: hash(b'a'),
+        expected_local_byte_length: 1,
+        expected_remote_revision: "remote-revision".into(),
+        expected_remote_sha256: None,
+        expected_remote_byte_length: None,
+        base_reference: None,
+        base_local_revision: Some("base-local-revision".into()),
+        base_remote_revision: Some("base-remote-revision".into()),
+        base_sha256: Some(hash(b'b')),
+        base_byte_length: Some(42),
+    };
+    let (intent, evidence) =
+        MutationIntent::remote_existing_blocked(operation_id, input.clone(), 10)
+            .expect("exact blocked evidence");
+    let (replayed_intent, replayed_evidence) =
+        MutationIntent::remote_existing_blocked(operation_id, input, 99)
+            .expect("same blocked identity despite replay timestamp");
+    assert_eq!(intent.operation_marker, replayed_intent.operation_marker);
+    assert_eq!(
+        intent.intent_fingerprint,
+        replayed_intent.intent_fingerprint
+    );
+    assert_eq!(evidence.evidence_id, replayed_evidence.evidence_id);
+    assert_eq!(evidence.captured_at_unix_ms, 10);
+    assert_eq!(replayed_evidence.captured_at_unix_ms, 99);
+    assert!(evidence.forbidden_side_effect);
+    assert_eq!(
+        intent.base_local_revision.as_deref(),
+        Some("base-local-revision")
+    );
+    assert_eq!(
+        intent.base_remote_revision.as_deref(),
+        Some("base-remote-revision")
+    );
+    assert_eq!(intent.base_sha256.as_deref(), Some(hash(b'b').as_str()));
+    assert_eq!(intent.base_byte_length, Some(42));
+
+    let mut partial = intent.clone();
+    partial.operation_id = Uuid::new_v4();
+    partial.operation_marker = "blocked-partial-base".into();
+    partial.base_byte_length = None;
+    partial.intent_fingerprint = partial.canonical_fingerprint();
+    let mut partial_evidence = evidence.clone();
+    partial_evidence.evidence_id = Uuid::new_v4();
+    partial_evidence.operation_id = partial.operation_id;
+    partial_evidence.observed_operation_marker = Some(partial.operation_marker.clone());
+    partial_evidence.evidence_fingerprint = partial_evidence.canonical_fingerprint();
+
+    {
+        let mut store = fixture.open();
+        assert_eq!(
+            store
+                .register_mutation_intent(&intent, Some(&evidence))
+                .unwrap(),
+            MutationRegistrationOutcome::Registered
+        );
+    }
+    assert!(matches!(
+        fixture
+            .open()
+            .register_mutation_intent(&partial, Some(&partial_evidence)),
+        Err(Error::InvalidTransferEvidence)
+    ));
+    let mut reopened = fixture.open();
+    assert_eq!(
+        reopened
+            .register_mutation_intent(&replayed_intent, Some(&replayed_evidence))
+            .unwrap(),
+        MutationRegistrationOutcome::AlreadyPresent
+    );
+    assert_eq!(reopened.mutation_events(operation_id).unwrap().len(), 2);
+    assert!(matches!(
+        reopened.claim_mutation(operation_id, 1, 100),
         Err(Error::MutationNeedsReconcile)
     ));
 }

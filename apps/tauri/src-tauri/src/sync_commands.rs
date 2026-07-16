@@ -476,9 +476,10 @@ mod platform {
     };
     use myvault_drive::{AccessToken, ReadOnlyDrive, ResolvedDriveChange, TransferDrive};
     use myvault_sync_engine::{
-        advance_initial_sync, BindOutcome, RemoteChange, RemotePreviewEntry, SyncStore,
-        TransferDirection, TransferMimeClass, TransferPhase, TransferRecord,
-        TransferRegistrationOutcome, VaultSyncState,
+        advance_initial_sync, BindOutcome, MutationIntent, MutationRegistrationOutcome,
+        RemoteChange, RemoteExistingBlockedInput, RemotePreviewEntry, SyncStore, TransferDirection,
+        TransferMimeClass, TransferPhase, TransferRecord, TransferRegistrationOutcome,
+        VaultSyncState,
     };
     use myvault_transfer::MAX_TRANSFER_BYTES;
     use std::{
@@ -501,6 +502,8 @@ mod platform {
     const MAX_GUARDED_OPERATIONS: usize = 1_000;
     const MAX_INCREMENTAL_PAGES: usize = 100;
     const TRANSFER_NAMESPACE: Uuid = Uuid::from_u128(0xa9c0_4bb5_7db8_5a83_8e1c_d67a_a646_a4f2);
+    const REMOTE_EXISTING_BLOCKED_NAMESPACE: Uuid =
+        Uuid::from_u128(0x6f68_eb5b_727a_5e1d_9b1a_0c95_16d4_6bb1);
 
     #[derive(Default)]
     pub struct SyncRuntime {
@@ -825,6 +828,116 @@ mod platform {
         format!("r2-{}", operation_id.simple())
     }
 
+    fn remote_existing_blocked_operation_id(parts: &[&str]) -> Uuid {
+        let mut evidence = String::from("myvault-r3-remote-existing-blocked\\0");
+        for part in parts {
+            evidence.push_str(&part.len().to_string());
+            evidence.push(':');
+            evidence.push_str(part);
+            evidence.push('\0');
+        }
+        Uuid::new_v5(&REMOTE_EXISTING_BLOCKED_NAMESPACE, evidence.as_bytes())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_remote_existing_blocked(
+        store: &mut SyncStore,
+        account_id: &str,
+        root_id: &str,
+        remote: &RemotePreviewEntry,
+        durable: &myvault_sync_engine::RemoteEntry,
+        base: Option<&myvault_sync_engine::RemoteBaseEvidence>,
+        local_path: &str,
+        local_revision: &str,
+        local_sha256: &str,
+        local_byte_length: u64,
+        captured_at_unix_ms: u64,
+    ) -> Result<bool, SyncCommandError> {
+        let base_byte_length = base.map(|value| value.byte_length.to_string());
+        let operation_id = remote_existing_blocked_operation_id(&[
+            account_id,
+            root_id,
+            &remote.file_id,
+            &remote.parent_id,
+            &remote.path,
+            &durable.remote_revision,
+            local_path,
+            local_revision,
+            local_sha256,
+            &local_byte_length.to_string(),
+            base.map_or("absent", |value| value.local_revision.as_str()),
+            base.map_or("absent", |value| value.remote_revision.as_str()),
+            base.map_or("absent", |value| value.content_hash.as_str()),
+            base_byte_length.as_deref().unwrap_or("absent"),
+        ]);
+        let (intent, evidence) = MutationIntent::remote_existing_blocked(
+            operation_id,
+            RemoteExistingBlockedInput {
+                account_id: account_id.to_owned(),
+                remote_root_id: root_id.to_owned(),
+                remote_file_id: remote.file_id.clone(),
+                source_parent_id: remote.parent_id.clone(),
+                source_path: remote.path.clone(),
+                local_object_id: None,
+                expected_local_revision: local_revision.to_owned(),
+                expected_local_sha256: local_sha256.to_owned(),
+                expected_local_byte_length: local_byte_length,
+                expected_remote_revision: durable.remote_revision.clone(),
+                expected_remote_sha256: None,
+                expected_remote_byte_length: None,
+                base_reference: None,
+                base_local_revision: base.map(|value| value.local_revision.clone()),
+                base_remote_revision: base.map(|value| value.remote_revision.clone()),
+                base_sha256: base.map(|value| value.content_hash.clone()),
+                base_byte_length: base.map(|value| value.byte_length),
+            },
+            captured_at_unix_ms,
+        )
+        .map_err(map_sync_error)?;
+        match store
+            .register_mutation_intent(&intent, Some(&evidence))
+            .map_err(map_sync_error)?
+        {
+            MutationRegistrationOutcome::Registered => Ok(true),
+            MutationRegistrationOutcome::AlreadyPresent
+            | MutationRegistrationOutcome::AlreadyCompleted => Ok(false),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_incremental_remote_existing_blocked(
+        store: &mut SyncStore,
+        account_id: &str,
+        root_id: &str,
+        remote: &myvault_sync_engine::RemoteEntry,
+        base: Option<&myvault_sync_engine::RemoteBaseEvidence>,
+        local_revision: &str,
+        local_sha256: &str,
+        local_byte_length: u64,
+        captured_at_unix_ms: u64,
+    ) -> Result<bool, SyncCommandError> {
+        let preview = RemotePreviewEntry {
+            file_id: remote.file_id.clone(),
+            parent_id: remote.parent_id.clone(),
+            path: remote.path.clone(),
+            kind: remote.kind,
+            path_collision: false,
+        };
+        register_remote_existing_blocked(
+            store,
+            account_id,
+            root_id,
+            &preview,
+            remote,
+            base,
+            &remote.path,
+            local_revision,
+            local_sha256,
+            local_byte_length,
+            captured_at_unix_ms,
+        )
+    }
+
     fn content_kind(path: &str, markdown: bool) -> TransferMimeClass {
         if markdown
             || path
@@ -944,6 +1057,22 @@ mod platform {
         drive: &TransferDrive,
         root_id: &str,
     ) -> Result<u64, SyncCommandError> {
+        let state = store
+            .vault_state()
+            .map_err(map_sync_error)?
+            .ok_or_else(SyncCommandError::internal)?;
+        let account_id = state.account_id.ok_or_else(|| {
+            SyncCommandError::new(
+                SyncCommandCode::BindingMismatch,
+                "an exact Drive account must be bound before transfer",
+            )
+        })?;
+        if state.remote_root_id != root_id {
+            return Err(SyncCommandError::new(
+                SyncCommandCode::BindingMismatch,
+                "the exact Drive root does not match the durable binding",
+            ));
+        }
         let remote_entries = collect_remote_preview(store)?;
         let local_entries = collect_local_entries(service, session_id)?;
         reject_portable_path_collisions(
@@ -1033,6 +1162,7 @@ mod platform {
                     base.local_revision == snapshot.revision.hex
                         && base.remote_revision == durable.remote_revision
                         && base.content_hash == snapshot.sha256.as_str()
+                        && base.byte_length == snapshot.byte_len
                 })
             });
             if exact_base_match {
@@ -1058,6 +1188,24 @@ mod platform {
                     content_kind(&local.path, matches!(local.kind, ExplorerKindDto::Markdown)),
                     reconciliation_time,
                     None,
+                )? {
+                    registered = registered.saturating_add(1);
+                }
+                continue;
+            }
+            if let (Some(remote), Some(durable)) = (matching_remote, matching_durable.as_ref()) {
+                if register_remote_existing_blocked(
+                    store,
+                    &account_id,
+                    root_id,
+                    remote,
+                    durable,
+                    matching_base.as_ref(),
+                    &local.path,
+                    &snapshot.revision.hex,
+                    snapshot.sha256.as_str(),
+                    snapshot.byte_len,
+                    reconciliation_time,
                 )? {
                     registered = registered.saturating_add(1);
                 }
@@ -1209,6 +1357,7 @@ mod platform {
         let final_page = page.new_start_page_token.is_some();
         let mut changes = Vec::new();
         let mut downloads = Vec::new();
+        let local_entries = collect_local_entries(service, session_id)?;
         let mut merged_remote_paths = collect_remote_preview(store)?
             .into_iter()
             .map(|entry| (entry.file_id, entry.path))
@@ -1249,6 +1398,52 @@ mod platform {
                             return Err(SyncCommandError::new(
                                 SyncCommandCode::RescanRequired,
                                 "remote move or rename requires explicit reconciliation",
+                            ));
+                        }
+                    }
+                    let remote_changed = known.as_ref().is_some_and(|previous| {
+                        previous.remote_revision != entry.remote_revision
+                            || previous.content_hash != entry.content_hash
+                    });
+                    if remote_changed
+                        && entry.kind == RemoteEntryKind::File
+                        && local_entries.iter().any(|local| local.path == entry.path)
+                    {
+                        let mut sink = std::io::sink();
+                        let snapshot = service
+                            .stream_transfer_source(
+                                session_id,
+                                &entry.path,
+                                &mut sink,
+                                MAX_TRANSFER_BYTES as usize,
+                            )
+                            .map_err(|_| {
+                                SyncCommandError::new(
+                                    SyncCommandCode::StorageUnavailable,
+                                    "exact local transfer evidence is unavailable",
+                                )
+                            })?;
+                        let base = store.remote_base(&entry.file_id).map_err(map_sync_error)?;
+                        let local_diverged = base.as_ref().is_none_or(|value| {
+                            value.local_revision != snapshot.revision.hex
+                                || value.content_hash != snapshot.sha256.as_str()
+                                || value.byte_length != snapshot.byte_len
+                        });
+                        if local_diverged {
+                            let _ = register_incremental_remote_existing_blocked(
+                                store,
+                                account_id,
+                                root_id,
+                                &entry,
+                                base.as_ref(),
+                                &snapshot.revision.hex,
+                                snapshot.sha256.as_str(),
+                                snapshot.byte_len,
+                                now_unix_ms()?,
+                            )?;
+                            return Err(SyncCommandError::new(
+                                SyncCommandCode::RescanRequired,
+                                "an existing remote item needs explicit reconciliation",
                             ));
                         }
                     }
@@ -1302,7 +1497,6 @@ mod platform {
             }
         }
 
-        let local_entries = collect_local_entries(service, session_id)?;
         let mut exact_remote_paths = BTreeSet::new();
         if merged_remote_paths
             .values()
@@ -2703,6 +2897,153 @@ mod platform {
         }
 
         #[test]
+        fn existing_remote_item_is_durably_blocked_without_an_upload_or_duplicate_intent() {
+            const REMOTE_SHA256: &str =
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            const REMOTE_REVISION: &str =
+                "0000000000000000000000000000000000000000000000000000000000000002";
+            let temporary = tempfile::tempdir().expect("temporary roots");
+            let base = temporary.path().canonicalize().expect("canonical root");
+            let app_data = base.join("app-data");
+            let vault_root = base.join("vault");
+            std::fs::create_dir(&app_data).expect("app data root");
+            std::fs::create_dir(&vault_root).expect("vault root");
+            std::fs::write(vault_root.join("note.md"), b"local change").expect("local source");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&app_data, std::fs::Permissions::from_mode(0o700))
+                    .expect("private app data permissions");
+            }
+            let service = AppService::with_app_data_root(&app_data);
+            let session_id = service
+                .activate_trusted_vault(
+                    Vault::open(vault_root.canonicalize().expect("canonical vault"))
+                        .expect("open vault"),
+                )
+                .expect("activate vault")
+                .session_id
+                .expect("session");
+            let mut sink = std::io::sink();
+            let local = service
+                .stream_transfer_source(
+                    session_id,
+                    "note.md",
+                    &mut sink,
+                    MAX_TRANSFER_BYTES as usize,
+                )
+                .expect("local evidence");
+            let context = service.native_vault_context(session_id).expect("context");
+            let mut store = SyncStore::open(
+                context.app_data_root().expect("app data"),
+                context.vault_root(),
+                context.vault_id(),
+            )
+            .expect("sync store");
+            let binding = myvault_sync_engine::VerifiedRemoteBinding::new(
+                "account_1",
+                "root_1",
+                "account_1",
+                "root_1",
+            )
+            .expect("binding");
+            store.bind_remote_root(&binding, 1).expect("bind");
+            let remote = myvault_sync_engine::RemoteEntry {
+                file_id: "file_1".to_owned(),
+                parent_id: "root_1".to_owned(),
+                path: "note.md".to_owned(),
+                kind: RemoteEntryKind::File,
+                content_hash: Some(
+                    myvault_sync_engine::RemoteContentHash::new(
+                        myvault_sync_engine::RemoteHashAlgorithm::Sha256,
+                        REMOTE_SHA256,
+                    )
+                    .expect("remote hash"),
+                ),
+                remote_revision: REMOTE_REVISION.to_owned(),
+            };
+            let mut initial = SingleFileInitialDrive {
+                entry: Some(remote),
+            };
+            for now in 2..=4 {
+                advance_initial_sync(&mut store, &mut initial, now).expect("initial step");
+            }
+            let cursor_before = store
+                .vault_state()
+                .expect("state")
+                .expect("bound state")
+                .durable_cursor;
+
+            let mut server = mockito::Server::new();
+            let post = server
+                .mock("POST", "/upload/drive/v3/files")
+                .match_query(mockito::Matcher::Any)
+                .expect(0)
+                .create();
+            let origin = server.url();
+            let drive = TransferDrive::for_test_origins(
+                &format!("{origin}/drive/v3/"),
+                &format!("{origin}/upload/drive/v3/"),
+                "account_1",
+                "root_1",
+                MAX_TRANSFER_BYTES,
+            )
+            .expect("test Drive");
+
+            assert_eq!(
+                prepare_guarded_transfers(&service, session_id, &mut store, &drive, "root_1",)
+                    .expect("block existing item"),
+                1
+            );
+            assert_eq!(
+                prepare_guarded_transfers(&service, session_id, &mut store, &drive, "root_1",)
+                    .expect("repeat does not duplicate intent"),
+                0
+            );
+            let operation_id = remote_existing_blocked_operation_id(&[
+                "account_1",
+                "root_1",
+                "file_1",
+                "root_1",
+                "note.md",
+                REMOTE_REVISION,
+                "note.md",
+                &local.revision.hex,
+                local.sha256.as_str(),
+                &local.byte_len.to_string(),
+                "absent",
+                "absent",
+                "absent",
+                "absent",
+            ]);
+            let mutation = store
+                .mutation_state(operation_id)
+                .expect("mutation state")
+                .expect("blocked mutation");
+            assert_eq!(
+                mutation.phase,
+                myvault_sync_engine::MutationPhase::NeedsReconcile
+            );
+            assert!(matches!(
+                store.claim_mutation(operation_id, 0, 5),
+                Err(myvault_sync_engine::Error::MutationNeedsReconcile)
+            ));
+            assert_eq!(
+                store.transfer_summary().expect("transfer summary").pending,
+                0
+            );
+            assert_eq!(
+                store
+                    .vault_state()
+                    .expect("state")
+                    .expect("bound state")
+                    .durable_cursor,
+                cursor_before
+            );
+            post.assert();
+        }
+
+        #[test]
         fn incremental_page_keeps_old_cursor_until_transfer_batch_commit() {
             let temporary = tempfile::tempdir().expect("temporary roots");
             let base = temporary.path().canonicalize().expect("canonical root");
@@ -3130,9 +3471,10 @@ mod platform {
     };
     use myvault_drive::{AccessToken, ReadOnlyDrive, ResolvedDriveChange, TransferDrive};
     use myvault_sync_engine::{
-        advance_initial_sync, BindOutcome, RemoteChange, RemotePreviewEntry, SyncStore,
-        TransferDirection, TransferMimeClass, TransferPhase, TransferRecord,
-        TransferRegistrationOutcome, VaultSyncState,
+        advance_initial_sync, BindOutcome, MutationIntent, MutationRegistrationOutcome,
+        RemoteChange, RemoteExistingBlockedInput, RemotePreviewEntry, SyncStore, TransferDirection,
+        TransferMimeClass, TransferPhase, TransferRecord, TransferRegistrationOutcome,
+        VaultSyncState,
     };
     use std::{
         collections::{BTreeMap, BTreeSet},
@@ -3149,6 +3491,8 @@ mod platform {
     const MAX_GUARDED_OPERATIONS: usize = 1_000;
     const MAX_INCREMENTAL_PAGES: usize = 100;
     const TRANSFER_NAMESPACE: Uuid = Uuid::from_u128(0xa9c0_4bb5_7db8_5a83_8e1c_d67a_a646_a4f2);
+    const REMOTE_EXISTING_BLOCKED_NAMESPACE: Uuid =
+        Uuid::from_u128(0x6f68_eb5b_727a_5e1d_9b1a_0c95_16d4_6bb1);
 
     #[derive(Default)]
     pub struct SyncRuntime {
@@ -3399,6 +3743,116 @@ mod platform {
         format!("r2-{}", operation_id.simple())
     }
 
+    fn remote_existing_blocked_operation_id(parts: &[&str]) -> Uuid {
+        let mut evidence = String::from("myvault-r3-remote-existing-blocked\\0");
+        for part in parts {
+            evidence.push_str(&part.len().to_string());
+            evidence.push(':');
+            evidence.push_str(part);
+            evidence.push('\0');
+        }
+        Uuid::new_v5(&REMOTE_EXISTING_BLOCKED_NAMESPACE, evidence.as_bytes())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_remote_existing_blocked(
+        store: &mut SyncStore,
+        account_id: &str,
+        root_id: &str,
+        remote: &RemotePreviewEntry,
+        durable: &myvault_sync_engine::RemoteEntry,
+        base: Option<&myvault_sync_engine::RemoteBaseEvidence>,
+        local_path: &str,
+        local_revision: &str,
+        local_sha256: &str,
+        local_byte_length: u64,
+        captured_at_unix_ms: u64,
+    ) -> Result<bool, SyncCommandError> {
+        let base_byte_length = base.map(|value| value.byte_length.to_string());
+        let operation_id = remote_existing_blocked_operation_id(&[
+            account_id,
+            root_id,
+            &remote.file_id,
+            &remote.parent_id,
+            &remote.path,
+            &durable.remote_revision,
+            local_path,
+            local_revision,
+            local_sha256,
+            &local_byte_length.to_string(),
+            base.map_or("absent", |value| value.local_revision.as_str()),
+            base.map_or("absent", |value| value.remote_revision.as_str()),
+            base.map_or("absent", |value| value.content_hash.as_str()),
+            base_byte_length.as_deref().unwrap_or("absent"),
+        ]);
+        let (intent, evidence) = MutationIntent::remote_existing_blocked(
+            operation_id,
+            RemoteExistingBlockedInput {
+                account_id: account_id.to_owned(),
+                remote_root_id: root_id.to_owned(),
+                remote_file_id: remote.file_id.clone(),
+                source_parent_id: remote.parent_id.clone(),
+                source_path: remote.path.clone(),
+                local_object_id: None,
+                expected_local_revision: local_revision.to_owned(),
+                expected_local_sha256: local_sha256.to_owned(),
+                expected_local_byte_length: local_byte_length,
+                expected_remote_revision: durable.remote_revision.clone(),
+                expected_remote_sha256: None,
+                expected_remote_byte_length: None,
+                base_reference: None,
+                base_local_revision: base.map(|value| value.local_revision.clone()),
+                base_remote_revision: base.map(|value| value.remote_revision.clone()),
+                base_sha256: base.map(|value| value.content_hash.clone()),
+                base_byte_length: base.map(|value| value.byte_length),
+            },
+            captured_at_unix_ms,
+        )
+        .map_err(map_sync_error)?;
+        match store
+            .register_mutation_intent(&intent, Some(&evidence))
+            .map_err(map_sync_error)?
+        {
+            MutationRegistrationOutcome::Registered => Ok(true),
+            MutationRegistrationOutcome::AlreadyPresent
+            | MutationRegistrationOutcome::AlreadyCompleted => Ok(false),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_incremental_remote_existing_blocked(
+        store: &mut SyncStore,
+        account_id: &str,
+        root_id: &str,
+        remote: &myvault_sync_engine::RemoteEntry,
+        base: Option<&myvault_sync_engine::RemoteBaseEvidence>,
+        local_revision: &str,
+        local_sha256: &str,
+        local_byte_length: u64,
+        captured_at_unix_ms: u64,
+    ) -> Result<bool, SyncCommandError> {
+        let preview = RemotePreviewEntry {
+            file_id: remote.file_id.clone(),
+            parent_id: remote.parent_id.clone(),
+            path: remote.path.clone(),
+            kind: remote.kind,
+            path_collision: false,
+        };
+        register_remote_existing_blocked(
+            store,
+            account_id,
+            root_id,
+            &preview,
+            remote,
+            base,
+            &remote.path,
+            local_revision,
+            local_sha256,
+            local_byte_length,
+            captured_at_unix_ms,
+        )
+    }
+
     fn content_kind(path: &str, markdown: bool) -> TransferMimeClass {
         if markdown
             || path
@@ -3541,6 +3995,22 @@ mod platform {
         drive: &TransferDrive,
         root_id: &str,
     ) -> Result<u64, SyncCommandError> {
+        let state = store
+            .vault_state()
+            .map_err(map_sync_error)?
+            .ok_or_else(SyncCommandError::internal)?;
+        let account_id = state.account_id.ok_or_else(|| {
+            SyncCommandError::new(
+                SyncCommandCode::BindingMismatch,
+                "an exact Drive account must be bound before transfer",
+            )
+        })?;
+        if state.remote_root_id != root_id {
+            return Err(SyncCommandError::new(
+                SyncCommandCode::BindingMismatch,
+                "the exact Drive root does not match the durable binding",
+            ));
+        }
         let remote_entries = collect_remote_preview(store)?;
         let local_entries = android_inventory(app, vault)?;
         reject_portable_path_collisions(
@@ -3609,6 +4079,7 @@ mod platform {
                     base.local_revision == revision.hex
                         && base.remote_revision == durable.remote_revision
                         && base.content_hash == digest.as_str()
+                        && base.byte_length == binary.byte_len
                 })
             });
             if exact_base_match {
@@ -3634,6 +4105,24 @@ mod platform {
                     content_kind(&local.path, local.kind == "markdown"),
                     reconciliation_time,
                     Some("android_local_publication_unknown"),
+                )? {
+                    registered = registered.saturating_add(1);
+                }
+                continue;
+            }
+            if let (Some(remote), Some(durable)) = (matching_remote, matching_durable.as_ref()) {
+                if register_remote_existing_blocked(
+                    store,
+                    &account_id,
+                    root_id,
+                    remote,
+                    durable,
+                    matching_base.as_ref(),
+                    &local.path,
+                    &revision.hex,
+                    digest.as_str(),
+                    binary.byte_len,
+                    reconciliation_time,
                 )? {
                     registered = registered.saturating_add(1);
                 }
@@ -3791,6 +4280,7 @@ mod platform {
         let final_page = page.new_start_page_token.is_some();
         let mut changes = Vec::new();
         let mut downloads = Vec::new();
+        let local = android_inventory(app, vault)?;
         let mut merged_remote_paths = collect_remote_preview(store)?
             .into_iter()
             .map(|entry| (entry.file_id, entry.path))
@@ -3831,6 +4321,61 @@ mod platform {
                             return Err(SyncCommandError::new(
                                 SyncCommandCode::RescanRequired,
                                 "remote move or rename requires explicit reconciliation",
+                            ));
+                        }
+                    }
+                    let remote_changed = known.as_ref().is_some_and(|previous| {
+                        previous.remote_revision != entry.remote_revision
+                            || previous.content_hash != entry.content_hash
+                    });
+                    if remote_changed
+                        && entry.kind == RemoteEntryKind::File
+                        && local.iter().any(|item| item.path == entry.path)
+                    {
+                        let local_entry = local
+                            .iter()
+                            .find(|item| item.path == entry.path)
+                            .ok_or_else(SyncCommandError::internal)?;
+                        let binary = app
+                            .vault_saf()
+                            .read_binary(vault, &entry.path, ANDROID_MAX_TRANSFER_BYTES)
+                            .map_err(|_| {
+                                SyncCommandError::new(
+                                    SyncCommandCode::StorageUnavailable,
+                                    "exact local transfer evidence is unavailable",
+                                )
+                            })?;
+                        let digest = myvault_core::Sha256Digest::from_bytes(&binary.bytes);
+                        let revision = myvault_core::FileRevision::from_bytes(&binary.bytes);
+                        if (local_entry.byte_len_known && binary.byte_len != local_entry.byte_len)
+                            || binary.revision_hex != digest.as_str()
+                        {
+                            return Err(SyncCommandError::new(
+                                SyncCommandCode::StorageUnavailable,
+                                "exact local transfer evidence is unavailable",
+                            ));
+                        }
+                        let base = store.remote_base(&entry.file_id).map_err(map_sync_error)?;
+                        let local_diverged = base.as_ref().is_none_or(|value| {
+                            value.local_revision != revision.hex
+                                || value.content_hash != digest.as_str()
+                                || value.byte_length != binary.byte_len
+                        });
+                        if local_diverged {
+                            let _ = register_incremental_remote_existing_blocked(
+                                store,
+                                account_id,
+                                root_id,
+                                &entry,
+                                base.as_ref(),
+                                &revision.hex,
+                                digest.as_str(),
+                                binary.byte_len,
+                                now_unix_ms()?,
+                            )?;
+                            return Err(SyncCommandError::new(
+                                SyncCommandCode::RescanRequired,
+                                "an existing remote item needs explicit reconciliation",
                             ));
                         }
                     }
@@ -3888,7 +4433,6 @@ mod platform {
                 }
             }
         }
-        let local = android_inventory(app, vault)?;
         let mut exact_remote_paths = BTreeSet::new();
         if merged_remote_paths
             .values()
@@ -4711,6 +5255,33 @@ mod tests {
     use uuid::Uuid;
 
     const WORKER_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn incremental_block_registration_precedes_cursor_batch_in_both_native_adapters() {
+        let source = include_str!("sync_commands.rs");
+        let adapters = source
+            .split("fn prepare_incremental_change_batch")
+            .skip(1)
+            .take(2)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            adapters.len(),
+            2,
+            "desktop and Android adapters remain explicit"
+        );
+        for adapter in adapters {
+            let registration = adapter
+                .find("register_incremental_remote_existing_blocked")
+                .expect("existing remote block must be checked in the change-page path");
+            let batch = adapter
+                .find("begin_transfer_change_batch")
+                .expect("change-page path must retain its cursor gate");
+            assert!(
+                registration < batch,
+                "blocked evidence must be durable before any cursor batch can begin"
+            );
+        }
+    }
 
     struct SnapshotJob {
         intent: TransferIntent,

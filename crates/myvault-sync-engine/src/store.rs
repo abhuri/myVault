@@ -30,6 +30,7 @@ type PersistedRemoteEntry = (
     Option<String>,
     String,
 );
+type PersistedRemoteBase = (Option<String>, Option<String>, Option<String>, Option<i64>);
 
 const VAULT_STATE_SCHEMA_V1: &str = "CREATE TABLE vault_state (
     singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
@@ -55,7 +56,7 @@ const VAULT_STATE_SCHEMA: &str = "CREATE TABLE vault_state (
     account_id TEXT,
     rescan_required INTEGER NOT NULL CHECK (rescan_required IN (0, 1))
 )";
-const REMOTE_ENTRIES_SCHEMA: &str = "CREATE TABLE remote_entries (
+const REMOTE_ENTRIES_SCHEMA_V4: &str = "CREATE TABLE remote_entries (
     file_id TEXT PRIMARY KEY NOT NULL,
     parent_id TEXT NOT NULL,
     portable_path TEXT NOT NULL,
@@ -66,6 +67,21 @@ const REMOTE_ENTRIES_SCHEMA: &str = "CREATE TABLE remote_entries (
     base_local_revision TEXT,
     base_remote_revision TEXT,
     base_content_hash TEXT
+)";
+const REMOTE_ENTRIES_SCHEMA: &str = "CREATE TABLE remote_entries (
+    file_id TEXT PRIMARY KEY NOT NULL,
+    parent_id TEXT NOT NULL,
+    portable_path TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('file', 'folder')),
+    content_hash_algorithm TEXT CHECK (content_hash_algorithm IN ('md5', 'sha1', 'sha256')),
+    content_hash TEXT,
+    remote_revision TEXT NOT NULL,
+    base_local_revision TEXT,
+    base_remote_revision TEXT,
+    base_content_hash TEXT,
+    base_byte_length INTEGER CHECK (base_byte_length >= 0),
+    CHECK ((base_local_revision IS NULL AND base_remote_revision IS NULL AND base_content_hash IS NULL AND base_byte_length IS NULL)
+        OR (base_local_revision IS NOT NULL AND base_remote_revision IS NOT NULL AND base_content_hash IS NOT NULL AND base_byte_length IS NOT NULL))
 )";
 const REMOTE_ENTRIES_INDEX_SCHEMA: &str =
     "CREATE INDEX remote_entries_path_idx ON remote_entries(portable_path COLLATE BINARY)";
@@ -313,7 +329,7 @@ const CONFLICT_EVIDENCE_NO_DELETE_TRIGGER: &str = "CREATE TRIGGER conflict_evide
 
 const SCHEMA_OBJECTS_V1: [(&str, &str, &str); 8] = [
     ("table", "vault_state", VAULT_STATE_SCHEMA_V1),
-    ("table", "remote_entries", REMOTE_ENTRIES_SCHEMA),
+    ("table", "remote_entries", REMOTE_ENTRIES_SCHEMA_V4),
     (
         "index",
         "remote_entries_path_idx",
@@ -332,7 +348,7 @@ const SCHEMA_OBJECTS_V1: [(&str, &str, &str); 8] = [
 
 const SCHEMA_OBJECTS_V2: [(&str, &str, &str); 10] = [
     ("table", "vault_state", VAULT_STATE_SCHEMA),
-    ("table", "remote_entries", REMOTE_ENTRIES_SCHEMA),
+    ("table", "remote_entries", REMOTE_ENTRIES_SCHEMA_V4),
     (
         "index",
         "remote_entries_path_idx",
@@ -357,7 +373,7 @@ const SCHEMA_OBJECTS_V2: [(&str, &str, &str); 10] = [
 
 const SCHEMA_OBJECTS_V3: [(&str, &str, &str); 13] = [
     ("table", "vault_state", VAULT_STATE_SCHEMA),
-    ("table", "remote_entries", REMOTE_ENTRIES_SCHEMA),
+    ("table", "remote_entries", REMOTE_ENTRIES_SCHEMA_V4),
     (
         "index",
         "remote_entries_path_idx",
@@ -381,6 +397,108 @@ const SCHEMA_OBJECTS_V3: [(&str, &str, &str); 13] = [
     ("table", "transfers", TRANSFERS_SCHEMA),
     ("index", "transfers_due_idx", TRANSFERS_DUE_INDEX_SCHEMA),
     ("table", "transfer_history", TRANSFER_HISTORY_SCHEMA),
+];
+
+const SCHEMA_OBJECTS_V4: [(&str, &str, &str); 31] = [
+    ("table", "vault_state", VAULT_STATE_SCHEMA),
+    ("table", "remote_entries", REMOTE_ENTRIES_SCHEMA_V4),
+    (
+        "index",
+        "remote_entries_path_idx",
+        REMOTE_ENTRIES_INDEX_SCHEMA,
+    ),
+    (
+        "index",
+        "remote_entries_preview_idx",
+        REMOTE_ENTRIES_PREVIEW_INDEX_SCHEMA,
+    ),
+    ("table", "scan_frontier", SCAN_FRONTIER_SCHEMA),
+    ("table", "sync_jobs", SYNC_JOBS_SCHEMA),
+    ("index", "sync_jobs_due_idx", SYNC_JOBS_INDEX_SCHEMA),
+    ("table", "sync_history", SYNC_HISTORY_SCHEMA),
+    ("table", "change_batch", CHANGE_BATCH_SCHEMA),
+    ("table", "mutation_intents", MUTATION_INTENTS_SCHEMA),
+    (
+        "table",
+        "mutation_verification_evidence",
+        MUTATION_VERIFICATION_EVIDENCE_SCHEMA,
+    ),
+    ("table", "mutation_state", MUTATION_STATE_SCHEMA),
+    ("table", "mutation_events", MUTATION_EVENTS_SCHEMA),
+    ("table", "conflict_evidence", CONFLICT_EVIDENCE_SCHEMA),
+    (
+        "table",
+        "change_batch_mutations",
+        CHANGE_BATCH_MUTATIONS_SCHEMA,
+    ),
+    ("table", "transfers", TRANSFERS_SCHEMA),
+    ("index", "transfers_due_idx", TRANSFERS_DUE_INDEX_SCHEMA),
+    ("table", "transfer_history", TRANSFER_HISTORY_SCHEMA),
+    (
+        "index",
+        "mutation_state_claim_idx",
+        MUTATION_STATE_CLAIM_INDEX_SCHEMA,
+    ),
+    (
+        "index",
+        "mutation_events_operation_attempt_idx",
+        MUTATION_EVENTS_OPERATION_ATTEMPT_INDEX_SCHEMA,
+    ),
+    (
+        "index",
+        "mutation_evidence_operation_attempt_idx",
+        MUTATION_EVIDENCE_OPERATION_ATTEMPT_INDEX_SCHEMA,
+    ),
+    (
+        "index",
+        "conflict_evidence_stable_cell_idx",
+        CONFLICT_EVIDENCE_STABLE_CELL_INDEX_SCHEMA,
+    ),
+    (
+        "index",
+        "conflict_evidence_copy_idx",
+        CONFLICT_EVIDENCE_COPY_INDEX_SCHEMA,
+    ),
+    (
+        "trigger",
+        "mutation_intents_no_update",
+        MUTATION_INTENTS_NO_UPDATE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "mutation_intents_no_delete",
+        MUTATION_INTENTS_NO_DELETE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "mutation_events_no_update",
+        MUTATION_EVENTS_NO_UPDATE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "mutation_events_no_delete",
+        MUTATION_EVENTS_NO_DELETE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "mutation_evidence_no_update",
+        MUTATION_EVIDENCE_NO_UPDATE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "mutation_evidence_no_delete",
+        MUTATION_EVIDENCE_NO_DELETE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "conflict_evidence_no_update",
+        CONFLICT_EVIDENCE_NO_UPDATE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "conflict_evidence_no_delete",
+        CONFLICT_EVIDENCE_NO_DELETE_TRIGGER,
+    ),
 ];
 
 const SCHEMA_OBJECTS: [(&str, &str, &str); 31] = [
@@ -485,7 +603,7 @@ const SCHEMA_OBJECTS: [(&str, &str, &str); 31] = [
     ),
 ];
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 pub const MAX_REMOTE_PREVIEW_PAGE_SIZE: usize = 200;
 
 /// Exact residual risk inherited from bundled `SQLite`'s ambient-path VFS.
@@ -544,6 +662,7 @@ pub struct RemoteBaseEvidence {
     pub local_revision: String,
     pub remote_revision: String,
     pub content_hash: String,
+    pub byte_length: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1364,6 +1483,112 @@ impl MutationIntent {
             ],
         )
     }
+
+    /// Builds the one allowed representation of a detected attempt to mutate an
+    /// already-existing remote item. The returned intent is deliberately
+    /// non-executable and comes with its exact initial `NeedsReconcile`
+    /// evidence; callers must register both together.
+    ///
+    /// This is a state/evidence constructor only. It does not grant any
+    /// provider mutation capability.
+    ///
+    /// # Errors
+    /// Returns validation errors when the supplied identity, revisions, hashes,
+    /// or timestamp are not suitable for durable evidence.
+    pub fn remote_existing_blocked(
+        operation_id: Uuid,
+        input: RemoteExistingBlockedInput,
+        registered_at_unix_ms: u64,
+    ) -> Result<(Self, MutationVerificationEvidence)> {
+        let operation_marker = format!("r3-blocked-{}", operation_id.simple());
+        let mut intent = Self {
+            operation_id,
+            operation_kind: MutationOperationKind::RemoteExistingBlocked,
+            account_id: Some(input.account_id.clone()),
+            remote_root_id: Some(input.remote_root_id.clone()),
+            remote_file_id: Some(input.remote_file_id.clone()),
+            source_parent_id: Some(input.source_parent_id.clone()),
+            destination_parent_id: None,
+            local_object_id: input.local_object_id,
+            source_path: Some(input.source_path.clone()),
+            destination_path: None,
+            expected_local_revision: Some(input.expected_local_revision.clone()),
+            expected_remote_revision: Some(input.expected_remote_revision.clone()),
+            base_reference: input.base_reference,
+            base_local_revision: input.base_local_revision,
+            base_remote_revision: input.base_remote_revision,
+            base_sha256: input.base_sha256,
+            base_byte_length: input.base_byte_length,
+            expected_local_sha256: Some(input.expected_local_sha256.clone()),
+            expected_local_byte_length: Some(input.expected_local_byte_length),
+            expected_remote_sha256: input.expected_remote_sha256.clone(),
+            expected_remote_byte_length: input.expected_remote_byte_length,
+            operation_marker,
+            intent_fingerprint: String::new(),
+            registered_at_unix_ms,
+        };
+        intent.intent_fingerprint = intent.canonical_fingerprint();
+        validate_mutation_intent(&intent)?;
+
+        let evidence_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!(
+                "myvault-r3-remote-existing-blocked-evidence\\0{}\\0{}",
+                operation_id, intent.intent_fingerprint
+            )
+            .as_bytes(),
+        );
+        let mut evidence = MutationVerificationEvidence {
+            evidence_id,
+            operation_id,
+            attempt_number: 0,
+            capture_phase: MutationEvidenceCapturePhase::Preflight,
+            disposition: MutationDisposition::NeedsReconcile,
+            outcome_code: Some("remote_existing_blocked".into()),
+            observed_account_id: Some(input.account_id),
+            observed_remote_root_id: Some(input.remote_root_id),
+            observed_remote_file_id: Some(input.remote_file_id),
+            observed_parent_id: Some(input.source_parent_id),
+            observed_path: Some(input.source_path),
+            observed_local_revision: Some(input.expected_local_revision),
+            observed_remote_revision: Some(input.expected_remote_revision),
+            observed_sha256: input.expected_remote_sha256,
+            observed_byte_length: input.expected_remote_byte_length,
+            observed_operation_marker: Some(intent.operation_marker.clone()),
+            forbidden_side_effect: true,
+            verified_received_byte_offset: None,
+            resume_reference: None,
+            evidence_fingerprint: String::new(),
+            captured_at_unix_ms: registered_at_unix_ms,
+        };
+        evidence.evidence_fingerprint = evidence.canonical_fingerprint();
+        validate_mutation_evidence(&evidence)?;
+        Ok((intent, evidence))
+    }
+}
+
+/// Exact facts captured when an existing remote item is rejected before a
+/// provider mutation can be attempted. Optional base fields must be supplied
+/// together when a verified three-way base is available.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteExistingBlockedInput {
+    pub account_id: String,
+    pub remote_root_id: String,
+    pub remote_file_id: String,
+    pub source_parent_id: String,
+    pub source_path: String,
+    pub local_object_id: Option<String>,
+    pub expected_local_revision: String,
+    pub expected_local_sha256: String,
+    pub expected_local_byte_length: u64,
+    pub expected_remote_revision: String,
+    pub expected_remote_sha256: Option<String>,
+    pub expected_remote_byte_length: Option<u64>,
+    pub base_reference: Option<String>,
+    pub base_local_revision: Option<String>,
+    pub base_remote_revision: Option<String>,
+    pub base_sha256: Option<String>,
+    pub base_byte_length: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1822,14 +2047,18 @@ impl SyncStore {
         if blocked {
             let evidence = initial_evidence.ok_or(Error::InvalidTransferEvidence)?;
             if evidence.disposition != MutationDisposition::NeedsReconcile
-                || evidence.capture_phase == MutationEvidenceCapturePhase::PostVerify
+                || evidence.capture_phase != MutationEvidenceCapturePhase::Preflight
+                || !evidence.forbidden_side_effect
                 || evidence.outcome_code.is_none()
                 || evidence.observed_account_id != intent.account_id
                 || evidence.observed_remote_root_id != intent.remote_root_id
                 || evidence.observed_remote_file_id != intent.remote_file_id
                 || evidence.observed_parent_id != intent.source_parent_id
                 || evidence.observed_path != intent.source_path
+                || evidence.observed_local_revision != intent.expected_local_revision
                 || evidence.observed_remote_revision != intent.expected_remote_revision
+                || evidence.observed_operation_marker.as_deref()
+                    != Some(intent.operation_marker.as_str())
             {
                 return Err(Error::InvalidTransferEvidence);
             }
@@ -2477,25 +2706,32 @@ impl SyncStore {
     /// Rejects malformed IDs or partially persisted base evidence.
     pub fn remote_base(&self, file_id: &str) -> Result<Option<RemoteBaseEvidence>> {
         validate_remote_id(file_id)?;
-        let persisted: Option<(Option<String>, Option<String>, Option<String>)> = self
+        let persisted: Option<PersistedRemoteBase> = self
             .connection
             .query_row(
-                "SELECT base_local_revision, base_remote_revision, base_content_hash
+                "SELECT base_local_revision, base_remote_revision, base_content_hash, base_byte_length
                  FROM remote_entries WHERE file_id = ?1",
                 [file_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
         match persisted {
-            None | Some((None, None, None)) => Ok(None),
-            Some((Some(local_revision), Some(remote_revision), Some(content_hash))) => {
+            None | Some((None, None, None, None)) => Ok(None),
+            Some((
+                Some(local_revision),
+                Some(remote_revision),
+                Some(content_hash),
+                Some(byte_length),
+            )) => {
                 validate_revision(&local_revision)?;
                 validate_remote_token(&remote_revision)?;
                 RemoteContentHash::new(RemoteHashAlgorithm::Sha256, content_hash.clone())?;
+                let byte_length = u64::try_from(byte_length).map_err(|_| Error::InvalidSchema)?;
                 Ok(Some(RemoteBaseEvidence {
                     local_revision,
                     remote_revision,
                     content_hash,
+                    byte_length,
                 }))
             }
             Some(_) => Err(Error::InvalidSchema),
@@ -3946,6 +4182,7 @@ impl SyncStore {
                OR remote.base_local_revision != transfer.verified_local_revision
                OR remote.base_remote_revision != transfer.verified_remote_revision
                OR remote.base_content_hash != transfer.sha256
+               OR remote.base_byte_length != transfer.byte_length
                OR (remote.content_hash_algorithm = 'sha256' AND
                    (remote.content_hash IS NULL OR remote.content_hash != transfer.sha256))
              )",
@@ -4159,6 +4396,21 @@ fn validate_mutation_intent(intent: &MutationIntent) -> Result<()> {
             || intent.source_path.is_none()
             || intent.expected_remote_revision.is_none())
     {
+        return Err(Error::InvalidTransferEvidence);
+    }
+    if intent.operation_kind == MutationOperationKind::RemoteExistingBlocked
+        && !matches!(
+            (
+                intent.base_local_revision.as_deref(),
+                intent.base_remote_revision.as_deref(),
+                intent.base_sha256.as_deref(),
+                intent.base_byte_length,
+            ),
+            (None, None, None, None) | (Some(_), Some(_), Some(_), Some(_))
+        )
+    {
+        // A blocked remote-existing intent may have no usable base after a
+        // fail-closed migration, but it must never persist a partial base.
         return Err(Error::InvalidTransferEvidence);
     }
     Ok(())
@@ -5229,7 +5481,14 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         }
         migrate_v3_to_v4(&transaction)?;
     }
-    if !schema_v4_is_valid(&transaction)? {
+    let after_v3: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if after_v3 == 4 {
+        if !schema_v4_is_valid(&transaction)? {
+            return Err(Error::InvalidSchema);
+        }
+        migrate_v4_to_v5(&transaction)?;
+    }
+    if !schema_v5_is_valid(&transaction)? {
         return Err(Error::InvalidSchema);
     }
     transaction.commit()?;
@@ -5294,6 +5553,32 @@ fn migrate_v3_to_v4(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute_batch(MUTATION_EVIDENCE_NO_DELETE_TRIGGER)?;
     transaction.execute_batch(CONFLICT_EVIDENCE_NO_UPDATE_TRIGGER)?;
     transaction.execute_batch(CONFLICT_EVIDENCE_NO_DELETE_TRIGGER)?;
+    transaction.pragma_update(None, "user_version", 4)?;
+    Ok(())
+}
+
+fn migrate_v4_to_v5(transaction: &Transaction<'_>) -> Result<()> {
+    // V4 retained a base hash without its exact byte length. It cannot be
+    // upgraded by inference, so clear those incomplete bases atomically rather
+    // than fabricating evidence or weakening the new pair invariant.
+    transaction.execute_batch(
+        "DROP INDEX remote_entries_path_idx;
+         DROP INDEX remote_entries_preview_idx;
+         ALTER TABLE remote_entries RENAME TO remote_entries_v4;",
+    )?;
+    transaction.execute_batch(REMOTE_ENTRIES_SCHEMA)?;
+    transaction.execute_batch(
+        "INSERT INTO remote_entries(
+            file_id, parent_id, portable_path, kind, content_hash_algorithm,
+            content_hash, remote_revision
+         )
+         SELECT file_id, parent_id, portable_path, kind, content_hash_algorithm,
+                content_hash, remote_revision
+         FROM remote_entries_v4;
+         DROP TABLE remote_entries_v4;",
+    )?;
+    transaction.execute_batch(REMOTE_ENTRIES_INDEX_SCHEMA)?;
+    transaction.execute_batch(REMOTE_ENTRIES_PREVIEW_INDEX_SCHEMA)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -5494,7 +5779,7 @@ fn schema_v3_is_valid(connection: &Connection) -> Result<bool> {
 }
 
 fn schema_v4_is_valid(connection: &Connection) -> Result<bool> {
-    if !schema_definitions_are_exact(connection, &SCHEMA_OBJECTS)? {
+    if !schema_definitions_are_exact(connection, &SCHEMA_OBJECTS_V4)? {
         return Ok(false);
     }
     let mut statement = connection.prepare(
@@ -5522,6 +5807,17 @@ fn schema_v4_is_valid(connection: &Connection) -> Result<bool> {
         "vault_state",
     ];
     if tables.iter().map(String::as_str).ne(expected) {
+        return Ok(false);
+    }
+    let foreign_key_errors: i64 =
+        connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    Ok(foreign_key_errors == 0)
+}
+
+fn schema_v5_is_valid(connection: &Connection) -> Result<bool> {
+    if !schema_definitions_are_exact(connection, &SCHEMA_OBJECTS)? {
         return Ok(false);
     }
     let foreign_key_errors: i64 =
@@ -6210,8 +6506,8 @@ fn update_remote_base_if_present(
     let metadata_changed = transaction.execute(
         "UPDATE remote_entries
          SET base_local_revision = ?1, base_remote_revision = ?2,
-             base_content_hash = ?3
-         WHERE file_id = ?4 AND parent_id = ?5 AND portable_path = ?6
+             base_content_hash = ?3, base_byte_length = ?4
+         WHERE file_id = ?5 AND parent_id = ?6 AND portable_path = ?7
            AND kind = 'file' AND remote_revision = ?2
            AND (content_hash_algorithm IS NULL OR content_hash_algorithm != 'sha256'
                 OR content_hash = ?3)",
@@ -6219,6 +6515,7 @@ fn update_remote_base_if_present(
             completion.local_revision,
             completion.remote_revision,
             transfer.sha256,
+            u64_to_i64(transfer.byte_length)?,
             completion.remote_file_id,
             transfer.remote_parent_id,
             transfer.portable_path

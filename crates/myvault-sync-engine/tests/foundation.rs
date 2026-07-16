@@ -149,7 +149,28 @@ fn downgrade_database_to_v1(database_path: &Path) {
              DROP INDEX transfers_due_idx;
              DROP TABLE transfers;
              DROP TABLE scan_frontier;
+             DROP INDEX remote_entries_path_idx;
              DROP INDEX remote_entries_preview_idx;
+             ALTER TABLE remote_entries RENAME TO remote_entries_v5;
+             CREATE TABLE remote_entries (
+                file_id TEXT PRIMARY KEY NOT NULL,
+                parent_id TEXT NOT NULL,
+                portable_path TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('file', 'folder')),
+                content_hash_algorithm TEXT CHECK (content_hash_algorithm IN ('md5', 'sha1', 'sha256')),
+                content_hash TEXT,
+                remote_revision TEXT NOT NULL,
+                base_local_revision TEXT,
+                base_remote_revision TEXT,
+                base_content_hash TEXT
+             );
+             INSERT INTO remote_entries
+             SELECT file_id, parent_id, portable_path, kind, content_hash_algorithm,
+                    content_hash, remote_revision, base_local_revision,
+                    base_remote_revision, base_content_hash
+             FROM remote_entries_v5;
+             DROP TABLE remote_entries_v5;
+             CREATE INDEX remote_entries_path_idx ON remote_entries(portable_path COLLATE BINARY);
              ALTER TABLE vault_state RENAME TO vault_state_v2;
              CREATE TABLE vault_state (
                 singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),

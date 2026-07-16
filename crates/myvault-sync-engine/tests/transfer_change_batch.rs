@@ -103,6 +103,7 @@ fn assert_remote_base(store: &SyncStore, entry: &RemoteEntry) {
             local_revision: hash(b'c'),
             remote_revision: entry.remote_revision.clone(),
             content_hash: hash(b'a'),
+            byte_length: 42,
         }
     );
 }
@@ -374,6 +375,7 @@ fn zero_mutation_and_unchanged_metadata_pages_can_advance() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn completion_and_cursor_commit_reject_tampered_metadata_without_partial_writes() {
     let fixture = Fixture::new();
     let mut store = ready_store(&fixture, &[]);
@@ -460,4 +462,23 @@ fn completion_and_cursor_commit_reject_tampered_metadata_without_partial_writes(
         store.commit_transfer_change_batch(batch_id, 22),
         Err(Error::LocalMutationIncomplete)
     ));
+    connection
+        .execute(
+            "UPDATE remote_entries SET base_byte_length = 41 WHERE file_id = 'remote-file'",
+            [],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.commit_transfer_change_batch(batch_id, 23),
+        Err(Error::LocalMutationIncomplete)
+    ));
+    assert_eq!(
+        store
+            .vault_state()
+            .unwrap()
+            .unwrap()
+            .durable_cursor
+            .as_deref(),
+        Some("cursor-1")
+    );
 }
