@@ -118,7 +118,7 @@ Planning range รวมที่เหลือจากผลรวม milesto
 |---|---|---|---|---|
 | R1 — Native Auth + Read-only Binding | แอปเชื่อม account, bind exact root และอ่าน remote state โดยไม่เขียน Drive ค่ะ | Phase 3A | 1–2 weeks | Complete — merged via PR #26 |
 | R2 — Guarded Transfer | Markdown และ attachment upload/download แบบ verified และ restart-safe ค่ะ | R1 | 2–3 weeks | Complete — merged via PR #27 |
-| R3 — Safe Conflict Core | Two-sided conflicts, preserve-both และ guarded local materialization ปลอดภัยโดย existing-item Drive mutation ถูก block ค่ะ | R2 | 2–3 weeks | R3.0 closed — transition pending |
+| R3 — Safe Conflict Core | Two-sided conflicts, preserve-both และ guarded local materialization ปลอดภัยโดย existing-item Drive mutation ถูก block ค่ะ | R2 | 2–3 weeks | R3.3 complete at `538fb72`; R3.4 open / blocked by R3.5 prerequisites |
 | R4 — Sync Control Plane + Safe Sync Alpha | ผู้ใช้ควบคุมและเข้าใจ Sync ได้ พร้อม end-to-end alpha acceptance ค่ะ | R3 | 1–2 weeks | Locked planned |
 | R5 — Local Product Completion | Local CRUD, attachment และ remaining editor/reader journey เชื่อม UI ครบค่ะ | R4 | 1–2 weeks | Locked planned |
 | R6 — Knowledge Core | Persistent index, search, links, backlinks และ basic graphs ใช้ full-vault truth ค่ะ | R5 | 1–2 weeks | Locked planned |
@@ -178,8 +178,9 @@ Exit gate มีดังนี้ค่ะ
 ### R3 — Safe Conflict Core
 
 Outcome คือสองอุปกรณ์สังเกตและ classify การแก้ไขพร้อมกันได้โดยไม่มีข้อมูลสูญหาย
-หรือ remote deletion ที่กำกวมค่ะ Safe merge, preserve-both และ guarded local
-materialization ทำได้ค่ะ Intent ที่ต้อง mutate existing Drive item ต้องหยุดที่
+หรือ remote deletion ที่กำกวมค่ะ Safe merge และ preserve-both contract ถูก freeze แล้ว
+แต่ guarded local materialization ยังต้องผ่าน R3.4 completion gate หลัง R3.5
+prerequisites ค่ะ Intent ที่ต้อง mutate existing Drive item ต้องหยุดที่
 `NeedsReconcile` ค่ะ
 
 In scope มีดังนี้ค่ะ
@@ -212,10 +213,14 @@ R3 scope เป็น Safe Conflict Core และแยก Provider-safe Remote
 ค่ะ การลด capability นี้ไม่ลด preserve-both/no-silent-overwrite safety boundary ค่ะ
 รายละเอียดอยู่ที่ [R3 safety contracts](docs/sync/R3_CONTRACTS.md) ค่ะ
 
-R3 แบ่ง execution เป็น `R3.0 → R3.1 → {R3.2, R3.3 block enforcement, R3.4} → R3.5 →
-R3.6 → R3.7` ค่ะ R3.1 durable mutation and conflict evidence complete ที่
-implementation `main@c774324` พร้อม Gate 1 ผ่านแล้วค่ะ รายละเอียด outcome, dependency, owner, exit gate, AI staffing
-และ usage contract อยู่ที่ [R3 plan](docs/sync/R3_PLAN.md),
+R3 แบ่ง execution เป็น `R3.0 → R3.1 → {R3.2, R3.3, R3.4 capability proof} →
+R3.5 prerequisites/orchestration → R3.4 completion gate → R3.6 → R3.7` ค่ะ
+R3.1 durable mutation and conflict evidence complete ที่ implementation
+`main@c774324` พร้อม Gate 1 ผ่านแล้วค่ะ R3.2 complete ที่ `6d82b77` และ R3.3
+complete ที่ `538fb72` พร้อม exact-head CI ค่ะ R3.4 capability proof ถูกหยุดแบบ
+fail-closed เพราะ Desktop/Android SAF ยังพิสูจน์ local identity/no-replace/final
+outcome/replay boundary ไม่ครบค่ะ รายละเอียด outcome, dependency, owner, exit gate,
+AI staffing และ usage contract อยู่ที่ [R3 plan](docs/sync/R3_PLAN.md),
 [R3 acceptance](docs/sync/R3_ACCEPTANCE.md) และ
 [R3 usage ledger](docs/sync/R3_USAGE.md) ค่ะ Safety decisions อยู่ที่
 [R3 safety contracts](docs/sync/R3_CONTRACTS.md) ค่ะ R3.2 และภายหลังยังต้องมี

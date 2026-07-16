@@ -22,8 +22,8 @@ preflight read + post-verification ไม่สามารถพิสูจน
 
 คุณโออนุมัติ Option A change-control เมื่อ 2026-07-16 ค่ะ R3 จึงปิด scope เป็น
 Safe Conflict Core ที่ classify, merge, preserve both, materialize conflict copy,
-ทำ guarded local mutation และหยุด remote-existing-item intent ที่
-`NeedsReconcile` ค่ะ Existing Drive item content update, rename, move และ
+เตรียม guarded local mutation เฉพาะเมื่อผ่าน R3.4 platform contract และหยุด
+remote-existing-item intent ที่ `NeedsReconcile` ค่ะ Existing Drive item content update, rename, move และ
 `trashed=true` คงสถานะ `BLOCKED` และถูกแยกไป Provider-safe Remote Mutation Gate
 ซึ่งไม่เป็น dependency ของ R3 Safe Conflict Core ค่ะ
 
@@ -198,6 +198,28 @@ intent พิสูจน์ได้เพียง observed final state ไม
   cross-root move, permission mutation, redirect/origin change และ malformed
   metadata ต้อง fail closed ค่ะ
 - Vault-local Trash เป็น local capability แยกจาก remote `trashed=true` ค่ะ
+
+### 7.3 R3.4 blocked capability disposition and R3.5 handoff
+
+R3.4 capability proof จบที่ `open / blocked by prerequisites` ค่ะ ไม่อนุญาตให้
+Desktop หรือ Android SAF execute guarded replace, rename, move, Vault-local Trash หรือ
+conflict-copy publication จาก contract นี้จนกว่าจะพิสูจน์ทุก precondition ก่อน side
+effect ได้แก่ held root, exact source identity, source revision, destination parent,
+collision set และ no-replace semantics ค่ะ
+
+Desktop foundation ที่มี revision check, held root/parent, collision scan และ
+recovery journal ไม่ใช่ proof ของ durable exact source identity หรือ atomic replacement
+ค่ะ Android SAF ที่คืน unavailable → `NeedsReconcile` เป็น fail-closed result ที่ถูกต้อง
+แต่ไม่ใช่ evidence ว่ามี guarded capability ค่ะ
+
+R3.5 ต้องรับ controlled change proposal สำหรับ durable identity,
+journal/recovery/replay semantics, final-outcome classification และ watcher/SAF echo
+idempotency ค่ะ Proposal ต้องผ่าน Sol High change-control disposition และได้รับ
+explicit user approval ที่จำกัด exact source/test scope ก่อน source write ค่ะ
+Documentation closeout approval อย่างเดียวไม่เปิด implementation ค่ะ ห้าม reinterpret
+`FileRevision`, preflight/post-verify หรือ watcher hint เป็น replacement proof ค่ะ
+ก่อน completion gate ของ R3.4 ทุก unknown/unsupported result ต้องเป็น
+`WriteOutcomeUnknown` หรือ `NeedsReconcile` ตาม evidence และห้าม advance cursor ค่ะ
 
 ## 8. Provider semantics record
 

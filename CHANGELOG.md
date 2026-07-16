@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased — R3.3 closure and R3.4 controlled handoff — 2026-07-16
+
+- ปิด R3.3 Remote Mutation Block Enforcement ที่ source boundary
+  `main@94cdffa` และ CI-boundary remediation `main@538fb72` ค่ะ Exact-head CI run
+  `29494622309` ผ่านทั้ง `quality` และ `android-compile` ค่ะ
+- ยืนยัน static/runtime block ว่าไม่มี executable production path สำหรับ existing-item
+  remote content update, rename, move, Trash, HTTP `DELETE`, permission mutation หรือ
+  generic provider request ค่ะ Blocked intent เก็บ exact evidence, จบที่
+  `NeedsReconcile` และไม่ advance cursor ค่ะ
+- R3.4 ทำ bounded read-only Desktop/Android SAF capability proof และ Sol High
+  change-control แล้วค่ะ ไม่เกิด source/test edit หรือ local mutation capability ใหม่ค่ะ
+- Desktop ยังพิสูจน์ durable exact source identity, atomic/no-replace replacement,
+  final outcome และ durable watcher/replay echo suppression ไม่ได้ค่ะ Android SAF ยัง
+  พิสูจน์ held destination-parent identity, complete collision set, atomic no-replace
+  publication และ final outcome ไม่ได้ค่ะ
+- R3.4 จึงมีสถานะ `open / blocked by prerequisites` ไม่ใช่ completed ค่ะ R3.5 ต้อง
+  รับ controlled durable identity/journal/recovery/echo prerequisites ก่อน แล้วจึง
+  กลับมารัน R3.4 completion gate ได้ค่ะ
+
 ## Unreleased — R3 planning prepared — 2026-07-15
 
 - ยืนยัน R2 implementation, PR #27 merge `94db388` และ post-merge Quality run

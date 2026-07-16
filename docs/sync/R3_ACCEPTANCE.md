@@ -127,23 +127,36 @@ Source `6d82b77` ผ่าน exact-head run `29482629396` ทั้ง `quality
 
 ## Gate 3 — R3.3 remote mutation block enforcement
 
-- [ ] `RemoteMutationBlocked` แยกจาก read-only reconciliation และ R2 create-only
+- [x] `RemoteMutationBlocked` แยกจาก read-only reconciliation และ R2 create-only
   transfer capability ค่ะ
-- [ ] Existing-item content update, rename, move และ remote Trash intent เก็บ
+- [x] Existing-item content update, rename, move และ remote Trash intent เก็บ
   exact identity/base evidence แล้วจบที่ `NeedsReconcile` ค่ะ
-- [ ] Remote content/name/parent/trashed observations เข้า classifier ได้โดยไม่ส่ง
+- [x] Remote content/name/parent/trashed observations เข้า classifier ได้โดยไม่ส่ง
   `files.update` request ค่ะ
-- [ ] Restart และ repeated Changes page ไม่สร้าง existing-item side effect หรือ
+- [x] Restart และ repeated Changes page ไม่สร้าง existing-item side effect หรือ
   duplicate blocked intent ค่ะ
-- [ ] Cursor ไม่ advance ข้าม unresolved blocked intent ค่ะ
-- [ ] Shortcut, Google-native ambiguity, multiple parent, outside-root, malformed
+- [x] Cursor ไม่ advance ข้าม unresolved blocked intent ค่ะ
+- [x] Shortcut, Google-native ambiguity, multiple parent, outside-root, malformed
   metadata, redirect และ origin change fail closed ค่ะ
-- [ ] Captured requests และ static audit พิสูจน์ว่า production surface ไม่มี
+- [x] Captured requests และ static audit พิสูจน์ว่า production surface ไม่มี
   existing-item update, HTTP `DELETE`, permission mutation หรือ generic request ค่ะ
-- [ ] R1/R2 read/create-only surface ไม่ถูก broaden และ provider-safe research
+- [x] R1/R2 read/create-only surface ไม่ถูก broaden และ provider-safe research
   ไม่มี source diff ปนใน Safe Conflict Core ค่ะ
 
+Gate 3 complete ที่ `main@538fb72d132b2b318298140f24780d65d01217a0` ค่ะ Exact-head
+CI run `29494622309` ผ่าน `quality` และ `android-compile` ค่ะ
+
 ## Gate 4 — R3.4 guarded local mutation
+
+**Disposition: open / blocked by R3.5 prerequisites** ค่ะ Sol High change-control
+ยืนยันว่า Gate นี้ยังปิดไม่ได้ภายใต้ frozen contract ค่ะ Desktop ยังพิสูจน์ durable
+exact identity, atomic/no-replace replacement, final outcome และ durable watcher/replay
+echo suppression ไม่ได้ค่ะ Android SAF ยังพิสูจน์ held destination-parent identity,
+complete collision set, atomic no-replace publication และ final outcome ไม่ได้ค่ะ
+Unavailable SAF → `NeedsReconcile` ปลอดภัยแต่ไม่ใช่ capability completion ค่ะ
+
+ห้าม check item ด้านล่างหรือเปิด Sync-owned local adapter จน R3.5 prerequisite gate
+ผ่าน controlled contract, implementation, Terra audit และ Sol adversarial audit ค่ะ
 
 - [ ] Desktop reuse revision checks, mutation service และ recovery journal ค่ะ
 - [ ] Sync-owned rename, move, Vault-local Trash, guarded replacement และ
@@ -159,6 +172,12 @@ Source `6d82b77` ผ่าน exact-head run `29482629396` ทั้ง `quality
   ผ่านตาม platform claim ค่ะ
 
 ## Gate 5 — R3.5 orchestration and reconciliation
+
+R3.5 เริ่มด้วย prerequisite gate ก่อน orchestration source implementation ค่ะ Gate
+ต้องเพิ่ม durable exact local identity, journal/recovery proof, no-replace/final-outcome
+classification และ watcher/SAF echo-to-replay idempotency โดยไม่ผ่อน
+`legacy_v3`/cursor gates ค่ะ เมื่อหลักฐานเหล่านี้ผ่านแล้วจึงกลับไปดำเนิน Gate 4
+completion matrix ค่ะ
 
 - [ ] Local rename/move/Trash observation เข้า durable queue โดยไม่ใช้ watcher
   เป็น source of truth ค่ะ
