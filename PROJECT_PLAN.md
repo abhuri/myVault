@@ -57,10 +57,10 @@ Demo, compile-only, mock-only, emulator-only หรือ foundation-only ไม
 | Create, rename, move, Trash และ Restore | Foundation only | Core/mutation services มี safety tests แต่ Tauri commands และ UI journey ยังไม่ครบค่ะ |
 | Editor และ Reader | Partially usable | CodeMirror, autosave, GFM, sanitized Reader, code และ Mermaid ใช้งานได้ค่ะ Attachment workflow, properties และ embeds ยังไม่ครบค่ะ |
 | Search, backlinks และ graph | Prototype | Filter/quick switcher และ opened-note backlinks/graph มีใน Demo ค่ะ ยังไม่มี persistent full-vault content index ค่ะ |
-| Native Google authorization | Foundation only | Desktop OAuth/Keyring primitives และ Android bridge มีแล้วค่ะ Desktop ยังไม่ต่อเข้า runtime และ Android ยังขาด physical-device evidence ค่ะ |
-| Drive REST behavior | Spike only | Live disposable fixture, pagination, resumable upload และ trash-only cleanup เคยผ่านค่ะ ยังไม่ใช่ production adapter ในแอปค่ะ |
-| Sync state foundation | Complete เฉพาะ 3A | Private SQLite, exact binding, lease, scan state, queue, cursor และ reconciliation ผ่าน 17 tests และ merge แล้วค่ะ Crate ยังไม่เป็น dependency ของ Tauri app ค่ะ |
-| Production Drive Sync | Missing | ยังไม่มี Existing Drive binding, production scan, transfer, conflict handling หรือ Sync UI ในแอปค่ะ |
+| Native Google authorization | Runtime integrated (R1) | Desktop OAuth/Keyring และ Android bridge เชื่อม runtime แล้วค่ะ Android physical-device evidence ยัง deferred ไป R7 ค่ะ |
+| Drive REST behavior | Runtime integrated, guarded (R1–R2) | Exact-root binding/read plus create-only resumable upload และ bounded verified download ผ่าน disposable live acceptance แล้วค่ะ Rename/move/Trash/conflict mutation ยังไม่อยู่ใน scope ค่ะ |
+| Sync state foundation | Runtime integrated (R1–R2) | Private SQLite, exact binding, lease, scan state, queue, cursor, reconciliation และ durable transfer evidence เชื่อม Tauri runtime แล้วค่ะ |
+| Production Drive Sync | Guarded transfer implemented (R1–R2) | Existing Drive binding และ verified transfer อยู่ใน runtime แล้วค่ะ ยังไม่มี conflict handling, full Sync control plane หรือ two-sided mutation UI ค่ะ |
 | Packaging และ release | Partial | Demo artifacts และ CI builds มีแล้วค่ะ Native acceptance, recovery guide และ Personal First Release gate ยังไม่ครบค่ะ |
 
 คำว่า `Complete` หมายถึง complete ตามขอบเขต milestone เท่านั้น และไม่แปลว่าผลิตภัณฑ์ทั้งเส้นทางเสร็จแล้วค่ะ
@@ -117,8 +117,8 @@ Planning range รวมที่เหลือจากผลรวม milesto
 | Milestone | Outcome | Dependency | Planning range | Status |
 |---|---|---|---|---|
 | R1 — Native Auth + Read-only Binding | แอปเชื่อม account, bind exact root และอ่าน remote state โดยไม่เขียน Drive ค่ะ | Phase 3A | 1–2 weeks | Complete — merged via PR #26 |
-| R2 — Guarded Transfer | Markdown และ attachment upload/download แบบ verified และ restart-safe ค่ะ | R1 | 2–3 weeks | Evidence-head CI passed — final docs-head CI/review pending |
-| R3 — Mutations + Conflict Safety | Rename/move/Trash และ two-sided conflicts ปลอดภัยข้ามอุปกรณ์ค่ะ | R2 | 2–3 weeks | Locked planned |
+| R2 — Guarded Transfer | Markdown และ attachment upload/download แบบ verified และ restart-safe ค่ะ | R1 | 2–3 weeks | Complete — merged via PR #27 |
+| R3 — Safe Conflict Core | Two-sided conflicts, preserve-both และ guarded local materialization ปลอดภัยโดย existing-item Drive mutation ถูก block ค่ะ | R2 | 2–3 weeks | R3.0 content complete — canonicalization/transition pending |
 | R4 — Sync Control Plane + Safe Sync Alpha | ผู้ใช้ควบคุมและเข้าใจ Sync ได้ พร้อม end-to-end alpha acceptance ค่ะ | R3 | 1–2 weeks | Locked planned |
 | R5 — Local Product Completion | Local CRUD, attachment และ remaining editor/reader journey เชื่อม UI ครบค่ะ | R4 | 1–2 weeks | Locked planned |
 | R6 — Knowledge Core | Persistent index, search, links, backlinks และ basic graphs ใช้ full-vault truth ค่ะ | R5 | 1–2 weeks | Locked planned |
@@ -175,26 +175,50 @@ Exit gate มีดังนี้ค่ะ
 - Hash mismatch, stale revision, quota/network error และ auth expiry fail closed พร้อม recovery action ค่ะ
 - ไม่มี cursor advancement ก่อน local commit หรือ verified remote completion ค่ะ
 
-### R3 — Remote Mutations and Conflict Safety
+### R3 — Safe Conflict Core
 
-Outcome คือสองอุปกรณ์แก้ไขพร้อมกันได้โดยไม่มีข้อมูลสูญหายหรือ remote deletion ที่กำกวมค่ะ
+Outcome คือสองอุปกรณ์สังเกตและ classify การแก้ไขพร้อมกันได้โดยไม่มีข้อมูลสูญหาย
+หรือ remote deletion ที่กำกวมค่ะ Safe merge, preserve-both และ guarded local
+materialization ทำได้ค่ะ Intent ที่ต้อง mutate existing Drive item ต้องหยุดที่
+`NeedsReconcile` ค่ะ
 
 In scope มีดังนี้ค่ะ
 
-- Rename, move และ Vault-local Trash propagation ค่ะ
-- Remote removed/trashed item handling โดยใช้ exact remote ID ค่ะ
+- Local rename, move, Vault-local Trash, guarded replacement และ conflict-copy
+  materialization ผ่าน exact local identity/revision contract ค่ะ
+- Remote content/name/parent/removed/trashed observation และ classification โดยใช้
+  exact remote identity evidence และไม่มี existing-item Drive mutation ค่ะ
 - Markdown three-way merge เมื่อ base/local/remote ชัดและ merge ปลอดภัยค่ะ
 - Conflict copy เมื่อ merge ไม่ปลอดภัยหรือเป็น binary attachment ค่ะ
 - Delete-versus-edit, rename-versus-edit, move collisions และ duplicate remote paths ค่ะ
 - Device/time metadata ที่จำเป็นต่อ conflict explanation โดยไม่พึ่ง timestamp เพื่อความถูกต้องค่ะ
+- Existing Drive item content update, rename, move และ remote Trash ถูก block และ
+  แยกไป Provider-safe Remote Mutation Gate ที่ไม่เป็น dependency ของ R3 ค่ะ
 
 Exit gate มีดังนี้ค่ะ
 
 - Conflict matrix ครอบคลุม local-only, remote-only, both-changed, delete/edit, rename/edit และ offline replay ค่ะ
 - ไม่มี conflict copy ถูกลบอัตโนมัติค่ะ
-- Remote Trash ต้องยืนยัน exact identity และไม่มี permanent-delete API ค่ะ
-- Two-device disposable fixture journey ผ่านพร้อม restart ระหว่าง mutation ค่ะ
+- Static/runtime evidence ยืนยันว่าไม่มี existing-item `files.update`, remote
+  Trash, permanent-delete หรือ generic request capability ค่ะ
+- Two-device disposable fixture journey ผ่านพร้อม restart ระหว่าง blocked remote
+  intent, guarded local mutation, merge และ conflict publication ค่ะ
 - ทุก unknown outcome จบที่ verified completion, retry-safe state หรือ Needs Reconcile ค่ะ
+
+R3.0 Sol High review พบว่า official Drive API v3 surface ที่ตรวจไม่ระบุ
+server-enforced expected-revision/conditional mutation สำหรับ existing-item
+`files.update` ค่ะ คุณโออนุมัติ Option A change-control เมื่อ 2026-07-16 ให้ลด
+R3 scope เป็น Safe Conflict Core และแยก Provider-safe Remote Mutation Gate ออกไป
+ค่ะ การลด capability นี้ไม่ลด preserve-both/no-silent-overwrite safety boundary ค่ะ
+รายละเอียดอยู่ที่ [R3 safety contracts](docs/sync/R3_CONTRACTS.md) ค่ะ
+
+R3 แบ่ง execution เป็น `R3.0 → R3.1 → {R3.2, R3.3 block enforcement, R3.4} → R3.5 →
+R3.6 → R3.7` ค่ะ รายละเอียด outcome, dependency, owner, exit gate, AI staffing
+และ usage contract อยู่ที่ [R3 plan](docs/sync/R3_PLAN.md),
+[R3 acceptance](docs/sync/R3_ACCEPTANCE.md) และ
+[R3 usage ledger](docs/sync/R3_USAGE.md) ค่ะ Safety decisions อยู่ที่
+[R3 safety contracts](docs/sync/R3_CONTRACTS.md) ค่ะ Planning pack นี้ไม่ใช่
+transition approval และยังห้าม R3 source implementation ค่ะ
 
 ### R4 — Sync Control Plane and Safe Sync Alpha
 
@@ -392,6 +416,12 @@ Milestone จะถือว่า complete เมื่อครบทุกข
 - ไฟล์นี้เป็นเจ้าของ locked direction, release scope, roadmap, gates และ risks ค่ะ
 - [SESSION_HANDOFF.md](SESSION_HANDOFF.md) เป็นเจ้าของ branch, dirty diff, verification ล่าสุด, active milestone และ approval state ค่ะ
 - [CHANGELOG.md](CHANGELOG.md) เก็บการเปลี่ยนแปลงตาม release/engineering milestone โดยไม่ทำหน้าที่เป็น handoff ค่ะ
+- [docs/sync/R3_PLAN.md](docs/sync/R3_PLAN.md) เป็นเจ้าของ R3.x execution,
+  safety contract, parallel ownership และ AI staffing methodology ค่ะ
+- [docs/sync/R3_ACCEPTANCE.md](docs/sync/R3_ACCEPTANCE.md) เป็นเจ้าของ R3 gate
+  checklist ค่ะ
+- [docs/sync/R3_USAGE.md](docs/sync/R3_USAGE.md) เป็นเจ้าของ AI usage vocabulary,
+  per-run ledger และ efficiency review ค่ะ
 - `docs/*/RESULTS.md` เก็บ evidence พร้อมวันที่และ commit โดยข้อมูลเก่าต้องติดป้าย historical หรือ superseded ค่ะ
 - Git และผล command ปัจจุบันเป็น source of truth เมื่อขัดกับ checkpoint ค่ะ
 
@@ -400,15 +430,22 @@ Milestone จะถือว่า complete เมื่อครบทุกข
 - R1 ถูก merge เข้า `main` ผ่าน PR #26 ที่ merge commit `681271a` หลัง live
   read-only acceptance, final review, Quality, Android compile, Ubuntu AppImage,
   และ Windows NSIS ผ่านค่ะ
-- Canonical R2 baseline คือ `origin/main` ที่ `681271a` และ active branch คือ
-  `codex/r2-guarded-transfer` ค่ะ
-- Active implementation milestone คือ R2 — Guarded Upload and Download ตาม
-  [R2 implementation plan](docs/sync/R2_PLAN.md) และ
-  [R2 acceptance](docs/sync/R2_ACCEPTANCE.md) ค่ะ
+- R2 ถูก merge เข้า `origin/main` ที่ `94db388` ผ่าน PR #27 ค่ะ
+- R2 documentation closure baseline คือ `f7a0d7c` บน
+  `codex/r2-closure` ค่ะ Baseline นี้ยังต้อง merge เข้า canonical `main` พร้อม
+  planning pack นี้หรือ equivalent reviewed diff ค่ะ `f7a0d7c` เป็น post-merge
+  narrative เท่านั้นค่ะ R2 source checkpoint ยังคงเป็น merge commit `94db388` ค่ะ
+- ไม่มี active implementation milestone ค่ะ R3 — Mutations + Conflict Safety มี
+  planning pack `R3.0–R3.7` แล้ว แต่ implementation ยัง locked จน R3.0 gate
+  ผ่านและคุณโออนุมัติ transition ใหม่ค่ะ
 - macOS disposable byte-exact round trip และ Android API 36 live acceptance
   ผ่านแล้วค่ะ macOS restart upload/download, offline pause/resume, credential
-  restoration และ disconnect/reconnect ผ่านแล้วค่ะ Evidence head `cba94d1`
-  ผ่าน fresh Quality, Android, Ubuntu และ Windows CI แล้วค่ะ R2 ยังไม่ complete
-  จน final evidence update ผ่าน exact-head CI, review และ merge PR #27ค่ะ
-- คุณโออนุมัติ one-time execution ครอบคลุม implementation, bounded subagents,
-  disposable Drive fixture, tests, CI, PR และ merge เมื่อ R2 gate ผ่านค่ะ
+  restoration และ disconnect/reconnect ผ่านแล้วค่ะ Final documentation head
+  `b08bb20` ผ่าน exact-head Quality/Android/Ubuntu/Windows CI และ post-merge
+  Quality บน `main` ผ่านแล้วค่ะ R2 complete ตาม locked scope ค่ะ
+- คุณโออนุมัติ one-time execution สำหรับ R2 แล้วและ execution ปิดสมบูรณ์ค่ะ
+  Approval นี้ไม่ครอบคลุม R3 rename/move/Trash/conflict work ค่ะ
+- คำขอวันที่ 2026-07-15 อนุญาตให้ทบทวนและบันทึก R3 planning methodology
+  ค่ะ คุณโออนุมัติ commit, push และ Draft PR สำหรับ planning/closure documents
+  เพิ่มเติมในวันเดียวกันค่ะ Approval นี้ไม่ครอบคลุม R3 source implementation,
+  live Drive mutation, PR merge หรือ R3 transition ค่ะ
