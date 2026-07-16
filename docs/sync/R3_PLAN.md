@@ -2,7 +2,7 @@
 
 Owner: Sunday ค่ะ
 
-Planning status: `R3.2 LOCAL CLOSURE CANDIDATE — GATE 2 PASSED LOCALLY` ค่ะ
+Planning status: `R3.2 COMPLETE — GATE 2 PASSED — SOURCE 6d82b77` ค่ะ
 
 R2 implementation ถูก merge เข้า `main` ผ่าน PR #27 ที่ `94db388` และ
 post-merge Quality run `29429364407` ผ่านแล้วค่ะ R2 complete ตาม locked
