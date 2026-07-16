@@ -116,6 +116,7 @@ fn binding(account_id: &str, root_id: &str) -> VerifiedRemoteBinding {
 
 fn downgrade_database_to_v1(database_path: &Path) {
     let connection = rusqlite::Connection::open(database_path).unwrap();
+    drop_local_execution_v6_objects(&connection);
     connection
         .execute_batch(
             "PRAGMA foreign_keys = OFF;
@@ -193,6 +194,51 @@ fn downgrade_database_to_v1(database_path: &Path) {
              DROP TABLE vault_state_v2;
              PRAGMA user_version = 1;
              PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+}
+
+fn drop_local_execution_v6_objects(connection: &rusqlite::Connection) {
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TRIGGER local_execution_outcomes_no_delete;
+             DROP TRIGGER local_execution_outcomes_no_update;
+             DROP TRIGGER local_execution_bridge_receipts_no_delete;
+             DROP TRIGGER local_execution_bridge_receipts_no_update;
+             DROP TRIGGER local_execution_consumption_anchors_no_delete;
+             DROP TRIGGER local_execution_consumption_anchors_no_update;
+             DROP TRIGGER mutation_retry_contracts_no_delete;
+             DROP TRIGGER mutation_retry_contracts_no_update;
+             DROP TRIGGER local_execution_boundaries_no_delete;
+             DROP TRIGGER local_execution_boundaries_no_update;
+             DROP TRIGGER local_execution_completions_no_delete;
+             DROP TRIGGER local_execution_completions_no_update;
+             DROP TRIGGER local_execution_members_no_delete;
+             DROP TRIGGER local_execution_members_no_update;
+             DROP TRIGGER local_execution_identities_no_delete;
+             DROP TRIGGER local_execution_identities_no_update;
+             DROP TRIGGER local_execution_contracts_no_delete;
+             DROP TRIGGER local_execution_contracts_no_update;
+             DROP TRIGGER local_execution_outcome_validate;
+             DROP TRIGGER local_execution_boundary_validate;
+             DROP TRIGGER local_execution_member_range;
+             DROP TRIGGER local_execution_completion_validate;
+             DROP INDEX local_execution_boundary_contract_idx;
+             DROP INDEX local_execution_bridge_receipt_operation_idx;
+             DROP INDEX local_execution_consumption_anchor_operation_idx;
+             DROP INDEX mutation_retry_contract_operation_idx;
+             DROP TABLE local_execution_r3_bridge_receipts;
+             DROP TABLE local_execution_r3_consumption_anchors;
+             DROP TABLE mutation_retry_contracts;
+             DROP INDEX local_execution_identity_operation_idx;
+             DROP INDEX local_execution_contracts_vault_idx;
+             DROP TABLE local_execution_attempt_outcomes;
+             DROP TABLE local_execution_attempt_boundaries;
+             DROP TABLE local_execution_contract_completions;
+             DROP TABLE local_execution_collision_members;
+             DROP TABLE local_execution_identity_evidence;
+             DROP TABLE local_execution_contracts;",
         )
         .unwrap();
 }

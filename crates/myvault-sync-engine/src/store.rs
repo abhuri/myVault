@@ -1,10 +1,21 @@
+use crate::local_orchestration::{authoritative_outcome_id, AuthoritativeFinalOutcome};
+use crate::sync_journal::{
+    BridgeConsumptionWitness, OutcomeWitness, PreSideEffectWitness, SyncExecutionJournal,
+};
 use crate::{
+    local_identity::{
+        local_intent_fingerprint_from_r3_intent, persisted_canonical_collision_key,
+        persisted_stable_identity_fingerprint, DurableExecutionBinding,
+        DurableExecutionBindingFingerprint, PersistedIdentityEvidence,
+    },
     parse_uuid, u64_to_i64, validate_content_path, validate_private_reference,
     validate_redacted_code, validate_remote_id, validate_remote_token, validate_revision,
     ChangesPage, Error, RemoteChange, RemoteContentHash, RemoteEntry, RemoteEntryKind,
     RemoteHashAlgorithm, Result, ScanPage, ScanRequest, SyncPhase, VerifiedRemoteBinding,
     MAX_SCAN_FRONTIER_FOLDERS,
 };
+#[cfg(target_os = "android")]
+use cap_fs_ext::OpenOptionsMaybeDirExt;
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
 use fs2::FileExt;
@@ -15,9 +26,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-const ROOT_DIRECTORY: &str = "sync-state";
-const VERSION_DIRECTORY: &str = "v1";
-const VAULTS_DIRECTORY: &str = "vaults";
+pub(crate) const ROOT_DIRECTORY: &str = "sync-state";
+pub(crate) const VERSION_DIRECTORY: &str = "v1";
+pub(crate) const VAULTS_DIRECTORY: &str = "vaults";
 const LEASE_NAME: &str = "sync-operation.lock";
 const DATABASE_NAME: &str = "myvault-sync.sqlite3";
 
@@ -31,6 +42,101 @@ type PersistedRemoteEntry = (
     String,
 );
 type PersistedRemoteBase = (Option<String>, Option<String>, Option<String>, Option<i64>);
+type LocalExecutionContractFingerprints = (Uuid, [u8; 32], [u8; 32], [u8; 32]);
+type LocalBridgeSnapshot = (
+    String,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    String,
+    i64,
+    String,
+    String,
+    String,
+    Vec<u8>,
+    i64,
+    String,
+    i64,
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    i64,
+    i64,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+type R3_5CursorProofRow = (
+    String,
+    Vec<u8>,
+    String,
+    i64,
+    String,
+    i64,
+    Vec<u8>,
+    String,
+    String,
+    Vec<u8>,
+    Vec<u8>,
+    i64,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+);
+type SemanticIdentityRow = (i64, i64, i64, Vec<u8>, Vec<u8>, Vec<u8>);
+#[derive(Clone)]
+struct BridgeReceiptFacts {
+    operation_id: Uuid,
+    attempt_number: u32,
+    boundary_id: Uuid,
+    boundary_occurred_at_unix_ms: u64,
+    contract_fingerprint: [u8; 32],
+    outcome_id: Uuid,
+    evidence_id: Uuid,
+    local_evidence_fingerprint: [u8; 32],
+    outcome_occurred_at_unix_ms: u64,
+    r3_intent_fingerprint: String,
+    r3_evidence_fingerprint: String,
+    // `NULL` is a real R3 fact, not an omitted field.  It is therefore bound
+    // with a presence byte in the receipt preimage below.
+    r3_outcome_code: Option<String>,
+    dependency_kind: String,
+    r3_state_phase: String,
+    r3_state_disposition: String,
+    r3_attempt_number: u32,
+    r3_state_version: u64,
+    r3_last_evidence_id: Uuid,
+    r3_event_state_version: u64,
+}
+
+#[derive(Clone, Copy)]
+enum JournalR3Expectation {
+    /// An ordinary local finalization has no R3 authority or R3 fingerprint.
+    GenericUnbridged,
+    /// An authoritative finalization published its R3 proof, but crashed
+    /// before the receipt transaction.  This is recoverable only while no
+    /// committed dependency exists.
+    AuthoritativePreReceipt([u8; 32]),
+    /// The receipt seals this exact R3 evidence fingerprint.
+    Bridged([u8; 32]),
+}
 
 const VAULT_STATE_SCHEMA_V1: &str = "CREATE TABLE vault_state (
     singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
@@ -327,6 +433,417 @@ const CONFLICT_EVIDENCE_NO_UPDATE_TRIGGER: &str = "CREATE TRIGGER conflict_evide
 const CONFLICT_EVIDENCE_NO_DELETE_TRIGGER: &str = "CREATE TRIGGER conflict_evidence_no_delete
     BEFORE DELETE ON conflict_evidence BEGIN SELECT RAISE(ABORT, 'conflict_evidence_immutable'); END";
 
+const LOCAL_EXECUTION_CONTRACTS_SCHEMA: &str = "CREATE TABLE local_execution_contracts (
+    operation_id TEXT PRIMARY KEY NOT NULL,
+    vault_id TEXT NOT NULL,
+    intent_fingerprint BLOB NOT NULL CHECK (typeof(intent_fingerprint) = 'blob' AND length(intent_fingerprint) = 32),
+    contract_fingerprint BLOB NOT NULL UNIQUE CHECK (typeof(contract_fingerprint) = 'blob' AND length(contract_fingerprint) = 32),
+    target_name TEXT NOT NULL CHECK (typeof(target_name) = 'text' AND length(CAST(target_name AS BLOB)) BETWEEN 1 AND 255),
+    target_collision_key TEXT NOT NULL CHECK (typeof(target_collision_key) = 'text' AND length(CAST(target_collision_key AS BLOB)) BETWEEN 1 AND 1024),
+    collision_member_count INTEGER NOT NULL CHECK (collision_member_count BETWEEN 0 AND 4096),
+    collision_snapshot_fingerprint BLOB NOT NULL CHECK (typeof(collision_snapshot_fingerprint) = 'blob' AND length(collision_snapshot_fingerprint) = 32),
+    completion_id TEXT NOT NULL UNIQUE,
+    registered_at_unix_ms INTEGER NOT NULL CHECK (registered_at_unix_ms >= 0),
+    FOREIGN KEY (completion_id) REFERENCES local_execution_contract_completions(completion_id) DEFERRABLE INITIALLY DEFERRED
+)";
+const LOCAL_EXECUTION_IDENTITY_EVIDENCE_SCHEMA: &str = "CREATE TABLE local_execution_identity_evidence (
+    evidence_id TEXT PRIMARY KEY NOT NULL,
+    operation_id TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('vault_root', 'source_parent', 'source_object', 'destination_parent', 'collision_parent_start', 'collision_parent_end')),
+    evidence_version INTEGER NOT NULL CHECK (evidence_version = 1),
+    evidence_kind INTEGER NOT NULL CHECK (evidence_kind = 1),
+    object_kind INTEGER NOT NULL CHECK (object_kind IN (1, 2)),
+    provider_id BLOB NOT NULL CHECK (typeof(provider_id) = 'blob' AND length(provider_id) BETWEEN 1 AND 128),
+    object_id BLOB NOT NULL CHECK (typeof(object_id) = 'blob' AND length(object_id) BETWEEN 1 AND 1024),
+    attestation BLOB NOT NULL CHECK (typeof(attestation) = 'blob' AND length(attestation) BETWEEN 1 AND 1024),
+    stable_identity_fingerprint BLOB NOT NULL CHECK (typeof(stable_identity_fingerprint) = 'blob' AND length(stable_identity_fingerprint) = 32),
+    UNIQUE (operation_id, role),
+    CHECK (role = 'source_object' OR object_kind = 1),
+    FOREIGN KEY (operation_id) REFERENCES local_execution_contracts(operation_id) DEFERRABLE INITIALLY DEFERRED
+)";
+const LOCAL_EXECUTION_COLLISION_MEMBERS_SCHEMA: &str = "CREATE TABLE local_execution_collision_members (
+    operation_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    name TEXT NOT NULL CHECK (typeof(name) = 'text' AND length(CAST(name AS BLOB)) BETWEEN 1 AND 255),
+    collision_key TEXT NOT NULL CHECK (typeof(collision_key) = 'text' AND length(CAST(collision_key AS BLOB)) BETWEEN 1 AND 1024),
+    evidence_version INTEGER NOT NULL CHECK (evidence_version = 1),
+    evidence_kind INTEGER NOT NULL CHECK (evidence_kind = 1),
+    object_kind INTEGER NOT NULL CHECK (object_kind IN (1, 2)),
+    provider_id BLOB NOT NULL CHECK (typeof(provider_id) = 'blob' AND length(provider_id) BETWEEN 1 AND 128),
+    object_id BLOB NOT NULL CHECK (typeof(object_id) = 'blob' AND length(object_id) BETWEEN 1 AND 1024),
+    attestation BLOB NOT NULL CHECK (typeof(attestation) = 'blob' AND length(attestation) BETWEEN 1 AND 1024),
+    stable_identity_fingerprint BLOB NOT NULL CHECK (typeof(stable_identity_fingerprint) = 'blob' AND length(stable_identity_fingerprint) = 32),
+    PRIMARY KEY (operation_id, ordinal),
+    UNIQUE (operation_id, name),
+    UNIQUE (operation_id, stable_identity_fingerprint),
+    FOREIGN KEY (operation_id) REFERENCES local_execution_contracts(operation_id) DEFERRABLE INITIALLY DEFERRED
+)";
+const LOCAL_EXECUTION_CONTRACT_COMPLETIONS_SCHEMA: &str = "CREATE TABLE local_execution_contract_completions (
+    completion_id TEXT PRIMARY KEY NOT NULL,
+    operation_id TEXT NOT NULL UNIQUE,
+    completed_at_unix_ms INTEGER NOT NULL CHECK (completed_at_unix_ms >= 0),
+    FOREIGN KEY (operation_id) REFERENCES local_execution_contracts(operation_id) DEFERRABLE INITIALLY DEFERRED
+)";
+const LOCAL_EXECUTION_ATTEMPT_BOUNDARIES_SCHEMA: &str =
+    "CREATE TABLE local_execution_attempt_boundaries (
+    operation_id TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL CHECK (attempt_number >= 0),
+    boundary_id TEXT NOT NULL UNIQUE,
+    contract_fingerprint BLOB NOT NULL CHECK (typeof(contract_fingerprint) = 'blob' AND length(contract_fingerprint) = 32),
+    occurred_at_unix_ms INTEGER NOT NULL CHECK (occurred_at_unix_ms >= 0),
+    PRIMARY KEY (operation_id, attempt_number),
+    FOREIGN KEY (operation_id) REFERENCES local_execution_contracts(operation_id)
+)";
+const LOCAL_EXECUTION_ATTEMPT_OUTCOMES_SCHEMA: &str = "CREATE TABLE local_execution_attempt_outcomes (
+    operation_id TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL CHECK (attempt_number >= 0),
+    outcome_id TEXT NOT NULL UNIQUE,
+    evidence_id TEXT NOT NULL UNIQUE,
+    outcome TEXT NOT NULL CHECK (outcome IN ('VerifiedApplied', 'VerifiedNotApplied', 'WriteOutcomeUnknown', 'NeedsReconcile')),
+    contract_fingerprint BLOB NOT NULL CHECK (typeof(contract_fingerprint) = 'blob' AND length(contract_fingerprint) = 32),
+    evidence_fingerprint BLOB NOT NULL CHECK (typeof(evidence_fingerprint) = 'blob' AND length(evidence_fingerprint) = 32),
+    non_retryable INTEGER NOT NULL CHECK (non_retryable IN (0, 1)),
+    occurred_at_unix_ms INTEGER NOT NULL CHECK (occurred_at_unix_ms >= 0),
+    PRIMARY KEY (operation_id, attempt_number),
+    FOREIGN KEY (operation_id, attempt_number) REFERENCES local_execution_attempt_boundaries(operation_id, attempt_number),
+    CHECK ((outcome IN ('WriteOutcomeUnknown', 'NeedsReconcile') AND non_retryable = 1) OR (outcome IN ('VerifiedApplied', 'VerifiedNotApplied') AND non_retryable = 0))
+)";
+// Kept in schema version 6 deliberately: v6 has not shipped and this is an
+// additive local-only execution proof, not a new protocol generation.
+const LOCAL_EXECUTION_R3_BRIDGE_RECEIPTS_SCHEMA: &str = "CREATE TABLE local_execution_r3_bridge_receipts (
+    receipt_id TEXT PRIMARY KEY NOT NULL,
+    receipt_fingerprint BLOB NOT NULL UNIQUE CHECK (typeof(receipt_fingerprint) = 'blob' AND length(receipt_fingerprint) = 32),
+    operation_id TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL CHECK (attempt_number BETWEEN 0 AND 4294967295),
+    boundary_id TEXT NOT NULL,
+    boundary_occurred_at_unix_ms INTEGER NOT NULL CHECK (boundary_occurred_at_unix_ms >= 0),
+    contract_fingerprint BLOB NOT NULL CHECK (typeof(contract_fingerprint) = 'blob' AND length(contract_fingerprint) = 32),
+    outcome_id TEXT NOT NULL,
+    evidence_id TEXT NOT NULL,
+    local_evidence_fingerprint BLOB NOT NULL CHECK (typeof(local_evidence_fingerprint) = 'blob' AND length(local_evidence_fingerprint) = 32),
+    outcome_occurred_at_unix_ms INTEGER NOT NULL CHECK (outcome_occurred_at_unix_ms >= 0),
+    r3_intent_fingerprint TEXT NOT NULL,
+    r3_evidence_fingerprint TEXT NOT NULL,
+    r3_outcome_code TEXT,
+    dependency_kind TEXT NOT NULL CHECK (dependency_kind IN ('mutation', 'merge_publication', 'conflict_copy_publication', 'base_publication')),
+    r3_state_phase TEXT NOT NULL CHECK (r3_state_phase = 'completed'),
+    r3_state_disposition TEXT NOT NULL CHECK (r3_state_disposition = 'verified_applied'),
+    r3_attempt_number INTEGER NOT NULL CHECK (r3_attempt_number BETWEEN 0 AND 4294967295),
+    r3_state_version INTEGER NOT NULL CHECK (r3_state_version >= 0),
+    r3_last_evidence_id TEXT NOT NULL,
+    r3_event_state_version INTEGER NOT NULL CHECK (r3_event_state_version >= 0),
+    FOREIGN KEY (operation_id, attempt_number) REFERENCES local_execution_attempt_boundaries(operation_id, attempt_number),
+    FOREIGN KEY (operation_id, attempt_number) REFERENCES local_execution_attempt_outcomes(operation_id, attempt_number),
+    FOREIGN KEY (evidence_id) REFERENCES mutation_verification_evidence(evidence_id),
+    UNIQUE (operation_id, attempt_number),
+    CHECK (r3_last_evidence_id = evidence_id)
+)";
+// Retained independently from the live receipt and batch rows.  This is a
+// consumption audit fact, never a cascade child: cleanup of a completed batch
+// must not make a consumed bridge look like a pre-receipt crash.
+const LOCAL_EXECUTION_R3_CONSUMPTION_ANCHORS_SCHEMA: &str = "CREATE TABLE local_execution_r3_consumption_anchors (
+    anchor_id TEXT PRIMARY KEY NOT NULL,
+    anchor_fingerprint BLOB NOT NULL UNIQUE CHECK (typeof(anchor_fingerprint) = 'blob' AND length(anchor_fingerprint) = 32),
+    receipt_id TEXT NOT NULL UNIQUE,
+    receipt_fingerprint BLOB NOT NULL UNIQUE CHECK (typeof(receipt_fingerprint) = 'blob' AND length(receipt_fingerprint) = 32),
+    operation_id TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL CHECK (attempt_number BETWEEN 0 AND 4294967295),
+    outcome_id TEXT NOT NULL,
+    evidence_id TEXT NOT NULL,
+    r3_evidence_fingerprint TEXT NOT NULL,
+    dependency_kind TEXT NOT NULL CHECK (dependency_kind IN ('mutation', 'merge_publication', 'conflict_copy_publication', 'base_publication')),
+    UNIQUE (operation_id, attempt_number)
+)";
+// A RetryScheduled event loses its state fields after claim.  Retain the
+// complete proof as an immutable event companion so reopening can prove the
+// exact contract rather than merely observing a coherent current state.
+const MUTATION_RETRY_CONTRACTS_SCHEMA: &str = "CREATE TABLE mutation_retry_contracts (
+    operation_id TEXT NOT NULL,
+    state_version INTEGER NOT NULL CHECK (state_version >= 0),
+    attempt_number INTEGER NOT NULL CHECK (attempt_number BETWEEN 0 AND 4294967295),
+    evidence_id TEXT NOT NULL UNIQUE,
+    evidence_fingerprint TEXT NOT NULL,
+    disposition TEXT NOT NULL CHECK (disposition IN ('verified_not_applied', 'retry_safe')),
+    outcome_code TEXT NOT NULL,
+    due_at_unix_ms INTEGER NOT NULL CHECK (due_at_unix_ms >= 0),
+    retry_mode TEXT NOT NULL CHECK (retry_mode IN ('restart_exact', 'resume_exact')),
+    resume_reference TEXT,
+    verified_received_byte_offset INTEGER,
+    captured_at_unix_ms INTEGER NOT NULL CHECK (captured_at_unix_ms >= 0),
+    PRIMARY KEY (operation_id, state_version),
+    UNIQUE (operation_id, attempt_number),
+    CHECK ((disposition = 'verified_not_applied' AND outcome_code = 'verified_not_applied' AND retry_mode = 'restart_exact' AND resume_reference IS NULL AND verified_received_byte_offset IS NULL) OR
+           (disposition = 'retry_safe' AND outcome_code = 'retry_safe' AND retry_mode = 'resume_exact' AND resume_reference IS NOT NULL AND verified_received_byte_offset IS NOT NULL AND verified_received_byte_offset >= 0))
+)";
+const LOCAL_EXECUTION_CONTRACTS_VAULT_INDEX_SCHEMA: &str =
+    "CREATE INDEX local_execution_contracts_vault_idx
+    ON local_execution_contracts(vault_id, registered_at_unix_ms, operation_id)";
+const LOCAL_EXECUTION_IDENTITY_OPERATION_INDEX_SCHEMA: &str =
+    "CREATE INDEX local_execution_identity_operation_idx
+    ON local_execution_identity_evidence(operation_id, role)";
+const LOCAL_EXECUTION_BOUNDARY_CONTRACT_INDEX_SCHEMA: &str =
+    "CREATE INDEX local_execution_boundary_contract_idx
+    ON local_execution_attempt_boundaries(operation_id, contract_fingerprint, attempt_number)";
+const LOCAL_EXECUTION_BRIDGE_RECEIPT_OPERATION_INDEX_SCHEMA: &str =
+    "CREATE INDEX local_execution_bridge_receipt_operation_idx
+    ON local_execution_r3_bridge_receipts(operation_id, evidence_id, dependency_kind)";
+const LOCAL_EXECUTION_CONSUMPTION_ANCHOR_OPERATION_INDEX_SCHEMA: &str =
+    "CREATE INDEX local_execution_consumption_anchor_operation_idx
+    ON local_execution_r3_consumption_anchors(operation_id, evidence_id, dependency_kind)";
+const MUTATION_RETRY_CONTRACT_OPERATION_INDEX_SCHEMA: &str =
+    "CREATE INDEX mutation_retry_contract_operation_idx
+    ON mutation_retry_contracts(operation_id, attempt_number, state_version)";
+const LOCAL_EXECUTION_COMPLETION_VALIDATE_TRIGGER: &str = "CREATE TRIGGER local_execution_completion_validate
+    BEFORE INSERT ON local_execution_contract_completions BEGIN
+      SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM local_execution_contracts WHERE operation_id = NEW.operation_id)
+        OR (SELECT COUNT(*) FROM local_execution_identity_evidence WHERE operation_id = NEW.operation_id) != 6
+        OR (SELECT COUNT(*) FROM local_execution_identity_evidence WHERE operation_id = NEW.operation_id AND role IN ('vault_root', 'source_parent', 'source_object', 'destination_parent', 'collision_parent_start', 'collision_parent_end')) != 6
+        OR (SELECT stable_identity_fingerprint FROM local_execution_identity_evidence WHERE operation_id = NEW.operation_id AND role = 'destination_parent') != (SELECT stable_identity_fingerprint FROM local_execution_identity_evidence WHERE operation_id = NEW.operation_id AND role = 'collision_parent_start')
+        OR (SELECT stable_identity_fingerprint FROM local_execution_identity_evidence WHERE operation_id = NEW.operation_id AND role = 'destination_parent') != (SELECT stable_identity_fingerprint FROM local_execution_identity_evidence WHERE operation_id = NEW.operation_id AND role = 'collision_parent_end')
+        OR (SELECT COUNT(*) FROM local_execution_collision_members WHERE operation_id = NEW.operation_id) != (SELECT collision_member_count FROM local_execution_contracts WHERE operation_id = NEW.operation_id)
+        OR EXISTS (SELECT 1 FROM local_execution_collision_members AS member JOIN local_execution_contracts AS contract ON contract.operation_id = member.operation_id WHERE member.operation_id = NEW.operation_id AND member.ordinal >= contract.collision_member_count)
+        THEN RAISE(ABORT, 'local_execution_contract_incomplete') END;
+    END";
+const LOCAL_EXECUTION_MEMBER_RANGE_TRIGGER: &str = "CREATE TRIGGER local_execution_member_range
+    BEFORE INSERT ON local_execution_collision_members BEGIN
+      SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM local_execution_contracts WHERE operation_id = NEW.operation_id AND NEW.ordinal < collision_member_count)
+        THEN RAISE(ABORT, 'local_execution_collision_member_out_of_range') END;
+    END";
+const LOCAL_EXECUTION_BOUNDARY_VALIDATE_TRIGGER: &str = "CREATE TRIGGER local_execution_boundary_validate
+    BEFORE INSERT ON local_execution_attempt_boundaries BEGIN
+      SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM local_execution_contracts WHERE operation_id = NEW.operation_id AND contract_fingerprint = NEW.contract_fingerprint)
+        THEN RAISE(ABORT, 'local_execution_boundary_contract_mismatch') END;
+    END";
+const LOCAL_EXECUTION_OUTCOME_VALIDATE_TRIGGER: &str = "CREATE TRIGGER local_execution_outcome_validate
+    BEFORE INSERT ON local_execution_attempt_outcomes BEGIN
+      SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM local_execution_contracts WHERE operation_id = NEW.operation_id AND contract_fingerprint = NEW.contract_fingerprint)
+        THEN RAISE(ABORT, 'local_execution_outcome_contract_mismatch') END;
+    END";
+const LOCAL_EXECUTION_CONTRACTS_NO_UPDATE_TRIGGER: &str = "CREATE TRIGGER local_execution_contracts_no_update
+    BEFORE UPDATE ON local_execution_contracts BEGIN SELECT RAISE(ABORT, 'local_execution_contracts_immutable'); END";
+const LOCAL_EXECUTION_CONTRACTS_NO_DELETE_TRIGGER: &str = "CREATE TRIGGER local_execution_contracts_no_delete
+    BEFORE DELETE ON local_execution_contracts BEGIN SELECT RAISE(ABORT, 'local_execution_contracts_immutable'); END";
+const LOCAL_EXECUTION_IDENTITIES_NO_UPDATE_TRIGGER: &str = "CREATE TRIGGER local_execution_identities_no_update
+    BEFORE UPDATE ON local_execution_identity_evidence BEGIN SELECT RAISE(ABORT, 'local_execution_identity_evidence_immutable'); END";
+const LOCAL_EXECUTION_IDENTITIES_NO_DELETE_TRIGGER: &str = "CREATE TRIGGER local_execution_identities_no_delete
+    BEFORE DELETE ON local_execution_identity_evidence BEGIN SELECT RAISE(ABORT, 'local_execution_identity_evidence_immutable'); END";
+const LOCAL_EXECUTION_MEMBERS_NO_UPDATE_TRIGGER: &str = "CREATE TRIGGER local_execution_members_no_update
+    BEFORE UPDATE ON local_execution_collision_members BEGIN SELECT RAISE(ABORT, 'local_execution_collision_members_immutable'); END";
+const LOCAL_EXECUTION_MEMBERS_NO_DELETE_TRIGGER: &str = "CREATE TRIGGER local_execution_members_no_delete
+    BEFORE DELETE ON local_execution_collision_members BEGIN SELECT RAISE(ABORT, 'local_execution_collision_members_immutable'); END";
+const LOCAL_EXECUTION_COMPLETIONS_NO_UPDATE_TRIGGER: &str = "CREATE TRIGGER local_execution_completions_no_update
+    BEFORE UPDATE ON local_execution_contract_completions BEGIN SELECT RAISE(ABORT, 'local_execution_contract_completions_immutable'); END";
+const LOCAL_EXECUTION_COMPLETIONS_NO_DELETE_TRIGGER: &str = "CREATE TRIGGER local_execution_completions_no_delete
+    BEFORE DELETE ON local_execution_contract_completions BEGIN SELECT RAISE(ABORT, 'local_execution_contract_completions_immutable'); END";
+const LOCAL_EXECUTION_BOUNDARIES_NO_UPDATE_TRIGGER: &str = "CREATE TRIGGER local_execution_boundaries_no_update
+    BEFORE UPDATE ON local_execution_attempt_boundaries BEGIN SELECT RAISE(ABORT, 'local_execution_attempt_boundaries_immutable'); END";
+const LOCAL_EXECUTION_BOUNDARIES_NO_DELETE_TRIGGER: &str = "CREATE TRIGGER local_execution_boundaries_no_delete
+    BEFORE DELETE ON local_execution_attempt_boundaries BEGIN SELECT RAISE(ABORT, 'local_execution_attempt_boundaries_immutable'); END";
+const LOCAL_EXECUTION_OUTCOMES_NO_UPDATE_TRIGGER: &str = "CREATE TRIGGER local_execution_outcomes_no_update
+    BEFORE UPDATE ON local_execution_attempt_outcomes BEGIN SELECT RAISE(ABORT, 'local_execution_attempt_outcomes_immutable'); END";
+const LOCAL_EXECUTION_OUTCOMES_NO_DELETE_TRIGGER: &str = "CREATE TRIGGER local_execution_outcomes_no_delete
+    BEFORE DELETE ON local_execution_attempt_outcomes BEGIN SELECT RAISE(ABORT, 'local_execution_attempt_outcomes_immutable'); END";
+const LOCAL_EXECUTION_BRIDGE_RECEIPTS_NO_UPDATE_TRIGGER: &str = "CREATE TRIGGER local_execution_bridge_receipts_no_update
+    BEFORE UPDATE ON local_execution_r3_bridge_receipts BEGIN SELECT RAISE(ABORT, 'local_execution_r3_bridge_receipts_immutable'); END";
+const LOCAL_EXECUTION_BRIDGE_RECEIPTS_NO_DELETE_TRIGGER: &str = "CREATE TRIGGER local_execution_bridge_receipts_no_delete
+    BEFORE DELETE ON local_execution_r3_bridge_receipts BEGIN SELECT RAISE(ABORT, 'local_execution_r3_bridge_receipts_immutable'); END";
+const LOCAL_EXECUTION_CONSUMPTION_ANCHORS_NO_UPDATE_TRIGGER: &str = "CREATE TRIGGER local_execution_consumption_anchors_no_update
+    BEFORE UPDATE ON local_execution_r3_consumption_anchors BEGIN SELECT RAISE(ABORT, 'local_execution_r3_consumption_anchors_immutable'); END";
+const LOCAL_EXECUTION_CONSUMPTION_ANCHORS_NO_DELETE_TRIGGER: &str = "CREATE TRIGGER local_execution_consumption_anchors_no_delete
+    BEFORE DELETE ON local_execution_r3_consumption_anchors BEGIN SELECT RAISE(ABORT, 'local_execution_r3_consumption_anchors_immutable'); END";
+const MUTATION_RETRY_CONTRACTS_NO_UPDATE_TRIGGER: &str = "CREATE TRIGGER mutation_retry_contracts_no_update
+    BEFORE UPDATE ON mutation_retry_contracts BEGIN SELECT RAISE(ABORT, 'mutation_retry_contracts_immutable'); END";
+const MUTATION_RETRY_CONTRACTS_NO_DELETE_TRIGGER: &str = "CREATE TRIGGER mutation_retry_contracts_no_delete
+    BEFORE DELETE ON mutation_retry_contracts BEGIN SELECT RAISE(ABORT, 'mutation_retry_contracts_immutable'); END";
+
+const LOCAL_EXECUTION_SCHEMA_OBJECTS: [(&str, &str, &str); 37] = [
+    (
+        "table",
+        "local_execution_contracts",
+        LOCAL_EXECUTION_CONTRACTS_SCHEMA,
+    ),
+    (
+        "table",
+        "local_execution_identity_evidence",
+        LOCAL_EXECUTION_IDENTITY_EVIDENCE_SCHEMA,
+    ),
+    (
+        "table",
+        "local_execution_collision_members",
+        LOCAL_EXECUTION_COLLISION_MEMBERS_SCHEMA,
+    ),
+    (
+        "table",
+        "local_execution_contract_completions",
+        LOCAL_EXECUTION_CONTRACT_COMPLETIONS_SCHEMA,
+    ),
+    (
+        "table",
+        "local_execution_attempt_boundaries",
+        LOCAL_EXECUTION_ATTEMPT_BOUNDARIES_SCHEMA,
+    ),
+    (
+        "table",
+        "local_execution_attempt_outcomes",
+        LOCAL_EXECUTION_ATTEMPT_OUTCOMES_SCHEMA,
+    ),
+    (
+        "table",
+        "local_execution_r3_bridge_receipts",
+        LOCAL_EXECUTION_R3_BRIDGE_RECEIPTS_SCHEMA,
+    ),
+    (
+        "table",
+        "local_execution_r3_consumption_anchors",
+        LOCAL_EXECUTION_R3_CONSUMPTION_ANCHORS_SCHEMA,
+    ),
+    (
+        "table",
+        "mutation_retry_contracts",
+        MUTATION_RETRY_CONTRACTS_SCHEMA,
+    ),
+    (
+        "index",
+        "local_execution_contracts_vault_idx",
+        LOCAL_EXECUTION_CONTRACTS_VAULT_INDEX_SCHEMA,
+    ),
+    (
+        "index",
+        "local_execution_identity_operation_idx",
+        LOCAL_EXECUTION_IDENTITY_OPERATION_INDEX_SCHEMA,
+    ),
+    (
+        "index",
+        "local_execution_boundary_contract_idx",
+        LOCAL_EXECUTION_BOUNDARY_CONTRACT_INDEX_SCHEMA,
+    ),
+    (
+        "index",
+        "local_execution_bridge_receipt_operation_idx",
+        LOCAL_EXECUTION_BRIDGE_RECEIPT_OPERATION_INDEX_SCHEMA,
+    ),
+    (
+        "index",
+        "local_execution_consumption_anchor_operation_idx",
+        LOCAL_EXECUTION_CONSUMPTION_ANCHOR_OPERATION_INDEX_SCHEMA,
+    ),
+    (
+        "index",
+        "mutation_retry_contract_operation_idx",
+        MUTATION_RETRY_CONTRACT_OPERATION_INDEX_SCHEMA,
+    ),
+    (
+        "trigger",
+        "local_execution_completion_validate",
+        LOCAL_EXECUTION_COMPLETION_VALIDATE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "local_execution_member_range",
+        LOCAL_EXECUTION_MEMBER_RANGE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "local_execution_boundary_validate",
+        LOCAL_EXECUTION_BOUNDARY_VALIDATE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "local_execution_outcome_validate",
+        LOCAL_EXECUTION_OUTCOME_VALIDATE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "local_execution_contracts_no_update",
+        LOCAL_EXECUTION_CONTRACTS_NO_UPDATE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "local_execution_contracts_no_delete",
+        LOCAL_EXECUTION_CONTRACTS_NO_DELETE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "local_execution_identities_no_update",
+        LOCAL_EXECUTION_IDENTITIES_NO_UPDATE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "local_execution_identities_no_delete",
+        LOCAL_EXECUTION_IDENTITIES_NO_DELETE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "local_execution_members_no_update",
+        LOCAL_EXECUTION_MEMBERS_NO_UPDATE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "local_execution_members_no_delete",
+        LOCAL_EXECUTION_MEMBERS_NO_DELETE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "local_execution_completions_no_update",
+        LOCAL_EXECUTION_COMPLETIONS_NO_UPDATE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "local_execution_completions_no_delete",
+        LOCAL_EXECUTION_COMPLETIONS_NO_DELETE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "local_execution_boundaries_no_update",
+        LOCAL_EXECUTION_BOUNDARIES_NO_UPDATE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "local_execution_boundaries_no_delete",
+        LOCAL_EXECUTION_BOUNDARIES_NO_DELETE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "local_execution_outcomes_no_update",
+        LOCAL_EXECUTION_OUTCOMES_NO_UPDATE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "local_execution_outcomes_no_delete",
+        LOCAL_EXECUTION_OUTCOMES_NO_DELETE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "local_execution_bridge_receipts_no_update",
+        LOCAL_EXECUTION_BRIDGE_RECEIPTS_NO_UPDATE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "local_execution_bridge_receipts_no_delete",
+        LOCAL_EXECUTION_BRIDGE_RECEIPTS_NO_DELETE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "local_execution_consumption_anchors_no_update",
+        LOCAL_EXECUTION_CONSUMPTION_ANCHORS_NO_UPDATE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "local_execution_consumption_anchors_no_delete",
+        LOCAL_EXECUTION_CONSUMPTION_ANCHORS_NO_DELETE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "mutation_retry_contracts_no_update",
+        MUTATION_RETRY_CONTRACTS_NO_UPDATE_TRIGGER,
+    ),
+    (
+        "trigger",
+        "mutation_retry_contracts_no_delete",
+        MUTATION_RETRY_CONTRACTS_NO_DELETE_TRIGGER,
+    ),
+];
+
 const SCHEMA_OBJECTS_V1: [(&str, &str, &str); 8] = [
     ("table", "vault_state", VAULT_STATE_SCHEMA_V1),
     ("table", "remote_entries", REMOTE_ENTRIES_SCHEMA_V4),
@@ -501,7 +1018,7 @@ const SCHEMA_OBJECTS_V4: [(&str, &str, &str); 31] = [
     ),
 ];
 
-const SCHEMA_OBJECTS: [(&str, &str, &str); 31] = [
+const SCHEMA_OBJECTS_V5: [(&str, &str, &str); 31] = [
     ("table", "vault_state", VAULT_STATE_SCHEMA),
     ("table", "remote_entries", REMOTE_ENTRIES_SCHEMA),
     (
@@ -603,7 +1120,7 @@ const SCHEMA_OBJECTS: [(&str, &str, &str); 31] = [
     ),
 ];
 
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 pub const MAX_REMOTE_PREVIEW_PAGE_SIZE: usize = 200;
 
 /// Exact residual risk inherited from bundled `SQLite`'s ambient-path VFS.
@@ -1867,6 +2384,151 @@ pub struct ChangeBatch {
     pub committed_mutations: u64,
 }
 
+/// Result of atomically registering immutable local execution evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalExecutionRegistrationOutcome {
+    Registered,
+    AlreadyPresent,
+}
+
+/// The only vocabulary stored for local execution outcomes.
+///
+/// These append-only `SQLite` ledger rows are evidence only. They neither
+/// authorize filesystem execution nor schedule a retry or recovery action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalExecutionOutcome {
+    VerifiedApplied,
+    VerifiedNotApplied,
+    WriteOutcomeUnknown,
+    NeedsReconcile,
+}
+
+impl LocalExecutionOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::VerifiedApplied => "VerifiedApplied",
+            Self::VerifiedNotApplied => "VerifiedNotApplied",
+            Self::WriteOutcomeUnknown => "WriteOutcomeUnknown",
+            Self::NeedsReconcile => "NeedsReconcile",
+        }
+    }
+
+    const fn non_retryable(self) -> bool {
+        matches!(self, Self::WriteOutcomeUnknown | Self::NeedsReconcile)
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "VerifiedApplied" => Ok(Self::VerifiedApplied),
+            "VerifiedNotApplied" => Ok(Self::VerifiedNotApplied),
+            "WriteOutcomeUnknown" => Ok(Self::WriteOutcomeUnknown),
+            "NeedsReconcile" => Ok(Self::NeedsReconcile),
+            _ => Err(Error::InvalidSchema),
+        }
+    }
+}
+
+/// Input for one append-only local execution attempt boundary.
+///
+/// The binding fingerprint must be the same immutable contract registered for
+/// `operation_id`; the ledger does not grant execution authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalExecutionAttemptBoundary {
+    pub operation_id: Uuid,
+    pub attempt_number: u32,
+    pub boundary_id: Uuid,
+    pub contract_fingerprint: DurableExecutionBindingFingerprint,
+    pub occurred_at_unix_ms: u64,
+}
+
+/// Input for one append-only local execution outcome.
+///
+/// `WriteOutcomeUnknown` is always stored as non-retryable. This API never
+/// fabricates an outcome and does not schedule execution or reconciliation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalExecutionAttemptOutcome {
+    pub operation_id: Uuid,
+    pub attempt_number: u32,
+    pub outcome_id: Uuid,
+    pub evidence_id: Uuid,
+    pub outcome: LocalExecutionOutcome,
+    pub evidence_fingerprint: [u8; 32],
+    pub occurred_at_unix_ms: u64,
+}
+
+/// Redacted, untrusted persisted contract metadata.
+///
+/// This read model intentionally omits provider identities, attestation
+/// material, target names, and collision members. It cannot reconstruct
+/// `RestartStableIdentityEvidence` and never authorizes a filesystem write.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalExecutionContractRecord {
+    pub operation_id: Uuid,
+    pub vault_id: Uuid,
+    pub intent_fingerprint: [u8; 32],
+    pub contract_fingerprint: [u8; 32],
+    pub collision_member_count: u32,
+    pub registered_at_unix_ms: u64,
+}
+
+/// Redacted, untrusted persisted outcome metadata from the `SQLite` ledger.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalExecutionOutcomeRecord {
+    pub operation_id: Uuid,
+    pub attempt_number: u32,
+    pub outcome_id: Uuid,
+    pub evidence_id: Uuid,
+    pub outcome: LocalExecutionOutcome,
+    pub evidence_fingerprint: [u8; 32],
+    pub non_retryable: bool,
+    pub occurred_at_unix_ms: u64,
+}
+
+/// Durable publication result for an immutable journal witness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalExecutionWitnessPublicationOutcome {
+    Published,
+    AlreadyPublished,
+}
+
+/// An untrusted outcome claim observed in journal evidence.
+///
+/// This deliberately has no conversion into [`LocalExecutionOutcome`].  Only
+/// the authoritative Step 4 classifier may turn revalidated platform evidence
+/// into a final execution outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UntrustedLocalExecutionOutcomeClaim {
+    VerifiedApplied,
+    VerifiedNotApplied,
+    WriteOutcomeUnknown,
+    NeedsReconcile,
+}
+
+impl UntrustedLocalExecutionOutcomeClaim {
+    const fn from_witness(outcome: LocalExecutionOutcome) -> Self {
+        match outcome {
+            LocalExecutionOutcome::VerifiedApplied => Self::VerifiedApplied,
+            LocalExecutionOutcome::VerifiedNotApplied => Self::VerifiedNotApplied,
+            LocalExecutionOutcome::WriteOutcomeUnknown => Self::WriteOutcomeUnknown,
+            LocalExecutionOutcome::NeedsReconcile => Self::NeedsReconcile,
+        }
+    }
+}
+
+/// A conservative observation after comparing a fresh binding, the immutable
+/// `SQLite` ledger, and journal witnesses.  It is not an execution decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalExecutionRecoveryObservation {
+    BoundaryWithoutWitness,
+    PreSideEffectWitnessOnly,
+    OutcomeWitnessPendingLedger {
+        claim: UntrustedLocalExecutionOutcomeClaim,
+    },
+    OutcomeWitnessAndLedgerMatch {
+        claim: UntrustedLocalExecutionOutcomeClaim,
+    },
+}
+
 pub struct SyncStore {
     connection: Connection,
     database_path: PathBuf,
@@ -1874,10 +2536,11 @@ pub struct SyncStore {
     _lease_file: std::fs::File,
     _private_root: Dir,
     _vault_directory: Dir,
+    execution_journal: SyncExecutionJournal,
 }
 
 #[derive(Clone, Copy)]
-enum PrivateStoragePolicy {
+pub(crate) enum PrivateStoragePolicy {
     Standard,
     #[cfg(target_os = "android")]
     NativeAndroidNoBackup,
@@ -1961,6 +2624,13 @@ impl SyncStore {
         let version = create_or_open_storage_dir(&sync_root, VERSION_DIRECTORY, policy)?;
         let vaults = create_or_open_storage_dir(&version, VAULTS_DIRECTORY, policy)?;
         let vault_directory = create_or_open_storage_dir(&vaults, vault_id.to_string(), policy)?;
+        let execution_journal = SyncExecutionJournal::open(
+            &private_root,
+            canonical_app_root,
+            &vault_directory,
+            vault_id,
+            policy,
+        )?;
         let lease_file = acquire_sync_lease(&vault_directory, policy)?;
         let database_path = canonical_app_root
             .join(ROOT_DIRECTORY)
@@ -1990,7 +2660,7 @@ impl SyncStore {
         let mut connection = Connection::open(&database_path)?;
         connection.pragma_update(None, "foreign_keys", true)?;
         connection.pragma_update(None, "temp_store", "MEMORY")?;
-        migrate(&mut connection)?;
+        migrate(&mut connection, vault_id)?;
         connection.pragma_update(None, "journal_mode", "DELETE")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         open_storage_file(&vault_directory, DATABASE_NAME, policy)?;
@@ -2002,8 +2672,12 @@ impl SyncStore {
             _lease_file: lease_file,
             _private_root: private_root,
             _vault_directory: vault_directory,
+            execution_journal,
         };
         let _ = load_state(&store.connection, store.vault_id)?;
+        if !store.local_execution_journal_outcomes_are_exact()? {
+            return Err(Error::InvalidSchema);
+        }
         store.recover_interrupted_jobs()?;
         Ok(store)
     }
@@ -2021,6 +2695,1320 @@ impl SyncStore {
         Ok(self
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))?)
+    }
+
+    /// Registers the complete immutable local execution contract atomically.
+    ///
+    /// This `SQLite` ledger registration is not filesystem mutation authority.
+    /// A held-runtime token cannot reach this API: callers must supply the
+    /// complete verifier-issued `DurableExecutionBinding` from Step 1.
+    ///
+    /// # Errors
+    /// Returns a collision for any same operation ID with differing immutable
+    /// facts, and rolls back every inserted row if the contract is incomplete.
+    #[allow(clippy::too_many_lines)]
+    pub fn register_local_execution_contract(
+        &mut self,
+        binding: &DurableExecutionBinding,
+        registered_at_unix_ms: u64,
+    ) -> Result<LocalExecutionRegistrationOutcome> {
+        let projection = binding.persistence_projection();
+        if projection.vault_id != self.vault_id {
+            return Err(Error::InvalidLocalExecutionEvidence);
+        }
+        let registered_at = u64_to_i64(registered_at_unix_ms)?;
+        let transaction = self.connection.transaction()?;
+        if let Some((vault_id, intent, contract, stored_registered_at)) = transaction
+            .query_row(
+                "SELECT vault_id, intent_fingerprint, contract_fingerprint, registered_at_unix_ms
+                 FROM local_execution_contracts WHERE operation_id = ?1",
+                [projection.operation_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            if vault_id == projection.vault_id.to_string()
+                && intent == projection.intent_fingerprint
+                && contract == projection.contract_fingerprint
+                && stored_registered_at == registered_at
+            {
+                // Header equality is only an index into the immutable
+                // contract.  Re-read the complete persisted projection so a
+                // child-row rewrite is rejected on the live idempotent path;
+                // stable identity is compared while the first attestation is
+                // intentionally retained as audit material.
+                if !local_execution_operation_rows_are_semantically_valid(
+                    &transaction,
+                    self.vault_id,
+                    projection.operation_id,
+                )? {
+                    return Err(Error::LocalExecutionJournalMismatch);
+                }
+                transaction.commit()?;
+                return Ok(LocalExecutionRegistrationOutcome::AlreadyPresent);
+            }
+            return Err(Error::LocalExecutionCollision);
+        }
+        // A local contract is a contract-first proof.  It must never be
+        // registered after R3 has already begun (or completed) the same
+        // operation, otherwise a fresh v6 record could retroactively bless
+        // historical public work.  This check is deliberately after the
+        // exact-idempotency branch above, so an already registered contract
+        // remains restart-safe and idempotent.
+        let r3_history_exists: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM mutation_intents WHERE operation_id = ?1
+                 UNION ALL SELECT 1 FROM mutation_state WHERE operation_id = ?1
+                 UNION ALL SELECT 1 FROM mutation_verification_evidence WHERE operation_id = ?1
+                 UNION ALL SELECT 1 FROM mutation_events WHERE operation_id = ?1
+                 UNION ALL SELECT 1 FROM change_batch_mutations WHERE operation_id = ?1
+                 UNION ALL SELECT 1 FROM sync_history WHERE operation_id = ?1
+             )",
+            [projection.operation_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if r3_history_exists {
+            return Err(Error::LocalExecutionCollision);
+        }
+        let completion_id = local_execution_completion_id(projection.operation_id);
+        transaction.execute(
+            "INSERT INTO local_execution_contracts(
+                operation_id, vault_id, intent_fingerprint, contract_fingerprint,
+                target_name, target_collision_key, collision_member_count,
+                collision_snapshot_fingerprint, completion_id, registered_at_unix_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                projection.operation_id.to_string(),
+                projection.vault_id.to_string(),
+                projection.intent_fingerprint.as_slice(),
+                projection.contract_fingerprint.as_slice(),
+                projection.target_name,
+                projection.target_collision_key,
+                i64::from(projection.collision_member_count),
+                projection.collision_snapshot_fingerprint.as_slice(),
+                completion_id,
+                registered_at,
+            ],
+        )?;
+        for identity in [
+            projection.vault_root,
+            projection.source_parent,
+            projection.source_object,
+            projection.destination_parent,
+            projection.collision_parent_start,
+            projection.collision_parent_end,
+        ] {
+            insert_local_execution_identity(&transaction, projection.operation_id, &identity)?;
+        }
+        for (ordinal, member) in projection.collision_members.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO local_execution_collision_members(
+                    operation_id, ordinal, name, collision_key, evidence_version,
+                    evidence_kind, object_kind, provider_id, object_id, attestation,
+                    stable_identity_fingerprint
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    projection.operation_id.to_string(),
+                    i64::try_from(ordinal).map_err(|_| Error::InvalidLocalExecutionEvidence)?,
+                    member.name,
+                    member.collision_key,
+                    i64::from(member.identity.version),
+                    i64::from(member.identity.kind),
+                    i64::from(member.identity.object_kind),
+                    member.identity.provider_id,
+                    member.identity.object_id,
+                    member.identity.attestation,
+                    member.identity.stable_identity_fingerprint.as_slice(),
+                ],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO local_execution_contract_completions(completion_id, operation_id, completed_at_unix_ms)
+             VALUES (?1, ?2, ?3)",
+            params![completion_id, projection.operation_id.to_string(), registered_at],
+        )?;
+        transaction.commit()?;
+        Ok(LocalExecutionRegistrationOutcome::Registered)
+    }
+
+    /// Reads redacted, untrusted local execution metadata only.
+    ///
+    /// The returned data cannot reconstruct verifier-issued identity evidence
+    /// and does not authorize execution.
+    ///
+    /// # Errors
+    /// Returns an invalid-operation or database error.
+    pub fn local_execution_contract(
+        &self,
+        operation_id: Uuid,
+    ) -> Result<Option<LocalExecutionContractRecord>> {
+        if operation_id.is_nil() {
+            return Err(Error::LocalExecutionNotFound);
+        }
+        self.connection
+            .query_row(
+                "SELECT vault_id, intent_fingerprint, contract_fingerprint, collision_member_count, registered_at_unix_ms
+                 FROM local_execution_contracts WHERE operation_id = ?1",
+                [operation_id.to_string()],
+                |row| {
+                    let vault_id = parse_uuid(&row.get::<_, String>(0)?).map_err(to_sql_error)?;
+                    let count: i64 = row.get(3)?;
+                    let timestamp: i64 = row.get(4)?;
+                    Ok(LocalExecutionContractRecord {
+                        operation_id,
+                        vault_id,
+                        intent_fingerprint: blob32(row.get(1)?).map_err(to_sql_error)?,
+                        contract_fingerprint: blob32(row.get(2)?).map_err(to_sql_error)?,
+                        collision_member_count: u32::try_from(count).map_err(|_| to_sql_error(Error::InvalidSchema))?,
+                        registered_at_unix_ms: u64::try_from(timestamp).map_err(|_| to_sql_error(Error::InvalidSchema))?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Appends one attempt boundary exactly once for a complete contract.
+    ///
+    /// It is ledger evidence only and never authorizes a write.
+    ///
+    /// # Errors
+    /// Returns a collision, absent contract, invalid boundary, or database error.
+    pub fn append_local_execution_attempt_boundary(
+        &mut self,
+        boundary: &LocalExecutionAttemptBoundary,
+    ) -> Result<LocalExecutionRegistrationOutcome> {
+        if boundary.operation_id.is_nil() || boundary.boundary_id.is_nil() {
+            return Err(Error::InvalidLocalExecutionEvidence);
+        }
+        let occurred_at = u64_to_i64(boundary.occurred_at_unix_ms)?;
+        let transaction = self.connection.transaction()?;
+        if let Some((boundary_id, fingerprint, timestamp)) = transaction
+            .query_row(
+                "SELECT boundary_id, contract_fingerprint, occurred_at_unix_ms
+                 FROM local_execution_attempt_boundaries WHERE operation_id = ?1 AND attempt_number = ?2",
+                params![boundary.operation_id.to_string(), i64::from(boundary.attempt_number)],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)?)),
+            )
+            .optional()?
+        {
+            if boundary_id == boundary.boundary_id.to_string()
+                && fingerprint == boundary.contract_fingerprint.as_bytes()
+                && timestamp == occurred_at
+            {
+                transaction.commit()?;
+                return Ok(LocalExecutionRegistrationOutcome::AlreadyPresent);
+            }
+            return Err(Error::LocalExecutionCollision);
+        }
+        let binding_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_execution_contracts WHERE operation_id = ?1)",
+            [boundary.operation_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if !binding_exists {
+            return Err(Error::LocalExecutionNotFound);
+        }
+        if transaction
+            .query_row(
+                "SELECT 1 FROM local_execution_attempt_boundaries WHERE boundary_id = ?1",
+                [boundary.boundary_id.to_string()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Err(Error::LocalExecutionCollision);
+        }
+        transaction.execute(
+            "INSERT INTO local_execution_attempt_boundaries(operation_id, attempt_number, boundary_id, contract_fingerprint, occurred_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                boundary.operation_id.to_string(),
+                i64::from(boundary.attempt_number),
+                boundary.boundary_id.to_string(),
+                boundary.contract_fingerprint.as_bytes().as_slice(),
+                occurred_at,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(LocalExecutionRegistrationOutcome::Registered)
+    }
+
+    /// Appends one observed local execution outcome exactly once.
+    ///
+    /// No outcome is inferred by this API. `WriteOutcomeUnknown` is stored
+    /// non-retryable by schema and is deliberately not connected to scheduling.
+    ///
+    /// # Errors
+    /// Returns a collision, absent boundary/contract, invalid outcome, or database error.
+    pub(crate) fn append_local_execution_attempt_outcome(
+        &mut self,
+        outcome: &LocalExecutionAttemptOutcome,
+    ) -> Result<LocalExecutionRegistrationOutcome> {
+        let transaction = self.connection.transaction()?;
+        let boundary: (Uuid, u64) = transaction
+            .query_row(
+                "SELECT boundary_id, occurred_at_unix_ms
+                   FROM local_execution_attempt_boundaries
+                  WHERE operation_id = ?1 AND attempt_number = ?2",
+                params![
+                    outcome.operation_id.to_string(),
+                    i64::from(outcome.attempt_number)
+                ],
+                |row| {
+                    Ok((
+                        parse_uuid(&row.get::<_, String>(0)?).map_err(to_sql_error)?,
+                        u64::try_from(row.get::<_, i64>(1)?)
+                            .map_err(|_| to_sql_error(Error::InvalidSchema))?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(Error::LocalExecutionNotFound)?;
+        let occurred_at =
+            Self::validate_local_execution_outcome_for_boundary(outcome, boundary.0, boundary.1)?;
+        if let Some((outcome_id, evidence_id, stored_outcome, evidence, non_retryable, timestamp)) = transaction
+            .query_row(
+                "SELECT outcome_id, evidence_id, outcome, evidence_fingerprint, non_retryable, occurred_at_unix_ms
+                 FROM local_execution_attempt_outcomes WHERE operation_id = ?1 AND attempt_number = ?2",
+                params![outcome.operation_id.to_string(), i64::from(outcome.attempt_number)],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Vec<u8>>(3)?, row.get::<_, i64>(4)?, row.get::<_, i64>(5)?)),
+            )
+            .optional()?
+        {
+            if outcome_id == outcome.outcome_id.to_string()
+                && evidence_id == outcome.evidence_id.to_string()
+                && stored_outcome == outcome.outcome.as_str()
+                && evidence == outcome.evidence_fingerprint
+                && non_retryable == i64::from(outcome.outcome.non_retryable())
+                && timestamp == occurred_at
+            {
+                transaction.commit()?;
+                return Ok(LocalExecutionRegistrationOutcome::AlreadyPresent);
+            }
+            return Err(Error::LocalExecutionCollision);
+        }
+        let fingerprint: Vec<u8> = transaction
+            .query_row(
+                "SELECT contract_fingerprint FROM local_execution_contracts WHERE operation_id = ?1",
+                [outcome.operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(Error::LocalExecutionNotFound)?;
+        if transaction
+            .query_row(
+                "SELECT 1 FROM local_execution_attempt_outcomes WHERE outcome_id = ?1",
+                [outcome.outcome_id.to_string()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Err(Error::LocalExecutionCollision);
+        }
+        if transaction
+            .query_row(
+                "SELECT 1 FROM local_execution_attempt_outcomes WHERE evidence_id = ?1",
+                [outcome.evidence_id.to_string()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Err(Error::LocalExecutionCollision);
+        }
+        transaction.execute(
+            "INSERT INTO local_execution_attempt_outcomes(
+                operation_id, attempt_number, outcome_id, evidence_id, outcome, contract_fingerprint,
+                evidence_fingerprint, non_retryable, occurred_at_unix_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                outcome.operation_id.to_string(),
+                i64::from(outcome.attempt_number),
+                outcome.outcome_id.to_string(),
+                outcome.evidence_id.to_string(),
+                outcome.outcome.as_str(),
+                fingerprint,
+                outcome.evidence_fingerprint.as_slice(),
+                i64::from(outcome.outcome.non_retryable()),
+                occurred_at,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(LocalExecutionRegistrationOutcome::Registered)
+    }
+
+    /// Reads redacted, untrusted attempt outcome metadata only.
+    ///
+    /// # Errors
+    /// Returns an invalid-operation or database error.
+    pub fn local_execution_attempt_outcome(
+        &self,
+        operation_id: Uuid,
+        attempt_number: u32,
+    ) -> Result<Option<LocalExecutionOutcomeRecord>> {
+        if operation_id.is_nil() {
+            return Err(Error::LocalExecutionNotFound);
+        }
+        self.connection.query_row(
+            "SELECT outcome_id, evidence_id, outcome, evidence_fingerprint, non_retryable, occurred_at_unix_ms
+             FROM local_execution_attempt_outcomes WHERE operation_id = ?1 AND attempt_number = ?2",
+            params![operation_id.to_string(), i64::from(attempt_number)],
+            |row| {
+                let outcome = LocalExecutionOutcome::parse(&row.get::<_, String>(2)?)
+                    .map_err(to_sql_error)?;
+                let non_retryable = row.get::<_, i64>(4)?;
+                if !matches!(non_retryable, 0 | 1)
+                    || (non_retryable == 1) != outcome.non_retryable()
+                {
+                    return Err(to_sql_error(Error::InvalidSchema));
+                }
+                Ok(LocalExecutionOutcomeRecord {
+                    operation_id,
+                    attempt_number,
+                    outcome_id: parse_uuid(&row.get::<_, String>(0)?).map_err(to_sql_error)?,
+                    evidence_id: parse_uuid(&row.get::<_, String>(1)?).map_err(to_sql_error)?,
+                    outcome,
+                    evidence_fingerprint: blob32(row.get(3)?).map_err(to_sql_error)?,
+                    non_retryable: non_retryable == 1,
+                    occurred_at_unix_ms: u64::try_from(row.get::<_, i64>(5)?)
+                        .map_err(|_| to_sql_error(Error::InvalidSchema))?,
+                })
+            },
+        ).optional().map_err(Into::into)
+    }
+
+    /// Publishes the immutable witness immediately before an approved external
+    /// side-effect window.  Both the exact contract and exact attempt boundary
+    /// must already be present in the append-only `SQLite` ledger.
+    ///
+    /// This is journal evidence only and does not authorize the side effect.
+    /// # Errors
+    /// Returns an error when the binding or boundary is not the exact durable
+    /// ledger record, or publication/private-storage validation fails.
+    pub fn publish_local_execution_pre_side_effect_witness(
+        &self,
+        binding: &DurableExecutionBinding,
+        boundary: &LocalExecutionAttemptBoundary,
+        created_at_unix_ms: u64,
+    ) -> Result<LocalExecutionWitnessPublicationOutcome> {
+        // The pre-side-effect witness has one immutable boundary timestamp.
+        // Letting the caller seal a second timestamp creates a journal value
+        // that the R3.5 bridge can never reconstruct, permanently blocking an
+        // otherwise exact attempt.  Reject before witness construction or any
+        // journal file creation.
+        if created_at_unix_ms != boundary.occurred_at_unix_ms {
+            return Err(Error::InvalidLocalExecutionEvidence);
+        }
+        let witness = self.exact_execution_witness(binding, boundary, created_at_unix_ms)?;
+        Ok(Self::publication_outcome(
+            self.execution_journal.publish_pre(&witness)?,
+        ))
+    }
+
+    /// Publishes an immutable post-window outcome witness.  The outcome is not
+    /// inserted into `SQLite` by this method, preserving the crash boundary
+    /// between witness publication and the Step 2 append-only ledger outcome.
+    /// # Errors
+    /// Returns an error unless the identical binding, boundary, and prior pre
+    /// witness are present, or when journal publication/private storage fails.
+    #[allow(dead_code)] // Reserved generic unbridged local-outcome publication path.
+    pub(crate) fn publish_local_execution_outcome_witness(
+        &self,
+        binding: &DurableExecutionBinding,
+        boundary: &LocalExecutionAttemptBoundary,
+        outcome: &LocalExecutionAttemptOutcome,
+    ) -> Result<LocalExecutionWitnessPublicationOutcome> {
+        self.publish_local_execution_outcome_witness_with_r3_evidence(
+            binding, boundary, outcome, None,
+        )
+    }
+
+    fn publish_local_execution_outcome_witness_with_r3_evidence(
+        &self,
+        binding: &DurableExecutionBinding,
+        boundary: &LocalExecutionAttemptBoundary,
+        outcome: &LocalExecutionAttemptOutcome,
+        r3_mutation_evidence_fingerprint: Option<[u8; 32]>,
+    ) -> Result<LocalExecutionWitnessPublicationOutcome> {
+        if outcome.operation_id != boundary.operation_id
+            || outcome.attempt_number != boundary.attempt_number
+        {
+            return Err(Error::InvalidLocalExecutionEvidence);
+        }
+        let _ = Self::validate_local_execution_outcome_for_boundary(
+            outcome,
+            boundary.boundary_id,
+            boundary.occurred_at_unix_ms,
+        )?;
+        let expected_pre =
+            self.exact_execution_witness(binding, boundary, boundary.occurred_at_unix_ms)?;
+        let published_pre = self
+            .execution_journal
+            .read_pre(outcome.operation_id, outcome.attempt_number)?
+            .ok_or(Error::LocalExecutionJournalMismatch)?;
+        Self::validate_journal_witness_contract(&published_pre, &expected_pre)?;
+        let witness = OutcomeWitness {
+            pre: published_pre,
+            outcome_id: outcome.outcome_id,
+            evidence_id: outcome.evidence_id,
+            outcome: outcome.outcome,
+            evidence_fingerprint: outcome.evidence_fingerprint,
+            r3_mutation_evidence_fingerprint,
+            created_at_unix_ms: outcome.occurred_at_unix_ms,
+        };
+        let existing_witness = self
+            .execution_journal
+            .read_outcome(outcome.operation_id, outcome.attempt_number)?;
+        let ledger =
+            self.local_execution_attempt_outcome(outcome.operation_id, outcome.attempt_number)?;
+        if let Some(existing) = existing_witness.as_ref() {
+            if existing != &witness {
+                return Err(Error::LocalExecutionJournalCollision);
+            }
+        }
+        if let Some(ledger) = ledger.as_ref() {
+            if existing_witness.is_none()
+                || !self.ledger_outcome_matches(
+                    ledger,
+                    &witness,
+                    *boundary.contract_fingerprint.as_bytes(),
+                )?
+            {
+                return Err(Error::LocalExecutionJournalMismatch);
+            }
+        }
+        Ok(Self::publication_outcome(
+            self.execution_journal.publish_outcome(&witness)?,
+        ))
+    }
+
+    /// Inspects one known attempt using a newly verifier-issued binding.
+    ///
+    /// The returned observation is deliberately insufficient to classify a
+    /// mutation as applied or not applied.  Step 4 must revalidate the platform
+    /// state authoritatively before any final action is taken.
+    /// # Errors
+    /// Returns an error for an absent/mismatched fresh binding or boundary, or
+    /// for malformed, insecure, substituted, or conflicting journal evidence.
+    pub fn inspect_local_execution_recovery(
+        &self,
+        binding: &DurableExecutionBinding,
+        attempt_number: u32,
+    ) -> Result<LocalExecutionRecoveryObservation> {
+        let projection = binding.persistence_projection();
+        let boundary = self.execution_boundary_for_binding(binding, attempt_number)?;
+        let expected = PreSideEffectWitness {
+            operation_id: projection.operation_id,
+            attempt_number,
+            boundary_id: boundary.0,
+            boundary_occurred_at_unix_ms: boundary.1,
+            intent_fingerprint: projection.intent_fingerprint,
+            contract_fingerprint: projection.contract_fingerprint,
+            collision_snapshot_fingerprint: projection.collision_snapshot_fingerprint,
+            created_at_unix_ms: boundary.1,
+        };
+        let pre = self
+            .execution_journal
+            .read_pre(projection.operation_id, attempt_number)?;
+        let outcome = self
+            .execution_journal
+            .read_outcome(projection.operation_id, attempt_number)?;
+        let ledger =
+            self.local_execution_attempt_outcome(projection.operation_id, attempt_number)?;
+        let Some(pre) = pre else {
+            if outcome.is_some() || ledger.is_some() {
+                return Err(Error::LocalExecutionJournalMismatch);
+            }
+            return Ok(LocalExecutionRecoveryObservation::BoundaryWithoutWitness);
+        };
+        Self::validate_journal_witness_contract(&pre, &expected)?;
+        let Some(outcome) = outcome else {
+            if ledger.is_some() {
+                return Err(Error::LocalExecutionJournalMismatch);
+            }
+            return Ok(LocalExecutionRecoveryObservation::PreSideEffectWitnessOnly);
+        };
+        let exact_expected = expected.clone();
+        let receipt_r3: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT r3_evidence_fingerprint FROM local_execution_r3_bridge_receipts
+              WHERE operation_id = ?1 AND attempt_number = ?2",
+                params![
+                    projection.operation_id.to_string(),
+                    i64::from(attempt_number)
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let expected_r3 = match receipt_r3 {
+            Some(value) => JournalR3Expectation::Bridged(
+                parse_canonical_sha256(&value).ok_or(Error::LocalExecutionJournalMismatch)?,
+            ),
+            None => match outcome.r3_mutation_evidence_fingerprint {
+                Some(value) => JournalR3Expectation::AuthoritativePreReceipt(value),
+                None => JournalR3Expectation::GenericUnbridged,
+            },
+        };
+        self.exact_journal_pair(
+            &exact_expected,
+            outcome.outcome_id,
+            outcome.evidence_id,
+            outcome.outcome,
+            outcome.evidence_fingerprint,
+            outcome.created_at_unix_ms,
+            expected_r3,
+        )?;
+        match ledger {
+            None => Ok(
+                LocalExecutionRecoveryObservation::OutcomeWitnessPendingLedger {
+                    claim: UntrustedLocalExecutionOutcomeClaim::from_witness(outcome.outcome),
+                },
+            ),
+            Some(ledger)
+                if self.ledger_outcome_matches(
+                    &ledger,
+                    &outcome,
+                    projection.contract_fingerprint,
+                )? =>
+            {
+                Ok(
+                    LocalExecutionRecoveryObservation::OutcomeWitnessAndLedgerMatch {
+                        claim: UntrustedLocalExecutionOutcomeClaim::from_witness(outcome.outcome),
+                    },
+                )
+            }
+            Some(_) => Err(Error::LocalExecutionJournalMismatch),
+        }
+    }
+
+    /// Finalizes one exact verifier-derived outcome in crash-safe order.
+    ///
+    /// The authoritative classifier must run before this method.  A prior
+    /// immutable outcome witness is reused only when it is byte-for-byte the
+    /// same logical outcome; a conflicting claim is never repaired.  The
+    /// journal is published before the v6 ledger, so a crash in between resumes
+    /// by appending the same immutable ledger row without a duplicate outcome.
+    ///
+    /// This method performs no local/provider side effect.
+    ///
+    /// # Errors
+    /// Returns a redacted mismatch/collision error for any stale binding,
+    /// witness, ledger, or purported authoritative decision.
+    pub fn finalize_authoritative_local_execution_outcome(
+        &mut self,
+        binding: &DurableExecutionBinding,
+        boundary: &LocalExecutionAttemptBoundary,
+        decision: &AuthoritativeFinalOutcome,
+    ) -> Result<LocalExecutionRegistrationOutcome> {
+        if !decision.matches_binding(binding, boundary) {
+            return Err(Error::LocalExecutionJournalMismatch);
+        }
+        let recorded_at_unix_ms = match self
+            .execution_journal
+            .read_outcome(boundary.operation_id, boundary.attempt_number)?
+        {
+            Some(witness) => {
+                if witness.outcome_id != decision.outcome_id()
+                    || witness.evidence_id != decision.evidence_id()
+                    || witness.outcome != decision.outcome()
+                    || witness.evidence_fingerprint != decision.evidence_fingerprint()
+                    || witness.created_at_unix_ms != decision.recorded_at_unix_ms()
+                {
+                    return Err(Error::LocalExecutionJournalCollision);
+                }
+                decision.recorded_at_unix_ms()
+            }
+            None => decision.recorded_at_unix_ms(),
+        };
+        let outcome = LocalExecutionAttemptOutcome {
+            operation_id: decision.operation_id(),
+            attempt_number: decision.attempt_number(),
+            outcome_id: decision.outcome_id(),
+            evidence_id: decision.evidence_id(),
+            outcome: decision.outcome(),
+            evidence_fingerprint: decision.evidence_fingerprint(),
+            occurred_at_unix_ms: recorded_at_unix_ms,
+        };
+        self.publish_local_execution_outcome_witness_with_r3_evidence(
+            binding,
+            boundary,
+            &outcome,
+            Some(decision.r3_mutation_evidence_fingerprint()),
+        )?;
+        self.append_local_execution_attempt_outcome(&outcome)
+    }
+
+    /// R3.5-only bridge from an authoritative local execution proof to the
+    /// frozen R3 cursor gates.
+    ///
+    /// Unlike [`Self::commit_r3_change_dependency`], this entry point proves
+    /// that the exact fresh local binding, Step 3 witness, v6 ledger, sealed
+    /// authoritative decision, and existing R3 post-verify evidence agree.
+    /// It then delegates to the existing R3 gate without changing its rules.
+    /// Journal/ledger/hint evidence alone, `legacy_v3`, and every non-applied
+    /// result are withheld.
+    ///
+    /// # Errors
+    /// Returns a redacted error unless every exact R3.5 relation holds.
+    #[allow(clippy::too_many_lines)]
+    pub fn commit_r3_5_verified_local_execution_dependency(
+        &mut self,
+        batch_id: Uuid,
+        dependency: ChangeBatchDependency,
+        binding: &DurableExecutionBinding,
+        attempt_number: u32,
+        decision: &AuthoritativeFinalOutcome,
+    ) -> Result<()> {
+        if dependency.operation_id != decision.operation_id()
+            || dependency.operation_id != binding.persistence_projection().operation_id
+            || decision.attempt_number() != attempt_number
+            || decision.outcome() != LocalExecutionOutcome::VerifiedApplied
+        {
+            return Err(Error::LocalMutationIncomplete);
+        }
+        let projection = binding.persistence_projection();
+        let decision_boundary = LocalExecutionAttemptBoundary {
+            operation_id: dependency.operation_id,
+            attempt_number,
+            boundary_id: decision.boundary_id(),
+            contract_fingerprint: binding.fingerprint(),
+            occurred_at_unix_ms: decision.boundary_occurred_at_unix_ms(),
+        };
+        if decision.boundary_id().is_nil()
+            || decision.evidence_id().is_nil()
+            || decision.outcome_id().is_nil()
+            || decision.boundary_occurred_at_unix_ms() > i64::MAX as u64
+            || decision.recorded_at_unix_ms() > i64::MAX as u64
+            || !decision.matches_binding(binding, &decision_boundary)
+        {
+            return Err(Error::LocalExecutionJournalMismatch);
+        }
+        // The journal is immutable/no-replace and is the only relation that
+        // may be checked outside the SQLite snapshot.  Every local-ledger to
+        // R3 relation below is deliberately reread in one transaction.
+        let expected_pre = PreSideEffectWitness {
+            operation_id: dependency.operation_id,
+            attempt_number,
+            boundary_id: decision.boundary_id(),
+            boundary_occurred_at_unix_ms: decision.boundary_occurred_at_unix_ms(),
+            intent_fingerprint: projection.intent_fingerprint,
+            contract_fingerprint: projection.contract_fingerprint,
+            collision_snapshot_fingerprint: projection.collision_snapshot_fingerprint,
+            created_at_unix_ms: decision.boundary_occurred_at_unix_ms(),
+        };
+        self.exact_journal_pair(
+            &expected_pre,
+            decision.outcome_id(),
+            decision.evidence_id(),
+            LocalExecutionOutcome::VerifiedApplied,
+            decision.evidence_fingerprint(),
+            decision.recorded_at_unix_ms(),
+            // Receipt consumption is published only after its SQLite
+            // transaction commits.  Until then this is the recoverable
+            // authoritative pre-receipt crash state, never cursor authority.
+            JournalR3Expectation::AuthoritativePreReceipt(
+                decision.r3_mutation_evidence_fingerprint(),
+            ),
+        )?;
+        let transaction = self.connection.transaction()?;
+        let persisted_intent =
+            load_persisted_mutation_intent(&transaction, dependency.operation_id)?
+                .ok_or(Error::MutationNotFound)?;
+        validate_mutation_intent(&persisted_intent)?;
+        if !mutation_history_is_exact(&transaction, dependency.operation_id)? {
+            return Err(Error::LocalMutationIncomplete);
+        }
+        // This one snapshot checks exact local contract/boundary/outcome and
+        // every R3 intent/evidence/state/completion-event fact before it can
+        // write either the durable receipt or the batch dependency.
+        let r3: Option<LocalBridgeSnapshot> = transaction
+            .query_row(
+                "SELECT contract.vault_id, contract.intent_fingerprint,
+                        contract.contract_fingerprint, contract.collision_snapshot_fingerprint,
+                        boundary.boundary_id, boundary.occurred_at_unix_ms,
+                        outcome.outcome_id, outcome.evidence_id, outcome.outcome,
+                        outcome.evidence_fingerprint, outcome.occurred_at_unix_ms,
+                        intent.intent_fingerprint, evidence.attempt_number,
+                        evidence.capture_phase, evidence.disposition, evidence.forbidden_side_effect,
+                        evidence.evidence_fingerprint, evidence.outcome_code,
+                        state.phase, state.disposition, state.outcome_code,
+                        state.attempt_number, state.state_version, state.last_evidence_id,
+                        event.phase, event.disposition, event.evidence_id, event.outcome_code
+                   FROM local_execution_contracts AS contract
+                   JOIN local_execution_attempt_boundaries AS boundary
+                     ON boundary.operation_id = contract.operation_id
+                   JOIN local_execution_attempt_outcomes AS outcome
+                     ON outcome.operation_id = boundary.operation_id AND outcome.attempt_number = boundary.attempt_number
+                   JOIN mutation_intents AS intent ON intent.operation_id = contract.operation_id
+                   JOIN mutation_verification_evidence AS evidence
+                     ON evidence.operation_id = intent.operation_id AND evidence.evidence_id = ?3
+                   JOIN mutation_state AS state ON state.operation_id = intent.operation_id
+                   JOIN mutation_events AS event ON event.operation_id = state.operation_id
+                     AND event.attempt_number = state.attempt_number
+                     AND event.state_version = state.state_version
+                     AND event.evidence_id = state.last_evidence_id
+                  WHERE contract.operation_id = ?1 AND boundary.attempt_number = ?2",
+                params![
+                    dependency.operation_id.to_string(),
+                    i64::from(attempt_number),
+                    decision.evidence_id().to_string(),
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?,
+                        row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?,
+                        row.get(12)?, row.get(13)?, row.get(14)?, row.get(15)?, row.get(16)?, row.get(17)?,
+                        row.get(18)?, row.get(19)?, row.get(20)?, row.get(21)?, row.get(22)?, row.get(23)?, row.get(24)?, row.get(25)?, row.get(26)?, row.get(27)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            vault,
+            local_intent,
+            local_contract,
+            local_collision,
+            boundary_id,
+            boundary_at,
+            outcome_id,
+            outcome_evidence_id,
+            outcome,
+            local_evidence,
+            outcome_at,
+            r3_intent,
+            r3_attempt,
+            capture_phase,
+            evidence_disposition,
+            forbidden,
+            r3_evidence,
+            evidence_outcome_code,
+            state_phase,
+            state_disposition,
+            state_outcome_code,
+            state_attempt,
+            state_version,
+            last_evidence,
+            event_phase,
+            event_disposition,
+            event_evidence,
+            event_outcome_code,
+        )) = r3
+        else {
+            return Err(Error::LocalMutationIncomplete);
+        };
+        let expected_local_intent = local_intent_fingerprint_from_r3_intent(&r3_intent)
+            .map_err(|_| Error::InvalidLocalExecutionEvidence)?;
+        if parse_uuid(&vault).ok() != Some(projection.vault_id)
+            || local_intent.as_slice() != projection.intent_fingerprint
+            || local_contract.as_slice() != projection.contract_fingerprint
+            || local_collision.as_slice() != projection.collision_snapshot_fingerprint
+            || parse_uuid(&boundary_id).ok() != Some(decision.boundary_id())
+            || u64::try_from(boundary_at).ok() != Some(decision.boundary_occurred_at_unix_ms())
+            || outcome_id != decision.outcome_id().to_string()
+            || outcome_evidence_id != decision.evidence_id().to_string()
+            || outcome != "VerifiedApplied"
+            || local_evidence.as_slice() != decision.evidence_fingerprint()
+            || u64::try_from(outcome_at).ok() != Some(decision.recorded_at_unix_ms())
+            || local_intent.as_slice() != expected_local_intent
+            || persisted_intent.intent_fingerprint != r3_intent
+            || u32::try_from(r3_attempt).ok() != Some(attempt_number)
+            || capture_phase != "post_verify"
+            || evidence_disposition != "verified_applied"
+            || forbidden != 0
+            || evidence_outcome_code != state_outcome_code
+            || state_phase != "completed"
+            || state_disposition.as_deref() != Some("verified_applied")
+            || u32::try_from(state_attempt).ok() != Some(attempt_number)
+            || last_evidence.as_deref() != Some(decision.evidence_id().to_string().as_str())
+            || event_phase != "completed"
+            || event_disposition.as_deref() != Some("verified_applied")
+            || event_evidence.as_deref() != Some(decision.evidence_id().to_string().as_str())
+            || event_outcome_code != state_outcome_code
+            || parse_canonical_sha256(&r3_evidence)
+                != Some(decision.r3_mutation_evidence_fingerprint())
+            || !persisted_verified_applied_mutation_evidence_is_exact(
+                &transaction,
+                decision.evidence_id(),
+            )?
+        {
+            return Err(Error::LocalMutationIncomplete);
+        }
+        let receipt = BridgeReceiptFacts {
+            operation_id: dependency.operation_id,
+            attempt_number,
+            boundary_id: decision.boundary_id(),
+            boundary_occurred_at_unix_ms: decision.boundary_occurred_at_unix_ms(),
+            contract_fingerprint: projection.contract_fingerprint,
+            outcome_id: decision.outcome_id(),
+            evidence_id: decision.evidence_id(),
+            local_evidence_fingerprint: decision.evidence_fingerprint(),
+            outcome_occurred_at_unix_ms: decision.recorded_at_unix_ms(),
+            r3_intent_fingerprint: r3_intent,
+            r3_evidence_fingerprint: r3_evidence,
+            r3_outcome_code: state_outcome_code,
+            dependency_kind: dependency.kind.as_str().to_owned(),
+            r3_state_phase: state_phase,
+            r3_state_disposition: state_disposition.ok_or(Error::LocalMutationIncomplete)?,
+            r3_attempt_number: attempt_number,
+            r3_state_version: u64::try_from(state_version).map_err(|_| Error::InvalidSchema)?,
+            r3_last_evidence_id: parse_uuid(&last_evidence.ok_or(Error::LocalMutationIncomplete)?)?,
+            r3_event_state_version: u64::try_from(state_version)
+                .map_err(|_| Error::InvalidSchema)?,
+        };
+        let consumption = bridge_consumption_witness(&expected_pre, &receipt)?;
+        insert_or_require_exact_bridge_receipt(&transaction, &receipt)?;
+        insert_or_require_exact_consumption_anchor(&transaction, &receipt)?;
+        Self::commit_r3_change_dependency_in_transaction(
+            &transaction,
+            batch_id,
+            dependency,
+            decision.evidence_id(),
+            true,
+        )?;
+        transaction.commit()?;
+        // This durable no-replace marker is deliberately outside the receipt
+        // transaction.  A crash before it is published leaves a recoverable
+        // receipt-complete bridge that cannot advance a cursor.  An exact
+        // retry rechecks the same receipt/dependency and publishes this exact
+        // marker without fabricating either SQLite row.
+        self.execution_journal
+            .publish_bridge_consumption(&consumption)?;
+        Ok(())
+    }
+
+    fn publication_outcome(published: bool) -> LocalExecutionWitnessPublicationOutcome {
+        if published {
+            LocalExecutionWitnessPublicationOutcome::Published
+        } else {
+            LocalExecutionWitnessPublicationOutcome::AlreadyPublished
+        }
+    }
+
+    fn validate_local_execution_outcome(outcome: &LocalExecutionAttemptOutcome) -> Result<i64> {
+        if outcome.operation_id.is_nil()
+            || outcome.outcome_id.is_nil()
+            || outcome.evidence_id.is_nil()
+        {
+            return Err(Error::InvalidLocalExecutionEvidence);
+        }
+        u64_to_i64(outcome.occurred_at_unix_ms)
+    }
+
+    fn validate_local_execution_outcome_for_boundary(
+        outcome: &LocalExecutionAttemptOutcome,
+        boundary_id: Uuid,
+        boundary_occurred_at_unix_ms: u64,
+    ) -> Result<i64> {
+        if boundary_id.is_nil() {
+            return Err(Error::InvalidLocalExecutionEvidence);
+        }
+        let occurred_at = Self::validate_local_execution_outcome(outcome)?;
+        if authoritative_outcome_id(
+            outcome.operation_id,
+            outcome.attempt_number,
+            boundary_id,
+            boundary_occurred_at_unix_ms,
+            outcome.evidence_id,
+            outcome.evidence_fingerprint,
+            outcome.outcome,
+            outcome.occurred_at_unix_ms,
+        ) != outcome.outcome_id
+        {
+            return Err(Error::InvalidLocalExecutionEvidence);
+        }
+        Ok(occurred_at)
+    }
+
+    fn exact_execution_witness(
+        &self,
+        binding: &DurableExecutionBinding,
+        boundary: &LocalExecutionAttemptBoundary,
+        created_at_unix_ms: u64,
+    ) -> Result<PreSideEffectWitness> {
+        if boundary.operation_id.is_nil()
+            || boundary.boundary_id.is_nil()
+            || created_at_unix_ms != boundary.occurred_at_unix_ms
+        {
+            return Err(Error::InvalidLocalExecutionEvidence);
+        }
+        let projection = binding.persistence_projection();
+        if projection.operation_id != boundary.operation_id
+            || projection.vault_id != self.vault_id
+            || projection.contract_fingerprint != *boundary.contract_fingerprint.as_bytes()
+        {
+            return Err(Error::LocalExecutionJournalMismatch);
+        }
+        let (boundary_id, occurred_at) =
+            self.execution_boundary_for_binding(binding, boundary.attempt_number)?;
+        if boundary_id != boundary.boundary_id || occurred_at != boundary.occurred_at_unix_ms {
+            return Err(Error::LocalExecutionJournalMismatch);
+        }
+        Ok(PreSideEffectWitness {
+            operation_id: projection.operation_id,
+            attempt_number: boundary.attempt_number,
+            boundary_id: boundary.boundary_id,
+            boundary_occurred_at_unix_ms: boundary.occurred_at_unix_ms,
+            intent_fingerprint: projection.intent_fingerprint,
+            contract_fingerprint: projection.contract_fingerprint,
+            collision_snapshot_fingerprint: projection.collision_snapshot_fingerprint,
+            created_at_unix_ms,
+        })
+    }
+
+    fn execution_boundary_for_binding(
+        &self,
+        binding: &DurableExecutionBinding,
+        attempt_number: u32,
+    ) -> Result<(Uuid, u64)> {
+        let projection = binding.persistence_projection();
+        if projection.vault_id != self.vault_id {
+            return Err(Error::LocalExecutionJournalMismatch);
+        }
+        let contract: Option<LocalExecutionContractFingerprints> = self.connection.query_row(
+            "SELECT vault_id, intent_fingerprint, contract_fingerprint, collision_snapshot_fingerprint
+             FROM local_execution_contracts WHERE operation_id = ?1",
+            [projection.operation_id.to_string()],
+            |row| {
+                Ok((
+                    parse_uuid(&row.get::<_, String>(0)?).map_err(to_sql_error)?,
+                    blob32(row.get(1)?).map_err(to_sql_error)?,
+                    blob32(row.get(2)?).map_err(to_sql_error)?,
+                    blob32(row.get(3)?).map_err(to_sql_error)?,
+                ))
+            },
+        ).optional()?;
+        let Some((vault_id, intent, contract, collision)) = contract else {
+            return Err(Error::LocalExecutionNotFound);
+        };
+        if vault_id != projection.vault_id
+            || intent != projection.intent_fingerprint
+            || contract != projection.contract_fingerprint
+            || collision != projection.collision_snapshot_fingerprint
+        {
+            return Err(Error::LocalExecutionJournalMismatch);
+        }
+        self.connection
+            .query_row(
+                "SELECT boundary_id, occurred_at_unix_ms FROM local_execution_attempt_boundaries
+             WHERE operation_id = ?1 AND attempt_number = ?2 AND contract_fingerprint = ?3",
+                params![
+                    projection.operation_id.to_string(),
+                    i64::from(attempt_number),
+                    projection.contract_fingerprint.as_slice(),
+                ],
+                |row| {
+                    Ok((
+                        parse_uuid(&row.get::<_, String>(0)?).map_err(to_sql_error)?,
+                        u64::try_from(row.get::<_, i64>(1)?)
+                            .map_err(|_| to_sql_error(Error::InvalidSchema))?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(Error::LocalExecutionNotFound)
+    }
+
+    fn validate_journal_witness_contract(
+        actual: &PreSideEffectWitness,
+        expected: &PreSideEffectWitness,
+    ) -> Result<()> {
+        if actual.operation_id != expected.operation_id
+            || actual.attempt_number != expected.attempt_number
+            || actual.boundary_id != expected.boundary_id
+            || actual.boundary_occurred_at_unix_ms != expected.boundary_occurred_at_unix_ms
+            || actual.intent_fingerprint != expected.intent_fingerprint
+            || actual.contract_fingerprint != expected.contract_fingerprint
+            || actual.collision_snapshot_fingerprint != expected.collision_snapshot_fingerprint
+            || actual.created_at_unix_ms != expected.created_at_unix_ms
+        {
+            return Err(Error::LocalExecutionJournalMismatch);
+        }
+        Ok(())
+    }
+
+    /// Reads the two independently persisted immutable files and proves the
+    /// sealed pair.  An embedded `pre` is never accepted as a substitute for
+    /// the separately named `.pre` witness.
+    #[allow(clippy::too_many_arguments)]
+    fn exact_journal_pair(
+        &self,
+        expected_pre: &PreSideEffectWitness,
+        outcome_id: Uuid,
+        evidence_id: Uuid,
+        outcome: LocalExecutionOutcome,
+        evidence_fingerprint: [u8; 32],
+        created_at_unix_ms: u64,
+        expected_r3_evidence_fingerprint: JournalR3Expectation,
+    ) -> Result<OutcomeWitness> {
+        exact_journal_pair(
+            &self.execution_journal,
+            expected_pre,
+            outcome_id,
+            evidence_id,
+            outcome,
+            evidence_fingerprint,
+            created_at_unix_ms,
+            expected_r3_evidence_fingerprint,
+        )
+    }
+
+    fn ledger_outcome_matches(
+        &self,
+        ledger: &LocalExecutionOutcomeRecord,
+        witness: &OutcomeWitness,
+        contract_fingerprint: [u8; 32],
+    ) -> Result<bool> {
+        if ledger.outcome_id != witness.outcome_id
+            || ledger.evidence_id != witness.evidence_id
+            || ledger.outcome != witness.outcome
+            || ledger.evidence_fingerprint != witness.evidence_fingerprint
+            || ledger.occurred_at_unix_ms != witness.created_at_unix_ms
+        {
+            return Ok(false);
+        }
+        let stored: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT contract_fingerprint FROM local_execution_attempt_outcomes
+             WHERE operation_id = ?1 AND attempt_number = ?2",
+                params![
+                    ledger.operation_id.to_string(),
+                    i64::from(ledger.attempt_number)
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(stored.as_deref() == Some(contract_fingerprint.as_slice()))
+    }
+
+    /// On every reopen, every durable local outcome must be independently
+    /// witnessed.  The journal is compared to the ledger; it is never used to
+    /// manufacture a row or authorize a cursor by itself.
+    #[allow(clippy::too_many_lines)]
+    fn local_execution_journal_outcomes_are_exact(&self) -> Result<bool> {
+        let mut statement = self.connection.prepare(
+            "SELECT outcome.operation_id, outcome.attempt_number, boundary.boundary_id,
+                    boundary.occurred_at_unix_ms, boundary.contract_fingerprint,
+                    outcome.outcome_id, outcome.evidence_id, outcome.outcome,
+                    outcome.evidence_fingerprint, outcome.occurred_at_unix_ms
+               FROM local_execution_attempt_outcomes AS outcome
+               JOIN local_execution_attempt_boundaries AS boundary
+                 ON boundary.operation_id = outcome.operation_id
+                AND boundary.attempt_number = outcome.attempt_number",
+        )?;
+        for row in statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Vec<u8>>(8)?,
+                row.get::<_, i64>(9)?,
+            ))
+        })? {
+            let (
+                operation,
+                attempt,
+                boundary,
+                boundary_at,
+                contract,
+                outcome_id,
+                evidence_id,
+                outcome,
+                evidence_fingerprint,
+                outcome_at,
+            ) = row?;
+            let (
+                Ok(operation),
+                Ok(attempt),
+                Ok(boundary),
+                Ok(boundary_at),
+                Ok(contract),
+                Ok(outcome_id),
+                Ok(evidence_id),
+                Ok(outcome),
+                Ok(evidence_fingerprint),
+                Ok(outcome_at),
+            ) = (
+                parse_uuid(&operation),
+                u32::try_from(attempt),
+                parse_uuid(&boundary),
+                u64::try_from(boundary_at),
+                blob32(contract),
+                parse_uuid(&outcome_id),
+                parse_uuid(&evidence_id),
+                LocalExecutionOutcome::parse(&outcome),
+                blob32(evidence_fingerprint),
+                u64::try_from(outcome_at),
+            )
+            else {
+                return Ok(false);
+            };
+            let expected_pre = PreSideEffectWitness {
+                operation_id: operation,
+                attempt_number: attempt,
+                boundary_id: boundary,
+                boundary_occurred_at_unix_ms: boundary_at,
+                // This fingerprint is fixed by the matching contract row;
+                // read it rather than trusting the outcome witness.
+                intent_fingerprint: self.connection.query_row(
+                    "SELECT intent_fingerprint FROM local_execution_contracts WHERE operation_id = ?1",
+                    [operation.to_string()],
+                    |row| blob32(row.get(0)?).map_err(to_sql_error),
+                )?,
+                contract_fingerprint: contract,
+                collision_snapshot_fingerprint: self.connection.query_row(
+                    "SELECT collision_snapshot_fingerprint FROM local_execution_contracts WHERE operation_id = ?1",
+                    [operation.to_string()],
+                    |row| blob32(row.get(0)?).map_err(to_sql_error),
+                )?,
+                created_at_unix_ms: boundary_at,
+            };
+            let pre = self
+                .execution_journal
+                .read_pre(operation, attempt)?
+                .ok_or(Error::LocalExecutionJournalMismatch)?;
+            Self::validate_journal_witness_contract(&pre, &expected_pre)?;
+            let receipt_marker_facts: Option<(String, Vec<u8>, String, String, String)> = self
+                .connection
+                .query_row(
+                    "SELECT receipt_id, receipt_fingerprint, r3_intent_fingerprint,
+                            r3_evidence_fingerprint, dependency_kind
+                       FROM local_execution_r3_bridge_receipts
+                      WHERE operation_id = ?1 AND attempt_number = ?2",
+                    params![operation.to_string(), i64::from(attempt)],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let expected_r3 = match receipt_marker_facts.as_ref() {
+                Some((_, _, _, value, _)) => match parse_canonical_sha256(value) {
+                    Some(value) => JournalR3Expectation::Bridged(value),
+                    None => return Ok(false),
+                },
+                None => match self.execution_journal.read_outcome(operation, attempt)? {
+                    Some(witness) => match witness.r3_mutation_evidence_fingerprint {
+                        Some(value) => JournalR3Expectation::AuthoritativePreReceipt(value),
+                        None => JournalR3Expectation::GenericUnbridged,
+                    },
+                    None => return Ok(false),
+                },
+            };
+            let pair = self
+                .exact_journal_pair(
+                    &expected_pre,
+                    outcome_id,
+                    evidence_id,
+                    outcome,
+                    evidence_fingerprint,
+                    outcome_at,
+                    expected_r3,
+                )
+                .ok();
+            if pair.is_none()
+                || authoritative_outcome_id(
+                    operation,
+                    attempt,
+                    boundary,
+                    boundary_at,
+                    evidence_id,
+                    evidence_fingerprint,
+                    outcome,
+                    outcome_at,
+                ) != outcome_id
+            {
+                return Ok(false);
+            }
+            #[allow(clippy::single_match_else)]
+            // Retain explicit fail-closed absent-receipt branch.
+            match receipt_marker_facts {
+                Some((receipt_id, receipt_fingerprint, r3_intent, r3_evidence, kind)) => {
+                    let (
+                        Ok(receipt_id),
+                        Ok(receipt_fingerprint),
+                        Some(r3_intent),
+                        Some(r3_evidence),
+                        Ok(kind),
+                    ) = (
+                        parse_uuid(&receipt_id),
+                        blob32(receipt_fingerprint),
+                        parse_canonical_sha256(&r3_intent),
+                        parse_canonical_sha256(&r3_evidence),
+                        bridge_dependency_kind_code(&kind),
+                    )
+                    else {
+                        return Ok(false);
+                    };
+                    let expected = BridgeConsumptionWitness {
+                        pre: expected_pre.clone(),
+                        receipt_id,
+                        receipt_fingerprint,
+                        outcome_id,
+                        evidence_id,
+                        local_evidence_fingerprint: evidence_fingerprint,
+                        outcome_occurred_at_unix_ms: outcome_at,
+                        r3_intent_fingerprint: r3_intent,
+                        r3_evidence_fingerprint: r3_evidence,
+                        dependency_kind: kind,
+                    };
+                    // No marker is the explicitly recoverable receipt-commit /
+                    // marker-publish crash window.  A present marker must be
+                    // exact; a substituted marker makes reopening fail closed.
+                    if let Some(actual) = self
+                        .execution_journal
+                        .read_bridge_consumption(operation, attempt)?
+                    {
+                        if actual != expected {
+                            return Ok(false);
+                        }
+                    }
+                }
+                None => {
+                    // A consumption marker is published only after receipt
+                    // commit.  It survives batch cleanup, so receipt deletion
+                    // can never downgrade this into a pre-receipt crash.
+                    if self
+                        .execution_journal
+                        .read_bridge_consumption(operation, attempt)?
+                        .is_some()
+                    {
+                        return Ok(false);
+                    }
+                    let orphaned_anchor: bool = self.connection.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM local_execution_r3_consumption_anchors
+                          WHERE operation_id = ?1 AND attempt_number = ?2)",
+                        params![operation.to_string(), i64::from(attempt)],
+                        |row| row.get(0),
+                    )?;
+                    if orphaned_anchor {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// Registers one immutable R3 intent with its initial durable state and event.
@@ -2046,32 +4034,33 @@ impl SyncStore {
         let blocked = intent.operation_kind == MutationOperationKind::RemoteExistingBlocked;
         if blocked {
             let evidence = initial_evidence.ok_or(Error::InvalidTransferEvidence)?;
-            if evidence.disposition != MutationDisposition::NeedsReconcile
-                || evidence.capture_phase != MutationEvidenceCapturePhase::Preflight
-                || !evidence.forbidden_side_effect
-                || evidence.outcome_code.is_none()
-                || evidence.observed_account_id != intent.account_id
-                || evidence.observed_remote_root_id != intent.remote_root_id
-                || evidence.observed_remote_file_id != intent.remote_file_id
-                || evidence.observed_parent_id != intent.source_parent_id
-                || evidence.observed_path != intent.source_path
-                || evidence.observed_local_revision != intent.expected_local_revision
-                || evidence.observed_remote_revision != intent.expected_remote_revision
-                || evidence.observed_operation_marker.as_deref()
-                    != Some(intent.operation_marker.as_str())
-            {
-                return Err(Error::InvalidTransferEvidence);
-            }
+            validate_remote_existing_blocked_initial_needs_reconcile(intent, evidence)?;
         } else if initial_evidence.is_some() {
             return Err(Error::InvalidStateTransition);
         }
 
         let transaction = self.connection.transaction()?;
-        if let Some((fingerprint, marker)) =
-            load_mutation_identity(&transaction, intent.operation_id)?
-        {
-            if fingerprint != intent.intent_fingerprint || marker != intent.operation_marker {
+        if load_mutation_identity(&transaction, intent.operation_id)?.is_some() {
+            let persisted = load_persisted_mutation_intent(&transaction, intent.operation_id)?
+                .ok_or(Error::InvalidSchema)?;
+            // The indexed fingerprint/marker are only a collision lookup.
+            // Reconstruct and validate the full immutable preimage before an
+            // idempotent result, so neither a stale hash nor a coherent hash
+            // rewrite can turn a different caller intent into AlreadyPresent.
+            let mut caller_preimage = intent.clone();
+            // Registration time is an observation timestamp, deliberately
+            // excluded from the immutable intent fingerprint so a restart can
+            // replay the same blocked intent at a later time.  Every actual
+            // immutable intent field remains an exact equality requirement.
+            caller_preimage.registered_at_unix_ms = persisted.registered_at_unix_ms;
+            if validate_mutation_intent(&persisted).is_err() || persisted != caller_preimage {
                 return Err(Error::MutationCollision);
+            }
+            // A blocked operation has no executable recovery path.  An exact
+            // re-registration therefore must not turn a forged initial
+            // `NeedsReconcile` history into an idempotent success.
+            if blocked && !mutation_history_is_exact(&transaction, intent.operation_id)? {
+                return Err(Error::LocalMutationIncomplete);
             }
             let state = load_mutation_state(&transaction, intent.operation_id)?
                 .ok_or(Error::InvalidSchema)?;
@@ -2169,7 +4158,7 @@ impl SyncStore {
         load_mutation_events(&self.connection, operation_id)
     }
 
-    /// Claims a durable intent or due retry using the caller's expected state version.
+    /// Claims a durable intent or an exact, due retry using the caller's expected state version.
     ///
     /// # Errors
     /// Returns an unknown-operation, stale-version, invalid-transition, or database error.
@@ -2198,22 +4187,39 @@ impl SyncStore {
         ) || state
             .next_attempt_at_unix_ms
             .is_some_and(|due| due > now_unix_ms)
+            || now_unix_ms < state.updated_at_unix_ms
         {
             return Err(Error::InvalidStateTransition);
         }
         let next = MutationState {
             operation_id,
             phase: MutationPhase::Running,
-            attempt_number: state.attempt_number + u32::from(retry),
-            state_version: state.state_version + 1,
+            // A retry is only possible after an exact durable retry outcome,
+            // and consumes exactly one checked attempt number.  The executor
+            // still has to revalidate the provider/local preconditions before
+            // any replay; this claim alone is never side-effect authority.
+            attempt_number: state
+                .attempt_number
+                .checked_add(u32::from(retry))
+                .ok_or(Error::InvalidSchema)?,
+            state_version: state
+                .state_version
+                .checked_add(1)
+                .ok_or(Error::InvalidSchema)?,
             disposition: None,
             next_attempt_at_unix_ms: None,
             retry_mode: None,
             resume_reference: None,
-            last_evidence_id: state.last_evidence_id,
+            last_evidence_id: None,
             outcome_code: None,
             updated_at_unix_ms: now_unix_ms,
         };
+        if retry && !mutation_history_is_exact(&transaction, operation_id)? {
+            return Err(Error::LocalMutationIncomplete);
+        }
+        if retry && !mutation_retry_contract_matches_state(&transaction, &state)? {
+            return Err(Error::LocalMutationIncomplete);
+        }
         update_mutation_state(&transaction, &next, state.state_version)?;
         insert_mutation_event(
             &transaction,
@@ -2259,8 +4265,21 @@ impl SyncStore {
         {
             return Err(Error::InvalidStateTransition);
         }
+        if evidence.captured_at_unix_ms < state.updated_at_unix_ms {
+            return Err(Error::InvalidStateTransition);
+        }
         if matches!(transition, MutationOutcomeTransition::VerifiedApplied) {
             validate_verified_applied_evidence(&transaction, evidence)?;
+        }
+        if matches!(
+            transition,
+            MutationOutcomeTransition::VerifiedNotApplied { .. }
+                | MutationOutcomeTransition::RetrySafe { .. }
+        ) {
+            let intent = load_persisted_mutation_intent(&transaction, operation_id)?
+                .ok_or(Error::MutationNotFound)?;
+            validate_mutation_intent(&intent)?;
+            validate_verified_applied_evidence_against_intent(&intent, evidence)?;
         }
         let (phase, disposition, next_attempt, retry_mode, resume_reference) =
             transition_target(state.phase, evidence, transition)?;
@@ -2269,7 +4288,10 @@ impl SyncStore {
             operation_id,
             phase,
             attempt_number: state.attempt_number,
-            state_version: state.state_version + 1,
+            state_version: state
+                .state_version
+                .checked_add(1)
+                .ok_or(Error::InvalidSchema)?,
             disposition: Some(disposition),
             next_attempt_at_unix_ms: next_attempt,
             retry_mode,
@@ -2278,6 +4300,9 @@ impl SyncStore {
             outcome_code: evidence.outcome_code.clone(),
             updated_at_unix_ms: evidence.captured_at_unix_ms,
         };
+        if next.phase == MutationPhase::RetryScheduled {
+            insert_mutation_retry_contract(&transaction, &next, evidence)?;
+        }
         update_mutation_state(&transaction, &next, state.state_version)?;
         insert_mutation_event(
             &transaction,
@@ -3749,11 +5774,33 @@ impl SyncStore {
         dependency: ChangeBatchDependency,
         evidence_id: Uuid,
     ) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        Self::commit_r3_change_dependency_in_transaction(
+            &transaction,
+            batch_id,
+            dependency,
+            evidence_id,
+            false,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// The cursor gate's sole private implementation.  A public R3 caller may
+    /// never use this path for an operation with a v6 local contract: only the
+    /// R3.5 bridge supplies `allow_verified_local_contract` after binding its
+    /// sealed proof in the same database transaction.
+    fn commit_r3_change_dependency_in_transaction(
+        transaction: &Transaction<'_>,
+        batch_id: Uuid,
+        dependency: ChangeBatchDependency,
+        evidence_id: Uuid,
+        allow_verified_local_contract: bool,
+    ) -> Result<()> {
         if batch_id.is_nil() || dependency.operation_id.is_nil() || evidence_id.is_nil() {
             return Err(Error::InvalidStateTransition);
         }
-        let transaction = self.connection.transaction()?;
-        let batch = load_change_batch(&transaction)?.ok_or(Error::NoActiveBatch)?;
+        let batch = load_change_batch(transaction)?.ok_or(Error::NoActiveBatch)?;
         if batch.batch_id != batch_id {
             return Err(Error::NoActiveBatch);
         }
@@ -3779,7 +5826,15 @@ impl SyncStore {
         {
             return Err(Error::MutationCollision);
         }
-        let (_, operation_kind) = load_mutation_kind(&transaction, dependency.operation_id)?
+        let local_contract_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_execution_contracts WHERE operation_id = ?1)",
+            [dependency.operation_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if local_contract_exists && !allow_verified_local_contract {
+            return Err(Error::LocalMutationIncomplete);
+        }
+        let (_, operation_kind) = load_mutation_kind(transaction, dependency.operation_id)?
             .ok_or(Error::MutationNotFound)?;
         if operation_kind != dependency.kind.required_operation_kind() {
             return Err(Error::MutationCollision);
@@ -3795,9 +5850,8 @@ impl SyncStore {
                 return Err(Error::MutationNeedsReconcile);
             }
         }
-        require_exact_r3_completion_evidence(&transaction, dependency.operation_id, evidence_id)?;
+        require_exact_r3_completion_evidence(transaction, dependency.operation_id, evidence_id)?;
         if LocalMutationState::parse(&row.3)? == LocalMutationState::Committed {
-            transaction.commit()?;
             return Ok(());
         }
         let changed = transaction.execute(
@@ -3816,7 +5870,6 @@ impl SyncStore {
         if changed != 1 {
             return Err(Error::MutationStateVersionMismatch);
         }
-        transaction.commit()?;
         Ok(())
     }
 
@@ -3824,6 +5877,7 @@ impl SyncStore {
     ///
     /// # Errors
     /// Returns missing-batch, incomplete-dependency, changed-cursor, or database errors.
+    #[allow(clippy::too_many_lines)]
     pub fn commit_r3_change_batch(&mut self, batch_id: Uuid, now_unix_ms: u64) -> Result<()> {
         let now = u64_to_i64(now_unix_ms)?;
         let transaction = self.connection.transaction()?;
@@ -3880,6 +5934,41 @@ impl SyncStore {
         )?;
         if incomplete != 0 {
             return Err(Error::LocalMutationIncomplete);
+        }
+        // Defense in depth: even if a row was marked committed by corruption
+        // or an older path, a v6 local-contract dependency cannot advance the
+        // cursor without the same exact bridge proof.
+        let local_dependencies = {
+            let mut statement = transaction.prepare(
+                "SELECT dependency.operation_id, dependency.committed_evidence_id, dependency.dependency_kind
+                   FROM change_batch_mutations AS dependency
+                   JOIN local_execution_contracts AS contract
+                     ON contract.operation_id = dependency.operation_id
+                  WHERE dependency.batch_id = ?1",
+            )?;
+            let rows = statement
+                .query_map([batch_id.to_string()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        for (operation, evidence, kind) in local_dependencies {
+            let operation = parse_uuid(&operation)?;
+            let evidence = parse_uuid(&evidence)?;
+            if !r3_5_cursor_proof_is_exact(
+                &self.execution_journal,
+                &transaction,
+                operation,
+                evidence,
+                &kind,
+            )? {
+                return Err(Error::LocalMutationIncomplete);
+            }
         }
         let changed = transaction.execute(
             "UPDATE vault_state SET durable_cursor = ?1, updated_at_unix_ms = ?2
@@ -4291,6 +6380,7 @@ impl SyncStore {
             let attempt = u32::try_from(attempt).map_err(|_| Error::InvalidSchema)?;
             let version = u64::try_from(version).map_err(|_| Error::InvalidSchema)?;
             let occurred_at = u64::try_from(updated_at).map_err(|_| Error::InvalidSchema)?;
+            let next_version = version.checked_add(1).ok_or(Error::InvalidSchema)?;
             let evidence =
                 interrupted_mutation_evidence(operation_id, attempt, version, occurred_at);
             insert_mutation_evidence(&transaction, &evidence)?;
@@ -4298,7 +6388,7 @@ impl SyncStore {
                 operation_id,
                 phase: MutationPhase::NeedsReconcile,
                 attempt_number: attempt,
-                state_version: version + 1,
+                state_version: next_version,
                 disposition: Some(MutationDisposition::NeedsReconcile),
                 next_attempt_at_unix_ms: None,
                 retry_mode: None,
@@ -4312,7 +6402,7 @@ impl SyncStore {
                 &transaction,
                 operation_id,
                 attempt,
-                version + 1,
+                next_version,
                 MutationPhase::NeedsReconcile,
                 Some(MutationDisposition::NeedsReconcile),
                 Some(evidence.evidence_id),
@@ -4323,6 +6413,1060 @@ impl SyncStore {
         transaction.commit()?;
         Ok(())
     }
+}
+
+/// Shared proof for every persisted final outcome and every R3.5 bridge.  The
+/// journal decoder accepts only canonical encodings, so equality of these
+/// typed witnesses is also equality of their sealed canonical bytes.
+#[allow(clippy::too_many_arguments)]
+fn exact_journal_pair(
+    journal: &SyncExecutionJournal,
+    expected_pre: &PreSideEffectWitness,
+    outcome_id: Uuid,
+    evidence_id: Uuid,
+    outcome: LocalExecutionOutcome,
+    evidence_fingerprint: [u8; 32],
+    created_at_unix_ms: u64,
+    expected_r3_evidence_fingerprint: JournalR3Expectation,
+) -> Result<OutcomeWitness> {
+    let pre = journal
+        .read_pre(expected_pre.operation_id, expected_pre.attempt_number)?
+        .ok_or(Error::LocalExecutionJournalMismatch)?;
+    SyncStore::validate_journal_witness_contract(&pre, expected_pre)?;
+    if pre != *expected_pre {
+        return Err(Error::LocalExecutionJournalMismatch);
+    }
+    let witness = journal
+        .read_outcome(expected_pre.operation_id, expected_pre.attempt_number)?
+        .ok_or(Error::LocalExecutionJournalMismatch)?;
+    SyncStore::validate_journal_witness_contract(&witness.pre, expected_pre)?;
+    if witness.pre != pre
+        || witness.outcome_id != outcome_id
+        || witness.evidence_id != evidence_id
+        || witness.outcome != outcome
+        || witness.evidence_fingerprint != evidence_fingerprint
+        || witness.created_at_unix_ms != created_at_unix_ms
+        || match expected_r3_evidence_fingerprint {
+            JournalR3Expectation::GenericUnbridged => {
+                witness.r3_mutation_evidence_fingerprint.is_some()
+            }
+            JournalR3Expectation::AuthoritativePreReceipt(expected)
+            | JournalR3Expectation::Bridged(expected) => {
+                witness.r3_mutation_evidence_fingerprint != Some(expected)
+            }
+        }
+    {
+        return Err(Error::LocalExecutionJournalMismatch);
+    }
+    Ok(witness)
+}
+
+fn bridge_receipt_fingerprint(receipt: &BridgeReceiptFacts) -> [u8; 32] {
+    fn field(material: &mut Vec<u8>, tag: &[u8], value: &[u8]) {
+        material.extend_from_slice(&(tag.len() as u64).to_be_bytes());
+        material.extend_from_slice(tag);
+        material.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        material.extend_from_slice(value);
+    }
+    let mut material = Vec::new();
+    field(&mut material, b"domain", b"myvault-r3.5-bridge-receipt-v1");
+    field(&mut material, b"operation", receipt.operation_id.as_bytes());
+    field(
+        &mut material,
+        b"attempt",
+        &receipt.attempt_number.to_be_bytes(),
+    );
+    field(&mut material, b"boundary", receipt.boundary_id.as_bytes());
+    field(
+        &mut material,
+        b"boundary_time",
+        &receipt.boundary_occurred_at_unix_ms.to_be_bytes(),
+    );
+    field(&mut material, b"contract", &receipt.contract_fingerprint);
+    field(&mut material, b"outcome", receipt.outcome_id.as_bytes());
+    field(&mut material, b"evidence", receipt.evidence_id.as_bytes());
+    field(
+        &mut material,
+        b"local_evidence",
+        &receipt.local_evidence_fingerprint,
+    );
+    field(
+        &mut material,
+        b"outcome_time",
+        &receipt.outcome_occurred_at_unix_ms.to_be_bytes(),
+    );
+    field(
+        &mut material,
+        b"r3_intent",
+        receipt.r3_intent_fingerprint.as_bytes(),
+    );
+    field(
+        &mut material,
+        b"r3_evidence",
+        receipt.r3_evidence_fingerprint.as_bytes(),
+    );
+    // Avoid an ambiguous `NULL`/empty-string representation in this sealed
+    // preimage.  The code itself remains redacted and is validated wherever
+    // it is read from SQLite.
+    match &receipt.r3_outcome_code {
+        Some(code) => {
+            field(&mut material, b"r3_outcome_code_present", &[1]);
+            field(&mut material, b"r3_outcome_code", code.as_bytes());
+        }
+        None => field(&mut material, b"r3_outcome_code_present", &[0]),
+    }
+    field(
+        &mut material,
+        b"dependency",
+        receipt.dependency_kind.as_bytes(),
+    );
+    field(
+        &mut material,
+        b"r3_state_phase",
+        receipt.r3_state_phase.as_bytes(),
+    );
+    field(
+        &mut material,
+        b"r3_state_disposition",
+        receipt.r3_state_disposition.as_bytes(),
+    );
+    field(
+        &mut material,
+        b"r3_attempt",
+        &receipt.r3_attempt_number.to_be_bytes(),
+    );
+    field(
+        &mut material,
+        b"state_version",
+        &receipt.r3_state_version.to_be_bytes(),
+    );
+    field(
+        &mut material,
+        b"r3_last_evidence",
+        receipt.r3_last_evidence_id.as_bytes(),
+    );
+    field(
+        &mut material,
+        b"event_version",
+        &receipt.r3_event_state_version.to_be_bytes(),
+    );
+    Sha256::digest(material).into()
+}
+
+fn bridge_receipt_id(fingerprint: [u8; 32]) -> Uuid {
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, &fingerprint)
+}
+
+fn bridge_consumption_anchor_fingerprint(receipt: &BridgeReceiptFacts) -> [u8; 32] {
+    let receipt_fingerprint = bridge_receipt_fingerprint(receipt);
+    let mut digest = Sha256::new();
+    // Keep this independent from the receipt ID derivation and bind the exact
+    // receipt preimage plus the cursor-critical identity fields.
+    for field in [
+        b"myvault-r3.5-consumption-anchor-v1".as_slice(),
+        receipt_fingerprint.as_slice(),
+        receipt.operation_id.as_bytes(),
+        receipt.attempt_number.to_be_bytes().as_slice(),
+        receipt.outcome_id.as_bytes(),
+        receipt.evidence_id.as_bytes(),
+        receipt.r3_evidence_fingerprint.as_bytes(),
+        receipt.dependency_kind.as_bytes(),
+    ] {
+        append_canonical_bytes(&mut digest, field);
+    }
+    digest.finalize().into()
+}
+
+fn bridge_consumption_anchor_id(fingerprint: [u8; 32]) -> Uuid {
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, &fingerprint)
+}
+
+fn bridge_dependency_kind_code(kind: &str) -> Result<u8> {
+    match kind {
+        "mutation" => Ok(1),
+        "merge_publication" => Ok(2),
+        "conflict_copy_publication" => Ok(3),
+        "base_publication" => Ok(4),
+        _ => Err(Error::LocalExecutionJournalMismatch),
+    }
+}
+
+/// Creates the exact journal proof published after the receipt transaction.
+/// Keep this construction adjacent to the receipt preimage so a new receipt
+/// field cannot accidentally become a cursor-authority split view.
+fn bridge_consumption_witness(
+    pre: &PreSideEffectWitness,
+    receipt: &BridgeReceiptFacts,
+) -> Result<BridgeConsumptionWitness> {
+    let r3_intent_fingerprint = parse_canonical_sha256(&receipt.r3_intent_fingerprint)
+        .ok_or(Error::LocalExecutionJournalMismatch)?;
+    let r3_evidence_fingerprint = parse_canonical_sha256(&receipt.r3_evidence_fingerprint)
+        .ok_or(Error::LocalExecutionJournalMismatch)?;
+    let receipt_fingerprint = bridge_receipt_fingerprint(receipt);
+    Ok(BridgeConsumptionWitness {
+        pre: pre.clone(),
+        receipt_id: bridge_receipt_id(receipt_fingerprint),
+        receipt_fingerprint,
+        outcome_id: receipt.outcome_id,
+        evidence_id: receipt.evidence_id,
+        local_evidence_fingerprint: receipt.local_evidence_fingerprint,
+        outcome_occurred_at_unix_ms: receipt.outcome_occurred_at_unix_ms,
+        r3_intent_fingerprint,
+        r3_evidence_fingerprint,
+        dependency_kind: bridge_dependency_kind_code(&receipt.dependency_kind)?,
+    })
+}
+
+fn exact_bridge_consumption(
+    journal: &SyncExecutionJournal,
+    expected: &BridgeConsumptionWitness,
+) -> Result<bool> {
+    Ok(journal
+        .bridge_consumption_is_confirmed(expected.pre.operation_id, expected.pre.attempt_number)?
+        && journal
+            .read_bridge_consumption(expected.pre.operation_id, expected.pre.attempt_number)?
+            .is_some_and(|actual| actual == *expected))
+}
+
+fn insert_or_require_exact_bridge_receipt(
+    transaction: &Transaction<'_>,
+    receipt: &BridgeReceiptFacts,
+) -> Result<()> {
+    let fingerprint = bridge_receipt_fingerprint(receipt);
+    let receipt_id = bridge_receipt_id(fingerprint);
+    transaction.execute(
+        "INSERT INTO local_execution_r3_bridge_receipts(
+            receipt_id, receipt_fingerprint, operation_id, attempt_number, boundary_id,
+            boundary_occurred_at_unix_ms, contract_fingerprint, outcome_id, evidence_id,
+            local_evidence_fingerprint, outcome_occurred_at_unix_ms, r3_intent_fingerprint,
+            r3_evidence_fingerprint, r3_outcome_code, dependency_kind, r3_state_phase, r3_state_disposition,
+            r3_attempt_number, r3_state_version, r3_last_evidence_id, r3_event_state_version
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                   ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+         ON CONFLICT(receipt_id) DO NOTHING",
+        params![
+            receipt_id.to_string(),
+            fingerprint.as_slice(),
+            receipt.operation_id.to_string(),
+            i64::from(receipt.attempt_number),
+            receipt.boundary_id.to_string(),
+            u64_to_i64(receipt.boundary_occurred_at_unix_ms)?,
+            receipt.contract_fingerprint.as_slice(),
+            receipt.outcome_id.to_string(),
+            receipt.evidence_id.to_string(),
+            receipt.local_evidence_fingerprint.as_slice(),
+            u64_to_i64(receipt.outcome_occurred_at_unix_ms)?,
+            receipt.r3_intent_fingerprint,
+            receipt.r3_evidence_fingerprint,
+            receipt.r3_outcome_code,
+            receipt.dependency_kind,
+            receipt.r3_state_phase,
+            receipt.r3_state_disposition,
+            i64::from(receipt.r3_attempt_number),
+            u64_to_i64(receipt.r3_state_version)?,
+            receipt.r3_last_evidence_id.to_string(),
+            u64_to_i64(receipt.r3_event_state_version)?,
+        ],
+    )?;
+    let exact: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_execution_r3_bridge_receipts
+          WHERE receipt_id = ?1 AND receipt_fingerprint = ?2 AND operation_id = ?3
+            AND attempt_number = ?4 AND boundary_id = ?5 AND boundary_occurred_at_unix_ms = ?6
+            AND contract_fingerprint = ?7 AND outcome_id = ?8 AND evidence_id = ?9
+            AND local_evidence_fingerprint = ?10 AND outcome_occurred_at_unix_ms = ?11
+            AND r3_intent_fingerprint = ?12 AND r3_evidence_fingerprint = ?13
+            AND r3_outcome_code IS ?14 AND dependency_kind = ?15 AND r3_state_phase = ?16
+            AND r3_state_disposition = ?17 AND r3_attempt_number = ?18
+            AND r3_state_version = ?19 AND r3_last_evidence_id = ?20 AND r3_event_state_version = ?21)",
+        params![
+            receipt_id.to_string(), fingerprint.as_slice(), receipt.operation_id.to_string(),
+            i64::from(receipt.attempt_number), receipt.boundary_id.to_string(),
+            u64_to_i64(receipt.boundary_occurred_at_unix_ms)?, receipt.contract_fingerprint.as_slice(),
+            receipt.outcome_id.to_string(), receipt.evidence_id.to_string(),
+            receipt.local_evidence_fingerprint.as_slice(), u64_to_i64(receipt.outcome_occurred_at_unix_ms)?,
+            receipt.r3_intent_fingerprint, receipt.r3_evidence_fingerprint, receipt.r3_outcome_code, receipt.dependency_kind,
+            receipt.r3_state_phase, receipt.r3_state_disposition, i64::from(receipt.r3_attempt_number),
+            u64_to_i64(receipt.r3_state_version)?, receipt.r3_last_evidence_id.to_string(),
+            u64_to_i64(receipt.r3_event_state_version)?,
+        ],
+        |row| row.get(0),
+    )?;
+    if !exact {
+        return Err(Error::LocalExecutionJournalMismatch);
+    }
+    Ok(())
+}
+
+fn insert_or_require_exact_consumption_anchor(
+    transaction: &Transaction<'_>,
+    receipt: &BridgeReceiptFacts,
+) -> Result<()> {
+    let receipt_fingerprint = bridge_receipt_fingerprint(receipt);
+    let receipt_id = bridge_receipt_id(receipt_fingerprint);
+    let anchor_fingerprint = bridge_consumption_anchor_fingerprint(receipt);
+    let anchor_id = bridge_consumption_anchor_id(anchor_fingerprint);
+    transaction.execute(
+        "INSERT INTO local_execution_r3_consumption_anchors(
+            anchor_id, anchor_fingerprint, receipt_id, receipt_fingerprint,
+            operation_id, attempt_number, outcome_id, evidence_id,
+            r3_evidence_fingerprint, dependency_kind
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(anchor_id) DO NOTHING",
+        params![
+            anchor_id.to_string(),
+            anchor_fingerprint.as_slice(),
+            receipt_id.to_string(),
+            receipt_fingerprint.as_slice(),
+            receipt.operation_id.to_string(),
+            i64::from(receipt.attempt_number),
+            receipt.outcome_id.to_string(),
+            receipt.evidence_id.to_string(),
+            receipt.r3_evidence_fingerprint,
+            receipt.dependency_kind
+        ],
+    )?;
+    let exact: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_execution_r3_consumption_anchors
+          WHERE anchor_id = ?1 AND anchor_fingerprint = ?2 AND receipt_id = ?3
+            AND receipt_fingerprint = ?4 AND operation_id = ?5 AND attempt_number = ?6
+            AND outcome_id = ?7 AND evidence_id = ?8 AND r3_evidence_fingerprint = ?9
+            AND dependency_kind = ?10)",
+        params![
+            anchor_id.to_string(),
+            anchor_fingerprint.as_slice(),
+            receipt_id.to_string(),
+            receipt_fingerprint.as_slice(),
+            receipt.operation_id.to_string(),
+            i64::from(receipt.attempt_number),
+            receipt.outcome_id.to_string(),
+            receipt.evidence_id.to_string(),
+            receipt.r3_evidence_fingerprint,
+            receipt.dependency_kind
+        ],
+        |row| row.get(0),
+    )?;
+    if !exact {
+        return Err(Error::LocalExecutionJournalMismatch);
+    }
+    Ok(())
+}
+
+fn consumption_anchor_is_exact(
+    connection: &Connection,
+    receipt: &BridgeReceiptFacts,
+) -> Result<bool> {
+    let receipt_fingerprint = bridge_receipt_fingerprint(receipt);
+    let anchor_fingerprint = bridge_consumption_anchor_fingerprint(receipt);
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_execution_r3_consumption_anchors
+          WHERE anchor_id = ?1 AND anchor_fingerprint = ?2 AND receipt_id = ?3
+            AND receipt_fingerprint = ?4 AND operation_id = ?5 AND attempt_number = ?6
+            AND outcome_id = ?7 AND evidence_id = ?8 AND r3_evidence_fingerprint = ?9
+            AND dependency_kind = ?10)",
+            params![
+                bridge_consumption_anchor_id(anchor_fingerprint).to_string(),
+                anchor_fingerprint.as_slice(),
+                bridge_receipt_id(receipt_fingerprint).to_string(),
+                receipt_fingerprint.as_slice(),
+                receipt.operation_id.to_string(),
+                i64::from(receipt.attempt_number),
+                receipt.outcome_id.to_string(),
+                receipt.evidence_id.to_string(),
+                receipt.r3_evidence_fingerprint,
+                receipt.dependency_kind
+            ],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+/// Read-only validation used by the final cursor gate. The public commit path
+/// has no bypass for this proof: it revalidates the immutable bridge receipt
+/// against the current local and R3 rows in the same cursor transaction.
+#[allow(clippy::too_many_lines)]
+fn r3_5_cursor_proof_is_exact(
+    journal: &SyncExecutionJournal,
+    transaction: &Transaction<'_>,
+    operation_id: Uuid,
+    evidence_id: Uuid,
+    dependency_kind: &str,
+) -> Result<bool> {
+    let row: Option<R3_5CursorProofRow> = transaction.query_row(
+        "SELECT receipt.receipt_id, receipt.receipt_fingerprint, receipt.boundary_id,
+                receipt.boundary_occurred_at_unix_ms, receipt.outcome_id,
+                receipt.outcome_occurred_at_unix_ms, receipt.local_evidence_fingerprint,
+                receipt.r3_intent_fingerprint, receipt.r3_evidence_fingerprint,
+                contract.contract_fingerprint, contract.intent_fingerprint, outcome.attempt_number,
+                outcome.outcome_id, outcome.evidence_id, outcome.outcome, evidence.attempt_number,
+                state.state_version, state.phase, state.disposition, state.last_evidence_id,
+                receipt.dependency_kind, receipt.r3_state_phase, receipt.r3_state_disposition,
+                receipt.r3_last_evidence_id, receipt.r3_event_state_version
+           FROM local_execution_contracts AS contract
+           JOIN local_execution_attempt_outcomes AS outcome ON outcome.operation_id = contract.operation_id
+           JOIN local_execution_attempt_boundaries AS boundary
+             ON boundary.operation_id = outcome.operation_id AND boundary.attempt_number = outcome.attempt_number
+           JOIN local_execution_r3_bridge_receipts AS receipt
+             ON receipt.operation_id = outcome.operation_id AND receipt.attempt_number = outcome.attempt_number
+           JOIN mutation_intents AS intent ON intent.operation_id = contract.operation_id
+           JOIN mutation_verification_evidence AS evidence
+             ON evidence.evidence_id = ?2 AND evidence.operation_id = contract.operation_id
+           JOIN mutation_state AS state ON state.operation_id = contract.operation_id
+           JOIN mutation_events AS event ON event.operation_id = state.operation_id
+             AND event.attempt_number = state.attempt_number
+             AND event.state_version = state.state_version
+             AND event.evidence_id = state.last_evidence_id
+          WHERE contract.operation_id = ?1
+            AND outcome.evidence_id = ?2
+            AND outcome.outcome = 'VerifiedApplied'
+            AND outcome.contract_fingerprint = contract.contract_fingerprint
+            AND boundary.contract_fingerprint = contract.contract_fingerprint
+            AND receipt.boundary_id = boundary.boundary_id
+            AND receipt.boundary_occurred_at_unix_ms = boundary.occurred_at_unix_ms
+            AND receipt.contract_fingerprint = contract.contract_fingerprint
+            AND receipt.outcome_id = outcome.outcome_id AND receipt.evidence_id = outcome.evidence_id
+            AND receipt.local_evidence_fingerprint = outcome.evidence_fingerprint
+            AND receipt.outcome_occurred_at_unix_ms = outcome.occurred_at_unix_ms
+            AND receipt.r3_intent_fingerprint = intent.intent_fingerprint
+            AND receipt.r3_evidence_fingerprint = evidence.evidence_fingerprint
+            AND receipt.r3_outcome_code IS evidence.outcome_code
+            AND evidence.outcome_code IS state.outcome_code
+            AND state.outcome_code IS event.outcome_code
+            AND receipt.r3_attempt_number = evidence.attempt_number
+            AND receipt.r3_attempt_number = state.attempt_number
+            AND receipt.r3_state_version = state.state_version
+            AND receipt.r3_event_state_version = state.state_version
+            AND receipt.r3_last_evidence_id = state.last_evidence_id
+            AND receipt.r3_state_phase = state.phase
+            AND receipt.r3_state_disposition = state.disposition
+            AND receipt.dependency_kind = ?3
+            AND evidence.capture_phase = 'post_verify'
+            AND evidence.disposition = 'verified_applied'
+            AND evidence.forbidden_side_effect = 0
+            AND state.phase = 'completed'
+            AND state.disposition = 'verified_applied'
+            AND event.phase = 'completed'
+            AND event.disposition = 'verified_applied'
+            AND event.evidence_id = ?2",
+        params![operation_id.to_string(), evidence_id.to_string(), dependency_kind],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?, row.get(14)?, row.get(15)?, row.get(16)?, row.get(17)?, row.get(18)?, row.get(19)?, row.get(20)?, row.get(21)?, row.get(22)?, row.get(23)?, row.get(24)?)),
+    ).optional()?;
+    let Some((
+        receipt_id,
+        receipt_fingerprint,
+        boundary_id,
+        boundary_at,
+        outcome_id,
+        outcome_at,
+        local_evidence_fingerprint,
+        r3_intent,
+        r3_evidence,
+        contract,
+        contract_intent,
+        local_attempt,
+        local_outcome_id,
+        local_evidence,
+        local_outcome,
+        r3_attempt,
+        state_version,
+        state_phase,
+        state_disposition,
+        last_evidence,
+        dependency_kind,
+        receipt_state_phase,
+        receipt_state_disposition,
+        receipt_last_evidence,
+        event_version,
+    )) = row
+    else {
+        return Ok(false);
+    };
+    let Ok(boundary_id) = parse_uuid(&boundary_id) else {
+        return Ok(false);
+    };
+    let Ok(outcome_id) = parse_uuid(&outcome_id) else {
+        return Ok(false);
+    };
+    let Ok(local_outcome_id) = parse_uuid(&local_outcome_id) else {
+        return Ok(false);
+    };
+    let Ok(local_evidence_id) = parse_uuid(&local_evidence) else {
+        return Ok(false);
+    };
+    let Ok(contract) = blob32(contract) else {
+        return Ok(false);
+    };
+    let Ok(contract_intent) = blob32(contract_intent) else {
+        return Ok(false);
+    };
+    let Ok(local_evidence_fingerprint) = blob32(local_evidence_fingerprint) else {
+        return Ok(false);
+    };
+    let Ok(receipt_fingerprint) = blob32(receipt_fingerprint) else {
+        return Ok(false);
+    };
+    let Ok(boundary_at) = u64::try_from(boundary_at) else {
+        return Ok(false);
+    };
+    let Ok(outcome_at) = u64::try_from(outcome_at) else {
+        return Ok(false);
+    };
+    let Ok(r3_attempt) = u32::try_from(r3_attempt) else {
+        return Ok(false);
+    };
+    let Ok(state_version) = u64::try_from(state_version) else {
+        return Ok(false);
+    };
+    let Ok(event_version) = u64::try_from(event_version) else {
+        return Ok(false);
+    };
+    let Ok(local_attempt) = u32::try_from(local_attempt) else {
+        return Ok(false);
+    };
+    let Ok(local_outcome) = LocalExecutionOutcome::parse(&local_outcome) else {
+        return Ok(false);
+    };
+    let Ok(receipt_last_evidence) = parse_uuid(&receipt_last_evidence) else {
+        return Ok(false);
+    };
+    let r3_outcome_code: Option<String> = transaction.query_row(
+        "SELECT outcome_code FROM mutation_state WHERE operation_id = ?1",
+        [operation_id.to_string()],
+        |row| row.get(0),
+    )?;
+    if r3_outcome_code
+        .as_deref()
+        .is_some_and(|code| validate_redacted_code(code).is_err())
+    {
+        return Ok(false);
+    }
+    if !persisted_verified_applied_mutation_evidence_is_exact(transaction, evidence_id)? {
+        return Ok(false);
+    }
+    if !mutation_history_is_exact(transaction, operation_id)? {
+        return Ok(false);
+    }
+    // The sealed journal is an immutable witness, not authority.  Requiring
+    // this exact independent preimage prevents a coherent rewrite of the
+    // SQLite outcome/receipt circular hashes from becoming cursor authority.
+    let collision: [u8; 32] = match transaction.query_row(
+        "SELECT collision_snapshot_fingerprint FROM local_execution_contracts WHERE operation_id = ?1",
+        [operation_id.to_string()],
+        |row| blob32(row.get(0)?).map_err(to_sql_error),
+    ) {
+        Ok(value) => value,
+        Err(_) => return Ok(false),
+    };
+    let expected_pre = PreSideEffectWitness {
+        operation_id,
+        attempt_number: local_attempt,
+        boundary_id,
+        boundary_occurred_at_unix_ms: boundary_at,
+        intent_fingerprint: contract_intent,
+        contract_fingerprint: contract,
+        collision_snapshot_fingerprint: collision,
+        created_at_unix_ms: boundary_at,
+    };
+    if exact_journal_pair(
+        journal,
+        &expected_pre,
+        outcome_id,
+        local_evidence_id,
+        local_outcome,
+        local_evidence_fingerprint,
+        outcome_at,
+        match parse_canonical_sha256(&r3_evidence) {
+            Some(value) => JournalR3Expectation::Bridged(value),
+            None => return Ok(false),
+        },
+    )
+    .is_err()
+    {
+        return Ok(false);
+    }
+    let (event_count, distinct_event_versions, minimum_event_version, maximum_event_version): (
+        i64,
+        i64,
+        Option<i64>,
+        Option<i64>,
+    ) = transaction.query_row(
+        "SELECT COUNT(*), COUNT(DISTINCT state_version), MIN(state_version), MAX(state_version)
+           FROM mutation_events WHERE operation_id = ?1 AND state_version BETWEEN 0 AND ?2",
+        params![operation_id.to_string(), u64_to_i64(state_version)?],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let Some(expected_event_count) = u64_to_i64(state_version)?.checked_add(1) else {
+        return Ok(false);
+    };
+    // Count all operation events: an extra future version is a forged
+    // history, even though it lies outside the state frontier.
+    let all_event_count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM mutation_events WHERE operation_id = ?1",
+        [operation_id.to_string()],
+        |row| row.get(0),
+    )?;
+    if event_count != expected_event_count
+        || all_event_count != event_count
+        || distinct_event_versions != event_count
+        || minimum_event_version != Some(0)
+        || maximum_event_version != Some(u64_to_i64(state_version)?)
+    {
+        return Ok(false);
+    }
+    let Ok(expected_local_intent) = local_intent_fingerprint_from_r3_intent(&r3_intent) else {
+        return Ok(false);
+    };
+    let receipt = BridgeReceiptFacts {
+        operation_id,
+        attempt_number: local_attempt,
+        boundary_id,
+        boundary_occurred_at_unix_ms: boundary_at,
+        contract_fingerprint: contract,
+        outcome_id,
+        evidence_id: local_evidence_id,
+        local_evidence_fingerprint,
+        outcome_occurred_at_unix_ms: outcome_at,
+        r3_intent_fingerprint: r3_intent,
+        r3_evidence_fingerprint: r3_evidence,
+        r3_outcome_code,
+        dependency_kind,
+        r3_state_phase: receipt_state_phase,
+        r3_state_disposition: receipt_state_disposition,
+        r3_attempt_number: r3_attempt,
+        r3_state_version: state_version,
+        r3_last_evidence_id: receipt_last_evidence,
+        r3_event_state_version: event_version,
+    };
+    let Ok(expected_consumption) = bridge_consumption_witness(&expected_pre, &receipt) else {
+        return Ok(false);
+    };
+    if parse_uuid(&receipt_id).ok() != Some(bridge_receipt_id(receipt_fingerprint))
+        || receipt_fingerprint != bridge_receipt_fingerprint(&receipt)
+        || !consumption_anchor_is_exact(transaction, &receipt)?
+        || outcome_id != local_outcome_id
+        || receipt.evidence_id != evidence_id
+        || contract_intent != expected_local_intent
+        || authoritative_outcome_id(
+            operation_id,
+            local_attempt,
+            boundary_id,
+            boundary_at,
+            local_evidence_id,
+            local_evidence_fingerprint,
+            local_outcome,
+            outcome_at,
+        ) != outcome_id
+        || state_phase != "completed"
+        || state_disposition != "verified_applied"
+        || last_evidence != evidence_id.to_string()
+        || !exact_bridge_consumption(journal, &expected_consumption)?
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+#[allow(dead_code)] // Retained as the narrower generic reopen primitive.
+fn persisted_mutation_evidence_fingerprint_is_exact(
+    connection: &Connection,
+    evidence_id: Uuid,
+) -> Result<bool> {
+    let evidence: Option<MutationVerificationEvidence> = connection.query_row(
+        "SELECT evidence_id, operation_id, attempt_number, capture_phase, disposition, outcome_code,
+                observed_account_id, observed_remote_root_id, observed_remote_file_id, observed_parent_id,
+                observed_path, observed_local_revision, observed_remote_revision, observed_sha256,
+                observed_byte_length, observed_operation_marker, forbidden_side_effect,
+                verified_received_byte_offset, resume_reference, evidence_fingerprint, captured_at_unix_ms
+           FROM mutation_verification_evidence WHERE evidence_id = ?1",
+        [evidence_id.to_string()],
+        |row| {
+            Ok(MutationVerificationEvidence {
+                evidence_id: parse_uuid(&row.get::<_, String>(0)?).map_err(to_sql_error)?,
+                operation_id: parse_uuid(&row.get::<_, String>(1)?).map_err(to_sql_error)?,
+                attempt_number: u32::try_from(row.get::<_, i64>(2)?)
+                    .map_err(|_| to_sql_error(Error::InvalidSchema))?,
+                capture_phase: match row.get::<_, String>(3)?.as_str() {
+                    "preflight" => MutationEvidenceCapturePhase::Preflight,
+                    "post_verify" => MutationEvidenceCapturePhase::PostVerify,
+                    "reconcile" => MutationEvidenceCapturePhase::Reconcile,
+                    _ => return Err(to_sql_error(Error::InvalidSchema)),
+                },
+                disposition: MutationDisposition::parse(&row.get::<_, String>(4)?)
+                    .map_err(to_sql_error)?,
+                outcome_code: row.get(5)?, observed_account_id: row.get(6)?,
+                observed_remote_root_id: row.get(7)?, observed_remote_file_id: row.get(8)?,
+                observed_parent_id: row.get(9)?, observed_path: row.get(10)?,
+                observed_local_revision: row.get(11)?, observed_remote_revision: row.get(12)?,
+                observed_sha256: row.get(13)?,
+                observed_byte_length: row.get::<_, Option<i64>>(14)?.map(u64::try_from).transpose()
+                    .map_err(|_| to_sql_error(Error::InvalidSchema))?,
+                observed_operation_marker: row.get(15)?,
+                forbidden_side_effect: row.get::<_, i64>(16)? == 1,
+                verified_received_byte_offset: row.get::<_, Option<i64>>(17)?.map(u64::try_from).transpose()
+                    .map_err(|_| to_sql_error(Error::InvalidSchema))?,
+                resume_reference: row.get(18)?, evidence_fingerprint: row.get(19)?,
+                captured_at_unix_ms: u64::try_from(row.get::<_, i64>(20)?)
+                    .map_err(|_| to_sql_error(Error::InvalidSchema))?,
+            })
+        },
+    ).optional()?;
+    Ok(evidence.is_some_and(|value| {
+        value.evidence_id == evidence_id
+            && value.evidence_fingerprint == value.canonical_fingerprint()
+    }))
+}
+
+/// Reopens the exact persisted R3 post-verify evidence as a typed value and
+/// validates both its canonical preimage and its semantic relationship to the
+/// immutable intent.  A self-consistent fingerprint alone is not evidence of
+/// a valid verified-applied observation.
+fn persisted_verified_applied_mutation_evidence_is_exact(
+    connection: &Connection,
+    evidence_id: Uuid,
+) -> Result<bool> {
+    let evidence: Option<MutationVerificationEvidence> = connection.query_row(
+        "SELECT evidence_id, operation_id, attempt_number, capture_phase, disposition, outcome_code,
+                observed_account_id, observed_remote_root_id, observed_remote_file_id, observed_parent_id,
+                observed_path, observed_local_revision, observed_remote_revision, observed_sha256,
+                observed_byte_length, observed_operation_marker, forbidden_side_effect,
+                verified_received_byte_offset, resume_reference, evidence_fingerprint, captured_at_unix_ms
+           FROM mutation_verification_evidence WHERE evidence_id = ?1",
+        [evidence_id.to_string()],
+        mutation_verification_evidence_from_row,
+    ).optional()?;
+    Ok(evidence.is_some_and(|value| {
+        value.evidence_id == evidence_id
+            && value.capture_phase == MutationEvidenceCapturePhase::PostVerify
+            && value.disposition == MutationDisposition::VerifiedApplied
+            && !value.forbidden_side_effect
+            && validate_mutation_evidence(&value).is_ok()
+            && validate_verified_applied_evidence(connection, &value).is_ok()
+    }))
+}
+
+/// Validates the whole append-only R3 history, not only the event that happens
+/// to match the current state.  R3.1/R3.5 retain a fail-closed no-blind-retry
+/// policy: a retry can occur only after exact persisted retry evidence and a
+/// due-time claim; the new Running attempt is not replay authority by itself.
+/// Supported histories additionally include
+/// `Running -> RetryScheduled -> Running(next attempt)`.
+#[allow(clippy::too_many_lines)]
+fn mutation_history_is_exact(connection: &Connection, operation_id: Uuid) -> Result<bool> {
+    let Some(intent) = load_persisted_mutation_intent(connection, operation_id)? else {
+        return Ok(false);
+    };
+    if intent.operation_id != operation_id || validate_mutation_intent(&intent).is_err() {
+        return Ok(false);
+    }
+    let Some(state) = load_mutation_state(connection, operation_id)? else {
+        return Ok(false);
+    };
+    let mut statement = connection.prepare(
+        "SELECT event_id, operation_id, attempt_number, state_version, phase, disposition,
+                evidence_id, outcome_code, occurred_at_unix_ms
+           FROM mutation_events WHERE operation_id = ?1 ORDER BY state_version, event_id",
+    )?;
+    let events = statement
+        .query_map([operation_id.to_string()], |row| {
+            row_to_mutation_event(row).map_err(to_sql_error)
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if state
+        .state_version
+        .checked_add(1)
+        .and_then(|n| usize::try_from(n).ok())
+        != Some(events.len())
+    {
+        return Ok(false);
+    }
+    let Some(initial) = events.first() else {
+        return Ok(false);
+    };
+    if initial.operation_id != operation_id
+        || initial.state_version != 0
+        || initial.attempt_number != 0
+        || initial.phase != MutationPhase::IntentDurable
+        || initial.disposition.is_some()
+        || initial.evidence_id.is_some()
+        || initial.outcome_code.is_some()
+        || initial.occurred_at_unix_ms != intent.registered_at_unix_ms
+    {
+        return Ok(false);
+    }
+    let mut previous = initial;
+    for (version, event) in events.iter().enumerate().skip(1) {
+        let retry_claim = previous.phase == MutationPhase::RetryScheduled
+            && event.phase == MutationPhase::Running;
+        let expected_attempt = previous.attempt_number.checked_add(u32::from(retry_claim));
+        if event.operation_id != operation_id
+            || event.state_version != u64::try_from(version).map_err(|_| Error::InvalidSchema)?
+            || Some(event.attempt_number) != expected_attempt
+            || event.occurred_at_unix_ms < previous.occurred_at_unix_ms
+        {
+            return Ok(false);
+        }
+        let legal = matches!(
+            (previous.phase, event.phase),
+            (
+                MutationPhase::IntentDurable,
+                MutationPhase::Running | MutationPhase::NeedsReconcile
+            ) | (
+                MutationPhase::Running | MutationPhase::NeedsReconcile,
+                MutationPhase::Completed
+            ) | (
+                MutationPhase::Running,
+                MutationPhase::NeedsReconcile | MutationPhase::RetryScheduled
+            ) | (MutationPhase::RetryScheduled, MutationPhase::Running)
+        );
+        if !legal {
+            return Ok(false);
+        }
+        match event.phase {
+            MutationPhase::Running => {
+                if event.disposition.is_some()
+                    || event.evidence_id.is_some()
+                    || event.outcome_code.is_some()
+                {
+                    return Ok(false);
+                }
+            }
+            MutationPhase::Completed
+            | MutationPhase::NeedsReconcile
+            | MutationPhase::RetryScheduled => {
+                let Some(evidence_id) = event.evidence_id else {
+                    return Ok(false);
+                };
+                let Some(evidence) = connection.query_row(
+                    "SELECT evidence_id, operation_id, attempt_number, capture_phase, disposition, outcome_code,
+                            observed_account_id, observed_remote_root_id, observed_remote_file_id, observed_parent_id,
+                            observed_path, observed_local_revision, observed_remote_revision, observed_sha256,
+                            observed_byte_length, observed_operation_marker, forbidden_side_effect,
+                            verified_received_byte_offset, resume_reference, evidence_fingerprint, captured_at_unix_ms
+                       FROM mutation_verification_evidence WHERE evidence_id = ?1",
+                    [evidence_id.to_string()], mutation_verification_evidence_from_row,
+                ).optional()? else { return Ok(false) };
+                if validate_mutation_evidence(&evidence).is_err()
+                    || evidence.operation_id != operation_id
+                    || evidence.attempt_number != event.attempt_number
+                    || evidence.disposition
+                        != event.disposition.unwrap_or(MutationDisposition::RetrySafe)
+                    || evidence.outcome_code != event.outcome_code
+                    || evidence.captured_at_unix_ms != event.occurred_at_unix_ms
+                {
+                    return Ok(false);
+                }
+                match event.phase {
+                    MutationPhase::Completed
+                        if event.disposition == Some(MutationDisposition::VerifiedApplied)
+                            && evidence.capture_phase
+                                == MutationEvidenceCapturePhase::PostVerify
+                            && !evidence.forbidden_side_effect =>
+                    {
+                        if validate_verified_applied_evidence_against_intent(&intent, &evidence)
+                            .is_err()
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    MutationPhase::NeedsReconcile
+                        if event.disposition == Some(MutationDisposition::NeedsReconcile) =>
+                    {
+                        // Initial reconciliation is not a generic escape hatch:
+                        // only the non-executable remote-existing contract may
+                        // make this direct transition, and every captured fact
+                        // must still equal the immutable intent.
+                        if previous.phase == MutationPhase::IntentDurable
+                            && validate_remote_existing_blocked_initial_needs_reconcile(
+                                &intent, &evidence,
+                            )
+                            .is_err()
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    MutationPhase::RetryScheduled
+                        if event.disposition == Some(MutationDisposition::VerifiedNotApplied)
+                            && evidence.capture_phase
+                                == MutationEvidenceCapturePhase::Reconcile
+                            && evidence.forbidden_side_effect =>
+                    {
+                        if validate_verified_applied_evidence_against_intent(&intent, &evidence)
+                            .is_err()
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    MutationPhase::RetryScheduled
+                        if event.disposition == Some(MutationDisposition::RetrySafe)
+                            && evidence.capture_phase
+                                == MutationEvidenceCapturePhase::Reconcile
+                            && !evidence.forbidden_side_effect
+                            && evidence.resume_reference.is_some()
+                            && evidence.verified_received_byte_offset.is_some() =>
+                    {
+                        if validate_verified_applied_evidence_against_intent(&intent, &evidence)
+                            .is_err()
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    _ => return Ok(false),
+                }
+                if event.phase == MutationPhase::RetryScheduled
+                    && !mutation_retry_contract_matches_event(connection, event)?
+                {
+                    return Ok(false);
+                }
+            }
+            MutationPhase::IntentDurable => return Ok(false),
+        }
+        previous = event;
+    }
+    let retry_state_is_exact = match state.phase {
+        MutationPhase::RetryScheduled => match state.disposition {
+            Some(MutationDisposition::VerifiedNotApplied) => {
+                state.next_attempt_at_unix_ms.is_some()
+                    && state.retry_mode == Some(MutationRetryMode::RestartExact)
+                    && state.resume_reference.is_none()
+            }
+            Some(MutationDisposition::RetrySafe) => {
+                state.next_attempt_at_unix_ms.is_some()
+                    && state.retry_mode == Some(MutationRetryMode::ResumeExact)
+                    && state.resume_reference.is_some()
+            }
+            _ => false,
+        },
+        _ => {
+            state.next_attempt_at_unix_ms.is_none()
+                && state.retry_mode.is_none()
+                && state.resume_reference.is_none()
+        }
+    };
+    let retry_event_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM mutation_events WHERE operation_id = ?1 AND phase = 'retry_scheduled'",
+        [operation_id.to_string()], |row| row.get(0),
+    )?;
+    let retry_contract_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM mutation_retry_contracts WHERE operation_id = ?1",
+        [operation_id.to_string()],
+        |row| row.get(0),
+    )?;
+    Ok(retry_state_is_exact
+        && retry_event_count == retry_contract_count
+        && (state.phase != MutationPhase::RetryScheduled
+            || mutation_retry_contract_matches_state(connection, &state)?)
+        && previous.operation_id == state.operation_id
+        && previous.attempt_number == state.attempt_number
+        && previous.state_version == state.state_version
+        && previous.phase == state.phase
+        && previous.disposition == state.disposition
+        && previous.evidence_id == state.last_evidence_id
+        && previous.outcome_code == state.outcome_code
+        && previous.occurred_at_unix_ms == state.updated_at_unix_ms)
+}
+
+fn mutation_verification_evidence_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<MutationVerificationEvidence> {
+    Ok(MutationVerificationEvidence {
+        evidence_id: parse_uuid(&row.get::<_, String>(0)?).map_err(to_sql_error)?,
+        operation_id: parse_uuid(&row.get::<_, String>(1)?).map_err(to_sql_error)?,
+        attempt_number: u32::try_from(row.get::<_, i64>(2)?)
+            .map_err(|_| to_sql_error(Error::InvalidSchema))?,
+        capture_phase: match row.get::<_, String>(3)?.as_str() {
+            "preflight" => MutationEvidenceCapturePhase::Preflight,
+            "post_verify" => MutationEvidenceCapturePhase::PostVerify,
+            "reconcile" => MutationEvidenceCapturePhase::Reconcile,
+            _ => return Err(to_sql_error(Error::InvalidSchema)),
+        },
+        disposition: MutationDisposition::parse(&row.get::<_, String>(4)?).map_err(to_sql_error)?,
+        outcome_code: row.get(5)?,
+        observed_account_id: row.get(6)?,
+        observed_remote_root_id: row.get(7)?,
+        observed_remote_file_id: row.get(8)?,
+        observed_parent_id: row.get(9)?,
+        observed_path: row.get(10)?,
+        observed_local_revision: row.get(11)?,
+        observed_remote_revision: row.get(12)?,
+        observed_sha256: row.get(13)?,
+        observed_byte_length: row
+            .get::<_, Option<i64>>(14)?
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| to_sql_error(Error::InvalidSchema))?,
+        observed_operation_marker: row.get(15)?,
+        forbidden_side_effect: row.get::<_, i64>(16)? == 1,
+        verified_received_byte_offset: row
+            .get::<_, Option<i64>>(17)?
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| to_sql_error(Error::InvalidSchema))?,
+        resume_reference: row.get(18)?,
+        evidence_fingerprint: row.get(19)?,
+        captured_at_unix_ms: u64::try_from(row.get::<_, i64>(20)?)
+            .map_err(|_| to_sql_error(Error::InvalidSchema))?,
+    })
+}
+
+fn local_execution_completion_id(operation_id: Uuid) -> String {
+    format!("local-execution-completion:{operation_id}")
+}
+
+fn insert_local_execution_identity(
+    transaction: &Transaction<'_>,
+    operation_id: Uuid,
+    identity: &PersistedIdentityEvidence<'_>,
+) -> Result<()> {
+    let evidence_id = format!("local-execution-identity:{operation_id}:{}", identity.role);
+    transaction.execute(
+        "INSERT INTO local_execution_identity_evidence(
+            evidence_id, operation_id, role, evidence_version, evidence_kind,
+            object_kind, provider_id, object_id, attestation, stable_identity_fingerprint
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            evidence_id,
+            operation_id.to_string(),
+            identity.role,
+            i64::from(identity.version),
+            i64::from(identity.kind),
+            i64::from(identity.object_kind),
+            identity.provider_id,
+            identity.object_id,
+            identity.attestation,
+            identity.stable_identity_fingerprint.as_slice(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn blob32(value: Vec<u8>) -> Result<[u8; 32]> {
+    value.try_into().map_err(|_| Error::InvalidSchema)
+}
+
+fn parse_canonical_sha256(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut parsed = [0_u8; 32];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_nibble(chunk[0])?;
+        let low = hex_nibble(chunk[1])?;
+        parsed[index] = (high << 4) | low;
+    }
+    Some(parsed)
+}
+
+const fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn to_sql_error(error: Error) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(error))
 }
 
 fn validate_mutation_intent(intent: &MutationIntent) -> Result<()> {
@@ -4451,59 +7595,65 @@ fn append_canonical_bytes(digest: &mut Sha256, value: &[u8]) {
     digest.update(value);
 }
 
-struct MutationEvidenceExpectation {
-    account_id: Option<String>,
-    remote_root_id: Option<String>,
-    remote_file_id: Option<String>,
-    source_parent_id: Option<String>,
-    destination_parent_id: Option<String>,
-    source_path: Option<String>,
-    destination_path: Option<String>,
-    expected_local_revision: Option<String>,
-    expected_remote_revision: Option<String>,
-    expected_local_sha256: Option<String>,
-    expected_local_byte_length: Option<u64>,
-    expected_remote_sha256: Option<String>,
-    expected_remote_byte_length: Option<u64>,
-    operation_marker: String,
-}
-
-fn load_mutation_evidence_expectation(
+/// Reconstructs the complete persisted immutable preimage.  Callers that
+/// validate evidence must use this value rather than a lossy projection so a
+/// `SQLite` rewrite of a field not observed by the evidence cannot create a
+/// split view of the operation.
+fn load_persisted_mutation_intent(
     connection: &Connection,
     operation_id: Uuid,
-) -> Result<Option<MutationEvidenceExpectation>> {
+) -> Result<Option<MutationIntent>> {
     connection
         .query_row(
-            "SELECT account_id, remote_root_id, remote_file_id, source_parent_id,
-                    destination_parent_id, source_path, destination_path, expected_local_revision,
-                    expected_remote_revision, expected_local_sha256, expected_local_byte_length,
-                    expected_remote_sha256, expected_remote_byte_length, operation_marker
+            "SELECT operation_id, operation_kind, account_id, remote_root_id, remote_file_id,
+                    source_parent_id, destination_parent_id, local_object_id, source_path,
+                    destination_path, expected_local_revision, expected_remote_revision,
+                    base_reference, base_local_revision, base_remote_revision, base_sha256,
+                    base_byte_length, expected_local_sha256, expected_local_byte_length,
+                    expected_remote_sha256, expected_remote_byte_length, operation_marker,
+                    intent_fingerprint, registered_at_unix_ms
              FROM mutation_intents WHERE operation_id = ?1",
             [operation_id.to_string()],
             |row| {
-                Ok(MutationEvidenceExpectation {
-                    account_id: row.get(0)?,
-                    remote_root_id: row.get(1)?,
-                    remote_file_id: row.get(2)?,
-                    source_parent_id: row.get(3)?,
-                    destination_parent_id: row.get(4)?,
-                    source_path: row.get(5)?,
-                    destination_path: row.get(6)?,
-                    expected_local_revision: row.get(7)?,
-                    expected_remote_revision: row.get(8)?,
-                    expected_local_sha256: row.get(9)?,
+                Ok(MutationIntent {
+                    operation_id: parse_uuid(&row.get::<_, String>(0)?).map_err(to_sql_error)?,
+                    operation_kind: MutationOperationKind::parse(&row.get::<_, String>(1)?)
+                        .map_err(to_sql_error)?,
+                    account_id: row.get(2)?,
+                    remote_root_id: row.get(3)?,
+                    remote_file_id: row.get(4)?,
+                    source_parent_id: row.get(5)?,
+                    destination_parent_id: row.get(6)?,
+                    local_object_id: row.get(7)?,
+                    source_path: row.get(8)?,
+                    destination_path: row.get(9)?,
+                    expected_local_revision: row.get(10)?,
+                    expected_remote_revision: row.get(11)?,
+                    base_reference: row.get(12)?,
+                    base_local_revision: row.get(13)?,
+                    base_remote_revision: row.get(14)?,
+                    base_sha256: row.get(15)?,
+                    base_byte_length: row
+                        .get::<_, Option<i64>>(16)?
+                        .map(u64::try_from)
+                        .transpose()
+                        .map_err(|_| to_sql_error(Error::InvalidSchema))?,
+                    expected_local_sha256: row.get(17)?,
                     expected_local_byte_length: row
-                        .get::<_, Option<i64>>(10)?
+                        .get::<_, Option<i64>>(18)?
                         .map(u64::try_from)
                         .transpose()
-                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(10, 0))?,
-                    expected_remote_sha256: row.get(11)?,
+                        .map_err(|_| to_sql_error(Error::InvalidSchema))?,
+                    expected_remote_sha256: row.get(19)?,
                     expected_remote_byte_length: row
-                        .get::<_, Option<i64>>(12)?
+                        .get::<_, Option<i64>>(20)?
                         .map(u64::try_from)
                         .transpose()
-                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(12, 0))?,
-                    operation_marker: row.get(13)?,
+                        .map_err(|_| to_sql_error(Error::InvalidSchema))?,
+                    operation_marker: row.get(21)?,
+                    intent_fingerprint: row.get(22)?,
+                    registered_at_unix_ms: u64::try_from(row.get::<_, i64>(23)?)
+                        .map_err(|_| to_sql_error(Error::InvalidSchema))?,
                 })
             },
         )
@@ -4527,8 +7677,16 @@ fn validate_verified_applied_evidence(
     {
         return Err(Error::InvalidTransferEvidence);
     }
-    let intent = load_mutation_evidence_expectation(connection, evidence.operation_id)?
+    let intent = load_persisted_mutation_intent(connection, evidence.operation_id)?
         .ok_or(Error::MutationNotFound)?;
+    validate_mutation_intent(&intent)?;
+    validate_verified_applied_evidence_against_intent(&intent, evidence)
+}
+
+fn validate_verified_applied_evidence_against_intent(
+    intent: &MutationIntent,
+    evidence: &MutationVerificationEvidence,
+) -> Result<()> {
     let expected_parent = intent
         .destination_parent_id
         .as_ref()
@@ -4627,6 +7785,40 @@ fn validate_mutation_evidence(evidence: &MutationVerificationEvidence) -> Result
     }
     if let Some(reference) = &evidence.resume_reference {
         validate_private_reference(reference)?;
+    }
+    Ok(())
+}
+
+/// The one permitted initial `IntentDurable -> NeedsReconcile` representation.
+/// This is deliberately shared by registration and history validation so a
+/// self-canonical forensic rewrite cannot turn a persisted initial event into
+/// a different blocked contract after registration has accepted it.
+fn validate_remote_existing_blocked_initial_needs_reconcile(
+    intent: &MutationIntent,
+    evidence: &MutationVerificationEvidence,
+) -> Result<()> {
+    if intent.operation_kind != MutationOperationKind::RemoteExistingBlocked
+        || evidence.operation_id != intent.operation_id
+        || evidence.attempt_number != 0
+        || evidence.capture_phase != MutationEvidenceCapturePhase::Preflight
+        || evidence.disposition != MutationDisposition::NeedsReconcile
+        || !evidence.forbidden_side_effect
+        || evidence.outcome_code.as_deref() != Some("remote_existing_blocked")
+        || evidence.captured_at_unix_ms != intent.registered_at_unix_ms
+        || evidence.observed_account_id != intent.account_id
+        || evidence.observed_remote_root_id != intent.remote_root_id
+        || evidence.observed_remote_file_id != intent.remote_file_id
+        || evidence.observed_parent_id != intent.source_parent_id
+        || evidence.observed_path != intent.source_path
+        || evidence.observed_local_revision != intent.expected_local_revision
+        || evidence.observed_remote_revision != intent.expected_remote_revision
+        || evidence.observed_sha256 != intent.expected_remote_sha256
+        || evidence.observed_byte_length != intent.expected_remote_byte_length
+        || evidence.observed_operation_marker.as_deref() != Some(intent.operation_marker.as_str())
+        || evidence.verified_received_byte_offset.is_some()
+        || evidence.resume_reference.is_some()
+    {
+        return Err(Error::InvalidTransferEvidence);
     }
     Ok(())
 }
@@ -4738,6 +7930,43 @@ fn transition_target(
                 None,
                 None,
                 None,
+            ))
+        }
+        MutationOutcomeTransition::VerifiedNotApplied {
+            next_attempt_at_unix_ms,
+        } if current == MutationPhase::Running
+            && evidence.disposition == MutationDisposition::VerifiedNotApplied
+            && evidence.capture_phase == MutationEvidenceCapturePhase::Reconcile
+            && evidence.forbidden_side_effect
+            && evidence.outcome_code.as_deref() == Some("verified_not_applied")
+            && *next_attempt_at_unix_ms >= evidence.captured_at_unix_ms =>
+        {
+            Ok((
+                MutationPhase::RetryScheduled,
+                MutationDisposition::VerifiedNotApplied,
+                Some(*next_attempt_at_unix_ms),
+                Some(MutationRetryMode::RestartExact),
+                None,
+            ))
+        }
+        MutationOutcomeTransition::RetrySafe {
+            next_attempt_at_unix_ms,
+            resume_reference,
+        } if current == MutationPhase::Running
+            && evidence.disposition == MutationDisposition::RetrySafe
+            && evidence.capture_phase == MutationEvidenceCapturePhase::Reconcile
+            && !evidence.forbidden_side_effect
+            && evidence.outcome_code.as_deref() == Some("retry_safe")
+            && evidence.resume_reference.as_deref() == Some(resume_reference.as_str())
+            && evidence.verified_received_byte_offset.is_some()
+            && *next_attempt_at_unix_ms >= evidence.captured_at_unix_ms =>
+        {
+            Ok((
+                MutationPhase::RetryScheduled,
+                MutationDisposition::RetrySafe,
+                Some(*next_attempt_at_unix_ms),
+                Some(MutationRetryMode::ResumeExact),
+                Some(resume_reference.clone()),
             ))
         }
         _ => Err(Error::InvalidStateTransition),
@@ -4894,6 +8123,123 @@ fn insert_mutation_evidence(
         ],
     )?;
     Ok(())
+}
+
+fn insert_mutation_retry_contract(
+    transaction: &Transaction<'_>,
+    state: &MutationState,
+    evidence: &MutationVerificationEvidence,
+) -> Result<()> {
+    let (Some(disposition), Some(due), Some(mode)) = (
+        state.disposition,
+        state.next_attempt_at_unix_ms,
+        state.retry_mode,
+    ) else {
+        return Err(Error::InvalidStateTransition);
+    };
+    transaction.execute(
+        "INSERT INTO mutation_retry_contracts(
+            operation_id, state_version, attempt_number, evidence_id, evidence_fingerprint,
+            disposition, outcome_code, due_at_unix_ms, retry_mode, resume_reference,
+            verified_received_byte_offset, captured_at_unix_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            state.operation_id.to_string(),
+            u64_to_i64(state.state_version)?,
+            i64::from(state.attempt_number),
+            evidence.evidence_id.to_string(),
+            evidence.evidence_fingerprint,
+            disposition.as_str(),
+            evidence.outcome_code,
+            u64_to_i64(due)?,
+            mode.as_str(),
+            state.resume_reference,
+            evidence
+                .verified_received_byte_offset
+                .map(u64_to_i64)
+                .transpose()?,
+            u64_to_i64(evidence.captured_at_unix_ms)?
+        ],
+    )?;
+    if !mutation_retry_contract_matches_state(transaction, state)? {
+        return Err(Error::LocalMutationIncomplete);
+    }
+    Ok(())
+}
+
+fn mutation_retry_contract_matches_state(
+    connection: &Connection,
+    state: &MutationState,
+) -> Result<bool> {
+    if state.phase != MutationPhase::RetryScheduled {
+        return Ok(false);
+    }
+    let Some(evidence_id) = state.last_evidence_id else {
+        return Ok(false);
+    };
+    let Some(disposition) = state.disposition else {
+        return Ok(false);
+    };
+    let Some(due) = state.next_attempt_at_unix_ms else {
+        return Ok(false);
+    };
+    let Some(mode) = state.retry_mode else {
+        return Ok(false);
+    };
+    connection.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM mutation_retry_contracts AS contract
+           JOIN mutation_verification_evidence AS evidence ON evidence.evidence_id = contract.evidence_id
+            WHERE contract.operation_id = ?1 AND contract.state_version = ?2
+              AND contract.attempt_number = ?3 AND contract.evidence_id = ?4
+              AND contract.evidence_fingerprint = evidence.evidence_fingerprint
+              AND contract.disposition = ?5 AND contract.outcome_code IS ?6
+              AND contract.due_at_unix_ms = ?7 AND contract.retry_mode = ?8
+              AND contract.resume_reference IS ?9
+              AND contract.verified_received_byte_offset IS evidence.verified_received_byte_offset
+              AND contract.captured_at_unix_ms = evidence.captured_at_unix_ms
+              AND contract.due_at_unix_ms >= evidence.captured_at_unix_ms
+              AND evidence.operation_id = ?1 AND evidence.attempt_number = ?3
+              AND evidence.disposition = ?5 AND evidence.outcome_code IS ?6
+              AND evidence.resume_reference IS ?9)",
+        params![state.operation_id.to_string(), u64_to_i64(state.state_version)?,
+            i64::from(state.attempt_number), evidence_id.to_string(), disposition.as_str(),
+            state.outcome_code, u64_to_i64(due)?, mode.as_str(), state.resume_reference],
+        |row| row.get(0),
+    ).map_err(Into::into)
+}
+
+fn mutation_retry_contract_matches_event(
+    connection: &Connection,
+    event: &MutationEvent,
+) -> Result<bool> {
+    let Some(evidence_id) = event.evidence_id else {
+        return Ok(false);
+    };
+    let Some(disposition) = event.disposition else {
+        return Ok(false);
+    };
+    let state = MutationState {
+        operation_id: event.operation_id, attempt_number: event.attempt_number,
+        state_version: event.state_version, phase: MutationPhase::RetryScheduled,
+        disposition: Some(disposition), next_attempt_at_unix_ms: connection.query_row(
+            "SELECT due_at_unix_ms FROM mutation_retry_contracts WHERE operation_id = ?1 AND state_version = ?2",
+            params![event.operation_id.to_string(), u64_to_i64(event.state_version)?], |row| {
+                u64::try_from(row.get::<_, i64>(0)?)
+                    .map_err(|_| to_sql_error(Error::InvalidSchema))
+            },
+        ).optional()?, retry_mode: connection.query_row(
+            "SELECT retry_mode FROM mutation_retry_contracts WHERE operation_id = ?1 AND state_version = ?2",
+            params![event.operation_id.to_string(), u64_to_i64(event.state_version)?], |row| {
+                MutationRetryMode::parse(&row.get::<_, String>(0)?).map_err(to_sql_error)
+            },
+        ).optional()?, resume_reference: connection.query_row(
+            "SELECT resume_reference FROM mutation_retry_contracts WHERE operation_id = ?1 AND state_version = ?2",
+            params![event.operation_id.to_string(), u64_to_i64(event.state_version)?], |row| row.get(0),
+        ).optional()?.flatten(), last_evidence_id: Some(evidence_id),
+        outcome_code: event.outcome_code.clone(), updated_at_unix_ms: event.occurred_at_unix_ms,
+    };
+    mutation_retry_contract_matches_state(connection, &state)
 }
 
 fn insert_conflict_evidence(
@@ -5313,6 +8659,31 @@ fn load_mutation_events(connection: &Connection, operation_id: Uuid) -> Result<V
     .collect()
 }
 
+fn row_to_mutation_event(row: &rusqlite::Row<'_>) -> Result<MutationEvent> {
+    let outcome_code: Option<String> = row.get(7)?;
+    if let Some(code) = &outcome_code {
+        validate_redacted_code(code)?;
+    }
+    Ok(MutationEvent {
+        event_id: u64::try_from(row.get::<_, i64>(0)?).map_err(|_| Error::InvalidSchema)?,
+        operation_id: parse_uuid(&row.get::<_, String>(1)?)?,
+        attempt_number: u32::try_from(row.get::<_, i64>(2)?).map_err(|_| Error::InvalidSchema)?,
+        state_version: u64::try_from(row.get::<_, i64>(3)?).map_err(|_| Error::InvalidSchema)?,
+        phase: MutationPhase::parse(&row.get::<_, String>(4)?)?,
+        disposition: row
+            .get::<_, Option<String>>(5)?
+            .map(|value| MutationDisposition::parse(&value))
+            .transpose()?,
+        evidence_id: row
+            .get::<_, Option<String>>(6)?
+            .map(|value| parse_uuid(&value))
+            .transpose()?,
+        outcome_code,
+        occurred_at_unix_ms: u64::try_from(row.get::<_, i64>(8)?)
+            .map_err(|_| Error::InvalidSchema)?,
+    })
+}
+
 fn interrupted_mutation_evidence(
     operation_id: Uuid,
     attempt_number: u32,
@@ -5346,7 +8717,7 @@ fn interrupted_mutation_evidence(
     evidence
 }
 
-fn create_or_open_storage_dir(
+pub(crate) fn create_or_open_storage_dir(
     parent: &Dir,
     name: impl AsRef<Path>,
     policy: PrivateStoragePolicy,
@@ -5360,7 +8731,10 @@ fn create_or_open_storage_dir(
     }
 }
 
-fn harden_new_storage_file(file: &cap_std::fs::File, policy: PrivateStoragePolicy) -> Result<()> {
+pub(crate) fn harden_new_storage_file(
+    file: &cap_std::fs::File,
+    policy: PrivateStoragePolicy,
+) -> Result<()> {
     match policy {
         PrivateStoragePolicy::Standard => private_fs::set_private_file_permissions(file)?,
         #[cfg(target_os = "android")]
@@ -5371,7 +8745,10 @@ fn harden_new_storage_file(file: &cap_std::fs::File, policy: PrivateStoragePolic
     Ok(())
 }
 
-fn verify_storage_file(file: &cap_std::fs::File, policy: PrivateStoragePolicy) -> Result<()> {
+pub(crate) fn verify_storage_file(
+    file: &cap_std::fs::File,
+    policy: PrivateStoragePolicy,
+) -> Result<()> {
     match policy {
         PrivateStoragePolicy::Standard => private_fs::verify_private_file(file, 1)?,
         #[cfg(target_os = "android")]
@@ -5387,16 +8764,72 @@ fn open_storage_file(
     name: impl AsRef<Path>,
     policy: PrivateStoragePolicy,
 ) -> Result<()> {
+    let _ = open_existing_storage_file(parent, name, policy)?;
+    Ok(())
+}
+
+pub(crate) fn open_existing_storage_file(
+    parent: &Dir,
+    name: impl AsRef<Path>,
+    policy: PrivateStoragePolicy,
+) -> Result<cap_std::fs::File> {
     match policy {
-        PrivateStoragePolicy::Standard => {
-            private_fs::open_private_file(parent, name, 1)?;
-        }
+        PrivateStoragePolicy::Standard => Ok(private_fs::open_private_file(parent, name, 1)?),
         #[cfg(target_os = "android")]
         PrivateStoragePolicy::NativeAndroidNoBackup => {
-            private_fs::open_android_private_file(parent, name)?;
+            Ok(private_fs::open_android_private_file(parent, name)?)
         }
     }
-    Ok(())
+}
+
+/// Opens an existing private storage file with the write capability required
+/// to flush a crash-recovered exact temp on Windows.  Normal reads must keep
+/// using [`open_existing_storage_file`].
+pub(crate) fn open_existing_storage_file_read_write(
+    parent: &Dir,
+    name: impl AsRef<Path>,
+    policy: PrivateStoragePolicy,
+) -> Result<cap_std::fs::File> {
+    match policy {
+        PrivateStoragePolicy::Standard => {
+            Ok(private_fs::open_private_file_read_write(parent, name, 1)?)
+        }
+        #[cfg(target_os = "android")]
+        PrivateStoragePolicy::NativeAndroidNoBackup => Ok(
+            private_fs::open_android_private_file_read_write(parent, name)?,
+        ),
+    }
+}
+
+pub(crate) fn open_existing_storage_dir(
+    parent: &Dir,
+    name: &str,
+    policy: PrivateStoragePolicy,
+) -> Result<Dir> {
+    match policy {
+        PrivateStoragePolicy::Standard => Ok(private_fs::open_private_dir(parent, name)?),
+        #[cfg(target_os = "android")]
+        PrivateStoragePolicy::NativeAndroidNoBackup => {
+            if parent
+                .symlink_metadata(name)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                return Err(Error::LocalExecutionJournalMismatch);
+            }
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .follow(FollowSymlinks::No)
+                .maybe_dir(true);
+            let file = parent.open_with(name, &options)?;
+            if !file.metadata()?.is_dir() {
+                return Err(Error::LocalExecutionJournalMismatch);
+            }
+            let directory = Dir::from_std_file(file.into_std());
+            private_fs::inspect_android_held_directory(&directory)?;
+            Ok(directory)
+        }
+    }
 }
 
 fn acquire_sync_lease(
@@ -5436,7 +8869,7 @@ fn acquire_sync_lease(
     Ok(lease)
 }
 
-fn migrate(connection: &mut Connection) -> Result<()> {
+fn migrate(connection: &mut Connection, expected_vault_id: Uuid) -> Result<()> {
     let transaction = connection.transaction()?;
     let integrity: String = transaction.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
     if integrity != "ok" {
@@ -5488,15 +8921,72 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         }
         migrate_v4_to_v5(&transaction)?;
     }
-    if !schema_v5_is_valid(&transaction)? {
+    let after_v4: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if after_v4 == 5 {
+        if !schema_v5_is_valid(&transaction)? {
+            return Err(Error::InvalidSchema);
+        }
+        migrate_v5_to_v6(&transaction)?;
+    }
+    // v6 is local and unstaged.  Its additive proof families may be absent
+    // only as complete families on an earlier local v6 database; partial
+    // families are forensic corruption and are never auto-repaired.
+    ensure_unshipped_v6_extension_schema(&transaction)?;
+    if !schema_v6_is_valid(&transaction, expected_vault_id)? {
         return Err(Error::InvalidSchema);
     }
     transaction.commit()?;
     Ok(())
 }
 
+fn ensure_unshipped_v6_extension_schema(transaction: &Transaction<'_>) -> Result<()> {
+    const FAMILIES: [&[&str]; 3] = [
+        &[
+            "local_execution_r3_bridge_receipts",
+            "local_execution_bridge_receipt_operation_idx",
+            "local_execution_bridge_receipts_no_update",
+            "local_execution_bridge_receipts_no_delete",
+        ],
+        &[
+            "local_execution_r3_consumption_anchors",
+            "local_execution_consumption_anchor_operation_idx",
+            "local_execution_consumption_anchors_no_update",
+            "local_execution_consumption_anchors_no_delete",
+        ],
+        &[
+            "mutation_retry_contracts",
+            "mutation_retry_contract_operation_idx",
+            "mutation_retry_contracts_no_update",
+            "mutation_retry_contracts_no_delete",
+        ],
+    ];
+    for names in FAMILIES {
+        let present = names.iter().try_fold(0_i64, |count, name| {
+            let exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = ?1)",
+                [*name],
+                |row| row.get(0),
+            )?;
+            Ok::<_, Error>(count + i64::from(exists))
+        })?;
+        if present == 0 {
+            for (_, name, statement) in LOCAL_EXECUTION_SCHEMA_OBJECTS {
+                if names.contains(&name) {
+                    transaction.execute_batch(statement)?;
+                }
+            }
+        } else if present != i64::try_from(names.len()).expect("constant length fits i64") {
+            return Err(Error::InvalidSchema);
+        }
+    }
+    Ok(())
+}
+
 fn create_schema(transaction: &Transaction<'_>) -> Result<()> {
-    for (_, _, statement) in SCHEMA_OBJECTS {
+    for (_, _, statement) in SCHEMA_OBJECTS_V5
+        .iter()
+        .chain(LOCAL_EXECUTION_SCHEMA_OBJECTS.iter())
+    {
         transaction.execute_batch(statement)?;
     }
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -5579,6 +9069,17 @@ fn migrate_v4_to_v5(transaction: &Transaction<'_>) -> Result<()> {
     )?;
     transaction.execute_batch(REMOTE_ENTRIES_INDEX_SCHEMA)?;
     transaction.execute_batch(REMOTE_ENTRIES_PREVIEW_INDEX_SCHEMA)?;
+    transaction.pragma_update(None, "user_version", 5)?;
+    Ok(())
+}
+
+fn migrate_v5_to_v6(transaction: &Transaction<'_>) -> Result<()> {
+    // This migration is additive. Existing mutation rows do not contain local
+    // verifier evidence, so they intentionally remain untouched and no
+    // identity, execution, or recovery facts are inferred from them.
+    for (_, _, statement) in LOCAL_EXECUTION_SCHEMA_OBJECTS {
+        transaction.execute_batch(statement)?;
+    }
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -5817,7 +9318,7 @@ fn schema_v4_is_valid(connection: &Connection) -> Result<bool> {
 }
 
 fn schema_v5_is_valid(connection: &Connection) -> Result<bool> {
-    if !schema_definitions_are_exact(connection, &SCHEMA_OBJECTS)? {
+    if !schema_definitions_are_exact(connection, &SCHEMA_OBJECTS_V5)? {
         return Ok(false);
     }
     let foreign_key_errors: i64 =
@@ -5825,6 +9326,982 @@ fn schema_v5_is_valid(connection: &Connection) -> Result<bool> {
             row.get(0)
         })?;
     Ok(foreign_key_errors == 0)
+}
+
+fn schema_v6_is_valid(connection: &Connection, expected_vault_id: Uuid) -> Result<bool> {
+    if !schema_definitions_are_exact_combined(
+        connection,
+        &SCHEMA_OBJECTS_V5,
+        &LOCAL_EXECUTION_SCHEMA_OBJECTS,
+    )? {
+        return Ok(false);
+    }
+    let foreign_key_errors: i64 =
+        connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if foreign_key_errors != 0
+        || !local_execution_rows_are_semantically_valid(connection, expected_vault_id)?
+    {
+        return Ok(false);
+    }
+    let operations = connection
+        .prepare("SELECT operation_id FROM mutation_intents")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for operation in operations {
+        let Ok(operation) = parse_uuid(&operation) else {
+            return Ok(false);
+        };
+        if !mutation_history_is_exact(connection, operation)? {
+            return Ok(false);
+        }
+    }
+    global_r3_5_relations_are_exact(connection)
+}
+
+fn global_r3_5_relations_are_exact(connection: &Connection) -> Result<bool> {
+    let receipts: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM local_execution_r3_bridge_receipts",
+        [],
+        |row| row.get(0),
+    )?;
+    let anchors: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM local_execution_r3_consumption_anchors",
+        [],
+        |row| row.get(0),
+    )?;
+    if receipts != anchors {
+        return Ok(false);
+    }
+    let unmatched_anchor: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM local_execution_r3_consumption_anchors AS anchor
+          WHERE NOT EXISTS (
+            SELECT 1 FROM local_execution_r3_bridge_receipts AS receipt
+             WHERE receipt.receipt_id = anchor.receipt_id
+               AND receipt.receipt_fingerprint = anchor.receipt_fingerprint
+               AND receipt.operation_id = anchor.operation_id
+               AND receipt.attempt_number = anchor.attempt_number
+               AND receipt.outcome_id = anchor.outcome_id
+               AND receipt.evidence_id = anchor.evidence_id
+               AND receipt.r3_evidence_fingerprint = anchor.r3_evidence_fingerprint
+               AND receipt.dependency_kind = anchor.dependency_kind)",
+        [],
+        |row| row.get(0),
+    )?;
+    if unmatched_anchor != 0 {
+        return Ok(false);
+    }
+    // The count/join check above prevents a missing counterpart, but it does
+    // not establish that either immutable row is the *canonical* encoding of
+    // that counterpart.  Rebuild both preimages for every receipt.  This is
+    // deliberately a reverse scan rather than an authority lookup: an
+    // attacker must not be able to substitute a coherent-looking pair with
+    // fresh UUIDs or fingerprints and retain reopen validity.
+    if !global_bridge_receipts_and_anchors_are_canonical(connection)? {
+        return Ok(false);
+    }
+    let retry_events: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM mutation_events WHERE phase = 'retry_scheduled'",
+        [],
+        |row| row.get(0),
+    )?;
+    let contracts: i64 =
+        connection.query_row("SELECT COUNT(*) FROM mutation_retry_contracts", [], |row| {
+            row.get(0)
+        })?;
+    if retry_events != contracts {
+        return Ok(false);
+    }
+    let unmatched_contract: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM mutation_retry_contracts AS contract
+          WHERE NOT EXISTS (
+            SELECT 1 FROM mutation_events AS event
+            JOIN mutation_verification_evidence AS evidence ON evidence.evidence_id = event.evidence_id
+            JOIN mutation_intents AS intent ON intent.operation_id = event.operation_id
+             WHERE event.operation_id = contract.operation_id
+               AND event.state_version = contract.state_version
+               AND event.phase = 'retry_scheduled'
+               AND event.attempt_number = contract.attempt_number
+               AND event.evidence_id = contract.evidence_id
+               AND event.disposition = contract.disposition
+               AND event.outcome_code IS contract.outcome_code
+               AND event.occurred_at_unix_ms = contract.captured_at_unix_ms
+               AND evidence.operation_id = contract.operation_id
+               AND evidence.attempt_number = contract.attempt_number
+               AND evidence.evidence_fingerprint = contract.evidence_fingerprint
+               AND evidence.disposition = contract.disposition
+               AND evidence.outcome_code IS contract.outcome_code
+               AND evidence.captured_at_unix_ms = contract.captured_at_unix_ms
+               AND contract.due_at_unix_ms >= contract.captured_at_unix_ms)", [], |row| row.get(0),
+    )?;
+    Ok(unmatched_contract == 0)
+}
+
+/// Recompute the complete receipt and consumption-anchor preimages for every
+/// durable bridge row.  Foreign keys and the pair-count check are insufficient
+/// here because the anchor table intentionally has no FK to the receipt: it
+/// survives receipt/batch cleanup as an independent audit fact.
+#[allow(clippy::too_many_lines)] // Complete canonical preimage must be read together.
+fn global_bridge_receipts_and_anchors_are_canonical(connection: &Connection) -> Result<bool> {
+    let mut statement = connection.prepare(
+        "SELECT receipt_id, receipt_fingerprint, operation_id, attempt_number, boundary_id,
+                boundary_occurred_at_unix_ms, contract_fingerprint, outcome_id, evidence_id,
+                local_evidence_fingerprint, outcome_occurred_at_unix_ms, r3_intent_fingerprint,
+                r3_evidence_fingerprint, r3_outcome_code, dependency_kind, r3_state_phase,
+                r3_state_disposition, r3_attempt_number, r3_state_version, r3_last_evidence_id,
+                r3_event_state_version
+           FROM local_execution_r3_bridge_receipts",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, Vec<u8>>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, Vec<u8>>(9)?,
+            row.get::<_, i64>(10)?,
+            row.get::<_, String>(11)?,
+            row.get::<_, String>(12)?,
+            row.get::<_, Option<String>>(13)?,
+            row.get::<_, String>(14)?,
+            row.get::<_, String>(15)?,
+            row.get::<_, String>(16)?,
+            row.get::<_, i64>(17)?,
+            row.get::<_, i64>(18)?,
+            row.get::<_, String>(19)?,
+            row.get::<_, i64>(20)?,
+        ))
+    })?;
+    for row in rows {
+        let (
+            receipt_id,
+            receipt_fingerprint,
+            operation_id,
+            attempt_number,
+            boundary_id,
+            boundary_at,
+            contract_fingerprint,
+            outcome_id,
+            evidence_id,
+            local_evidence_fingerprint,
+            outcome_at,
+            r3_intent,
+            r3_evidence,
+            r3_outcome_code,
+            dependency_kind,
+            state_phase,
+            state_disposition,
+            r3_attempt,
+            state_version,
+            last_evidence_id,
+            event_version,
+        ) = row?;
+        let (
+            Ok(operation_id),
+            Ok(boundary_id),
+            Ok(outcome_id),
+            Ok(evidence_id),
+            Ok(last_evidence_id),
+            Ok(receipt_fingerprint),
+            Ok(contract_fingerprint),
+            Ok(local_evidence_fingerprint),
+            Ok(attempt_number),
+            Ok(boundary_at),
+            Ok(outcome_at),
+            Ok(r3_attempt),
+            Ok(state_version),
+            Ok(event_version),
+        ) = (
+            parse_uuid(&operation_id),
+            parse_uuid(&boundary_id),
+            parse_uuid(&outcome_id),
+            parse_uuid(&evidence_id),
+            parse_uuid(&last_evidence_id),
+            blob32(receipt_fingerprint),
+            blob32(contract_fingerprint),
+            blob32(local_evidence_fingerprint),
+            u32::try_from(attempt_number),
+            u64::try_from(boundary_at),
+            u64::try_from(outcome_at),
+            u32::try_from(r3_attempt),
+            u64::try_from(state_version),
+            u64::try_from(event_version),
+        )
+        else {
+            return Ok(false);
+        };
+        if parse_canonical_sha256(&r3_intent).is_none()
+            || parse_canonical_sha256(&r3_evidence).is_none()
+            || r3_outcome_code
+                .as_deref()
+                .is_some_and(|value| validate_redacted_code(value).is_err())
+            || bridge_dependency_kind_code(&dependency_kind).is_err()
+        {
+            return Ok(false);
+        }
+        let receipt = BridgeReceiptFacts {
+            operation_id,
+            attempt_number,
+            boundary_id,
+            boundary_occurred_at_unix_ms: boundary_at,
+            contract_fingerprint,
+            outcome_id,
+            evidence_id,
+            local_evidence_fingerprint,
+            outcome_occurred_at_unix_ms: outcome_at,
+            r3_intent_fingerprint: r3_intent,
+            r3_evidence_fingerprint: r3_evidence,
+            r3_outcome_code,
+            dependency_kind,
+            r3_state_phase: state_phase,
+            r3_state_disposition: state_disposition,
+            r3_attempt_number: r3_attempt,
+            r3_state_version: state_version,
+            r3_last_evidence_id: last_evidence_id,
+            r3_event_state_version: event_version,
+        };
+        let expected_receipt_fingerprint = bridge_receipt_fingerprint(&receipt);
+        if parse_uuid(&receipt_id).ok() != Some(bridge_receipt_id(expected_receipt_fingerprint))
+            || receipt_fingerprint != expected_receipt_fingerprint
+            || !consumption_anchor_is_exact(connection, &receipt)?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Validates v6's encoded ledger invariants on every reopen.  `SQLite` CHECKs
+/// and FKs protect new writes, but an interrupted/older or manually-corrupted
+/// database must remain readable for forensics while refusing normal open.
+/// Attestation bytes are intentionally not compared: they are first-issuance
+/// audit material, while authority/equality uses the stable identity binding.
+#[allow(clippy::too_many_lines)]
+fn local_execution_rows_are_semantically_valid(
+    connection: &Connection,
+    expected_vault_id: Uuid,
+) -> Result<bool> {
+    local_execution_rows_are_semantically_valid_in_scope(connection, expected_vault_id, None)
+}
+
+/// Exact re-registration must validate the requested immutable contract, not
+/// make a healthy operation hostage to a separately corrupt operation.  Full
+/// reopen intentionally calls the same validator without a scope and remains
+/// global/fail-closed.
+fn local_execution_operation_rows_are_semantically_valid(
+    connection: &Connection,
+    expected_vault_id: Uuid,
+    operation_id: Uuid,
+) -> Result<bool> {
+    local_execution_rows_are_semantically_valid_in_scope(
+        connection,
+        expected_vault_id,
+        Some(operation_id),
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn local_execution_rows_are_semantically_valid_in_scope(
+    connection: &Connection,
+    expected_vault_id: Uuid,
+    operation_scope: Option<Uuid>,
+) -> Result<bool> {
+    let scoped = operation_scope.map(|value| value.to_string());
+    let mut contracts = connection
+        .prepare(if scoped.is_some() {
+            "SELECT operation_id, vault_id, completion_id FROM local_execution_contracts WHERE operation_id = ?1"
+        } else {
+            "SELECT operation_id, vault_id, completion_id FROM local_execution_contracts WHERE (?1 IS NULL OR operation_id = ?1)"
+        })?;
+    for row in contracts.query_map((scoped.as_deref(),), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })? {
+        let (operation, vault, completion) = row?;
+        let Ok(operation) = parse_uuid(&operation) else {
+            return Ok(false);
+        };
+        if operation.is_nil()
+            || parse_uuid(&vault).map_or(true, |value| value != expected_vault_id)
+            || completion != local_execution_completion_id(operation)
+        {
+            return Ok(false);
+        }
+    }
+    {
+        let mut statement = connection.prepare(if scoped.is_some() {
+            "SELECT evidence_id, operation_id, role FROM local_execution_identity_evidence WHERE operation_id = ?1"
+        } else { "SELECT evidence_id, operation_id, role FROM local_execution_identity_evidence WHERE (?1 IS NULL OR operation_id = ?1)" })?;
+        for row in statement.query_map((scoped.as_deref(),), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (evidence_id, operation, role) = row?;
+            let Ok(operation) = parse_uuid(&operation) else {
+                return Ok(false);
+            };
+            if operation.is_nil()
+                || !matches!(
+                    role.as_str(),
+                    "vault_root"
+                        | "source_parent"
+                        | "source_object"
+                        | "destination_parent"
+                        | "collision_parent_start"
+                        | "collision_parent_end"
+                )
+                || evidence_id != format!("local-execution-identity:{operation}:{role}")
+            {
+                return Ok(false);
+            }
+        }
+    }
+    {
+        let mut statement = connection.prepare(if scoped.is_some() {
+            "SELECT boundary_id, operation_id, attempt_number, occurred_at_unix_ms
+               FROM local_execution_attempt_boundaries WHERE operation_id = ?1"
+        } else {
+            "SELECT boundary_id, operation_id, attempt_number, occurred_at_unix_ms
+               FROM local_execution_attempt_boundaries WHERE (?1 IS NULL OR operation_id = ?1)"
+        })?;
+        for row in statement.query_map((scoped.as_deref(),), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })? {
+            let (identifier, operation, attempt, occurred_at) = row?;
+            if parse_uuid(&identifier).map_or(true, |value| value.is_nil())
+                || parse_uuid(&operation).map_or(true, |value| value.is_nil())
+                || u32::try_from(attempt).is_err()
+                || u64::try_from(occurred_at).is_err()
+            {
+                return Ok(false);
+            }
+        }
+    }
+    {
+        let mut statement = connection.prepare(if scoped.is_some() {
+            "SELECT outcome_id, evidence_id, operation_id, attempt_number, occurred_at_unix_ms
+               FROM local_execution_attempt_outcomes WHERE operation_id = ?1"
+        } else {
+            "SELECT outcome_id, evidence_id, operation_id, attempt_number, occurred_at_unix_ms
+               FROM local_execution_attempt_outcomes WHERE (?1 IS NULL OR operation_id = ?1)"
+        })?;
+        for row in statement.query_map((scoped.as_deref(),), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })? {
+            let (outcome_id, evidence_id, operation, attempt, occurred_at) = row?;
+            if parse_uuid(&outcome_id).map_or(true, |value| value.is_nil())
+                || parse_uuid(&evidence_id).map_or(true, |value| value.is_nil())
+                || parse_uuid(&operation).map_or(true, |value| value.is_nil())
+                || u32::try_from(attempt).is_err()
+                || u64::try_from(occurred_at).is_err()
+            {
+                return Ok(false);
+            }
+        }
+    }
+    // Complete typed roles, exact destination capture equality, deterministic
+    // completion timestamp, contiguous ordinal/count relation, and every
+    // boundary/outcome association must all still hold after reopen.
+    let invalid: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM local_execution_contracts AS contract
+          WHERE NOT EXISTS (
+                SELECT 1 FROM local_execution_contract_completions AS completion
+                 WHERE completion.completion_id = contract.completion_id
+                   AND completion.operation_id = contract.operation_id
+                   AND completion.completed_at_unix_ms = contract.registered_at_unix_ms)
+             OR (SELECT COUNT(*) FROM local_execution_identity_evidence WHERE operation_id = contract.operation_id) != 6
+             OR (SELECT COUNT(*) FROM local_execution_identity_evidence
+                  WHERE operation_id = contract.operation_id
+                    AND role IN ('vault_root','source_parent','source_object','destination_parent','collision_parent_start','collision_parent_end')) != 6
+             OR (SELECT object_kind FROM local_execution_identity_evidence WHERE operation_id = contract.operation_id AND role = 'source_object') NOT IN (1,2)
+             OR EXISTS (SELECT 1 FROM local_execution_identity_evidence WHERE operation_id = contract.operation_id AND role != 'source_object' AND object_kind != 1)
+             OR (SELECT stable_identity_fingerprint FROM local_execution_identity_evidence WHERE operation_id = contract.operation_id AND role = 'destination_parent') !=
+                (SELECT stable_identity_fingerprint FROM local_execution_identity_evidence WHERE operation_id = contract.operation_id AND role = 'collision_parent_start')
+             OR (SELECT stable_identity_fingerprint FROM local_execution_identity_evidence WHERE operation_id = contract.operation_id AND role = 'destination_parent') !=
+                (SELECT stable_identity_fingerprint FROM local_execution_identity_evidence WHERE operation_id = contract.operation_id AND role = 'collision_parent_end')
+             OR (SELECT COUNT(*) FROM local_execution_collision_members WHERE operation_id = contract.operation_id) != contract.collision_member_count
+             OR EXISTS (SELECT 1 FROM local_execution_collision_members WHERE operation_id = contract.operation_id AND ordinal NOT BETWEEN 0 AND contract.collision_member_count - 1)
+             OR EXISTS (SELECT 1 FROM local_execution_attempt_boundaries AS boundary
+                          WHERE boundary.operation_id = contract.operation_id
+                            AND boundary.contract_fingerprint != contract.contract_fingerprint)
+             OR EXISTS (SELECT 1 FROM local_execution_attempt_outcomes AS outcome
+                          LEFT JOIN local_execution_attempt_boundaries AS boundary
+                            ON boundary.operation_id = outcome.operation_id AND boundary.attempt_number = outcome.attempt_number
+                         WHERE outcome.operation_id = contract.operation_id
+                           AND (boundary.operation_id IS NULL OR outcome.contract_fingerprint != contract.contract_fingerprint
+                                OR (outcome.outcome IN ('VerifiedApplied','VerifiedNotApplied')) != (outcome.non_retryable = 0)))
+           AND (?1 IS NULL OR contract.operation_id = ?1)",
+        [scoped.as_deref()],
+        |row| row.get(0),
+    )?;
+    if invalid != 0 {
+        return Ok(false);
+    }
+    local_execution_persisted_fingerprints_are_exact(connection, expected_vault_id, operation_scope)
+}
+
+#[allow(clippy::too_many_lines)]
+fn local_execution_persisted_fingerprints_are_exact(
+    connection: &Connection,
+    expected_vault_id: Uuid,
+    operation_scope: Option<Uuid>,
+) -> Result<bool> {
+    let scoped = operation_scope.map(|value| value.to_string());
+    let mut contracts = connection.prepare(if scoped.is_some() {
+        "SELECT operation_id, vault_id, intent_fingerprint, contract_fingerprint,
+                target_name, target_collision_key, collision_member_count,
+                collision_snapshot_fingerprint
+           FROM local_execution_contracts WHERE operation_id = ?1"
+    } else {
+        "SELECT operation_id, vault_id, intent_fingerprint, contract_fingerprint,
+                target_name, target_collision_key, collision_member_count,
+                collision_snapshot_fingerprint
+           FROM local_execution_contracts WHERE (?1 IS NULL OR operation_id = ?1)"
+    })?;
+    let rows = contracts.query_map((scoped.as_deref(),), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, Vec<u8>>(7)?,
+        ))
+    })?;
+    for row in rows {
+        let (operation, vault, intent, stored_contract, target, target_key, count, stored_snapshot) =
+            row?;
+        let (
+            Ok(operation),
+            Ok(vault),
+            Ok(intent),
+            Ok(stored_contract),
+            Ok(stored_snapshot),
+            Ok(count),
+        ) = (
+            parse_uuid(&operation),
+            parse_uuid(&vault),
+            blob32(intent),
+            blob32(stored_contract),
+            blob32(stored_snapshot),
+            u32::try_from(count),
+        )
+        else {
+            return Ok(false);
+        };
+        if operation.is_nil()
+            || vault != expected_vault_id
+            || persisted_canonical_collision_key(&target).ok().as_deref()
+                != Some(target_key.as_str())
+        {
+            return Ok(false);
+        }
+        let mut identities = Vec::new();
+        for role in [
+            "vault_root",
+            "source_parent",
+            "source_object",
+            "destination_parent",
+            "collision_parent_start",
+            "collision_parent_end",
+        ] {
+            let identity: Option<SemanticIdentityRow> = connection.query_row(
+                "SELECT evidence_version, evidence_kind, object_kind, provider_id, object_id, stable_identity_fingerprint
+                   FROM local_execution_identity_evidence WHERE operation_id = ?1 AND role = ?2",
+                params![operation.to_string(), role],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            ).optional()?;
+            let Some((version, kind, object_kind, provider_id, object_id, fingerprint)) = identity
+            else {
+                return Ok(false);
+            };
+            let (Ok(version), Ok(kind), Ok(object_kind), Ok(fingerprint)) = (
+                u8::try_from(version),
+                u8::try_from(kind),
+                u8::try_from(object_kind),
+                blob32(fingerprint),
+            ) else {
+                return Ok(false);
+            };
+            let identity = SemanticIdentity {
+                version,
+                kind,
+                object_kind,
+                provider_id,
+                object_id,
+                fingerprint,
+            };
+            if persisted_stable_identity_fingerprint(
+                version,
+                kind,
+                object_kind,
+                &identity.provider_id,
+                &identity.object_id,
+            )
+            .ok()
+                != Some(fingerprint)
+                || (role != "source_object" && object_kind != 1)
+            {
+                return Ok(false);
+            }
+            identities.push(identity);
+        }
+        if identities[3].fingerprint != identities[4].fingerprint
+            || identities[3].fingerprint != identities[5].fingerprint
+        {
+            return Ok(false);
+        }
+        let mut statement = connection.prepare(
+            "SELECT ordinal, name, collision_key, evidence_version, evidence_kind, object_kind,
+                    provider_id, object_id, stable_identity_fingerprint
+               FROM local_execution_collision_members WHERE operation_id = ?1 ORDER BY ordinal",
+        )?;
+        let member_rows = statement.query_map([operation.to_string()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
+                row.get::<_, Vec<u8>>(7)?,
+                row.get::<_, Vec<u8>>(8)?,
+            ))
+        })?;
+        let mut members: Vec<SemanticCollisionMember> = Vec::new();
+        for (ordinal, row) in member_rows.enumerate() {
+            let (
+                ordinal_db,
+                name,
+                key,
+                version,
+                kind,
+                object_kind,
+                provider_id,
+                object_id,
+                fingerprint,
+            ) = row?;
+            let (Ok(version), Ok(kind), Ok(object_kind), Ok(fingerprint)) = (
+                u8::try_from(version),
+                u8::try_from(kind),
+                u8::try_from(object_kind),
+                blob32(fingerprint),
+            ) else {
+                return Ok(false);
+            };
+            if ordinal_db != i64::try_from(ordinal).expect("ordinal fits i64")
+                || persisted_canonical_collision_key(&name).ok().as_deref() != Some(key.as_str())
+            {
+                return Ok(false);
+            }
+            let identity = SemanticIdentity {
+                version,
+                kind,
+                object_kind,
+                provider_id,
+                object_id,
+                fingerprint,
+            };
+            if persisted_stable_identity_fingerprint(
+                version,
+                kind,
+                object_kind,
+                &identity.provider_id,
+                &identity.object_id,
+            )
+            .ok()
+                != Some(fingerprint)
+            {
+                return Ok(false);
+            }
+            let member = SemanticCollisionMember {
+                name,
+                collision_key: key,
+                identity,
+            };
+            if let Some(previous) = members.last() {
+                if (
+                    previous.collision_key.as_str(),
+                    previous.name.as_str(),
+                    previous.identity.fingerprint,
+                ) >= (
+                    member.collision_key.as_str(),
+                    member.name.as_str(),
+                    member.identity.fingerprint,
+                ) {
+                    return Ok(false);
+                }
+            }
+            members.push(member);
+        }
+        if members.len() != usize::try_from(count).map_err(|_| Error::InvalidSchema)?
+            || semantic_collision_fingerprint(&identities[4], &identities[5], &members)
+                != stored_snapshot
+            || semantic_contract_fingerprint(
+                operation,
+                vault,
+                intent,
+                &identities[..4],
+                &target,
+                &target_key,
+                &identities[4],
+                &identities[5],
+                &members,
+            ) != stored_contract
+        {
+            return Ok(false);
+        }
+    }
+    bridge_receipts_are_semantically_exact(connection, operation_scope)
+}
+
+#[allow(clippy::too_many_lines)]
+fn bridge_receipts_are_semantically_exact(
+    connection: &Connection,
+    operation_scope: Option<Uuid>,
+) -> Result<bool> {
+    let scoped = operation_scope.map(|value| value.to_string());
+    let mut statement = connection.prepare(
+        if scoped.is_some() { "SELECT receipt_id, receipt_fingerprint, operation_id, attempt_number, boundary_id,
+                boundary_occurred_at_unix_ms, contract_fingerprint, outcome_id, evidence_id,
+                local_evidence_fingerprint, outcome_occurred_at_unix_ms, r3_intent_fingerprint,
+                r3_evidence_fingerprint, r3_outcome_code, dependency_kind, r3_attempt_number, r3_state_version,
+                r3_state_phase, r3_state_disposition, r3_last_evidence_id, r3_event_state_version
+           FROM local_execution_r3_bridge_receipts WHERE operation_id = ?1" } else { "SELECT receipt_id, receipt_fingerprint, operation_id, attempt_number, boundary_id,
+                boundary_occurred_at_unix_ms, contract_fingerprint, outcome_id, evidence_id,
+                local_evidence_fingerprint, outcome_occurred_at_unix_ms, r3_intent_fingerprint,
+                r3_evidence_fingerprint, r3_outcome_code, dependency_kind, r3_attempt_number, r3_state_version,
+                r3_state_phase, r3_state_disposition, r3_last_evidence_id, r3_event_state_version
+           FROM local_execution_r3_bridge_receipts WHERE (?1 IS NULL OR operation_id = ?1)" },
+    )?;
+    for row in statement.query_map((scoped.as_deref(),), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, Vec<u8>>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, Vec<u8>>(9)?,
+            row.get::<_, i64>(10)?,
+            row.get::<_, String>(11)?,
+            row.get::<_, String>(12)?,
+            row.get::<_, Option<String>>(13)?,
+            row.get::<_, String>(14)?,
+            row.get::<_, i64>(15)?,
+            row.get::<_, i64>(16)?,
+            row.get::<_, String>(17)?,
+            row.get::<_, String>(18)?,
+            row.get::<_, String>(19)?,
+            row.get::<_, i64>(20)?,
+        ))
+    })? {
+        let (
+            receipt_id,
+            fingerprint,
+            operation,
+            attempt,
+            boundary,
+            boundary_at,
+            contract,
+            outcome,
+            evidence,
+            local_evidence,
+            outcome_at,
+            r3_intent,
+            r3_evidence,
+            r3_outcome_code,
+            kind,
+            r3_attempt,
+            state_version,
+            state_phase,
+            state_disposition,
+            last_evidence,
+            event_version,
+        ) = row?;
+        let (
+            Ok(fingerprint),
+            Ok(operation),
+            Ok(attempt),
+            Ok(boundary),
+            Ok(boundary_at),
+            Ok(contract),
+            Ok(outcome),
+            Ok(evidence),
+            Ok(local_evidence),
+            Ok(outcome_at),
+            Ok(r3_attempt),
+            Ok(state_version),
+            Ok(last_evidence),
+            Ok(event_version),
+        ) = (
+            blob32(fingerprint),
+            parse_uuid(&operation),
+            u32::try_from(attempt),
+            parse_uuid(&boundary),
+            u64::try_from(boundary_at),
+            blob32(contract),
+            parse_uuid(&outcome),
+            parse_uuid(&evidence),
+            blob32(local_evidence),
+            u64::try_from(outcome_at),
+            u32::try_from(r3_attempt),
+            u64::try_from(state_version),
+            parse_uuid(&last_evidence),
+            u64::try_from(event_version),
+        )
+        else {
+            return Ok(false);
+        };
+        if receipt_id.is_empty()
+            || operation.is_nil()
+            || boundary.is_nil()
+            || outcome.is_nil()
+            || evidence.is_nil()
+        {
+            return Ok(false);
+        }
+        let receipt = BridgeReceiptFacts {
+            operation_id: operation,
+            attempt_number: attempt,
+            boundary_id: boundary,
+            boundary_occurred_at_unix_ms: boundary_at,
+            contract_fingerprint: contract,
+            outcome_id: outcome,
+            evidence_id: evidence,
+            local_evidence_fingerprint: local_evidence,
+            outcome_occurred_at_unix_ms: outcome_at,
+            r3_intent_fingerprint: r3_intent,
+            r3_evidence_fingerprint: r3_evidence,
+            r3_outcome_code,
+            dependency_kind: kind,
+            r3_state_phase: state_phase,
+            r3_state_disposition: state_disposition,
+            r3_attempt_number: r3_attempt,
+            r3_state_version: state_version,
+            r3_last_evidence_id: last_evidence,
+            r3_event_state_version: event_version,
+        };
+        if parse_uuid(&receipt_id).ok() != Some(bridge_receipt_id(fingerprint))
+            || bridge_receipt_fingerprint(&receipt) != fingerprint
+            || !consumption_anchor_is_exact(connection, &receipt)?
+            || !persisted_verified_applied_mutation_evidence_is_exact(connection, evidence)?
+            || !mutation_history_is_exact(connection, operation)?
+        {
+            return Ok(false);
+        }
+        // R3 state versions are an append-only event sequence.  A receipt
+        // cannot be rebound to a forged later final state by rewriting the
+        // current state and its final event: every version through the bound
+        // state must still be represented exactly once.
+        let event_versions = connection
+            .prepare(
+                "SELECT state_version FROM mutation_events
+                   WHERE operation_id = ?1 ORDER BY state_version",
+            )?
+            .query_map([operation.to_string()], |row| row.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if usize::try_from(state_version)
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            != Some(event_versions.len())
+            || event_versions.iter().enumerate().any(|(expected, actual)| {
+                *actual != i64::try_from(expected).expect("state version fits i64")
+            })
+        {
+            return Ok(false);
+        }
+        let joined: bool = connection.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM local_execution_contracts AS contract
+               JOIN local_execution_attempt_boundaries AS boundary ON boundary.operation_id = contract.operation_id
+               JOIN local_execution_attempt_outcomes AS outcome ON outcome.operation_id = boundary.operation_id AND outcome.attempt_number = boundary.attempt_number
+               JOIN local_execution_r3_bridge_receipts AS receipt ON receipt.operation_id = outcome.operation_id AND receipt.attempt_number = outcome.attempt_number
+               JOIN mutation_intents AS intent ON intent.operation_id = contract.operation_id
+               JOIN mutation_verification_evidence AS evidence ON evidence.operation_id = intent.operation_id
+               JOIN mutation_state AS state ON state.operation_id = intent.operation_id
+               JOIN mutation_events AS event ON event.operation_id = state.operation_id AND event.attempt_number = state.attempt_number AND event.state_version = state.state_version AND event.evidence_id = state.last_evidence_id
+              WHERE contract.operation_id = ?1 AND boundary.attempt_number = ?2 AND boundary.boundary_id = ?3
+                AND boundary.occurred_at_unix_ms = ?4 AND contract.contract_fingerprint = ?5
+                AND outcome.outcome_id = ?6 AND outcome.evidence_id = ?7 AND outcome.evidence_fingerprint = ?8 AND outcome.occurred_at_unix_ms = ?9 AND outcome.outcome = 'VerifiedApplied'
+                AND intent.intent_fingerprint = ?10 AND contract.intent_fingerprint = ?11
+                AND evidence.evidence_id = ?7 AND evidence.attempt_number = ?12 AND evidence.evidence_fingerprint = ?13
+                AND evidence.capture_phase = 'post_verify' AND evidence.disposition = 'verified_applied' AND evidence.forbidden_side_effect = 0
+                AND receipt.r3_outcome_code IS evidence.outcome_code
+                AND evidence.outcome_code IS state.outcome_code
+                AND state.outcome_code IS event.outcome_code
+                AND state.phase = ?14 AND state.disposition = ?15 AND state.attempt_number = ?12 AND state.state_version = ?16 AND state.last_evidence_id = ?17
+                AND event.phase = ?14 AND event.disposition = ?15 AND event.evidence_id = ?17 AND event.state_version = ?18)",
+            params![operation.to_string(), i64::from(attempt), boundary.to_string(), u64_to_i64(boundary_at)?, contract.as_slice(),
+                outcome.to_string(), evidence.to_string(), local_evidence.as_slice(), u64_to_i64(outcome_at)?,
+                receipt.r3_intent_fingerprint, local_intent_fingerprint_from_r3_intent(&receipt.r3_intent_fingerprint)
+                    .map_err(|_| Error::InvalidSchema)?.as_slice(), i64::from(r3_attempt), receipt.r3_evidence_fingerprint,
+                receipt.r3_state_phase, receipt.r3_state_disposition, u64_to_i64(state_version)?,
+                receipt.r3_last_evidence_id.to_string(), u64_to_i64(event_version)?],
+            |row| row.get(0),
+        )?;
+        if !joined
+            || authoritative_outcome_id(
+                operation,
+                attempt,
+                boundary,
+                boundary_at,
+                evidence,
+                local_evidence,
+                LocalExecutionOutcome::VerifiedApplied,
+                outcome_at,
+            ) != outcome
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[derive(Clone)]
+struct SemanticIdentity {
+    version: u8,
+    kind: u8,
+    object_kind: u8,
+    provider_id: Vec<u8>,
+    object_id: Vec<u8>,
+    fingerprint: [u8; 32],
+}
+
+#[derive(Clone)]
+struct SemanticCollisionMember {
+    name: String,
+    collision_key: String,
+    identity: SemanticIdentity,
+}
+
+fn semantic_append_bytes(material: &mut Vec<u8>, field: &[u8], value: &[u8]) {
+    material.extend_from_slice(&(field.len() as u64).to_be_bytes());
+    material.extend_from_slice(field);
+    material.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    material.extend_from_slice(value);
+}
+
+fn semantic_append_identity(material: &mut Vec<u8>, identity: &SemanticIdentity) {
+    semantic_append_bytes(material, b"evidence_version", &[identity.version]);
+    semantic_append_bytes(material, b"evidence_kind", &[identity.kind]);
+    semantic_append_bytes(material, b"object_kind", &[identity.object_kind]);
+    semantic_append_bytes(material, b"provider_id", &identity.provider_id);
+    semantic_append_bytes(material, b"object_id", &identity.object_id);
+}
+
+fn semantic_collision_fingerprint(
+    start: &SemanticIdentity,
+    end: &SemanticIdentity,
+    members: &[SemanticCollisionMember],
+) -> [u8; 32] {
+    let mut material = Vec::new();
+    semantic_append_bytes(
+        &mut material,
+        b"contract_version",
+        b"myvault-r3.5-local-identity-v1",
+    );
+    semantic_append_bytes(&mut material, b"domain", b"collision-snapshot");
+    semantic_append_identity(&mut material, start);
+    semantic_append_identity(&mut material, end);
+    semantic_append_bytes(
+        &mut material,
+        b"member_count",
+        &u32::try_from(members.len())
+            .expect("validated member bound")
+            .to_be_bytes(),
+    );
+    for member in members {
+        semantic_append_bytes(&mut material, b"member_name", member.name.as_bytes());
+        semantic_append_bytes(
+            &mut material,
+            b"member_collision_key",
+            member.collision_key.as_bytes(),
+        );
+        semantic_append_identity(&mut material, &member.identity);
+    }
+    Sha256::digest(material).into()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn semantic_contract_fingerprint(
+    operation_id: Uuid,
+    vault_id: Uuid,
+    intent: [u8; 32],
+    identities: &[SemanticIdentity],
+    target_name: &str,
+    target_collision_key: &str,
+    start: &SemanticIdentity,
+    end: &SemanticIdentity,
+    members: &[SemanticCollisionMember],
+) -> [u8; 32] {
+    let mut material = Vec::new();
+    semantic_append_bytes(
+        &mut material,
+        b"contract_version",
+        b"myvault-r3.5-local-identity-v1",
+    );
+    semantic_append_bytes(&mut material, b"domain", b"durable-execution-binding");
+    semantic_append_bytes(&mut material, b"operation_id", operation_id.as_bytes());
+    semantic_append_bytes(&mut material, b"vault_id", vault_id.as_bytes());
+    semantic_append_bytes(&mut material, b"intent_sha256", &intent);
+    for identity in identities {
+        semantic_append_identity(&mut material, identity);
+    }
+    semantic_append_bytes(&mut material, b"target_name", target_name.as_bytes());
+    semantic_append_bytes(
+        &mut material,
+        b"target_collision_key",
+        target_collision_key.as_bytes(),
+    );
+    semantic_append_identity(&mut material, start);
+    semantic_append_identity(&mut material, end);
+    semantic_append_bytes(
+        &mut material,
+        b"member_count",
+        &u32::try_from(members.len())
+            .expect("validated member bound")
+            .to_be_bytes(),
+    );
+    for member in members {
+        semantic_append_bytes(&mut material, b"member_name", member.name.as_bytes());
+        semantic_append_bytes(
+            &mut material,
+            b"member_collision_key",
+            member.collision_key.as_bytes(),
+        );
+        semantic_append_identity(&mut material, &member.identity);
+    }
+    Sha256::digest(material).into()
 }
 
 fn transfer_schema_columns_are_valid(connection: &Connection) -> Result<bool> {
@@ -6047,6 +10524,19 @@ fn schema_definitions_are_exact(
         }
     }
     Ok(true)
+}
+
+fn schema_definitions_are_exact_combined(
+    connection: &Connection,
+    first: &[(&str, &str, &str)],
+    second: &[(&str, &str, &str)],
+) -> Result<bool> {
+    let expected = first
+        .iter()
+        .chain(second.iter())
+        .copied()
+        .collect::<Vec<_>>();
+    schema_definitions_are_exact(connection, &expected)
 }
 
 fn normalize_schema_sql(value: &str) -> String {
@@ -6979,4 +11469,4774 @@ fn load_local_mutations(
 fn query_count(connection: &Connection, query: &str) -> Result<u64> {
     let count: i64 = connection.query_row(query, [], |row| row.get(0))?;
     u64::try_from(count).map_err(|_| Error::InvalidSchema)
+}
+
+#[cfg(test)]
+mod local_execution_tests {
+    use super::*;
+    use crate::local_identity::{
+        test_durable_execution_binding, test_durable_execution_binding_for_r3_intent,
+        test_durable_execution_binding_with_attestation_offset, DurableExecutionBinding,
+    };
+    use crate::local_orchestration::{
+        classify_authoritative_final_outcome, handle_local_execution_echo_hint,
+        test_authoritative_evidence, test_authoritative_evidence_with_identity,
+        EchoHintDisposition, LocalExecutionEchoHint, LocalExecutionEchoSource, PlatformCallFact,
+    };
+    use rusqlite::Connection;
+    use std::fs;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use tempfile::TempDir;
+
+    struct Fixture {
+        _temporary: TempDir,
+        app_data: PathBuf,
+        vault: PathBuf,
+        vault_id: Uuid,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let temporary = tempfile::tempdir().expect("temporary root");
+            let root = temporary.path().canonicalize().expect("canonical root");
+            let app_data = root.join("private-app-data");
+            let vault = root.join("Vault");
+            fs::create_dir(&app_data).expect("app data");
+            fs::create_dir(&vault).expect("vault");
+            make_private(&app_data);
+            Self {
+                _temporary: temporary,
+                app_data,
+                vault,
+                vault_id: Uuid::new_v4(),
+            }
+        }
+
+        fn open(&self) -> SyncStore {
+            SyncStore::open(&self.app_data, &self.vault, self.vault_id).expect("sync store")
+        }
+
+        fn journal_directory(&self) -> PathBuf {
+            self.app_data
+                .join(ROOT_DIRECTORY)
+                .join(VERSION_DIRECTORY)
+                .join(VAULTS_DIRECTORY)
+                .join(self.vault_id.to_string())
+                .join(crate::sync_journal::JOURNAL_DIRECTORY)
+        }
+    }
+
+    #[cfg(unix)]
+    fn make_private(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("private mode");
+    }
+
+    #[cfg(not(unix))]
+    fn make_private(_path: &Path) {}
+
+    #[cfg(unix)]
+    fn make_private_file(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private file mode");
+    }
+
+    #[cfg(not(unix))]
+    fn make_private_file(_path: &Path) {}
+
+    fn sync_journal_temporary_count(directory: &Path) -> usize {
+        fs::read_dir(directory)
+            .expect("read journal directory")
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".sync-execution-witness-")
+            })
+            .count()
+    }
+
+    fn count(database_path: &Path, table: &str) -> i64 {
+        Connection::open(database_path)
+            .expect("read connection")
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("row count")
+    }
+
+    fn install_abort_trigger(database_path: &Path, name: &str, table: &str) {
+        Connection::open(database_path)
+            .expect("fault connection")
+            .execute_batch(&format!(
+                "CREATE TRIGGER {name} BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT, 'injected fault'); END;"
+            ))
+            .expect("install fault trigger");
+    }
+
+    fn prepared_journal_attempt() -> (
+        Fixture,
+        SyncStore,
+        DurableExecutionBinding,
+        LocalExecutionAttemptBoundary,
+    ) {
+        let fixture = Fixture::new();
+        let operation_id = Uuid::new_v4();
+        let binding = test_durable_execution_binding(operation_id, fixture.vault_id);
+        let boundary = LocalExecutionAttemptBoundary {
+            operation_id,
+            attempt_number: 0,
+            boundary_id: Uuid::new_v4(),
+            contract_fingerprint: binding.fingerprint(),
+            occurred_at_unix_ms: 11,
+        };
+        let mut store = fixture.open();
+        store
+            .register_local_execution_contract(&binding, 10)
+            .expect("contract");
+        store
+            .append_local_execution_attempt_boundary(&boundary)
+            .expect("boundary");
+        (fixture, store, binding, boundary)
+    }
+
+    fn ready_store(fixture: &Fixture) -> SyncStore {
+        let mut store = fixture.open();
+        let binding =
+            VerifiedRemoteBinding::new("account-a", "remote-root", "account-a", "remote-root")
+                .expect("binding");
+        store.bind_remote_root(&binding, 1).expect("bind");
+        store.begin_initial_scan("start-token", 2).expect("scan");
+        store
+            .apply_scan_page(
+                None,
+                &ScanPage {
+                    entries: Vec::new(),
+                    next_page_token: None,
+                },
+                3,
+            )
+            .expect("scan page");
+        store
+            .apply_changes_page(
+                "start-token",
+                &ChangesPage {
+                    changes: Vec::new(),
+                    next_page_token: None,
+                    new_start_page_token: Some("cursor-1".into()),
+                },
+                4,
+            )
+            .expect("changes page");
+        store
+    }
+
+    fn test_hash(byte: u8) -> String {
+        std::iter::repeat_n(char::from(byte), 64).collect()
+    }
+
+    fn local_publish_intent(operation_id: Uuid) -> MutationIntent {
+        let mut intent = MutationIntent {
+            operation_id,
+            operation_kind: MutationOperationKind::LocalPublish,
+            account_id: None,
+            remote_root_id: None,
+            remote_file_id: None,
+            source_parent_id: None,
+            destination_parent_id: None,
+            local_object_id: None,
+            source_path: Some("notes/local-execution.md".into()),
+            destination_path: None,
+            expected_local_revision: Some("revision-a".into()),
+            expected_remote_revision: None,
+            base_reference: None,
+            base_local_revision: None,
+            base_remote_revision: None,
+            base_sha256: None,
+            base_byte_length: None,
+            expected_local_sha256: Some(test_hash(b'a')),
+            expected_local_byte_length: Some(1),
+            expected_remote_sha256: None,
+            expected_remote_byte_length: None,
+            operation_marker: format!("r3.5-local-{operation_id}"),
+            intent_fingerprint: String::new(),
+            registered_at_unix_ms: 10,
+        };
+        intent.intent_fingerprint = intent.canonical_fingerprint();
+        intent
+    }
+
+    fn local_publish_evidence(
+        evidence_id: Uuid,
+        intent: &MutationIntent,
+    ) -> MutationVerificationEvidence {
+        local_publish_evidence_with_outcome_code(
+            evidence_id,
+            intent,
+            Some("verified_applied".into()),
+        )
+    }
+
+    fn local_publish_evidence_with_outcome_code(
+        evidence_id: Uuid,
+        intent: &MutationIntent,
+        outcome_code: Option<String>,
+    ) -> MutationVerificationEvidence {
+        let mut evidence = MutationVerificationEvidence {
+            evidence_id,
+            operation_id: intent.operation_id,
+            attempt_number: 0,
+            capture_phase: MutationEvidenceCapturePhase::PostVerify,
+            disposition: MutationDisposition::VerifiedApplied,
+            outcome_code,
+            observed_account_id: None,
+            observed_remote_root_id: None,
+            observed_remote_file_id: None,
+            observed_parent_id: None,
+            observed_path: intent.source_path.clone(),
+            observed_local_revision: intent.expected_local_revision.clone(),
+            observed_remote_revision: None,
+            observed_sha256: intent.expected_local_sha256.clone(),
+            observed_byte_length: intent.expected_local_byte_length,
+            observed_operation_marker: Some(intent.operation_marker.clone()),
+            forbidden_side_effect: false,
+            verified_received_byte_offset: None,
+            resume_reference: None,
+            evidence_fingerprint: String::new(),
+            captured_at_unix_ms: 20,
+        };
+        evidence.evidence_fingerprint = evidence.canonical_fingerprint();
+        evidence
+    }
+
+    fn scheduled_retry(
+        store: &mut SyncStore,
+        retry_safe: bool,
+    ) -> (MutationIntent, MutationVerificationEvidence, MutationState) {
+        let intent = local_publish_intent(Uuid::new_v4());
+        store
+            .register_mutation_intent(&intent, None)
+            .expect("retry intent");
+        store
+            .claim_mutation(intent.operation_id, 0, 12)
+            .expect("claim");
+        let mut evidence = local_publish_evidence(Uuid::new_v4(), &intent);
+        evidence.capture_phase = MutationEvidenceCapturePhase::Reconcile;
+        let transition = if retry_safe {
+            evidence.disposition = MutationDisposition::RetrySafe;
+            evidence.outcome_code = Some("retry_safe".into());
+            evidence.resume_reference = Some("resume-ref-a".into());
+            evidence.verified_received_byte_offset = Some(0);
+            MutationOutcomeTransition::RetrySafe {
+                next_attempt_at_unix_ms: 25,
+                resume_reference: "resume-ref-a".into(),
+            }
+        } else {
+            evidence.disposition = MutationDisposition::VerifiedNotApplied;
+            evidence.outcome_code = Some("verified_not_applied".into());
+            evidence.forbidden_side_effect = true;
+            MutationOutcomeTransition::VerifiedNotApplied {
+                next_attempt_at_unix_ms: 25,
+            }
+        };
+        evidence.evidence_fingerprint = evidence.canonical_fingerprint();
+        let state = store
+            .record_mutation_outcome(intent.operation_id, 1, &evidence, &transition)
+            .expect("schedule retry");
+        assert_eq!(state.phase, MutationPhase::RetryScheduled);
+        (intent, evidence, state)
+    }
+
+    fn assert_tampered_retry_rejects_live_and_reopen(
+        fixture: &Fixture,
+        mut store: SyncStore,
+        operation_id: Uuid,
+        state_version: u64,
+    ) {
+        let state_before = store.mutation_state(operation_id).expect("state");
+        let events_before: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM mutation_events WHERE operation_id = ?1",
+                [operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("event count");
+        let evidence_before: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM mutation_verification_evidence WHERE operation_id = ?1",
+                [operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("evidence count");
+        assert!(matches!(
+            store.claim_mutation(operation_id, state_version, 25),
+            Err(Error::LocalMutationIncomplete)
+        ));
+        assert_eq!(
+            store.mutation_state(operation_id).expect("unchanged state"),
+            state_before
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM mutation_events WHERE operation_id = ?1",
+                    [operation_id.to_string()],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("events"),
+            events_before
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM mutation_verification_evidence WHERE operation_id = ?1",
+                    [operation_id.to_string()],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("evidence"),
+            evidence_before
+        );
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Matrix keeps every fail-closed proof visible together.
+    fn retry_contract_forensic_tamper_matrix_rejects_before_claim_and_on_reopen() {
+        // Canonical evidence rewrites remain syntactically valid and update
+        // the contract fingerprint too; the retry phase semantics must still
+        // reject them before the claim writes a new event/state.
+        for forbidden in [true, false] {
+            let fixture = Fixture::new();
+            let mut store = ready_store(&fixture);
+            let (intent, mut evidence, state) = scheduled_retry(&mut store, false);
+            evidence.capture_phase = MutationEvidenceCapturePhase::PostVerify;
+            evidence.forbidden_side_effect = forbidden;
+            evidence.evidence_fingerprint = evidence.canonical_fingerprint();
+            store
+                .connection
+                .execute_batch(
+                    "DROP TRIGGER mutation_evidence_no_update;
+                 DROP TRIGGER mutation_retry_contracts_no_update;",
+                )
+                .expect("drop immutable guards");
+            store
+                .connection
+                .execute(
+                    "UPDATE mutation_verification_evidence
+                    SET capture_phase = ?1, forbidden_side_effect = ?2, evidence_fingerprint = ?3
+                  WHERE evidence_id = ?4",
+                    params![
+                        evidence.capture_phase.as_str(),
+                        i64::from(evidence.forbidden_side_effect),
+                        evidence.evidence_fingerprint,
+                        evidence.evidence_id.to_string()
+                    ],
+                )
+                .expect("rewrite canonical evidence");
+            store
+                .connection
+                .execute(
+                    "UPDATE mutation_retry_contracts SET evidence_fingerprint = ?1
+                  WHERE operation_id = ?2 AND state_version = ?3",
+                    params![
+                        evidence.evidence_fingerprint,
+                        intent.operation_id.to_string(),
+                        u64_to_i64(state.state_version).expect("version")
+                    ],
+                )
+                .expect("bind rewritten fingerprint");
+            store.connection.execute_batch(&format!(
+                "{MUTATION_EVIDENCE_NO_UPDATE_TRIGGER};{MUTATION_RETRY_CONTRACTS_NO_UPDATE_TRIGGER};"
+            )).expect("restore guards");
+            assert_tampered_retry_rejects_live_and_reopen(
+                &fixture,
+                store,
+                intent.operation_id,
+                state.state_version,
+            );
+        }
+
+        // Missing current contract and an extra otherwise-CHECK-valid contract
+        // must both fail history/cardinality before claim mutation.
+        for extra in [false, true] {
+            let fixture = Fixture::new();
+            let mut store = ready_store(&fixture);
+            let (intent, _evidence, state) = scheduled_retry(&mut store, false);
+            if extra {
+                store.connection.execute(
+                    "INSERT INTO mutation_retry_contracts(operation_id, state_version, attempt_number,
+                        evidence_id, evidence_fingerprint, disposition, outcome_code, due_at_unix_ms,
+                        retry_mode, resume_reference, verified_received_byte_offset, captured_at_unix_ms)
+                     VALUES (?1, 99, 99, ?2, ?3, 'verified_not_applied', 'verified_not_applied',
+                        25, 'restart_exact', NULL, NULL, 20)",
+                    params![intent.operation_id.to_string(), Uuid::new_v4().to_string(), "a".repeat(64)],
+                ).expect("insert extra contract");
+            } else {
+                store
+                    .connection
+                    .execute_batch("DROP TRIGGER mutation_retry_contracts_no_delete;")
+                    .expect("drop delete guard");
+                assert_eq!(store.connection.execute("DELETE FROM mutation_retry_contracts WHERE operation_id = ?1 AND state_version = ?2", params![intent.operation_id.to_string(), u64_to_i64(state.state_version).expect("version")]).expect("delete contract"), 1);
+                store
+                    .connection
+                    .execute_batch(MUTATION_RETRY_CONTRACTS_NO_DELETE_TRIGGER)
+                    .expect("restore delete guard");
+            }
+            assert_tampered_retry_rejects_live_and_reopen(
+                &fixture,
+                store,
+                intent.operation_id,
+                state.state_version,
+            );
+        }
+
+        // Bound fields are individually tampered while retaining SQL-valid
+        // values; state/evidence/contract exact equality, not a CHECK, rejects.
+        for (retry_safe, sql) in [
+            (false, "UPDATE mutation_retry_contracts SET due_at_unix_ms = 26 WHERE operation_id = ?1 AND state_version = ?2"),
+            (true, "UPDATE mutation_retry_contracts SET resume_reference = 'resume-ref-b' WHERE operation_id = ?1 AND state_version = ?2"),
+            (true, "UPDATE mutation_retry_contracts SET verified_received_byte_offset = 1 WHERE operation_id = ?1 AND state_version = ?2"),
+            (true, "UPDATE mutation_retry_contracts SET disposition = 'verified_not_applied', outcome_code = 'verified_not_applied', retry_mode = 'restart_exact', resume_reference = NULL, verified_received_byte_offset = NULL WHERE operation_id = ?1 AND state_version = ?2"),
+        ] {
+            let fixture = Fixture::new();
+            let mut store = ready_store(&fixture);
+            let (intent, _evidence, state) = scheduled_retry(&mut store, retry_safe);
+            store
+                .connection
+                .execute_batch("DROP TRIGGER mutation_retry_contracts_no_update;")
+                .expect("drop update guard");
+            assert_eq!(store.connection.execute(sql, params![intent.operation_id.to_string(), u64_to_i64(state.state_version).expect("version")]).expect("tamper bound field"), 1);
+            store
+                .connection
+                .execute_batch(MUTATION_RETRY_CONTRACTS_NO_UPDATE_TRIGGER)
+                .expect("restore update guard");
+            assert_tampered_retry_rejects_live_and_reopen(&fixture, store, intent.operation_id, state.state_version);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keeps the coherent forensic rewrite matrix explicit.
+    fn blocked_initial_history_canonical_rewrites_fail_closed_without_state_or_event_mutation() {
+        for rewrite in [
+            "capture_phase",
+            "forbidden_side_effect",
+            "observed_path",
+            "observed_hash_and_length",
+        ] {
+            let fixture = Fixture::new();
+            let operation_id = Uuid::new_v4();
+            let input = RemoteExistingBlockedInput {
+                account_id: "account-a".into(),
+                remote_root_id: "remote-root".into(),
+                remote_file_id: "remote-file".into(),
+                source_parent_id: "remote-parent".into(),
+                source_path: "notes/blocked.md".into(),
+                local_object_id: None,
+                expected_local_revision: "local-revision".into(),
+                expected_local_sha256: test_hash(b'a'),
+                expected_local_byte_length: 1,
+                expected_remote_revision: "remote-revision".into(),
+                expected_remote_sha256: Some(test_hash(b'b')),
+                expected_remote_byte_length: Some(2),
+                base_reference: None,
+                base_local_revision: None,
+                base_remote_revision: None,
+                base_sha256: None,
+                base_byte_length: None,
+            };
+            let (intent, mut evidence) =
+                MutationIntent::remote_existing_blocked(operation_id, input, 10)
+                    .expect("blocked initial evidence");
+            let mut store = fixture.open();
+            store
+                .register_mutation_intent(&intent, Some(&evidence))
+                .expect("register exact blocked intent");
+            let original_evidence = evidence.clone();
+            let state_before = store
+                .mutation_state(operation_id)
+                .expect("state")
+                .expect("blocked state");
+            let events_before = store.mutation_events(operation_id).expect("events");
+            let evidence_count_before =
+                count(store.database_path(), "mutation_verification_evidence");
+
+            match rewrite {
+                "capture_phase" => evidence.capture_phase = MutationEvidenceCapturePhase::Reconcile,
+                "forbidden_side_effect" => evidence.forbidden_side_effect = false,
+                "observed_path" => evidence.observed_path = Some("notes/rewritten.md".into()),
+                "observed_hash_and_length" => {
+                    evidence.observed_sha256 = Some(test_hash(b'c'));
+                    evidence.observed_byte_length = Some(3);
+                }
+                _ => unreachable!("fixed rewrite matrix"),
+            }
+            evidence.evidence_fingerprint = evidence.canonical_fingerprint();
+            store
+                .connection
+                .execute_batch("DROP TRIGGER mutation_evidence_no_update;")
+                .expect("remove immutable evidence guard for forensic rewrite");
+            store
+                .connection
+                .execute(
+                    "UPDATE mutation_verification_evidence
+                        SET capture_phase = ?1, forbidden_side_effect = ?2,
+                            observed_path = ?3, observed_sha256 = ?4,
+                            observed_byte_length = ?5, evidence_fingerprint = ?6
+                      WHERE evidence_id = ?7",
+                    params![
+                        evidence.capture_phase.as_str(),
+                        i64::from(evidence.forbidden_side_effect),
+                        evidence.observed_path.clone(),
+                        evidence.observed_sha256.clone(),
+                        evidence
+                            .observed_byte_length
+                            .map(u64_to_i64)
+                            .transpose()
+                            .expect("test byte length"),
+                        evidence.evidence_fingerprint.clone(),
+                        evidence.evidence_id.to_string(),
+                    ],
+                )
+                .expect("install self-canonical forensic rewrite");
+            store
+                .connection
+                .execute_batch(MUTATION_EVIDENCE_NO_UPDATE_TRIGGER)
+                .expect("restore immutable evidence guard");
+
+            assert!(
+                !mutation_history_is_exact(&store.connection, operation_id)
+                    .expect("live history validation"),
+                "{rewrite} must not become an accepted initial NeedsReconcile history"
+            );
+            assert_eq!(
+                store
+                    .mutation_state(operation_id)
+                    .expect("state after rejection"),
+                Some(state_before.clone()),
+                "live validation must not mutate state"
+            );
+            assert_eq!(
+                store
+                    .mutation_events(operation_id)
+                    .expect("events after rejection"),
+                events_before,
+                "live validation must not append or rewrite events"
+            );
+            assert_eq!(
+                count(store.database_path(), "mutation_verification_evidence"),
+                evidence_count_before,
+                "live validation must not create evidence"
+            );
+            assert!(matches!(
+                store.register_mutation_intent(&intent, Some(&original_evidence)),
+                Err(Error::LocalMutationIncomplete)
+            ));
+            assert_eq!(
+                store
+                    .mutation_state(operation_id)
+                    .expect("state after public rejection"),
+                Some(state_before),
+                "idempotent rejection must not mutate state"
+            );
+            assert_eq!(
+                store
+                    .mutation_events(operation_id)
+                    .expect("events after public rejection"),
+                events_before,
+                "idempotent rejection must not append or rewrite events"
+            );
+            assert_eq!(
+                count(store.database_path(), "mutation_verification_evidence"),
+                evidence_count_before,
+                "idempotent rejection must not create evidence"
+            );
+            drop(store);
+            assert!(matches!(
+                SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+                Err(Error::InvalidSchema)
+            ));
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn bridged_r3_5_batch(
+        fixture: &Fixture,
+    ) -> (
+        SyncStore,
+        DurableExecutionBinding,
+        LocalExecutionAttemptBoundary,
+        MutationIntent,
+        MutationVerificationEvidence,
+        AuthoritativeFinalOutcome,
+        ChangeBatchDependency,
+        Uuid,
+    ) {
+        bridged_r3_5_batch_with_outcome_code(fixture, Some("verified_applied".into()))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn bridged_r3_5_batch_with_outcome_code(
+        fixture: &Fixture,
+        outcome_code: Option<String>,
+    ) -> (
+        SyncStore,
+        DurableExecutionBinding,
+        LocalExecutionAttemptBoundary,
+        MutationIntent,
+        MutationVerificationEvidence,
+        AuthoritativeFinalOutcome,
+        ChangeBatchDependency,
+        Uuid,
+    ) {
+        let mut store = ready_store(fixture);
+        let operation_id = Uuid::new_v4();
+        let intent = local_publish_intent(operation_id);
+        let binding = test_durable_execution_binding_for_r3_intent(
+            operation_id,
+            fixture.vault_id,
+            &intent.intent_fingerprint,
+        );
+        let boundary = LocalExecutionAttemptBoundary {
+            operation_id,
+            attempt_number: 0,
+            boundary_id: Uuid::new_v4(),
+            contract_fingerprint: binding.fingerprint(),
+            occurred_at_unix_ms: 11,
+        };
+        store
+            .register_local_execution_contract(&binding, 10)
+            .expect("contract");
+        store
+            .append_local_execution_attempt_boundary(&boundary)
+            .expect("boundary");
+        store
+            .publish_local_execution_pre_side_effect_witness(&binding, &boundary, 11)
+            .expect("pre witness");
+        store
+            .register_mutation_intent(&intent, None)
+            .expect("intent");
+        store.claim_mutation(operation_id, 0, 12).expect("claim");
+        let evidence =
+            local_publish_evidence_with_outcome_code(Uuid::new_v4(), &intent, outcome_code);
+        let r3_fingerprint = parse_canonical_sha256(&evidence.evidence_fingerprint)
+            .expect("canonical R3 fingerprint");
+        store
+            .record_mutation_outcome(
+                operation_id,
+                1,
+                &evidence,
+                &MutationOutcomeTransition::VerifiedApplied,
+            )
+            .expect("R3 completion");
+        let dependency = ChangeBatchDependency {
+            operation_id,
+            kind: ChangeBatchDependencyKind::Mutation,
+        };
+        let batch_id = Uuid::new_v4();
+        store
+            .begin_r3_change_batch(batch_id, "cursor-1", "cursor-2", &[dependency])
+            .expect("batch");
+        let decision = classify_authoritative_final_outcome(
+            &binding,
+            &boundary,
+            test_authoritative_evidence_with_identity(
+                &binding,
+                &boundary,
+                PlatformCallFact::Returned,
+                LocalExecutionOutcome::VerifiedApplied,
+                evidence.evidence_id,
+                r3_fingerprint,
+            ),
+        )
+        .expect("authoritative decision");
+        store
+            .finalize_authoritative_local_execution_outcome(&binding, &boundary, &decision)
+            .expect("local finalization");
+        store
+            .commit_r3_5_verified_local_execution_dependency(
+                batch_id, dependency, &binding, 0, &decision,
+            )
+            .expect("bridge receipt");
+        (
+            store, binding, boundary, intent, evidence, decision, dependency, batch_id,
+        )
+    }
+
+    fn bridge_receipt_for(
+        binding: &DurableExecutionBinding,
+        boundary: &LocalExecutionAttemptBoundary,
+        intent: &MutationIntent,
+        evidence: &MutationVerificationEvidence,
+        decision: &AuthoritativeFinalOutcome,
+        dependency: ChangeBatchDependency,
+    ) -> BridgeReceiptFacts {
+        BridgeReceiptFacts {
+            operation_id: boundary.operation_id,
+            attempt_number: boundary.attempt_number,
+            boundary_id: boundary.boundary_id,
+            boundary_occurred_at_unix_ms: boundary.occurred_at_unix_ms,
+            contract_fingerprint: *binding.fingerprint().as_bytes(),
+            outcome_id: decision.outcome_id(),
+            evidence_id: evidence.evidence_id,
+            local_evidence_fingerprint: decision.evidence_fingerprint(),
+            outcome_occurred_at_unix_ms: decision.recorded_at_unix_ms(),
+            r3_intent_fingerprint: intent.intent_fingerprint.clone(),
+            r3_evidence_fingerprint: evidence.evidence_fingerprint.clone(),
+            r3_outcome_code: evidence.outcome_code.clone(),
+            dependency_kind: dependency.kind.as_str().to_owned(),
+            r3_state_phase: "completed".to_owned(),
+            r3_state_disposition: "verified_applied".to_owned(),
+            r3_attempt_number: 0,
+            r3_state_version: 2,
+            r3_last_evidence_id: evidence.evidence_id,
+            r3_event_state_version: 2,
+        }
+    }
+
+    #[test]
+    fn equal_cardinality_substituted_anchor_and_partial_extension_family_fail_reopen() {
+        let fixture = Fixture::new();
+        let (store, _binding, _boundary, _intent, _evidence, _decision, _dependency, _batch) =
+            bridged_r3_5_batch(&fixture);
+        let database_path = store.database_path().to_owned();
+        // Change only the canonical anchor ID.  Counts and copied receipt
+        // fields remain equal, so this reaches canonical reverse validation
+        // rather than an FK/CHECK or cardinality rejection.
+        store
+            .connection
+            .execute_batch("DROP TRIGGER local_execution_consumption_anchors_no_update;")
+            .expect("drop anchor update guard");
+        assert_eq!(
+            store
+                .connection
+                .execute(
+                    "UPDATE local_execution_r3_consumption_anchors SET anchor_id = ?1",
+                    [Uuid::new_v4().to_string()],
+                )
+                .expect("substitute anchor id"),
+            1
+        );
+        store
+            .connection
+            .execute_batch(LOCAL_EXECUTION_CONSUMPTION_ANCHORS_NO_UPDATE_TRIGGER)
+            .expect("restore anchor guard");
+        let counts: (i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM local_execution_r3_bridge_receipts),
+                        (SELECT COUNT(*) FROM local_execution_r3_consumption_anchors)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("equal relation counts");
+        assert_eq!(counts, (1, 1));
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+        assert_eq!(
+            count(&database_path, "local_execution_r3_consumption_anchors"),
+            1
+        );
+
+        let fixture = Fixture::new();
+        let store = fixture.open();
+        let database_path = store.database_path().to_owned();
+        drop(store);
+        let connection = Connection::open(&database_path).expect("forensic schema connection");
+        connection
+            .execute_batch("DROP TRIGGER local_execution_bridge_receipts_no_update;")
+            .expect("remove one extension guard");
+        drop(connection);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+    }
+
+    fn assert_live_cursor_rejects_and_is_unchanged(store: &mut SyncStore, batch_id: Uuid) {
+        assert!(matches!(
+            store.commit_r3_change_batch(batch_id, 30),
+            Err(Error::LocalMutationIncomplete)
+        ));
+        assert_eq!(
+            store
+                .vault_state()
+                .expect("state after rejected cursor")
+                .expect("bound state")
+                .durable_cursor,
+            Some("cursor-1".into()),
+            "a rejected proof must leave the durable cursor unchanged"
+        );
+    }
+
+    fn append_forged_mutation_event(
+        database_path: &Path,
+        operation_id: Uuid,
+        attempt_number: u32,
+        state_version: u64,
+        evidence_id: Uuid,
+    ) {
+        Connection::open(database_path)
+            .expect("forensic connection")
+            .execute(
+                "INSERT INTO mutation_events(
+                    operation_id, attempt_number, state_version, phase, disposition,
+                    evidence_id, outcome_code, occurred_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, 'completed', 'verified_applied', ?4,
+                           'verified_applied', 21)",
+                params![
+                    operation_id.to_string(),
+                    i64::from(attempt_number),
+                    u64_to_i64(state_version).expect("test state version"),
+                    evidence_id.to_string(),
+                ],
+            )
+            .expect("append forged event permitted by the schema");
+    }
+
+    fn insert_forged_bridge_receipt(database_path: &Path, receipt: &BridgeReceiptFacts) {
+        let fingerprint = bridge_receipt_fingerprint(receipt);
+        Connection::open(database_path)
+            .expect("forensic connection")
+            .execute(
+                "INSERT INTO local_execution_r3_bridge_receipts(
+                    receipt_id, receipt_fingerprint, operation_id, attempt_number, boundary_id,
+                    boundary_occurred_at_unix_ms, contract_fingerprint, outcome_id, evidence_id,
+                    local_evidence_fingerprint, outcome_occurred_at_unix_ms,
+                    r3_intent_fingerprint, r3_evidence_fingerprint, r3_outcome_code,
+                    dependency_kind, r3_state_phase, r3_state_disposition, r3_attempt_number,
+                    r3_state_version, r3_last_evidence_id, r3_event_state_version
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                           ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                params![
+                    bridge_receipt_id(fingerprint).to_string(),
+                    fingerprint.as_slice(),
+                    receipt.operation_id.to_string(),
+                    i64::from(receipt.attempt_number),
+                    receipt.boundary_id.to_string(),
+                    u64_to_i64(receipt.boundary_occurred_at_unix_ms).expect("test timestamp"),
+                    receipt.contract_fingerprint.as_slice(),
+                    receipt.outcome_id.to_string(),
+                    receipt.evidence_id.to_string(),
+                    receipt.local_evidence_fingerprint.as_slice(),
+                    u64_to_i64(receipt.outcome_occurred_at_unix_ms).expect("test timestamp"),
+                    receipt.r3_intent_fingerprint,
+                    receipt.r3_evidence_fingerprint,
+                    receipt.r3_outcome_code,
+                    receipt.dependency_kind,
+                    receipt.r3_state_phase,
+                    receipt.r3_state_disposition,
+                    i64::from(receipt.r3_attempt_number),
+                    u64_to_i64(receipt.r3_state_version).expect("test state version"),
+                    receipt.r3_last_evidence_id.to_string(),
+                    u64_to_i64(receipt.r3_event_state_version).expect("test state version"),
+                ],
+            )
+            .expect("install forged receipt");
+    }
+
+    #[test]
+    fn r3_5_coherent_local_proof_sqlite_forgery_cannot_advance_cursor_or_survive_reopen() {
+        let fixture = Fixture::new();
+        let (mut store, binding, boundary, intent, evidence, decision, dependency, batch_id) =
+            bridged_r3_5_batch(&fixture);
+        let original = bridge_receipt_for(
+            &binding, &boundary, &intent, &evidence, &decision, dependency,
+        );
+        let mut forged = original.clone();
+        forged.local_evidence_fingerprint = [0xa5; 32];
+        forged.outcome_id = authoritative_outcome_id(
+            boundary.operation_id,
+            boundary.attempt_number,
+            boundary.boundary_id,
+            boundary.occurred_at_unix_ms,
+            evidence.evidence_id,
+            forged.local_evidence_fingerprint,
+            LocalExecutionOutcome::VerifiedApplied,
+            decision.recorded_at_unix_ms(),
+        );
+        let database_path = store.database_path().to_owned();
+        let forensic = Connection::open(&database_path).expect("forensic connection");
+        forensic
+            .execute("DROP TRIGGER local_execution_outcomes_no_update", [])
+            .expect("remove immutable outcome guard");
+        forensic
+            .execute("DROP TRIGGER local_execution_bridge_receipts_no_update", [])
+            .expect("remove immutable receipt guard");
+        forensic
+            .execute(
+                "UPDATE local_execution_attempt_outcomes
+                    SET outcome_id = ?1, evidence_fingerprint = ?2
+                  WHERE operation_id = ?3 AND attempt_number = ?4",
+                params![
+                    forged.outcome_id.to_string(),
+                    forged.local_evidence_fingerprint.as_slice(),
+                    boundary.operation_id.to_string(),
+                    i64::from(boundary.attempt_number),
+                ],
+            )
+            .expect("coherent local outcome forgery");
+        let forged_fingerprint = bridge_receipt_fingerprint(&forged);
+        forensic
+            .execute(
+                "UPDATE local_execution_r3_bridge_receipts
+                    SET receipt_id = ?1, receipt_fingerprint = ?2, outcome_id = ?3,
+                        local_evidence_fingerprint = ?4
+                  WHERE receipt_id = ?5",
+                params![
+                    bridge_receipt_id(forged_fingerprint).to_string(),
+                    forged_fingerprint.as_slice(),
+                    forged.outcome_id.to_string(),
+                    forged.local_evidence_fingerprint.as_slice(),
+                    bridge_receipt_id(bridge_receipt_fingerprint(&original)).to_string(),
+                ],
+            )
+            .expect("coherent receipt forgery");
+        forensic
+            .execute_batch(LOCAL_EXECUTION_OUTCOMES_NO_UPDATE_TRIGGER)
+            .expect("restore immutable outcome guard");
+        forensic
+            .execute_batch(LOCAL_EXECUTION_BRIDGE_RECEIPTS_NO_UPDATE_TRIGGER)
+            .expect("restore immutable receipt guard");
+        drop(forensic);
+
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+        assert_eq!(count(&database_path, "local_execution_attempt_outcomes"), 1);
+        assert_eq!(
+            count(&database_path, "local_execution_r3_bridge_receipts"),
+            1
+        );
+    }
+
+    #[test]
+    fn r3_5_coherent_outcome_code_rewrite_cannot_advance_cursor_or_survive_reopen() {
+        let fixture = Fixture::new();
+        let (mut store, binding, boundary, intent, evidence, decision, dependency, batch_id) =
+            bridged_r3_5_batch(&fixture);
+        let original = bridge_receipt_for(
+            &binding, &boundary, &intent, &evidence, &decision, dependency,
+        );
+        let mut forged = original.clone();
+        forged.r3_outcome_code = Some("rewritten_outcome".into());
+        let forged_fingerprint = bridge_receipt_fingerprint(&forged);
+        let database_path = store.database_path().to_owned();
+        let forensic = Connection::open(&database_path).expect("forensic connection");
+        forensic
+            .execute("DROP TRIGGER mutation_events_no_update", [])
+            .expect("remove immutable event guard");
+        forensic
+            .execute("DROP TRIGGER local_execution_bridge_receipts_no_update", [])
+            .expect("remove immutable receipt guard");
+        forensic
+            .execute(
+                "UPDATE mutation_state SET outcome_code = ?1 WHERE operation_id = ?2",
+                params!["rewritten_outcome", boundary.operation_id.to_string()],
+            )
+            .expect("rewrite state outcome code");
+        forensic
+            .execute(
+                "UPDATE mutation_events SET outcome_code = ?1
+                  WHERE operation_id = ?2 AND state_version = 2",
+                params!["rewritten_outcome", boundary.operation_id.to_string()],
+            )
+            .expect("rewrite final event outcome code");
+        forensic
+            .execute(
+                "UPDATE local_execution_r3_bridge_receipts
+                    SET receipt_id = ?1, receipt_fingerprint = ?2, r3_outcome_code = ?3
+                  WHERE receipt_id = ?4",
+                params![
+                    bridge_receipt_id(forged_fingerprint).to_string(),
+                    forged_fingerprint.as_slice(),
+                    "rewritten_outcome",
+                    bridge_receipt_id(bridge_receipt_fingerprint(&original)).to_string(),
+                ],
+            )
+            .expect("rewrite receipt outcome code and identity");
+        forensic
+            .execute_batch(MUTATION_EVENTS_NO_UPDATE_TRIGGER)
+            .expect("restore immutable event guard");
+        forensic
+            .execute_batch(LOCAL_EXECUTION_BRIDGE_RECEIPTS_NO_UPDATE_TRIGGER)
+            .expect("restore immutable receipt guard");
+        drop(forensic);
+
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn r3_5_journal_seals_original_r3_evidence_against_coherent_rewrite() {
+        let fixture = Fixture::new();
+        let (mut store, binding, boundary, intent, evidence, decision, dependency, batch_id) =
+            bridged_r3_5_batch(&fixture);
+        let original = bridge_receipt_for(
+            &binding, &boundary, &intent, &evidence, &decision, dependency,
+        );
+        let mut rewritten_evidence = evidence.clone();
+        rewritten_evidence.outcome_code = Some("rewritten_outcome".into());
+        rewritten_evidence.evidence_fingerprint = rewritten_evidence.canonical_fingerprint();
+        let mut rewritten_receipt = original.clone();
+        rewritten_receipt.r3_evidence_fingerprint = rewritten_evidence.evidence_fingerprint.clone();
+        rewritten_receipt.r3_outcome_code = rewritten_evidence.outcome_code.clone();
+        let rewritten_receipt_fingerprint = bridge_receipt_fingerprint(&rewritten_receipt);
+        let database_path = store.database_path().to_owned();
+        let forensic = Connection::open(&database_path).expect("forensic connection");
+        for trigger in [
+            "mutation_evidence_no_update",
+            "mutation_events_no_update",
+            "local_execution_bridge_receipts_no_update",
+        ] {
+            forensic
+                .execute(&format!("DROP TRIGGER {trigger}"), [])
+                .expect("remove immutable guard");
+        }
+        forensic
+            .execute(
+                "UPDATE mutation_verification_evidence
+                    SET outcome_code = ?1, evidence_fingerprint = ?2
+                  WHERE evidence_id = ?3",
+                params![
+                    rewritten_evidence.outcome_code,
+                    rewritten_evidence.evidence_fingerprint,
+                    evidence.evidence_id.to_string(),
+                ],
+            )
+            .expect("rewrite canonical R3 evidence preimage");
+        forensic
+            .execute(
+                "UPDATE mutation_state SET outcome_code = ?1 WHERE operation_id = ?2",
+                params!["rewritten_outcome", boundary.operation_id.to_string()],
+            )
+            .expect("rewrite state outcome code");
+        forensic
+            .execute(
+                "UPDATE mutation_events SET outcome_code = ?1
+                  WHERE operation_id = ?2 AND state_version = 2",
+                params!["rewritten_outcome", boundary.operation_id.to_string()],
+            )
+            .expect("rewrite final event outcome code");
+        forensic
+            .execute(
+                "UPDATE local_execution_r3_bridge_receipts
+                    SET receipt_id = ?1, receipt_fingerprint = ?2,
+                        r3_evidence_fingerprint = ?3, r3_outcome_code = ?4
+                  WHERE receipt_id = ?5",
+                params![
+                    bridge_receipt_id(rewritten_receipt_fingerprint).to_string(),
+                    rewritten_receipt_fingerprint.as_slice(),
+                    rewritten_receipt.r3_evidence_fingerprint,
+                    "rewritten_outcome",
+                    bridge_receipt_id(bridge_receipt_fingerprint(&original)).to_string(),
+                ],
+            )
+            .expect("rewrite coherent receipt identity");
+        forensic
+            .execute_batch(MUTATION_EVIDENCE_NO_UPDATE_TRIGGER)
+            .expect("restore evidence guard");
+        forensic
+            .execute_batch(MUTATION_EVENTS_NO_UPDATE_TRIGGER)
+            .expect("restore event guard");
+        forensic
+            .execute_batch(LOCAL_EXECUTION_BRIDGE_RECEIPTS_NO_UPDATE_TRIGGER)
+            .expect("restore receipt guard");
+        drop(forensic);
+
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn r3_5_stale_or_semantically_invalid_evidence_rejects_live_and_on_reopen() {
+        let fixture = Fixture::new();
+        let (mut store, _, _boundary, _, evidence, _, _, batch_id) = bridged_r3_5_batch(&fixture);
+        let database_path = store.database_path().to_owned();
+        let forensic = Connection::open(&database_path).expect("forensic connection");
+        forensic
+            .execute("DROP TRIGGER mutation_evidence_no_update", [])
+            .expect("remove immutable evidence guard");
+        forensic
+            .execute(
+                "UPDATE mutation_verification_evidence
+                    SET observed_path = 'notes/tampered.md'
+                  WHERE evidence_id = ?1",
+                [evidence.evidence_id.to_string()],
+            )
+            .expect("leave stale fingerprint over changed preimage");
+        forensic
+            .execute_batch(MUTATION_EVIDENCE_NO_UPDATE_TRIGGER)
+            .expect("restore immutable evidence guard");
+        drop(forensic);
+
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+        assert_eq!(count(&database_path, "mutation_verification_evidence"), 1);
+        assert_eq!(count(&database_path, "local_execution_attempt_outcomes"), 1);
+    }
+
+    #[test]
+    fn r3_5_self_canonical_but_intent_mismatched_evidence_rejects_live_and_on_reopen() {
+        let fixture = Fixture::new();
+        let (mut store, _, _, _, evidence, _, _, batch_id) = bridged_r3_5_batch(&fixture);
+        let mut forged = evidence.clone();
+        forged.observed_path = Some("notes/not-the-bound-intent.md".into());
+        forged.evidence_fingerprint = forged.canonical_fingerprint();
+        let database_path = store.database_path().to_owned();
+        let forensic = Connection::open(&database_path).expect("forensic connection");
+        forensic
+            .execute("DROP TRIGGER mutation_evidence_no_update", [])
+            .expect("remove immutable evidence guard");
+        forensic
+            .execute(
+                "UPDATE mutation_verification_evidence
+                    SET observed_path = ?1, evidence_fingerprint = ?2
+                  WHERE evidence_id = ?3",
+                params![
+                    forged.observed_path,
+                    forged.evidence_fingerprint,
+                    evidence.evidence_id.to_string(),
+                ],
+            )
+            .expect("rewrite self-canonical but semantically mismatched evidence");
+        forensic
+            .execute_batch(MUTATION_EVIDENCE_NO_UPDATE_TRIGGER)
+            .expect("restore immutable evidence guard");
+        drop(forensic);
+        assert!(!persisted_verified_applied_mutation_evidence_is_exact(
+            &store.connection,
+            evidence.evidence_id,
+        )
+        .expect("semantic recomputation"));
+
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn r3_5_receipt_only_nullable_outcome_code_drift_is_not_hash_bypass() {
+        let fixture = Fixture::new();
+        let (mut store, binding, boundary, intent, evidence, decision, dependency, batch_id) =
+            bridged_r3_5_batch(&fixture);
+        let original = bridge_receipt_for(
+            &binding, &boundary, &intent, &evidence, &decision, dependency,
+        );
+        let mut forged = original.clone();
+        forged.r3_outcome_code = None;
+        let forged_fingerprint = bridge_receipt_fingerprint(&forged);
+        let database_path = store.database_path().to_owned();
+        let forensic = Connection::open(&database_path).expect("forensic connection");
+        forensic
+            .execute("DROP TRIGGER local_execution_bridge_receipts_no_update", [])
+            .expect("remove immutable receipt guard");
+        forensic
+            .execute(
+                "UPDATE local_execution_r3_bridge_receipts
+                    SET receipt_id = ?1, receipt_fingerprint = ?2, r3_outcome_code = NULL
+                  WHERE receipt_id = ?3",
+                params![
+                    bridge_receipt_id(forged_fingerprint).to_string(),
+                    forged_fingerprint.as_slice(),
+                    bridge_receipt_id(bridge_receipt_fingerprint(&original)).to_string(),
+                ],
+            )
+            .expect("rewrite nullable receipt field and hash");
+        forensic
+            .execute_batch(LOCAL_EXECUTION_BRIDGE_RECEIPTS_NO_UPDATE_TRIGGER)
+            .expect("restore immutable receipt guard");
+        drop(forensic);
+
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn r3_5_clean_null_outcome_code_bridges_and_reopens_exactly() {
+        let fixture = Fixture::new();
+        let (mut store, _, _, _, evidence, _, _, batch_id) =
+            bridged_r3_5_batch_with_outcome_code(&fixture, None);
+        assert_eq!(evidence.outcome_code, None);
+        store
+            .commit_r3_change_batch(batch_id, 30)
+            .expect("NULL outcome-code bridge cursor");
+        drop(store);
+        let reopened = fixture.open();
+        assert_eq!(
+            reopened
+                .vault_state()
+                .expect("state")
+                .expect("bound")
+                .durable_cursor,
+            Some("cursor-2".into())
+        );
+    }
+
+    #[test]
+    fn r3_5_missing_journal_outcome_after_bridge_fails_closed_without_repair() {
+        let fixture = Fixture::new();
+        let (mut store, _, boundary, _, _, _, _, batch_id) = bridged_r3_5_batch(&fixture);
+        let database_path = store.database_path().to_owned();
+        let outcome_path = fixture.journal_directory().join(format!(
+            "{}-{}.out",
+            boundary.operation_id, boundary.attempt_number
+        ));
+        fs::remove_file(&outcome_path).expect("remove journal outcome in forensic test");
+
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+        assert_eq!(count(&database_path, "local_execution_attempt_outcomes"), 1);
+        assert_eq!(
+            count(&database_path, "local_execution_r3_bridge_receipts"),
+            1
+        );
+    }
+
+    #[test]
+    fn r3_5_missing_pre_after_bridge_rejects_live_and_reopen_without_repair() {
+        let fixture = Fixture::new();
+        let (mut store, _, boundary, _, _, _, _, batch_id) = bridged_r3_5_batch(&fixture);
+        let database_path = store.database_path().to_owned();
+        let pre_path = fixture.journal_directory().join(format!(
+            "{}-{}.pre",
+            boundary.operation_id, boundary.attempt_number
+        ));
+        fs::remove_file(&pre_path).expect("remove journal pre in forensic test");
+
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::LocalExecutionJournalMismatch)
+        ));
+        assert_eq!(count(&database_path, "local_execution_attempt_outcomes"), 1);
+        assert_eq!(
+            count(&database_path, "local_execution_r3_bridge_receipts"),
+            1
+        );
+    }
+
+    #[test]
+    fn r3_5_substituted_canonical_pre_rejects_even_when_out_embeds_original_pre() {
+        let fixture = Fixture::new();
+        let (mut store, _, boundary, _, _, _, _, batch_id) = bridged_r3_5_batch(&fixture);
+        let mut substituted = store
+            .execution_journal
+            .read_pre(boundary.operation_id, boundary.attempt_number)
+            .expect("read original pre")
+            .expect("pre exists");
+        let embedded = store
+            .execution_journal
+            .read_outcome(boundary.operation_id, boundary.attempt_number)
+            .expect("read original outcome")
+            .expect("out exists");
+        substituted.intent_fingerprint = [0x51; 32];
+        assert_ne!(
+            substituted, embedded.pre,
+            "forensic pre must differ from out pre"
+        );
+        let pre_path = fixture.journal_directory().join(format!(
+            "{}-{}.pre",
+            boundary.operation_id, boundary.attempt_number
+        ));
+        fs::write(
+            &pre_path,
+            crate::sync_journal::canonical_pre_bytes_for_test(&substituted),
+        )
+        .expect("replace with canonical but substituted pre");
+        make_private_file(&pre_path);
+
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::LocalExecutionJournalMismatch)
+        ));
+    }
+
+    #[test]
+    fn r3_5_out_with_different_canonical_embedded_pre_rejects_live_and_reopen() {
+        let fixture = Fixture::new();
+        let (mut store, _, boundary, _, _, _, _, batch_id) = bridged_r3_5_batch(&fixture);
+        let pre = store
+            .execution_journal
+            .read_pre(boundary.operation_id, boundary.attempt_number)
+            .expect("read pre")
+            .expect("pre exists");
+        let mut substituted_out = store
+            .execution_journal
+            .read_outcome(boundary.operation_id, boundary.attempt_number)
+            .expect("read outcome")
+            .expect("out exists");
+        substituted_out.pre.collision_snapshot_fingerprint = [0x52; 32];
+        assert_ne!(
+            substituted_out.pre, pre,
+            "out must embed a different canonical pre"
+        );
+        let out_path = fixture.journal_directory().join(format!(
+            "{}-{}.out",
+            boundary.operation_id, boundary.attempt_number
+        ));
+        fs::write(
+            &out_path,
+            crate::sync_journal::canonical_outcome_bytes_for_test(&substituted_out),
+        )
+        .expect("replace with canonical out containing substituted pre");
+        make_private_file(&out_path);
+
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn r3_5_committed_dependency_receipt_deletion_cannot_downgrade_to_prereceipt() {
+        let fixture = Fixture::new();
+        let (mut store, _, boundary, _, _, _, _, batch_id) = bridged_r3_5_batch(&fixture);
+        let database_path = store.database_path().to_owned();
+        let forensic = Connection::open(&database_path).expect("forensic connection");
+        forensic
+            .execute("DROP TRIGGER local_execution_bridge_receipts_no_delete", [])
+            .expect("remove receipt delete guard");
+        forensic
+            .execute(
+                "DELETE FROM local_execution_r3_bridge_receipts
+                  WHERE operation_id = ?1 AND attempt_number = ?2",
+                params![
+                    boundary.operation_id.to_string(),
+                    i64::from(boundary.attempt_number)
+                ],
+            )
+            .expect("delete committed bridge receipt");
+        forensic
+            .execute_batch(LOCAL_EXECUTION_BRIDGE_RECEIPTS_NO_DELETE_TRIGGER)
+            .expect("restore receipt delete guard");
+        drop(forensic);
+
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        assert_eq!(
+            count(&database_path, "local_execution_r3_bridge_receipts"),
+            0
+        );
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn r3_5_receipt_deletion_after_batch_cleanup_rejects_reopen_forever() {
+        let fixture = Fixture::new();
+        let (mut store, _, boundary, _, _, _, _, batch_id) = bridged_r3_5_batch(&fixture);
+        store
+            .commit_r3_change_batch(batch_id, 30)
+            .expect("cursor finalization removes batch rows");
+        let database_path = store.database_path().to_owned();
+        let forensic = Connection::open(&database_path).expect("forensic connection");
+        forensic
+            .execute("DROP TRIGGER local_execution_bridge_receipts_no_delete", [])
+            .expect("remove immutable receipt guard");
+        forensic
+            .execute(
+                "DELETE FROM local_execution_r3_bridge_receipts
+                  WHERE operation_id = ?1 AND attempt_number = ?2",
+                params![
+                    boundary.operation_id.to_string(),
+                    i64::from(boundary.attempt_number)
+                ],
+            )
+            .expect("delete receipt after cascading batch cleanup");
+        forensic
+            .execute_batch(LOCAL_EXECUTION_BRIDGE_RECEIPTS_NO_DELETE_TRIGGER)
+            .expect("restore immutable receipt guard");
+        drop(forensic);
+        let marker_path = fixture.journal_directory().join(format!(
+            "{}-{}.bridge",
+            boundary.operation_id, boundary.attempt_number
+        ));
+        fs::remove_file(&marker_path).expect("remove marker with deleted receipt");
+        assert_eq!(count(&database_path, "change_batch_mutations"), 0);
+        assert_eq!(
+            count(&database_path, "local_execution_r3_consumption_anchors"),
+            1,
+            "retained anchor prevents receipt+marker deletion from downgrading to pre-receipt"
+        );
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn r3_5_missing_or_substituted_consumption_marker_is_never_cursor_authority() {
+        let fixture = Fixture::new();
+        let (mut store, _, boundary, _, _, _, _, batch_id) = bridged_r3_5_batch(&fixture);
+        let marker_path = fixture.journal_directory().join(format!(
+            "{}-{}.bridge",
+            boundary.operation_id, boundary.attempt_number
+        ));
+        fs::remove_file(&marker_path).expect("remove bridge marker to model post-receipt crash");
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        drop(store);
+        // A missing marker is the recoverable receipt-commit/publish crash
+        // window, so opening remains forensic/retry-capable but not cursor
+        // authoritative.
+        let reopened = fixture.open();
+        drop(reopened);
+
+        let fixture = Fixture::new();
+        let (mut store, _, boundary, _, _, _, _, batch_id) = bridged_r3_5_batch(&fixture);
+        let marker_path = fixture.journal_directory().join(format!(
+            "{}-{}.bridge",
+            boundary.operation_id, boundary.attempt_number
+        ));
+        let mut marker = store
+            .execution_journal
+            .read_bridge_consumption(boundary.operation_id, boundary.attempt_number)
+            .expect("read marker")
+            .expect("marker exists");
+        marker.r3_evidence_fingerprint = [0xa5; 32];
+        fs::write(
+            &marker_path,
+            crate::sync_journal::canonical_bridge_consumption_bytes_for_test(&marker),
+        )
+        .expect("substitute canonical but wrong marker");
+        make_private_file(&marker_path);
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn r3_5_marker_publish_interrupt_is_not_authority_until_reopen_sync_recovers() {
+        let fixture = Fixture::new();
+        let (mut store, binding, boundary, intent, evidence, decision, dependency, batch_id) =
+            bridged_r3_5_batch(&fixture);
+        let receipt = bridge_receipt_for(
+            &binding, &boundary, &intent, &evidence, &decision, dependency,
+        );
+        let pre = store
+            .execution_journal
+            .read_pre(boundary.operation_id, boundary.attempt_number)
+            .expect("read pre")
+            .expect("pre exists");
+        let consumption = bridge_consumption_witness(&pre, &receipt).expect("canonical marker");
+        let marker_path = fixture.journal_directory().join(format!(
+            "{}-{}.bridge",
+            boundary.operation_id, boundary.attempt_number
+        ));
+        fs::remove_file(&marker_path).expect("model post-transaction marker interruption");
+        store.execution_journal.fail_next_directory_sync_for_test();
+        assert!(matches!(
+            store
+                .execution_journal
+                .publish_bridge_consumption(&consumption),
+            Err(Error::LocalExecutionJournalPublishedButNotSynced(_))
+        ));
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        // Cross the store/process lifetime without the bridge retry.  Open
+        // itself performs the required directory fsync before it permits the
+        // visible marker to become authority; this is deliberately different
+        // from forgetting the live-process unconfirmed set.
+        drop(store);
+        let mut recovered = fixture.open();
+        recovered
+            .commit_r3_change_batch(batch_id, 30)
+            .expect("reopen durability recovery establishes marker authority");
+    }
+
+    #[test]
+    fn r3_5_pre_receipt_crash_boundary_recovers_without_cursor_or_bridge_authority() {
+        let fixture = Fixture::new();
+        let mut store = ready_store(&fixture);
+        let operation_id = Uuid::new_v4();
+        let binding = test_durable_execution_binding(operation_id, fixture.vault_id);
+        let boundary = LocalExecutionAttemptBoundary {
+            operation_id,
+            attempt_number: 0,
+            boundary_id: Uuid::new_v4(),
+            contract_fingerprint: binding.fingerprint(),
+            occurred_at_unix_ms: 11,
+        };
+        store
+            .register_local_execution_contract(&binding, 10)
+            .expect("contract");
+        store
+            .append_local_execution_attempt_boundary(&boundary)
+            .expect("boundary");
+        store
+            .publish_local_execution_pre_side_effect_witness(&binding, &boundary, 11)
+            .expect("pre-side-effect witness");
+        assert_eq!(
+            store
+                .inspect_local_execution_recovery(&binding, 0)
+                .expect("recoverable crash boundary"),
+            LocalExecutionRecoveryObservation::PreSideEffectWitnessOnly
+        );
+        assert_eq!(
+            count(store.database_path(), "local_execution_attempt_outcomes"),
+            0
+        );
+        assert_eq!(
+            count(store.database_path(), "local_execution_r3_bridge_receipts"),
+            0
+        );
+        assert_eq!(
+            store
+                .vault_state()
+                .expect("state")
+                .expect("bound")
+                .durable_cursor,
+            Some("cursor-1".into())
+        );
+        drop(store);
+        let reopened = fixture.open();
+        assert_eq!(
+            reopened
+                .inspect_local_execution_recovery(&binding, 0)
+                .expect("reopen recovery"),
+            LocalExecutionRecoveryObservation::PreSideEffectWitnessOnly
+        );
+        assert_eq!(
+            reopened
+                .vault_state()
+                .expect("state")
+                .expect("bound")
+                .durable_cursor,
+            Some("cursor-1".into())
+        );
+    }
+
+    #[test]
+    fn r3_5_stale_base_reference_fingerprint_rejects_live_and_reopen() {
+        let fixture = Fixture::new();
+        let (mut store, _, boundary, _, _, _, _, batch_id) = bridged_r3_5_batch(&fixture);
+        let database_path = store.database_path().to_owned();
+        let forensic = Connection::open(&database_path).expect("forensic connection");
+        forensic
+            .execute("DROP TRIGGER mutation_intents_no_update", [])
+            .expect("remove intent guard");
+        forensic
+            .execute(
+                "UPDATE mutation_intents SET base_reference = 'base-reference-a'
+                  WHERE operation_id = ?1",
+                [boundary.operation_id.to_string()],
+            )
+            .expect("alter valid base reference without matching fingerprint");
+        forensic
+            .execute_batch(MUTATION_INTENTS_NO_UPDATE_TRIGGER)
+            .expect("restore exact intent guard");
+        let persisted = load_persisted_mutation_intent(&forensic, boundary.operation_id)
+            .expect("read full persisted intent")
+            .expect("intent exists");
+        assert!(matches!(
+            validate_mutation_intent(&persisted),
+            Err(Error::InvalidTransferEvidence)
+        ));
+        drop(forensic);
+
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn r3_5_stale_local_object_id_fingerprint_rejects_live_and_reopen() {
+        let fixture = Fixture::new();
+        let (mut store, _, boundary, _, _, _, _, batch_id) = bridged_r3_5_batch(&fixture);
+        let database_path = store.database_path().to_owned();
+        let forensic = Connection::open(&database_path).expect("forensic connection");
+        forensic
+            .execute("DROP TRIGGER mutation_intents_no_update", [])
+            .expect("remove intent guard");
+        forensic
+            .execute(
+                "UPDATE mutation_intents SET local_object_id = 'local-object-a'
+                  WHERE operation_id = ?1",
+                [boundary.operation_id.to_string()],
+            )
+            .expect("alter valid local object without matching fingerprint");
+        forensic
+            .execute_batch(MUTATION_INTENTS_NO_UPDATE_TRIGGER)
+            .expect("restore exact intent guard");
+        let persisted = load_persisted_mutation_intent(&forensic, boundary.operation_id)
+            .expect("read full persisted intent")
+            .expect("intent exists");
+        assert!(matches!(
+            validate_mutation_intent(&persisted),
+            Err(Error::InvalidTransferEvidence)
+        ));
+        drop(forensic);
+
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn r3_5_direct_intent_reregistration_rejects_stale_and_coherent_rewrites() {
+        let fixture = Fixture::new();
+        let (mut store, _, boundary, intent, _, _, _, _) = bridged_r3_5_batch(&fixture);
+        let forensic = Connection::open(store.database_path()).expect("forensic connection");
+        forensic
+            .execute("DROP TRIGGER mutation_intents_no_update", [])
+            .expect("remove immutable guard");
+        forensic
+            .execute(
+                "UPDATE mutation_intents SET base_reference = 'stale-base' WHERE operation_id = ?1",
+                [boundary.operation_id.to_string()],
+            )
+            .expect("stale rewrite");
+        forensic
+            .execute_batch(MUTATION_INTENTS_NO_UPDATE_TRIGGER)
+            .expect("restore immutable guard");
+        drop(forensic);
+        assert!(matches!(
+            store.register_mutation_intent(&intent, None),
+            Err(Error::MutationCollision)
+        ));
+
+        let fixture = Fixture::new();
+        let (mut store, _, boundary, intent, _, _, _, _) = bridged_r3_5_batch(&fixture);
+        let forensic = Connection::open(store.database_path()).expect("forensic connection");
+        forensic
+            .execute("DROP TRIGGER mutation_intents_no_update", [])
+            .expect("remove immutable guard");
+        let mut rewritten = load_persisted_mutation_intent(&forensic, boundary.operation_id)
+            .expect("read intent")
+            .expect("intent exists");
+        rewritten.base_reference = Some("coherent-base".into());
+        rewritten.local_object_id = Some("coherent-local".into());
+        rewritten.intent_fingerprint = rewritten.canonical_fingerprint();
+        forensic
+            .execute(
+                "UPDATE mutation_intents SET base_reference = ?1, local_object_id = ?2,
+                    intent_fingerprint = ?3 WHERE operation_id = ?4",
+                params![
+                    rewritten.base_reference,
+                    rewritten.local_object_id,
+                    rewritten.intent_fingerprint,
+                    boundary.operation_id.to_string(),
+                ],
+            )
+            .expect("coherent rewrite");
+        forensic
+            .execute_batch(MUTATION_INTENTS_NO_UPDATE_TRIGGER)
+            .expect("restore immutable guard");
+        drop(forensic);
+        assert!(matches!(
+            store.register_mutation_intent(&intent, None),
+            Err(Error::MutationCollision)
+        ));
+    }
+
+    #[test]
+    fn r3_5_operation_scoped_reregistration_ignores_corrupt_b_but_reopen_rejects_it() {
+        let fixture = Fixture::new();
+        let mut store = fixture.open();
+        let a = test_durable_execution_binding(Uuid::new_v4(), fixture.vault_id);
+        let b = test_durable_execution_binding(Uuid::new_v4(), fixture.vault_id);
+        store
+            .register_local_execution_contract(&a, 10)
+            .expect("healthy A contract");
+        store
+            .register_local_execution_contract(&b, 10)
+            .expect("B contract");
+        let forensic = Connection::open(store.database_path()).expect("forensic connection");
+        forensic
+            .execute("DROP TRIGGER local_execution_contracts_no_update", [])
+            .expect("remove immutable guard");
+        forensic
+            .execute(
+                "UPDATE local_execution_contracts SET target_name = 'corrupt-b'
+                  WHERE operation_id = ?1",
+                [b.persistence_projection().operation_id.to_string()],
+            )
+            .expect("corrupt unrelated B contract");
+        forensic
+            .execute_batch(LOCAL_EXECUTION_CONTRACTS_NO_UPDATE_TRIGGER)
+            .expect("restore immutable guard");
+        drop(forensic);
+        assert!(matches!(
+            store.register_local_execution_contract(&a, 10),
+            Ok(LocalExecutionRegistrationOutcome::AlreadyPresent)
+        ));
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn r3_5_history_rejects_running_after_final_time_and_attempt_jump() {
+        for (column, value) in [("occurred_at_unix_ms", "22"), ("attempt_number", "1")] {
+            let fixture = Fixture::new();
+            let (mut store, _, boundary, _, _, _, _, batch_id) = bridged_r3_5_batch(&fixture);
+            let forensic = Connection::open(store.database_path()).expect("forensic connection");
+            forensic
+                .execute("DROP TRIGGER mutation_events_no_update", [])
+                .expect("remove immutable event guard");
+            forensic
+                .execute(
+                    &format!(
+                        "UPDATE mutation_events SET {column} = {value}
+                          WHERE operation_id = ?1 AND state_version = 1"
+                    ),
+                    [boundary.operation_id.to_string()],
+                )
+                .expect("tamper intermediate running event");
+            forensic
+                .execute_batch(MUTATION_EVENTS_NO_UPDATE_TRIGGER)
+                .expect("restore immutable event guard");
+            drop(forensic);
+            assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+            drop(store);
+            assert!(matches!(
+                SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+                Err(Error::InvalidSchema)
+            ));
+        }
+    }
+
+    #[test]
+    fn r3_5_coherent_full_intent_rewrite_rejects_against_unchanged_local_contract_and_receipt() {
+        let fixture = Fixture::new();
+        let (mut store, binding, boundary, _, _, _, _, batch_id) = bridged_r3_5_batch(&fixture);
+        let database_path = store.database_path().to_owned();
+        let forensic = Connection::open(&database_path).expect("forensic connection");
+        forensic
+            .execute("DROP TRIGGER mutation_intents_no_update", [])
+            .expect("remove intent guard");
+        let mut rewritten = load_persisted_mutation_intent(&forensic, boundary.operation_id)
+            .expect("read full persisted intent")
+            .expect("intent exists");
+        rewritten.base_reference = Some("base-reference-a".into());
+        rewritten.local_object_id = Some("local-object-a".into());
+        rewritten.intent_fingerprint = rewritten.canonical_fingerprint();
+        validate_mutation_intent(&rewritten).expect("coherent full intent rewrite");
+        forensic
+            .execute(
+                "UPDATE mutation_intents
+                    SET base_reference = ?1, local_object_id = ?2, intent_fingerprint = ?3
+                  WHERE operation_id = ?4",
+                params![
+                    rewritten.base_reference,
+                    rewritten.local_object_id,
+                    rewritten.intent_fingerprint,
+                    boundary.operation_id.to_string(),
+                ],
+            )
+            .expect("rewrite all changed fields and fingerprint");
+        forensic
+            .execute_batch(MUTATION_INTENTS_NO_UPDATE_TRIGGER)
+            .expect("restore exact intent guard");
+        let persisted = load_persisted_mutation_intent(&forensic, boundary.operation_id)
+            .expect("read rewritten full intent")
+            .expect("intent exists");
+        validate_mutation_intent(&persisted).expect("full typed intent validation reached");
+        assert_ne!(
+            binding.persistence_projection().intent_fingerprint,
+            local_intent_fingerprint_from_r3_intent(&persisted.intent_fingerprint)
+                .expect("derived changed local fingerprint"),
+            "unchanged local contract must bind the original R3 intent"
+        );
+        drop(forensic);
+
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn r3_5_event_zero_semantic_tamper_with_versions_zero_one_two_rejects_live_and_reopen() {
+        let fixture = Fixture::new();
+        let (mut store, _, boundary, _, _, _, _, batch_id) = bridged_r3_5_batch(&fixture);
+        let database_path = store.database_path().to_owned();
+        let forensic = Connection::open(&database_path).expect("forensic connection");
+        forensic
+            .execute("DROP TRIGGER mutation_events_no_update", [])
+            .expect("remove event guard");
+        forensic
+            .execute(
+                "UPDATE mutation_events
+                    SET phase = 'running'
+                  WHERE operation_id = ?1 AND state_version = 0",
+                [boundary.operation_id.to_string()],
+            )
+            .expect("semantic tamper of initial event");
+        forensic
+            .execute_batch(MUTATION_EVENTS_NO_UPDATE_TRIGGER)
+            .expect("restore exact event guard");
+        drop(forensic);
+
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn r3_5_event_one_semantic_tamper_with_versions_zero_one_two_rejects_live_and_reopen() {
+        let fixture = Fixture::new();
+        let (mut store, _, boundary, _, _, _, _, batch_id) = bridged_r3_5_batch(&fixture);
+        let database_path = store.database_path().to_owned();
+        let forensic = Connection::open(&database_path).expect("forensic connection");
+        forensic
+            .execute("DROP TRIGGER mutation_events_no_update", [])
+            .expect("remove event guard");
+        forensic
+            .execute(
+                "UPDATE mutation_events
+                    SET phase = 'needs_reconcile', disposition = 'needs_reconcile'
+                  WHERE operation_id = ?1 AND state_version = 1",
+                [boundary.operation_id.to_string()],
+            )
+            .expect("semantic tamper of non-final event");
+        forensic
+            .execute_batch(MUTATION_EVENTS_NO_UPDATE_TRIGGER)
+            .expect("restore exact event guard");
+        drop(forensic);
+
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn r3_5_missing_middle_event_rejects_live_and_reopen_without_advancing_cursor() {
+        let fixture = Fixture::new();
+        let (mut store, _, boundary, _, _, _, _, batch_id) = bridged_r3_5_batch(&fixture);
+        let database_path = store.database_path().to_owned();
+        let forensic = Connection::open(&database_path).expect("forensic connection");
+        forensic
+            .execute("DROP TRIGGER mutation_events_no_delete", [])
+            .expect("remove event delete guard");
+        forensic
+            .execute(
+                "DELETE FROM mutation_events WHERE operation_id = ?1 AND state_version = 1",
+                [boundary.operation_id.to_string()],
+            )
+            .expect("delete middle event under forensic setup");
+        forensic
+            .execute_batch(MUTATION_EVENTS_NO_DELETE_TRIGGER)
+            .expect("restore exact event delete guard");
+        drop(forensic);
+
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn retry_attempt_overflow_fails_closed_before_state_event_or_evidence_artifacts() {
+        let fixture = Fixture::new();
+        let mut store = ready_store(&fixture);
+        let operation_id = Uuid::new_v4();
+        let intent = local_publish_intent(operation_id);
+        store
+            .register_mutation_intent(&intent, None)
+            .expect("intent durable");
+        let database_path = store.database_path().to_owned();
+        let forensic = Connection::open(&database_path).expect("forensic connection");
+        forensic
+            .execute(
+                "UPDATE mutation_state
+                    SET phase = 'retry_scheduled', attempt_number = ?1, state_version = 1,
+                        next_attempt_at_unix_ms = 12, retry_mode = 'restart_exact',
+                        resume_reference = NULL, updated_at_unix_ms = 12
+                  WHERE operation_id = ?2",
+                params![i64::from(u32::MAX), operation_id.to_string()],
+            )
+            .expect("forge due retry at maximum attempt");
+        forensic
+            .execute(
+                "INSERT INTO mutation_events(
+                    operation_id, attempt_number, state_version, phase, disposition,
+                    evidence_id, outcome_code, occurred_at_unix_ms
+                 ) VALUES (?1, ?2, 1, 'retry_scheduled', NULL, NULL, NULL, 12)",
+                params![operation_id.to_string(), i64::from(u32::MAX)],
+            )
+            .expect("preserve append-only forensic history shape");
+        drop(forensic);
+        let state_before = store
+            .mutation_state(operation_id)
+            .expect("read forged retry state")
+            .expect("state exists");
+        let events_before = count(&database_path, "mutation_events");
+        let evidence_before = count(&database_path, "mutation_verification_evidence");
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            store.claim_mutation(operation_id, 1, 12)
+        }));
+        assert!(
+            matches!(result, Ok(Err(Error::InvalidSchema))),
+            "{result:?}"
+        );
+        assert_eq!(
+            store
+                .mutation_state(operation_id)
+                .expect("read state after overflow"),
+            Some(state_before)
+        );
+        assert_eq!(count(&database_path, "mutation_events"), events_before);
+        assert_eq!(
+            count(&database_path, "mutation_verification_evidence"),
+            evidence_before
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn r3_5_authoritative_finalization_matrix_is_exact_idempotent_and_restart_safe() {
+        for (index, (requested, call_fact, expected_non_retryable)) in [
+            (
+                LocalExecutionOutcome::VerifiedApplied,
+                PlatformCallFact::Returned,
+                false,
+            ),
+            (
+                LocalExecutionOutcome::VerifiedNotApplied,
+                PlatformCallFact::NotEntered,
+                false,
+            ),
+            (
+                LocalExecutionOutcome::WriteOutcomeUnknown,
+                PlatformCallFact::Ambiguous,
+                true,
+            ),
+            (
+                LocalExecutionOutcome::NeedsReconcile,
+                PlatformCallFact::Returned,
+                true,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (fixture, mut store, binding, boundary) = prepared_journal_attempt();
+            store
+                .publish_local_execution_pre_side_effect_witness(&binding, &boundary, 11)
+                .expect("pre witness");
+            let decision = classify_authoritative_final_outcome(
+                &binding,
+                &boundary,
+                test_authoritative_evidence_with_identity(
+                    &binding,
+                    &boundary,
+                    call_fact,
+                    requested,
+                    Uuid::new_v5(
+                        &Uuid::NAMESPACE_OID,
+                        format!("r3.5-finalization-matrix-{index}").as_bytes(),
+                    ),
+                    [u8::try_from(index + 1).expect("small matrix index"); 32],
+                ),
+            )
+            .expect("classify authoritative outcome");
+            assert_eq!(decision.outcome(), requested);
+            assert_eq!(
+                store
+                    .finalize_authoritative_local_execution_outcome(&binding, &boundary, &decision)
+                    .expect("first finalization"),
+                LocalExecutionRegistrationOutcome::Registered
+            );
+            assert_eq!(
+                store
+                    .finalize_authoritative_local_execution_outcome(&binding, &boundary, &decision)
+                    .expect("idempotent finalization"),
+                LocalExecutionRegistrationOutcome::AlreadyPresent
+            );
+            let pre = store
+                .execution_journal
+                .read_pre(boundary.operation_id, boundary.attempt_number)
+                .expect("read journal pre")
+                .expect("journal pre exists");
+            let out = store
+                .execution_journal
+                .read_outcome(boundary.operation_id, boundary.attempt_number)
+                .expect("read journal out")
+                .expect("journal out exists");
+            assert_eq!(out.pre, pre, "exact named and embedded pre pair");
+            assert_eq!(out.outcome_id, decision.outcome_id());
+            assert_eq!(out.evidence_id, decision.evidence_id());
+            assert_eq!(out.outcome, requested);
+            assert_eq!(
+                out.r3_mutation_evidence_fingerprint,
+                Some(decision.r3_mutation_evidence_fingerprint())
+            );
+            let ledger = store
+                .local_execution_attempt_outcome(boundary.operation_id, boundary.attempt_number)
+                .expect("read local ledger")
+                .expect("local ledger exists");
+            assert_eq!(ledger.outcome_id, decision.outcome_id());
+            assert_eq!(ledger.non_retryable, expected_non_retryable);
+            assert_eq!(
+                count(store.database_path(), "local_execution_r3_bridge_receipts"),
+                0,
+                "finalization alone never creates bridge authority"
+            );
+            if requested != LocalExecutionOutcome::VerifiedApplied {
+                assert!(matches!(
+                    store.commit_r3_5_verified_local_execution_dependency(
+                        Uuid::new_v4(),
+                        ChangeBatchDependency {
+                            operation_id: boundary.operation_id,
+                            kind: ChangeBatchDependencyKind::Mutation,
+                        },
+                        &binding,
+                        boundary.attempt_number,
+                        &decision,
+                    ),
+                    Err(Error::LocalMutationIncomplete)
+                ));
+                assert_eq!(
+                    count(store.database_path(), "local_execution_r3_bridge_receipts"),
+                    0,
+                    "non-applied final outcome cannot create a receipt"
+                );
+            }
+            drop(store);
+            let reopened = fixture.open();
+            assert!(matches!(
+                reopened.inspect_local_execution_recovery(&binding, boundary.attempt_number),
+                Ok(LocalExecutionRecoveryObservation::OutcomeWitnessAndLedgerMatch { .. })
+            ));
+            assert_eq!(
+                reopened
+                    .local_execution_attempt_outcome(boundary.operation_id, boundary.attempt_number)
+                    .expect("read reopen ledger")
+                    .expect("reopen ledger exists")
+                    .outcome_id,
+                decision.outcome_id()
+            );
+        }
+    }
+
+    #[test]
+    fn r3_5_exact_reregistration_with_rotated_attestation_remains_already_present() {
+        let fixture = Fixture::new();
+        let operation_id = Uuid::new_v4();
+        let original = test_durable_execution_binding(operation_id, fixture.vault_id);
+        let rotated = test_durable_execution_binding_with_attestation_offset(
+            operation_id,
+            fixture.vault_id,
+            9,
+        );
+        let mut store = fixture.open();
+        assert_eq!(
+            store
+                .register_local_execution_contract(&original, 10)
+                .expect("first registration"),
+            LocalExecutionRegistrationOutcome::Registered
+        );
+        assert_eq!(
+            store
+                .register_local_execution_contract(&rotated, 10)
+                .expect("rotated exact re-registration"),
+            LocalExecutionRegistrationOutcome::AlreadyPresent
+        );
+    }
+
+    #[test]
+    fn r3_5_reregistration_rejects_structurally_valid_child_row_tampering_immediately() {
+        enum ChildTamper {
+            Identity,
+            CollisionMember,
+            Completion,
+        }
+        for tamper in [
+            ChildTamper::Identity,
+            ChildTamper::CollisionMember,
+            ChildTamper::Completion,
+        ] {
+            let fixture = Fixture::new();
+            let operation_id = Uuid::new_v4();
+            let binding = test_durable_execution_binding(operation_id, fixture.vault_id);
+            let mut store = fixture.open();
+            store
+                .register_local_execution_contract(&binding, 10)
+                .expect("first registration");
+            let forensic = Connection::open(store.database_path()).expect("forensic connection");
+            match tamper {
+                ChildTamper::Identity => {
+                    forensic
+                        .execute("DROP TRIGGER local_execution_identities_no_update", [])
+                        .expect("remove identity guard");
+                    forensic
+                        .execute(
+                            "UPDATE local_execution_identity_evidence
+                                SET provider_id = X'01'
+                              WHERE operation_id = ?1 AND role = 'vault_root'",
+                            [operation_id.to_string()],
+                        )
+                        .expect("structurally valid identity rewrite");
+                    forensic
+                        .execute_batch(LOCAL_EXECUTION_IDENTITIES_NO_UPDATE_TRIGGER)
+                        .expect("restore identity guard");
+                }
+                ChildTamper::CollisionMember => {
+                    forensic
+                        .execute("DROP TRIGGER local_execution_members_no_update", [])
+                        .expect("remove member guard");
+                    forensic
+                        .execute(
+                            "UPDATE local_execution_collision_members
+                                SET collision_key = 'different'
+                              WHERE operation_id = ?1 AND ordinal = 0",
+                            [operation_id.to_string()],
+                        )
+                        .expect("structurally valid collision rewrite");
+                    forensic
+                        .execute_batch(LOCAL_EXECUTION_MEMBERS_NO_UPDATE_TRIGGER)
+                        .expect("restore member guard");
+                }
+                ChildTamper::Completion => {
+                    forensic
+                        .execute("DROP TRIGGER local_execution_completions_no_update", [])
+                        .expect("remove completion guard");
+                    forensic
+                        .execute(
+                            "UPDATE local_execution_contract_completions
+                                SET completed_at_unix_ms = 11
+                              WHERE operation_id = ?1",
+                            [operation_id.to_string()],
+                        )
+                        .expect("structurally valid completion rewrite");
+                    forensic
+                        .execute_batch(LOCAL_EXECUTION_COMPLETIONS_NO_UPDATE_TRIGGER)
+                        .expect("restore completion guard");
+                }
+            }
+            drop(forensic);
+            assert!(matches!(
+                store.register_local_execution_contract(&binding, 10),
+                Err(Error::LocalExecutionJournalMismatch)
+            ));
+        }
+    }
+
+    #[test]
+    fn mutation_state_version_max_fails_closed_before_evidence_or_event_write() {
+        let fixture = Fixture::new();
+        let mut store = ready_store(&fixture);
+        let operation_id = Uuid::new_v4();
+        let intent = local_publish_intent(operation_id);
+        store
+            .register_mutation_intent(&intent, None)
+            .expect("intent");
+        store.claim_mutation(operation_id, 0, 12).expect("claim");
+        let evidence = local_publish_evidence(Uuid::new_v4(), &intent);
+        let database_path = store.database_path().to_owned();
+        Connection::open(&database_path)
+            .expect("forensic connection")
+            .execute(
+                "UPDATE mutation_state SET state_version = ?1 WHERE operation_id = ?2",
+                params![i64::MAX, operation_id.to_string()],
+            )
+            .expect("set adversarial state version");
+        let evidence_count_before = count(&database_path, "mutation_verification_evidence");
+        let event_count_before = count(&database_path, "mutation_events");
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            store.record_mutation_outcome(
+                operation_id,
+                i64::MAX as u64,
+                &evidence,
+                &MutationOutcomeTransition::VerifiedApplied,
+            )
+        }));
+        assert!(
+            matches!(
+                result,
+                Ok(Err(Error::InvalidSchema | Error::InvalidTimestamp))
+            ),
+            "unexpected max-version result: {result:?}"
+        );
+        assert_eq!(
+            count(&database_path, "mutation_verification_evidence"),
+            evidence_count_before
+        );
+        assert_eq!(count(&database_path, "mutation_events"), event_count_before);
+    }
+
+    #[test]
+    fn r3_5_future_mutation_event_cannot_advance_cursor_or_survive_reopen() {
+        let fixture = Fixture::new();
+        let (mut store, _, boundary, _, evidence, _, _, batch_id) = bridged_r3_5_batch(&fixture);
+        let database_path = store.database_path().to_owned();
+        append_forged_mutation_event(
+            &database_path,
+            boundary.operation_id,
+            0,
+            3,
+            evidence.evidence_id,
+        );
+
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn r3_5_i64_max_state_event_and_receipt_rewrite_fails_closed_without_panicking() {
+        let fixture = Fixture::new();
+        let (mut store, binding, boundary, intent, evidence, decision, dependency, batch_id) =
+            bridged_r3_5_batch(&fixture);
+        let original = bridge_receipt_for(
+            &binding, &boundary, &intent, &evidence, &decision, dependency,
+        );
+        let mut forged = original.clone();
+        forged.r3_state_version = i64::MAX as u64;
+        forged.r3_event_state_version = i64::MAX as u64;
+        let forged_fingerprint = bridge_receipt_fingerprint(&forged);
+        let database_path = store.database_path().to_owned();
+        let forensic = Connection::open(&database_path).expect("forensic connection");
+        forensic
+            .execute("DROP TRIGGER mutation_events_no_update", [])
+            .expect("remove immutable event guard");
+        forensic
+            .execute("DROP TRIGGER local_execution_bridge_receipts_no_update", [])
+            .expect("remove immutable receipt guard");
+        forensic
+            .execute(
+                "UPDATE mutation_state SET state_version = ?1 WHERE operation_id = ?2",
+                params![i64::MAX, boundary.operation_id.to_string()],
+            )
+            .expect("rewrite state version to i64 max");
+        forensic
+            .execute(
+                "UPDATE mutation_events SET state_version = ?1
+                  WHERE operation_id = ?2 AND state_version = 2",
+                params![i64::MAX, boundary.operation_id.to_string()],
+            )
+            .expect("rewrite final event version to i64 max");
+        forensic
+            .execute(
+                "UPDATE local_execution_r3_bridge_receipts
+                    SET receipt_id = ?1, receipt_fingerprint = ?2,
+                        r3_state_version = ?3, r3_event_state_version = ?3
+                  WHERE receipt_id = ?4",
+                params![
+                    bridge_receipt_id(forged_fingerprint).to_string(),
+                    forged_fingerprint.as_slice(),
+                    i64::MAX,
+                    bridge_receipt_id(bridge_receipt_fingerprint(&original)).to_string(),
+                ],
+            )
+            .expect("rewrite receipt versions and identity");
+        forensic
+            .execute_batch(MUTATION_EVENTS_NO_UPDATE_TRIGGER)
+            .expect("restore immutable event guard");
+        forensic
+            .execute_batch(LOCAL_EXECUTION_BRIDGE_RECEIPTS_NO_UPDATE_TRIGGER)
+            .expect("restore immutable receipt guard");
+        drop(forensic);
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            store.commit_r3_change_batch(batch_id, 30)
+        }));
+        assert!(matches!(result, Ok(Err(Error::LocalMutationIncomplete))));
+        assert_eq!(
+            store
+                .vault_state()
+                .expect("state")
+                .expect("bound")
+                .durable_cursor,
+            Some("cursor-1".into())
+        );
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn r3_5_duplicate_mutation_state_version_in_same_attempt_is_rejected_live_and_on_reopen() {
+        let fixture = Fixture::new();
+        let (mut store, _, boundary, _, evidence, _, _, batch_id) = bridged_r3_5_batch(&fixture);
+        let database_path = store.database_path().to_owned();
+        append_forged_mutation_event(
+            &database_path,
+            boundary.operation_id,
+            0,
+            2,
+            evidence.evidence_id,
+        );
+
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn r3_5_duplicate_mutation_state_version_across_attempts_is_rejected_live_and_on_reopen() {
+        let fixture = Fixture::new();
+        let (mut store, _, boundary, _, evidence, _, _, batch_id) = bridged_r3_5_batch(&fixture);
+        let database_path = store.database_path().to_owned();
+        append_forged_mutation_event(
+            &database_path,
+            boundary.operation_id,
+            1,
+            2,
+            evidence.evidence_id,
+        );
+
+        assert_live_cursor_rejects_and_is_unchanged(&mut store, batch_id);
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn r3_5_canonical_unreceipted_outcome_and_exact_journal_reopen_cleanly() {
+        let (fixture, mut store, binding, boundary) = prepared_journal_attempt();
+        store
+            .publish_local_execution_pre_side_effect_witness(&binding, &boundary, 11)
+            .expect("pre-side-effect witness");
+        let decision = classify_authoritative_final_outcome(
+            &binding,
+            &boundary,
+            test_authoritative_evidence(
+                &binding,
+                &boundary,
+                PlatformCallFact::Returned,
+                LocalExecutionOutcome::VerifiedApplied,
+            ),
+        )
+        .expect("authoritative decision");
+        store
+            .finalize_authoritative_local_execution_outcome(&binding, &boundary, &decision)
+            .expect("canonical unreceipted outcome");
+        drop(store);
+
+        let reopened = fixture.open();
+        assert!(matches!(
+            reopened.inspect_local_execution_recovery(&binding, boundary.attempt_number),
+            Ok(LocalExecutionRecoveryObservation::OutcomeWitnessAndLedgerMatch { .. })
+        ));
+    }
+
+    #[test]
+    fn r3_5_arbitrary_deterministic_id_on_unreceipted_outcome_is_rejected_on_reopen() {
+        let (fixture, mut store, binding, boundary) = prepared_journal_attempt();
+        store
+            .publish_local_execution_pre_side_effect_witness(&binding, &boundary, 11)
+            .expect("pre-side-effect witness");
+        let decision = classify_authoritative_final_outcome(
+            &binding,
+            &boundary,
+            test_authoritative_evidence(
+                &binding,
+                &boundary,
+                PlatformCallFact::Returned,
+                LocalExecutionOutcome::VerifiedApplied,
+            ),
+        )
+        .expect("authoritative decision");
+        store
+            .finalize_authoritative_local_execution_outcome(&binding, &boundary, &decision)
+            .expect("canonical unreceipted outcome");
+        let database_path = store.database_path().to_owned();
+        let forged_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"forged-unreceipted-outcome-id");
+        assert_ne!(forged_id, decision.outcome_id());
+        let forensic = Connection::open(&database_path).expect("forensic connection");
+        forensic
+            .execute("DROP TRIGGER local_execution_outcomes_no_update", [])
+            .expect("remove immutable outcome guard");
+        forensic
+            .execute(
+                "UPDATE local_execution_attempt_outcomes SET outcome_id = ?1
+                  WHERE operation_id = ?2 AND attempt_number = ?3",
+                params![
+                    forged_id.to_string(),
+                    boundary.operation_id.to_string(),
+                    i64::from(boundary.attempt_number),
+                ],
+            )
+            .expect("install arbitrary deterministic id");
+        forensic
+            .execute_batch(LOCAL_EXECUTION_OUTCOMES_NO_UPDATE_TRIGGER)
+            .expect("restore immutable outcome guard");
+        drop(forensic);
+        drop(store);
+
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+        assert_eq!(count(&database_path, "local_execution_attempt_outcomes"), 1);
+    }
+
+    #[test]
+    fn r3_5_contract_first_bridged_restart_exact_binding_and_timestamp_is_already_present() {
+        let fixture = Fixture::new();
+        let (store, binding, boundary, _, _, _, _, _) = bridged_r3_5_batch(&fixture);
+        let r3_state = store
+            .mutation_state(boundary.operation_id)
+            .expect("R3 state")
+            .expect("completed R3 state");
+        assert_eq!(r3_state.phase, MutationPhase::Completed);
+        assert_eq!(r3_state.attempt_number, 0);
+        assert_eq!(r3_state.state_version, 2);
+        assert_eq!(
+            r3_state.disposition,
+            Some(MutationDisposition::VerifiedApplied)
+        );
+        drop(store);
+
+        let mut reopened = fixture.open();
+        assert_eq!(
+            reopened
+                .register_local_execution_contract(&binding, 10)
+                .expect("same original registration timestamp"),
+            LocalExecutionRegistrationOutcome::AlreadyPresent
+        );
+        assert_eq!(
+            count(
+                reopened.database_path(),
+                "local_execution_r3_bridge_receipts"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn r3_5_receipt_collision_rejects_bridge_atomically_and_preserves_dependency_and_cursor() {
+        let fixture = Fixture::new();
+        let (mut store, binding, boundary, intent, evidence, decision, dependency, batch_id) =
+            bridged_r3_5_batch(&fixture);
+        let database_path = store.database_path().to_owned();
+        let original = bridge_receipt_for(
+            &binding, &boundary, &intent, &evidence, &decision, dependency,
+        );
+        let mut collision = original.clone();
+        collision.r3_outcome_code = Some("receipt_collision".into());
+        let forensic = Connection::open(&database_path).expect("forensic connection");
+        forensic
+            .execute("DROP TRIGGER local_execution_bridge_receipts_no_delete", [])
+            .expect("remove immutable receipt delete guard");
+        forensic
+            .execute(
+                "DELETE FROM local_execution_r3_bridge_receipts WHERE receipt_id = ?1",
+                [bridge_receipt_id(bridge_receipt_fingerprint(&original)).to_string()],
+            )
+            .expect("remove original receipt for collision setup");
+        forensic
+            .execute_batch(LOCAL_EXECUTION_BRIDGE_RECEIPTS_NO_DELETE_TRIGGER)
+            .expect("restore immutable receipt delete guard");
+        drop(forensic);
+        insert_forged_bridge_receipt(&database_path, &collision);
+        assert_eq!(
+            count(&database_path, "local_execution_r3_bridge_receipts"),
+            1
+        );
+
+        assert!(store
+            .commit_r3_5_verified_local_execution_dependency(
+                batch_id, dependency, &binding, 0, &decision,
+            )
+            .is_err());
+        assert_eq!(
+            count(&database_path, "local_execution_r3_bridge_receipts"),
+            1
+        );
+        assert_eq!(
+            store
+                .active_change_batch()
+                .expect("active batch")
+                .expect("batch")
+                .committed_mutations,
+            1,
+            "the already-committed dependency must remain unchanged"
+        );
+        assert_eq!(
+            store
+                .vault_state()
+                .expect("state")
+                .expect("bound")
+                .durable_cursor,
+            Some("cursor-1".into())
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn r3_5_bridge_requires_cross_layer_exact_verified_applied_proof() {
+        let fixture = Fixture::new();
+        let mut store = ready_store(&fixture);
+        let operation_id = Uuid::new_v4();
+        let intent = local_publish_intent(operation_id);
+        let binding = test_durable_execution_binding_for_r3_intent(
+            operation_id,
+            fixture.vault_id,
+            &intent.intent_fingerprint,
+        );
+        let boundary = LocalExecutionAttemptBoundary {
+            operation_id,
+            attempt_number: 0,
+            boundary_id: Uuid::new_v4(),
+            contract_fingerprint: binding.fingerprint(),
+            occurred_at_unix_ms: 11,
+        };
+        store
+            .register_local_execution_contract(&binding, 10)
+            .expect("contract");
+        store
+            .append_local_execution_attempt_boundary(&boundary)
+            .expect("boundary");
+        store
+            .publish_local_execution_pre_side_effect_witness(&binding, &boundary, 11)
+            .expect("pre witness");
+        store
+            .register_mutation_intent(&intent, None)
+            .expect("intent");
+        store.claim_mutation(operation_id, 0, 12).expect("claim");
+        let evidence_id = Uuid::new_v4();
+        let r3_evidence = local_publish_evidence(evidence_id, &intent);
+        let evidence_fingerprint = parse_canonical_sha256(&r3_evidence.evidence_fingerprint)
+            .expect("canonical fingerprint");
+        store
+            .record_mutation_outcome(
+                operation_id,
+                1,
+                &r3_evidence,
+                &MutationOutcomeTransition::VerifiedApplied,
+            )
+            .expect("r3 completion");
+        let dependency = ChangeBatchDependency {
+            operation_id,
+            kind: ChangeBatchDependencyKind::Mutation,
+        };
+        let batch_id = Uuid::new_v4();
+        store
+            .begin_r3_change_batch(
+                batch_id,
+                "cursor-1",
+                "cursor-2",
+                std::slice::from_ref(&dependency),
+            )
+            .expect("batch");
+        let decision = classify_authoritative_final_outcome(
+            &binding,
+            &boundary,
+            test_authoritative_evidence_with_identity(
+                &binding,
+                &boundary,
+                PlatformCallFact::Returned,
+                LocalExecutionOutcome::VerifiedApplied,
+                evidence_id,
+                evidence_fingerprint,
+            ),
+        )
+        .expect("test evidence");
+        store
+            .finalize_authoritative_local_execution_outcome(&binding, &boundary, &decision)
+            .expect("local finalization");
+        // A durable v6 contract closes the legacy public cursor gate even
+        // when every legacy R3 row is otherwise exact.
+        assert!(matches!(
+            store.commit_r3_change_dependency(batch_id, dependency, evidence_id),
+            Err(Error::LocalMutationIncomplete)
+        ));
+        // The receipt and public dependency are one SQLite transaction.  A
+        // fault after receipt insertion must leave neither a receipt nor a
+        // committed dependency behind.
+        Connection::open(store.database_path())
+            .expect("fault connection")
+            .execute_batch(
+                "CREATE TRIGGER fault_after_bridge_receipt
+                 BEFORE UPDATE ON change_batch_mutations
+                 BEGIN SELECT RAISE(ABORT, 'injected fault'); END;",
+            )
+            .expect("install dependency-update fault");
+        assert!(store
+            .commit_r3_5_verified_local_execution_dependency(
+                batch_id, dependency, &binding, 0, &decision,
+            )
+            .is_err());
+        assert_eq!(
+            count(store.database_path(), "local_execution_r3_bridge_receipts"),
+            0
+        );
+        assert_eq!(
+            store
+                .active_change_batch()
+                .expect("active batch")
+                .expect("batch")
+                .committed_mutations,
+            0
+        );
+        Connection::open(store.database_path())
+            .expect("fault connection")
+            .execute("DROP TRIGGER fault_after_bridge_receipt", [])
+            .expect("restore exact trigger family");
+        store
+            .commit_r3_5_verified_local_execution_dependency(
+                batch_id, dependency, &binding, 0, &decision,
+            )
+            .expect("bridge");
+        assert_eq!(
+            count(store.database_path(), "local_execution_r3_bridge_receipts"),
+            1
+        );
+        // The receipt carries the sealed local/R3 relation across a process
+        // restart; the cursor gate revalidates it rather than reconstructing
+        // authority from journal or caller input.
+        drop(store);
+        let mut store = fixture.open();
+        assert!(matches!(
+            store.commit_r3_5_verified_local_execution_dependency(
+                batch_id, dependency, &binding, 0, &decision,
+            ),
+            Ok(())
+        ));
+        assert_eq!(
+            count(store.database_path(), "local_execution_r3_bridge_receipts"),
+            1
+        );
+        assert!(store
+            .commit_r3_5_verified_local_execution_dependency(
+                batch_id, dependency, &binding, 1, &decision,
+            )
+            .is_err());
+        // A self-consistent receipt/ledger pair is not authority: changing
+        // the deterministic local outcome identifier must reach its canonical
+        // recomputation, rather than failing at receipt↔ledger equality.
+        let original_receipt = BridgeReceiptFacts {
+            operation_id,
+            attempt_number: 0,
+            boundary_id: boundary.boundary_id,
+            boundary_occurred_at_unix_ms: boundary.occurred_at_unix_ms,
+            contract_fingerprint: *binding.fingerprint().as_bytes(),
+            outcome_id: decision.outcome_id(),
+            evidence_id,
+            local_evidence_fingerprint: decision.evidence_fingerprint(),
+            outcome_occurred_at_unix_ms: decision.recorded_at_unix_ms(),
+            r3_intent_fingerprint: intent.intent_fingerprint.clone(),
+            r3_evidence_fingerprint: r3_evidence.evidence_fingerprint.clone(),
+            r3_outcome_code: r3_evidence.outcome_code.clone(),
+            dependency_kind: ChangeBatchDependencyKind::Mutation.as_str().to_owned(),
+            r3_state_phase: "completed".to_owned(),
+            r3_state_disposition: "verified_applied".to_owned(),
+            r3_attempt_number: 0,
+            r3_state_version: 2,
+            r3_last_evidence_id: evidence_id,
+            r3_event_state_version: 2,
+        };
+        let original_fingerprint = bridge_receipt_fingerprint(&original_receipt);
+        let mut tampered_receipt = original_receipt.clone();
+        tampered_receipt.outcome_id = Uuid::new_v4();
+        let tampered_fingerprint = bridge_receipt_fingerprint(&tampered_receipt);
+        let tampered_id = bridge_receipt_id(tampered_fingerprint);
+        let database_path = store.database_path().to_owned();
+        let forensic = Connection::open(&database_path).expect("forensic connection");
+        forensic
+            .execute("DROP TRIGGER local_execution_outcomes_no_update", [])
+            .expect("temporarily remove local outcome immutable update guard");
+        forensic
+            .execute("DROP TRIGGER local_execution_bridge_receipts_no_update", [])
+            .expect("temporarily remove immutable update guard");
+        forensic
+            .execute(
+                "UPDATE local_execution_attempt_outcomes SET outcome_id = ?1
+                 WHERE operation_id = ?2 AND attempt_number = 0",
+                params![
+                    tampered_receipt.outcome_id.to_string(),
+                    operation_id.to_string()
+                ],
+            )
+            .expect("self-consistent local outcome tamper");
+        forensic
+            .execute(
+                "UPDATE local_execution_r3_bridge_receipts
+                 SET receipt_id = ?1, receipt_fingerprint = ?2, outcome_id = ?3
+                 WHERE receipt_id = ?4",
+                params![
+                    tampered_id.to_string(),
+                    tampered_fingerprint.as_slice(),
+                    tampered_receipt.outcome_id.to_string(),
+                    bridge_receipt_id(original_fingerprint).to_string(),
+                ],
+            )
+            .expect("self-consistent tamper");
+        forensic
+            .execute_batch(LOCAL_EXECUTION_OUTCOMES_NO_UPDATE_TRIGGER)
+            .expect("restore exact local outcome immutable guard");
+        forensic
+            .execute_batch(LOCAL_EXECUTION_BRIDGE_RECEIPTS_NO_UPDATE_TRIGGER)
+            .expect("restore immutable schema");
+        assert_ne!(
+            authoritative_outcome_id(
+                operation_id,
+                0,
+                boundary.boundary_id,
+                boundary.occurred_at_unix_ms,
+                evidence_id,
+                decision.evidence_fingerprint(),
+                LocalExecutionOutcome::VerifiedApplied,
+                decision.recorded_at_unix_ms(),
+            ),
+            tampered_receipt.outcome_id,
+            "the tamper must be noncanonical, not merely a mismatched receipt"
+        );
+        assert!(matches!(
+            store.commit_r3_change_batch(batch_id, 30),
+            Err(Error::LocalMutationIncomplete)
+        ));
+        assert_eq!(
+            store
+                .active_change_batch()
+                .expect("batch after rejection")
+                .expect("still active")
+                .committed_mutations,
+            1
+        );
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+        assert_eq!(count(&database_path, "local_execution_attempt_outcomes"), 1);
+        assert_eq!(
+            count(&database_path, "local_execution_r3_bridge_receipts"),
+            1
+        );
+        forensic
+            .execute("DROP TRIGGER local_execution_outcomes_no_update", [])
+            .expect("temporarily remove local outcome immutable update guard");
+        forensic
+            .execute("DROP TRIGGER local_execution_bridge_receipts_no_update", [])
+            .expect("temporarily remove immutable update guard");
+        forensic
+            .execute(
+                "UPDATE local_execution_attempt_outcomes SET outcome_id = ?1
+                 WHERE operation_id = ?2 AND attempt_number = 0",
+                params![
+                    original_receipt.outcome_id.to_string(),
+                    operation_id.to_string()
+                ],
+            )
+            .expect("restore local outcome fixture only");
+        forensic
+            .execute(
+                "UPDATE local_execution_r3_bridge_receipts
+                 SET receipt_id = ?1, receipt_fingerprint = ?2, outcome_id = ?3
+                 WHERE receipt_id = ?4",
+                params![
+                    bridge_receipt_id(original_fingerprint).to_string(),
+                    original_fingerprint.as_slice(),
+                    original_receipt.outcome_id.to_string(),
+                    tampered_id.to_string(),
+                ],
+            )
+            .expect("restore test fixture only");
+        forensic
+            .execute_batch(LOCAL_EXECUTION_OUTCOMES_NO_UPDATE_TRIGGER)
+            .expect("restore exact local outcome immutable guard");
+        forensic
+            .execute_batch(LOCAL_EXECUTION_BRIDGE_RECEIPTS_NO_UPDATE_TRIGGER)
+            .expect("restore immutable schema");
+        drop(forensic);
+        let mut store = fixture.open();
+        store
+            .commit_r3_change_batch(batch_id, 30)
+            .expect("cursor commit");
+        assert_eq!(
+            store
+                .vault_state()
+                .expect("state")
+                .expect("bound")
+                .durable_cursor,
+            Some("cursor-2".into())
+        );
+    }
+
+    #[test]
+    fn r3_5_bridge_rejects_self_consistent_r3_intent_tamper() {
+        let fixture = Fixture::new();
+        let (mut store, binding, boundary, intent, evidence, decision, dependency, batch_id) =
+            bridged_r3_5_batch(&fixture);
+        let mut changed_intent = intent.clone();
+        changed_intent.operation_marker = format!("{}-alternate", intent.operation_marker);
+        changed_intent.intent_fingerprint = changed_intent.canonical_fingerprint();
+        validate_mutation_intent(&changed_intent).expect("different valid canonical R3 intent");
+        let original_receipt = bridge_receipt_for(
+            &binding, &boundary, &intent, &evidence, &decision, dependency,
+        );
+        let original_id = bridge_receipt_id(bridge_receipt_fingerprint(&original_receipt));
+        let mut tampered_receipt = original_receipt;
+        tampered_receipt.r3_intent_fingerprint = changed_intent.intent_fingerprint.clone();
+        let tampered_fingerprint = bridge_receipt_fingerprint(&tampered_receipt);
+        let tampered_id = bridge_receipt_id(tampered_fingerprint);
+        let database_path = store.database_path().to_owned();
+        let forensic = Connection::open(&database_path).expect("forensic connection");
+        forensic
+            .execute("DROP TRIGGER mutation_intents_no_update", [])
+            .expect("remove intent guard");
+        forensic
+            .execute("DROP TRIGGER local_execution_bridge_receipts_no_update", [])
+            .expect("remove receipt guard");
+        forensic
+            .execute(
+                "UPDATE mutation_intents
+                    SET operation_marker = ?1, intent_fingerprint = ?2
+                  WHERE operation_id = ?3",
+                params![
+                    changed_intent.operation_marker,
+                    changed_intent.intent_fingerprint,
+                    boundary.operation_id.to_string(),
+                ],
+            )
+            .expect("self-consistent canonical R3 intent tamper");
+        forensic
+            .execute(
+                "UPDATE local_execution_r3_bridge_receipts
+                    SET receipt_id = ?1, receipt_fingerprint = ?2, r3_intent_fingerprint = ?3
+                  WHERE receipt_id = ?4",
+                params![
+                    tampered_id.to_string(),
+                    tampered_fingerprint.as_slice(),
+                    tampered_receipt.r3_intent_fingerprint,
+                    original_id.to_string(),
+                ],
+            )
+            .expect("self-consistent receipt tamper");
+        forensic
+            .execute_batch(MUTATION_INTENTS_NO_UPDATE_TRIGGER)
+            .expect("restore exact intent guard");
+        forensic
+            .execute_batch(LOCAL_EXECUTION_BRIDGE_RECEIPTS_NO_UPDATE_TRIGGER)
+            .expect("restore exact receipt guard");
+        assert_ne!(
+            binding.persistence_projection().intent_fingerprint,
+            local_intent_fingerprint_from_r3_intent(&changed_intent.intent_fingerprint)
+                .expect("local hash for alternate R3 intent"),
+            "the local contract intentionally remains unchanged"
+        );
+        assert!(matches!(
+            store.commit_r3_change_batch(batch_id, 30),
+            Err(Error::LocalMutationIncomplete)
+        ));
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+        assert_eq!(count(&database_path, "mutation_intents"), 1);
+        assert_eq!(
+            count(&database_path, "local_execution_r3_bridge_receipts"),
+            1
+        );
+    }
+
+    #[test]
+    fn r3_5_bridge_final_state_fields_are_hash_bound_and_history_bound() {
+        let fixture = Fixture::new();
+        let (mut store, binding, boundary, intent, evidence, decision, dependency, batch_id) =
+            bridged_r3_5_batch(&fixture);
+        let original = bridge_receipt_for(
+            &binding, &boundary, &intent, &evidence, &decision, dependency,
+        );
+        let original_fingerprint = bridge_receipt_fingerprint(&original);
+        for alter in [
+            |receipt: &mut BridgeReceiptFacts| receipt.r3_state_phase = "other".to_owned(),
+            |receipt: &mut BridgeReceiptFacts| receipt.r3_state_disposition = "other".to_owned(),
+            |receipt: &mut BridgeReceiptFacts| receipt.r3_last_evidence_id = Uuid::new_v4(),
+            |receipt: &mut BridgeReceiptFacts| receipt.r3_state_version += 1,
+            |receipt: &mut BridgeReceiptFacts| receipt.r3_event_state_version += 1,
+        ] {
+            let mut changed = original.clone();
+            alter(&mut changed);
+            assert_ne!(bridge_receipt_fingerprint(&changed), original_fingerprint);
+        }
+        let mut tampered = original;
+        tampered.r3_state_version = 3;
+        tampered.r3_event_state_version = 3;
+        let tampered_fingerprint = bridge_receipt_fingerprint(&tampered);
+        let original_id = bridge_receipt_id(original_fingerprint);
+        let tampered_id = bridge_receipt_id(tampered_fingerprint);
+        let database_path = store.database_path().to_owned();
+        let forensic = Connection::open(&database_path).expect("forensic connection");
+        forensic
+            .execute("DROP TRIGGER mutation_events_no_update", [])
+            .expect("remove event guard");
+        forensic
+            .execute("DROP TRIGGER local_execution_bridge_receipts_no_update", [])
+            .expect("remove receipt guard");
+        forensic
+            .execute(
+                "UPDATE mutation_state SET state_version = 3 WHERE operation_id = ?1",
+                [boundary.operation_id.to_string()],
+            )
+            .expect("tamper R3 final state version");
+        forensic
+            .execute(
+                "UPDATE mutation_events SET state_version = 3
+                  WHERE operation_id = ?1 AND state_version = 2",
+                [boundary.operation_id.to_string()],
+            )
+            .expect("tamper matching R3 final event version");
+        forensic
+            .execute(
+                "UPDATE local_execution_r3_bridge_receipts
+                    SET receipt_id = ?1, receipt_fingerprint = ?2,
+                        r3_state_version = 3, r3_event_state_version = 3
+                  WHERE receipt_id = ?3",
+                params![
+                    tampered_id.to_string(),
+                    tampered_fingerprint.as_slice(),
+                    original_id.to_string()
+                ],
+            )
+            .expect("tamper self-consistent receipt final state");
+        forensic
+            .execute_batch(MUTATION_EVENTS_NO_UPDATE_TRIGGER)
+            .expect("restore exact event guard");
+        forensic
+            .execute_batch(LOCAL_EXECUTION_BRIDGE_RECEIPTS_NO_UPDATE_TRIGGER)
+            .expect("restore exact receipt guard");
+        assert!(matches!(
+            store.commit_r3_change_batch(batch_id, 30),
+            Err(Error::LocalMutationIncomplete)
+        ));
+        drop(store);
+        assert!(matches!(
+            SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+            Err(Error::InvalidSchema)
+        ));
+        assert_eq!(count(&database_path, "mutation_events"), 3);
+        assert_eq!(
+            count(&database_path, "local_execution_r3_bridge_receipts"),
+            1
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn local_contract_cannot_retroactively_bless_started_or_committed_r3_work() {
+        let fixture = Fixture::new();
+        let mut store = ready_store(&fixture);
+        let operation_id = Uuid::new_v4();
+        let intent = local_publish_intent(operation_id);
+        store
+            .register_mutation_intent(&intent, None)
+            .expect("R3 intent without local contract");
+        store
+            .claim_mutation(operation_id, 0, 12)
+            .expect("R3 started");
+        let evidence_id = Uuid::new_v4();
+        let evidence = local_publish_evidence(evidence_id, &intent);
+        store
+            .record_mutation_outcome(
+                operation_id,
+                1,
+                &evidence,
+                &MutationOutcomeTransition::VerifiedApplied,
+            )
+            .expect("R3 completed");
+        let binding = test_durable_execution_binding_for_r3_intent(
+            operation_id,
+            fixture.vault_id,
+            &intent.intent_fingerprint,
+        );
+        assert!(matches!(
+            store.register_local_execution_contract(&binding, 10),
+            Err(Error::LocalExecutionCollision)
+        ));
+        assert_eq!(count(store.database_path(), "local_execution_contracts"), 0);
+
+        // A complete public R3 batch can advance without a local contract;
+        // it still cannot be blessed retroactively afterwards.
+        let dependency = ChangeBatchDependency {
+            operation_id,
+            kind: ChangeBatchDependencyKind::Mutation,
+        };
+        let batch_id = Uuid::new_v4();
+        store
+            .begin_r3_change_batch(batch_id, "cursor-1", "cursor-2", &[dependency])
+            .expect("typed R3 batch");
+        store
+            .commit_r3_change_dependency(batch_id, dependency, evidence_id)
+            .expect("public dependency commit");
+        store
+            .commit_r3_change_batch(batch_id, 30)
+            .expect("public cursor advance");
+        drop(store);
+        let mut reopened = fixture.open();
+        assert!(matches!(
+            reopened.register_local_execution_contract(&binding, 10),
+            Err(Error::LocalExecutionCollision)
+        ));
+        assert_eq!(
+            count(reopened.database_path(), "local_execution_contracts"),
+            0
+        );
+
+        // The same rule also holds while a completed public dependency is
+        // still inside an active batch; no restart can turn it into R3.5
+        // authority.
+        let active_operation = Uuid::new_v4();
+        let active_intent = local_publish_intent(active_operation);
+        reopened
+            .register_mutation_intent(&active_intent, None)
+            .expect("second R3 intent");
+        reopened
+            .claim_mutation(active_operation, 0, 40)
+            .expect("second R3 start");
+        let active_evidence_id = Uuid::new_v4();
+        let mut active_evidence = local_publish_evidence(active_evidence_id, &active_intent);
+        active_evidence.captured_at_unix_ms = 40;
+        active_evidence.evidence_fingerprint = active_evidence.canonical_fingerprint();
+        reopened
+            .record_mutation_outcome(
+                active_operation,
+                1,
+                &active_evidence,
+                &MutationOutcomeTransition::VerifiedApplied,
+            )
+            .expect("second R3 completion");
+        let active_dependency = ChangeBatchDependency {
+            operation_id: active_operation,
+            kind: ChangeBatchDependencyKind::Mutation,
+        };
+        let active_batch = Uuid::new_v4();
+        reopened
+            .begin_r3_change_batch(active_batch, "cursor-2", "cursor-3", &[active_dependency])
+            .expect("active typed batch");
+        reopened
+            .commit_r3_change_dependency(active_batch, active_dependency, active_evidence_id)
+            .expect("active public dependency commit");
+        // Restart in the narrow interval after the public dependency commits
+        // but before its cursor finalizes.  This remains a pure R3 batch;
+        // reopening cannot manufacture R3.5 authority retroactively.
+        drop(reopened);
+        let mut reopened = fixture.open();
+        let active_binding = test_durable_execution_binding_for_r3_intent(
+            active_operation,
+            fixture.vault_id,
+            &active_intent.intent_fingerprint,
+        );
+        assert!(matches!(
+            reopened.register_local_execution_contract(&active_binding, 40),
+            Err(Error::LocalExecutionCollision)
+        ));
+        reopened
+            .commit_r3_change_batch(active_batch, 50)
+            .expect("pure R3 cursor finalization after restart");
+        assert_eq!(
+            count(reopened.database_path(), "local_execution_contracts"),
+            0,
+            "no retroactive R3.5 contract can appear"
+        );
+        assert_eq!(
+            reopened
+                .vault_state()
+                .expect("state after pure R3 cursor")
+                .expect("bound state")
+                .durable_cursor,
+            Some("cursor-3".into())
+        );
+    }
+
+    #[test]
+    fn authoritative_finalization_resumes_witness_before_ledger_without_duplication() {
+        let (_fixture, mut store, binding, boundary) = prepared_journal_attempt();
+        store
+            .publish_local_execution_pre_side_effect_witness(&binding, &boundary, 11)
+            .expect("pre witness");
+        let decision = classify_authoritative_final_outcome(
+            &binding,
+            &boundary,
+            test_authoritative_evidence(
+                &binding,
+                &boundary,
+                PlatformCallFact::Returned,
+                LocalExecutionOutcome::VerifiedApplied,
+            ),
+        )
+        .expect("test evidence");
+        let different_boundary = LocalExecutionAttemptBoundary {
+            boundary_id: Uuid::new_v4(),
+            ..boundary
+        };
+        let decision_for_different_boundary = classify_authoritative_final_outcome(
+            &binding,
+            &different_boundary,
+            test_authoritative_evidence(
+                &binding,
+                &different_boundary,
+                PlatformCallFact::Returned,
+                LocalExecutionOutcome::VerifiedApplied,
+            ),
+        )
+        .expect("different-boundary classification");
+        assert!(matches!(
+            store.finalize_authoritative_local_execution_outcome(
+                &binding,
+                &boundary,
+                &decision_for_different_boundary,
+            ),
+            Err(Error::LocalExecutionJournalMismatch)
+        ));
+        let pending = LocalExecutionAttemptOutcome {
+            operation_id: boundary.operation_id,
+            attempt_number: boundary.attempt_number,
+            outcome_id: decision.outcome_id(),
+            evidence_id: decision.evidence_id(),
+            outcome: decision.outcome(),
+            evidence_fingerprint: decision.evidence_fingerprint(),
+            occurred_at_unix_ms: decision.recorded_at_unix_ms(),
+        };
+        store
+            .publish_local_execution_outcome_witness_with_r3_evidence(
+                &binding,
+                &boundary,
+                &pending,
+                Some(decision.r3_mutation_evidence_fingerprint()),
+            )
+            .expect("outcome witness");
+        assert!(matches!(
+            store
+                .inspect_local_execution_recovery(&binding, boundary.attempt_number)
+                .expect("recovery"),
+            LocalExecutionRecoveryObservation::OutcomeWitnessPendingLedger { .. }
+        ));
+        assert_eq!(
+            store
+                .finalize_authoritative_local_execution_outcome(&binding, &boundary, &decision)
+                .expect("resume ledger"),
+            LocalExecutionRegistrationOutcome::Registered
+        );
+        assert_eq!(
+            store
+                .finalize_authoritative_local_execution_outcome(&binding, &boundary, &decision)
+                .expect("idempotent finalization"),
+            LocalExecutionRegistrationOutcome::AlreadyPresent
+        );
+        assert!(matches!(
+            store
+                .inspect_local_execution_recovery(&binding, boundary.attempt_number)
+                .expect("recovery"),
+            LocalExecutionRecoveryObservation::OutcomeWitnessAndLedgerMatch { .. }
+        ));
+    }
+
+    #[test]
+    fn echo_hints_are_inventory_only_and_make_no_durable_writes() {
+        let (_fixture, mut store, binding, boundary) = prepared_journal_attempt();
+        let hint = LocalExecutionEchoHint::new(
+            boundary.operation_id,
+            *binding.fingerprint().as_bytes(),
+            LocalExecutionEchoSource::AndroidSaf,
+        );
+        let before_boundaries = count(store.database_path(), "local_execution_attempt_boundaries");
+        let before_outcomes = count(store.database_path(), "local_execution_attempt_outcomes");
+        assert_eq!(
+            handle_local_execution_echo_hint(&store, &binding, boundary.attempt_number, hint)
+                .expect("first hint"),
+            EchoHintDisposition::InventoryRequired
+        );
+        assert_eq!(
+            handle_local_execution_echo_hint(&store, &binding, boundary.attempt_number, hint)
+                .expect("repeated hint"),
+            EchoHintDisposition::InventoryRequired
+        );
+        assert_eq!(
+            count(store.database_path(), "local_execution_attempt_boundaries"),
+            before_boundaries
+        );
+        assert_eq!(
+            count(store.database_path(), "local_execution_attempt_outcomes"),
+            before_outcomes
+        );
+        store
+            .publish_local_execution_pre_side_effect_witness(&binding, &boundary, 11)
+            .expect("pre witness");
+        let decision = classify_authoritative_final_outcome(
+            &binding,
+            &boundary,
+            test_authoritative_evidence(
+                &binding,
+                &boundary,
+                PlatformCallFact::Returned,
+                LocalExecutionOutcome::VerifiedApplied,
+            ),
+        )
+        .expect("test evidence");
+        store
+            .finalize_authoritative_local_execution_outcome(&binding, &boundary, &decision)
+            .expect("finalize");
+        assert_eq!(
+            handle_local_execution_echo_hint(&store, &binding, boundary.attempt_number, hint)
+                .expect("observed hint"),
+            EchoHintDisposition::DurableClaimPresentInventoryRequired
+        );
+    }
+
+    #[test]
+    fn local_execution_registration_is_atomic_at_every_contract_row_boundary() {
+        for (name, table) in [
+            ("fault_local_contract", "local_execution_contracts"),
+            ("fault_local_identity", "local_execution_identity_evidence"),
+            ("fault_local_member", "local_execution_collision_members"),
+        ] {
+            let fixture = Fixture::new();
+            let mut store = fixture.open();
+            let operation_id = Uuid::new_v4();
+            let binding = test_durable_execution_binding(operation_id, fixture.vault_id);
+            install_abort_trigger(store.database_path(), name, table);
+            assert!(store
+                .register_local_execution_contract(&binding, 10)
+                .is_err());
+            for table in [
+                "local_execution_contracts",
+                "local_execution_identity_evidence",
+                "local_execution_collision_members",
+                "local_execution_contract_completions",
+            ] {
+                assert_eq!(count(store.database_path(), table), 0, "{name}: {table}");
+            }
+        }
+    }
+
+    #[test]
+    fn local_execution_first_issuance_attestations_survive_rotated_reissue_and_reopen() {
+        let fixture = Fixture::new();
+        let operation_id = Uuid::new_v4();
+        let first = test_durable_execution_binding_with_attestation_offset(
+            operation_id,
+            fixture.vault_id,
+            0,
+        );
+        let rotated = test_durable_execution_binding_with_attestation_offset(
+            operation_id,
+            fixture.vault_id,
+            19,
+        );
+        assert_eq!(first.fingerprint(), rotated.fingerprint());
+        let mut store = fixture.open();
+        assert_eq!(
+            store
+                .register_local_execution_contract(&first, 10)
+                .expect("first issuance"),
+            LocalExecutionRegistrationOutcome::Registered
+        );
+        let contract_before = store
+            .local_execution_contract(operation_id)
+            .expect("contract read")
+            .expect("stored contract");
+        let database_path = store.database_path().to_owned();
+        let attestation_rows = |path: &Path| {
+            let connection = Connection::open(path).expect("read forensic attestation rows");
+            let mut statement = connection
+                .prepare(
+                    "SELECT role, attestation FROM local_execution_identity_evidence
+                       WHERE operation_id = ?1
+                     UNION ALL
+                     SELECT printf('member:%08d', ordinal), attestation
+                       FROM local_execution_collision_members WHERE operation_id = ?1
+                     ORDER BY 1",
+                )
+                .expect("attestation query");
+            statement
+                .query_map([operation_id.to_string()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .expect("attestation rows")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("collect attestations")
+        };
+        let first_attestations = attestation_rows(&database_path);
+        assert_eq!(first_attestations.len(), 7, "six roles plus one member");
+        assert_eq!(
+            store
+                .register_local_execution_contract(&rotated, 10)
+                .expect("rotated exact stable reissue"),
+            LocalExecutionRegistrationOutcome::AlreadyPresent
+        );
+        assert_eq!(attestation_rows(&database_path), first_attestations);
+        assert_eq!(
+            store
+                .local_execution_contract(operation_id)
+                .expect("contract after reissue"),
+            Some(contract_before.clone())
+        );
+        drop(store);
+        let reopened = fixture.open();
+        assert_eq!(attestation_rows(&database_path), first_attestations);
+        assert_eq!(
+            reopened
+                .local_execution_contract(operation_id)
+                .expect("contract after reopen"),
+            Some(contract_before)
+        );
+    }
+
+    fn populated_local_contract(fixture: &Fixture) -> (SyncStore, LocalExecutionAttemptBoundary) {
+        let operation_id = Uuid::new_v4();
+        let binding = test_durable_execution_binding(operation_id, fixture.vault_id);
+        let boundary = LocalExecutionAttemptBoundary {
+            operation_id,
+            attempt_number: 0,
+            boundary_id: Uuid::new_v4(),
+            contract_fingerprint: binding.fingerprint(),
+            occurred_at_unix_ms: 11,
+        };
+        let mut store = fixture.open();
+        store
+            .register_local_execution_contract(&binding, 10)
+            .expect("complete contract");
+        store
+            .append_local_execution_attempt_boundary(&boundary)
+            .expect("complete boundary");
+        let evidence_id = Uuid::new_v4();
+        let outcome = LocalExecutionAttemptOutcome {
+            operation_id,
+            attempt_number: 0,
+            outcome_id: authoritative_outcome_id(
+                operation_id,
+                0,
+                boundary.boundary_id,
+                boundary.occurred_at_unix_ms,
+                evidence_id,
+                [9; 32],
+                LocalExecutionOutcome::VerifiedApplied,
+                12,
+            ),
+            evidence_id,
+            outcome: LocalExecutionOutcome::VerifiedApplied,
+            evidence_fingerprint: [9; 32],
+            occurred_at_unix_ms: 12,
+        };
+        store
+            .append_local_execution_attempt_outcome(&outcome)
+            .expect("complete outcome");
+        (store, boundary)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn populated_local_contract_semantic_reopen_tamper_matrix() {
+        enum Tamper {
+            IdentityProviderPreimage,
+            IdentityStableFingerprint,
+            CollisionMemberCanonicalKey,
+            ContractVault,
+            NilBoundaryIdentifier,
+            BoundaryAttemptOutOfRange,
+        }
+        for tamper in [
+            Tamper::IdentityProviderPreimage,
+            Tamper::IdentityStableFingerprint,
+            Tamper::CollisionMemberCanonicalKey,
+            Tamper::ContractVault,
+            Tamper::NilBoundaryIdentifier,
+            Tamper::BoundaryAttemptOutOfRange,
+        ] {
+            let fixture = Fixture::new();
+            let (store, boundary) = populated_local_contract(&fixture);
+            let database_path = store.database_path().to_owned();
+            drop(store);
+            let forensic = Connection::open(&database_path).expect("forensic connection");
+            let operation = boundary.operation_id.to_string();
+            let name = match tamper {
+                Tamper::IdentityProviderPreimage => {
+                    forensic
+                        .execute("DROP TRIGGER local_execution_identities_no_update", [])
+                        .expect("remove identity guard");
+                    forensic
+                        .execute(
+                            "UPDATE local_execution_identity_evidence SET provider_id = X'01'
+                              WHERE operation_id = ?1 AND role = 'vault_root'",
+                            [&operation],
+                        )
+                        .expect("alter provider preimage only");
+                    forensic
+                        .execute_batch(LOCAL_EXECUTION_IDENTITIES_NO_UPDATE_TRIGGER)
+                        .expect("restore exact identity guard");
+                    "identity_provider_preimage"
+                }
+                Tamper::IdentityStableFingerprint => {
+                    forensic
+                        .execute("DROP TRIGGER local_execution_identities_no_update", [])
+                        .expect("remove identity guard");
+                    forensic
+                        .execute(
+                            "UPDATE local_execution_identity_evidence
+                                SET stable_identity_fingerprint = zeroblob(32)
+                              WHERE operation_id = ?1 AND role = 'source_parent'",
+                            [&operation],
+                        )
+                        .expect("alter CHECK-valid stable fingerprint");
+                    forensic
+                        .execute_batch(LOCAL_EXECUTION_IDENTITIES_NO_UPDATE_TRIGGER)
+                        .expect("restore exact identity guard");
+                    "identity_stable_fingerprint"
+                }
+                Tamper::CollisionMemberCanonicalKey => {
+                    forensic
+                        .execute("DROP TRIGGER local_execution_members_no_update", [])
+                        .expect("remove member guard");
+                    forensic
+                        .execute(
+                            "UPDATE local_execution_collision_members SET collision_key = 'not-canonical'
+                              WHERE operation_id = ?1 AND ordinal = 0",
+                            [&operation],
+                        )
+                        .expect("alter member canonical key");
+                    forensic
+                        .execute_batch(LOCAL_EXECUTION_MEMBERS_NO_UPDATE_TRIGGER)
+                        .expect("restore exact member guard");
+                    "collision_member_canonical_key"
+                }
+                Tamper::ContractVault => {
+                    forensic
+                        .execute("DROP TRIGGER local_execution_contracts_no_update", [])
+                        .expect("remove contract guard");
+                    forensic
+                        .execute(
+                            "UPDATE local_execution_contracts SET vault_id = ?1 WHERE operation_id = ?2",
+                            params![Uuid::new_v4().to_string(), operation],
+                        )
+                        .expect("alter expected vault identifier");
+                    forensic
+                        .execute_batch(LOCAL_EXECUTION_CONTRACTS_NO_UPDATE_TRIGGER)
+                        .expect("restore exact contract guard");
+                    "contract_expected_vault"
+                }
+                Tamper::NilBoundaryIdentifier => {
+                    forensic
+                        .execute("DROP TRIGGER local_execution_boundaries_no_update", [])
+                        .expect("remove boundary guard");
+                    forensic
+                        .execute(
+                            "UPDATE local_execution_attempt_boundaries SET boundary_id = ?1
+                              WHERE operation_id = ?2 AND attempt_number = 0",
+                            params![Uuid::nil().to_string(), operation],
+                        )
+                        .expect("alter CHECK-valid nil boundary identifier");
+                    forensic
+                        .execute_batch(LOCAL_EXECUTION_BOUNDARIES_NO_UPDATE_TRIGGER)
+                        .expect("restore exact boundary guard");
+                    "nil_boundary_identifier"
+                }
+                Tamper::BoundaryAttemptOutOfRange => {
+                    forensic
+                        .execute("DROP TRIGGER local_execution_boundaries_no_update", [])
+                        .expect("remove boundary guard");
+                    forensic
+                        .execute("DROP TRIGGER local_execution_outcomes_no_update", [])
+                        .expect("remove outcome guard");
+                    forensic
+                        .pragma_update(None, "foreign_keys", false)
+                        .expect("temporarily defer forensic foreign-key enforcement");
+                    forensic
+                        .execute(
+                            "UPDATE local_execution_attempt_boundaries SET attempt_number = 4294967296
+                              WHERE operation_id = ?1 AND attempt_number = 0",
+                            [&operation],
+                        )
+                        .expect("alter CHECK-valid boundary attempt range");
+                    forensic
+                        .execute(
+                            "UPDATE local_execution_attempt_outcomes SET attempt_number = 4294967296
+                              WHERE operation_id = ?1 AND attempt_number = 0",
+                            [&operation],
+                        )
+                        .expect("keep outcome relation self-consistent");
+                    forensic
+                        .execute_batch(LOCAL_EXECUTION_BOUNDARIES_NO_UPDATE_TRIGGER)
+                        .expect("restore exact boundary guard");
+                    forensic
+                        .execute_batch(LOCAL_EXECUTION_OUTCOMES_NO_UPDATE_TRIGGER)
+                        .expect("restore exact outcome guard");
+                    forensic
+                        .pragma_update(None, "foreign_keys", true)
+                        .expect("restore forensic foreign-key enforcement");
+                    "boundary_attempt_out_of_range"
+                }
+            };
+            assert!(matches!(
+                SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+                Err(Error::InvalidSchema)
+            ));
+            assert_eq!(
+                count(&database_path, "local_execution_contracts"),
+                1,
+                "{name}"
+            );
+            assert_eq!(
+                count(&database_path, "local_execution_identity_evidence"),
+                6,
+                "{name}"
+            );
+            assert_eq!(
+                count(&database_path, "local_execution_collision_members"),
+                1,
+                "{name}"
+            );
+            assert_eq!(
+                count(&database_path, "local_execution_attempt_boundaries"),
+                1,
+                "{name}"
+            );
+            assert_eq!(
+                count(&database_path, "local_execution_attempt_outcomes"),
+                1,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_execution_attempt_and_outcome_faults_roll_back_without_fabrication() {
+        let fixture = Fixture::new();
+        let mut store = fixture.open();
+        let operation_id = Uuid::new_v4();
+        let binding = test_durable_execution_binding(operation_id, fixture.vault_id);
+        assert_eq!(
+            store
+                .register_local_execution_contract(&binding, 10)
+                .expect("contract"),
+            LocalExecutionRegistrationOutcome::Registered
+        );
+        let boundary = LocalExecutionAttemptBoundary {
+            operation_id,
+            attempt_number: 0,
+            boundary_id: Uuid::new_v4(),
+            contract_fingerprint: binding.fingerprint(),
+            occurred_at_unix_ms: 11,
+        };
+        install_abort_trigger(
+            store.database_path(),
+            "fault_local_boundary",
+            "local_execution_attempt_boundaries",
+        );
+        let boundary_fault = store.append_local_execution_attempt_boundary(&boundary);
+        assert!(matches!(
+            boundary_fault,
+            Err(Error::Database(error)) if error.to_string().contains("injected fault")
+        ));
+        assert_eq!(
+            count(store.database_path(), "local_execution_attempt_boundaries"),
+            0
+        );
+        Connection::open(store.database_path())
+            .expect("fault connection")
+            .execute("DROP TRIGGER fault_local_boundary", [])
+            .expect("drop fault trigger");
+        assert_eq!(
+            store
+                .append_local_execution_attempt_boundary(&boundary)
+                .expect("boundary"),
+            LocalExecutionRegistrationOutcome::Registered
+        );
+        let evidence_id = Uuid::new_v4();
+        let outcome = LocalExecutionAttemptOutcome {
+            operation_id,
+            attempt_number: 0,
+            outcome_id: authoritative_outcome_id(
+                operation_id,
+                0,
+                boundary.boundary_id,
+                boundary.occurred_at_unix_ms,
+                evidence_id,
+                [9; 32],
+                LocalExecutionOutcome::WriteOutcomeUnknown,
+                12,
+            ),
+            evidence_id,
+            outcome: LocalExecutionOutcome::WriteOutcomeUnknown,
+            evidence_fingerprint: [9; 32],
+            occurred_at_unix_ms: 12,
+        };
+        install_abort_trigger(
+            store.database_path(),
+            "fault_local_outcome",
+            "local_execution_attempt_outcomes",
+        );
+        let outcome_fault = store.append_local_execution_attempt_outcome(&outcome);
+        assert!(matches!(
+            outcome_fault,
+            Err(Error::Database(error)) if error.to_string().contains("injected fault")
+        ));
+        assert_eq!(
+            count(store.database_path(), "local_execution_attempt_outcomes"),
+            0
+        );
+        Connection::open(store.database_path())
+            .expect("fault connection")
+            .execute("DROP TRIGGER fault_local_outcome", [])
+            .expect("drop outcome fault trigger");
+        assert_eq!(
+            store
+                .append_local_execution_attempt_outcome(&outcome)
+                .expect("canonical outcome inserts after trigger removal"),
+            LocalExecutionRegistrationOutcome::Registered
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn local_execution_records_are_exactly_idempotent_and_reject_fact_drift() {
+        let fixture = Fixture::new();
+        let mut store = fixture.open();
+        let operation_id = Uuid::new_v4();
+        let binding = test_durable_execution_binding(operation_id, fixture.vault_id);
+        assert_eq!(
+            store
+                .register_local_execution_contract(&binding, 10)
+                .expect("contract"),
+            LocalExecutionRegistrationOutcome::Registered
+        );
+        assert_eq!(
+            store
+                .register_local_execution_contract(&binding, 10)
+                .expect("repeat contract"),
+            LocalExecutionRegistrationOutcome::AlreadyPresent
+        );
+        assert!(matches!(
+            store.register_local_execution_contract(&binding, 11),
+            Err(Error::LocalExecutionCollision)
+        ));
+        let boundary = LocalExecutionAttemptBoundary {
+            operation_id,
+            attempt_number: 0,
+            boundary_id: Uuid::new_v4(),
+            contract_fingerprint: binding.fingerprint(),
+            occurred_at_unix_ms: 12,
+        };
+        assert_eq!(
+            store
+                .append_local_execution_attempt_boundary(&boundary)
+                .expect("boundary"),
+            LocalExecutionRegistrationOutcome::Registered
+        );
+        assert_eq!(
+            store
+                .append_local_execution_attempt_boundary(&boundary)
+                .expect("repeat boundary"),
+            LocalExecutionRegistrationOutcome::AlreadyPresent
+        );
+        let outcome = LocalExecutionAttemptOutcome {
+            operation_id,
+            attempt_number: 0,
+            outcome_id: Uuid::nil(),
+            evidence_id: Uuid::new_v4(),
+            outcome: LocalExecutionOutcome::WriteOutcomeUnknown,
+            evidence_fingerprint: [9; 32],
+            occurred_at_unix_ms: 13,
+        };
+        let outcome = LocalExecutionAttemptOutcome {
+            outcome_id: authoritative_outcome_id(
+                operation_id,
+                0,
+                boundary.boundary_id,
+                boundary.occurred_at_unix_ms,
+                outcome.evidence_id,
+                outcome.evidence_fingerprint,
+                outcome.outcome,
+                outcome.occurred_at_unix_ms,
+            ),
+            ..outcome
+        };
+        assert_eq!(
+            store
+                .append_local_execution_attempt_outcome(&outcome)
+                .expect("outcome"),
+            LocalExecutionRegistrationOutcome::Registered
+        );
+        assert_eq!(
+            store
+                .append_local_execution_attempt_outcome(&outcome)
+                .expect("repeat outcome"),
+            LocalExecutionRegistrationOutcome::AlreadyPresent
+        );
+        let mut drifted_outcome = outcome.clone();
+        drifted_outcome.evidence_fingerprint = [8; 32];
+        assert!(matches!(
+            store.append_local_execution_attempt_outcome(&drifted_outcome),
+            Err(Error::InvalidLocalExecutionEvidence)
+        ));
+
+        let reconcile_boundary = LocalExecutionAttemptBoundary {
+            operation_id,
+            attempt_number: 1,
+            boundary_id: Uuid::new_v4(),
+            contract_fingerprint: binding.fingerprint(),
+            occurred_at_unix_ms: 14,
+        };
+        store
+            .append_local_execution_attempt_boundary(&reconcile_boundary)
+            .expect("reconcile boundary");
+        let reconcile_evidence_id = Uuid::new_v4();
+        let reconcile_outcome = LocalExecutionAttemptOutcome {
+            operation_id,
+            attempt_number: 1,
+            outcome_id: authoritative_outcome_id(
+                operation_id,
+                1,
+                reconcile_boundary.boundary_id,
+                reconcile_boundary.occurred_at_unix_ms,
+                reconcile_evidence_id,
+                [7; 32],
+                LocalExecutionOutcome::NeedsReconcile,
+                15,
+            ),
+            evidence_id: reconcile_evidence_id,
+            outcome: LocalExecutionOutcome::NeedsReconcile,
+            evidence_fingerprint: [7; 32],
+            occurred_at_unix_ms: 15,
+        };
+        store
+            .append_local_execution_attempt_outcome(&reconcile_outcome)
+            .expect("needs reconcile outcome");
+        let persisted = store
+            .local_execution_attempt_outcome(operation_id, 1)
+            .expect("read outcome")
+            .expect("persisted outcome");
+        assert_eq!(persisted.evidence_id, reconcile_outcome.evidence_id);
+        assert!(persisted.non_retryable);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn deterministic_local_outcome_ids_publish_append_and_restart_for_every_variant() {
+        for (index, outcome) in [
+            LocalExecutionOutcome::VerifiedApplied,
+            LocalExecutionOutcome::VerifiedNotApplied,
+            LocalExecutionOutcome::WriteOutcomeUnknown,
+            LocalExecutionOutcome::NeedsReconcile,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = Fixture::new();
+            let operation_id = Uuid::new_v4();
+            let binding = test_durable_execution_binding(operation_id, fixture.vault_id);
+            let boundary = LocalExecutionAttemptBoundary {
+                operation_id,
+                attempt_number: 0,
+                boundary_id: Uuid::new_v4(),
+                contract_fingerprint: binding.fingerprint(),
+                occurred_at_unix_ms: 10,
+            };
+            let evidence_id = Uuid::new_v4();
+            let evidence_fingerprint = [u8::try_from(index + 1).expect("small index"); 32];
+            let local_outcome = LocalExecutionAttemptOutcome {
+                operation_id,
+                attempt_number: 0,
+                outcome_id: authoritative_outcome_id(
+                    operation_id,
+                    0,
+                    boundary.boundary_id,
+                    boundary.occurred_at_unix_ms,
+                    evidence_id,
+                    evidence_fingerprint,
+                    outcome,
+                    11,
+                ),
+                evidence_id,
+                outcome,
+                evidence_fingerprint,
+                occurred_at_unix_ms: 11,
+            };
+            let mut store = fixture.open();
+            store
+                .register_local_execution_contract(&binding, 9)
+                .expect("contract");
+            store
+                .append_local_execution_attempt_boundary(&boundary)
+                .expect("boundary");
+            store
+                .publish_local_execution_pre_side_effect_witness(&binding, &boundary, 10)
+                .expect("pre witness");
+            assert_eq!(
+                store
+                    .publish_local_execution_outcome_witness(&binding, &boundary, &local_outcome)
+                    .expect("canonical outcome witness"),
+                LocalExecutionWitnessPublicationOutcome::Published
+            );
+            assert_eq!(
+                store
+                    .append_local_execution_attempt_outcome(&local_outcome)
+                    .expect("canonical outcome ledger"),
+                LocalExecutionRegistrationOutcome::Registered
+            );
+            drop(store);
+            let reopened = fixture.open();
+            assert_eq!(
+                reopened
+                    .local_execution_attempt_outcome(operation_id, 0)
+                    .expect("read after restart")
+                    .expect("persisted after restart")
+                    .outcome_id,
+                local_outcome.outcome_id
+            );
+            drop(reopened);
+
+            let bad_fixture = Fixture::new();
+            let bad_operation = Uuid::new_v4();
+            let bad_binding = test_durable_execution_binding(bad_operation, bad_fixture.vault_id);
+            let bad_boundary = LocalExecutionAttemptBoundary {
+                operation_id: bad_operation,
+                attempt_number: 0,
+                boundary_id: Uuid::new_v4(),
+                contract_fingerprint: bad_binding.fingerprint(),
+                occurred_at_unix_ms: 10,
+            };
+            let mut bad = local_outcome.clone();
+            bad.operation_id = bad_operation;
+            bad.outcome_id = Uuid::new_v4();
+            let mut bad_store = bad_fixture.open();
+            bad_store
+                .register_local_execution_contract(&bad_binding, 9)
+                .expect("bad contract");
+            bad_store
+                .append_local_execution_attempt_boundary(&bad_boundary)
+                .expect("bad boundary");
+            bad_store
+                .publish_local_execution_pre_side_effect_witness(&bad_binding, &bad_boundary, 10)
+                .expect("bad pre witness");
+            let outcomes_before = count(
+                bad_store.database_path(),
+                "local_execution_attempt_outcomes",
+            );
+            let journal_before = fs::read_dir(bad_fixture.journal_directory())
+                .expect("journal dir")
+                .count();
+            assert!(matches!(
+                bad_store.publish_local_execution_outcome_witness(
+                    &bad_binding,
+                    &bad_boundary,
+                    &bad
+                ),
+                Err(Error::InvalidLocalExecutionEvidence)
+            ));
+            assert!(matches!(
+                bad_store.append_local_execution_attempt_outcome(&bad),
+                Err(Error::InvalidLocalExecutionEvidence)
+            ));
+            assert_eq!(
+                count(
+                    bad_store.database_path(),
+                    "local_execution_attempt_outcomes"
+                ),
+                outcomes_before
+            );
+            assert_eq!(
+                fs::read_dir(bad_fixture.journal_directory())
+                    .expect("journal dir")
+                    .count(),
+                journal_before
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn execution_journal_preserves_all_attempt_crash_boundaries_without_authority() {
+        let fixture = Fixture::new();
+        let operation_id = Uuid::new_v4();
+        let binding = test_durable_execution_binding(operation_id, fixture.vault_id);
+        let boundary = LocalExecutionAttemptBoundary {
+            operation_id,
+            attempt_number: 0,
+            boundary_id: Uuid::new_v4(),
+            contract_fingerprint: binding.fingerprint(),
+            occurred_at_unix_ms: 11,
+        };
+        let evidence_id = Uuid::new_v4();
+        let outcome = LocalExecutionAttemptOutcome {
+            operation_id,
+            attempt_number: 0,
+            outcome_id: authoritative_outcome_id(
+                operation_id,
+                0,
+                boundary.boundary_id,
+                boundary.occurred_at_unix_ms,
+                evidence_id,
+                [7; 32],
+                LocalExecutionOutcome::VerifiedApplied,
+                13,
+            ),
+            evidence_id,
+            outcome: LocalExecutionOutcome::VerifiedApplied,
+            evidence_fingerprint: [7; 32],
+            occurred_at_unix_ms: 13,
+        };
+
+        let mut store = fixture.open();
+        store
+            .register_local_execution_contract(&binding, 10)
+            .expect("contract");
+        store
+            .append_local_execution_attempt_boundary(&boundary)
+            .expect("boundary");
+        assert_eq!(
+            store
+                .inspect_local_execution_recovery(&binding, 0)
+                .expect("before witness"),
+            LocalExecutionRecoveryObservation::BoundaryWithoutWitness
+        );
+        drop(store);
+        let store = fixture.open();
+        let binding_after_boundary = test_durable_execution_binding(operation_id, fixture.vault_id);
+        assert_eq!(
+            store
+                .publish_local_execution_pre_side_effect_witness(
+                    &binding_after_boundary,
+                    &boundary,
+                    boundary.occurred_at_unix_ms,
+                )
+                .expect("pre witness"),
+            LocalExecutionWitnessPublicationOutcome::Published
+        );
+        assert_eq!(
+            store
+                .publish_local_execution_pre_side_effect_witness(
+                    &binding_after_boundary,
+                    &boundary,
+                    boundary.occurred_at_unix_ms,
+                )
+                .expect("idempotent pre witness"),
+            LocalExecutionWitnessPublicationOutcome::AlreadyPublished
+        );
+        assert_eq!(
+            store
+                .inspect_local_execution_recovery(&binding_after_boundary, 0)
+                .expect("platform-call window"),
+            LocalExecutionRecoveryObservation::PreSideEffectWitnessOnly
+        );
+        drop(store);
+        let mut store = fixture.open();
+        let binding_after_pre = test_durable_execution_binding(operation_id, fixture.vault_id);
+        assert_eq!(
+            store
+                .inspect_local_execution_recovery(&binding_after_pre, 0)
+                .expect("restart during platform-call window"),
+            LocalExecutionRecoveryObservation::PreSideEffectWitnessOnly
+        );
+        let mut unpersistable_outcome = outcome.clone();
+        unpersistable_outcome.occurred_at_unix_ms = (i64::MAX as u64) + 1;
+        assert!(matches!(
+            store.publish_local_execution_outcome_witness(
+                &binding_after_pre,
+                &boundary,
+                &unpersistable_outcome,
+            ),
+            Err(Error::InvalidTimestamp)
+        ));
+        assert!(store
+            .execution_journal
+            .read_outcome(operation_id, 0)
+            .expect("read journal after rejected timestamp")
+            .is_none());
+        assert_eq!(
+            store
+                .publish_local_execution_outcome_witness(&binding_after_pre, &boundary, &outcome,)
+                .expect("outcome witness"),
+            LocalExecutionWitnessPublicationOutcome::Published
+        );
+        let published_outcome = store
+            .execution_journal
+            .read_outcome(operation_id, 0)
+            .expect("read outcome witness")
+            .expect("published outcome witness");
+        assert_eq!(
+            published_outcome.pre.created_at_unix_ms,
+            boundary.occurred_at_unix_ms
+        );
+        assert_eq!(published_outcome.created_at_unix_ms, 13);
+        assert_eq!(
+            store
+                .inspect_local_execution_recovery(&binding_after_pre, 0)
+                .expect("before ledger outcome"),
+            LocalExecutionRecoveryObservation::OutcomeWitnessPendingLedger {
+                claim: UntrustedLocalExecutionOutcomeClaim::VerifiedApplied,
+            }
+        );
+        install_abort_trigger(
+            store.database_path(),
+            "fault_outcome_after_journal",
+            "local_execution_attempt_outcomes",
+        );
+        assert!(store
+            .append_local_execution_attempt_outcome(&outcome)
+            .is_err());
+        assert_eq!(
+            count(store.database_path(), "local_execution_attempt_outcomes"),
+            0
+        );
+        Connection::open(store.database_path())
+            .expect("fault connection")
+            .execute("DROP TRIGGER fault_outcome_after_journal", [])
+            .expect("drop outcome fault trigger");
+        drop(store);
+
+        let mut store = fixture.open();
+        let binding_after_outcome = test_durable_execution_binding(operation_id, fixture.vault_id);
+        assert_eq!(
+            store
+                .inspect_local_execution_recovery(&binding_after_outcome, 0)
+                .expect("restart before ledger commit"),
+            LocalExecutionRecoveryObservation::OutcomeWitnessPendingLedger {
+                claim: UntrustedLocalExecutionOutcomeClaim::VerifiedApplied,
+            }
+        );
+        store
+            .append_local_execution_attempt_outcome(&outcome)
+            .expect("ledger outcome after restart");
+        assert_eq!(
+            store
+                .inspect_local_execution_recovery(&binding_after_outcome, 0)
+                .expect("matching ledger outcome"),
+            LocalExecutionRecoveryObservation::OutcomeWitnessAndLedgerMatch {
+                claim: UntrustedLocalExecutionOutcomeClaim::VerifiedApplied,
+            }
+        );
+        drop(store);
+
+        let mut reopened = fixture.open();
+        let freshly_reissued_binding =
+            test_durable_execution_binding(operation_id, fixture.vault_id);
+        assert_eq!(
+            reopened
+                .inspect_local_execution_recovery(&freshly_reissued_binding, 0)
+                .expect("restart observation"),
+            LocalExecutionRecoveryObservation::OutcomeWitnessAndLedgerMatch {
+                claim: UntrustedLocalExecutionOutcomeClaim::VerifiedApplied,
+            }
+        );
+        assert_eq!(
+            reopened
+                .append_local_execution_attempt_boundary(&boundary)
+                .expect("no duplicate boundary"),
+            LocalExecutionRegistrationOutcome::AlreadyPresent
+        );
+        assert_eq!(
+            reopened
+                .append_local_execution_attempt_outcome(&outcome)
+                .expect("no duplicate outcome"),
+            LocalExecutionRegistrationOutcome::AlreadyPresent
+        );
+    }
+
+    #[test]
+    fn outcome_witness_cannot_be_fabricated_after_the_ledger_outcome() {
+        let fixture = Fixture::new();
+        let operation_id = Uuid::new_v4();
+        let binding = test_durable_execution_binding(operation_id, fixture.vault_id);
+        let boundary = LocalExecutionAttemptBoundary {
+            operation_id,
+            attempt_number: 0,
+            boundary_id: Uuid::new_v4(),
+            contract_fingerprint: binding.fingerprint(),
+            occurred_at_unix_ms: 11,
+        };
+        let evidence_id = Uuid::new_v4();
+        let outcome = LocalExecutionAttemptOutcome {
+            operation_id,
+            attempt_number: 0,
+            outcome_id: authoritative_outcome_id(
+                operation_id,
+                0,
+                boundary.boundary_id,
+                boundary.occurred_at_unix_ms,
+                evidence_id,
+                [7; 32],
+                LocalExecutionOutcome::VerifiedApplied,
+                13,
+            ),
+            evidence_id,
+            outcome: LocalExecutionOutcome::VerifiedApplied,
+            evidence_fingerprint: [7; 32],
+            occurred_at_unix_ms: 13,
+        };
+        let mut store = fixture.open();
+        store
+            .register_local_execution_contract(&binding, 10)
+            .expect("contract");
+        store
+            .append_local_execution_attempt_boundary(&boundary)
+            .expect("boundary");
+        store
+            .publish_local_execution_pre_side_effect_witness(
+                &binding,
+                &boundary,
+                boundary.occurred_at_unix_ms,
+            )
+            .expect("pre witness");
+        store
+            .append_local_execution_attempt_outcome(&outcome)
+            .expect("ledger outcome injected before journal outcome");
+
+        assert!(matches!(
+            store.inspect_local_execution_recovery(&binding, 0),
+            Err(Error::LocalExecutionJournalMismatch)
+        ));
+        assert!(matches!(
+            store.publish_local_execution_outcome_witness(&binding, &boundary, &outcome),
+            Err(Error::LocalExecutionJournalMismatch)
+        ));
+        assert!(store
+            .execution_journal
+            .read_outcome(operation_id, 0)
+            .expect("read journal")
+            .is_none());
+    }
+
+    #[test]
+    fn published_witness_survives_directory_sync_failure() {
+        let fixture = Fixture::new();
+        let operation_id = Uuid::new_v4();
+        let binding = test_durable_execution_binding(operation_id, fixture.vault_id);
+        let boundary = LocalExecutionAttemptBoundary {
+            operation_id,
+            attempt_number: 0,
+            boundary_id: Uuid::new_v4(),
+            contract_fingerprint: binding.fingerprint(),
+            occurred_at_unix_ms: 11,
+        };
+        let mut store = fixture.open();
+        store
+            .register_local_execution_contract(&binding, 10)
+            .expect("contract");
+        store
+            .append_local_execution_attempt_boundary(&boundary)
+            .expect("boundary");
+        let journal = fixture.journal_directory();
+        let temporary_before_fault = sync_journal_temporary_count(&journal);
+        store.execution_journal.fail_next_directory_sync_for_test();
+        assert!(matches!(
+            store.publish_local_execution_pre_side_effect_witness(
+                &binding,
+                &boundary,
+                boundary.occurred_at_unix_ms,
+            ),
+            Err(Error::LocalExecutionJournalPublishedButNotSynced(_))
+        ));
+        let temporary_after_initial_fault = sync_journal_temporary_count(&journal);
+        assert_eq!(temporary_after_initial_fault, temporary_before_fault);
+        assert_eq!(
+            store
+                .inspect_local_execution_recovery(&binding, 0)
+                .expect("published witness remains readable"),
+            LocalExecutionRecoveryObservation::PreSideEffectWitnessOnly
+        );
+        // Exact-final retry creates no temp, but it must still execute the
+        // directory durability repair.  Re-arm the injected fsync fault to
+        // prove the retry consumes it rather than returning early.
+        store.execution_journal.fail_next_directory_sync_for_test();
+        assert!(matches!(
+            store.publish_local_execution_pre_side_effect_witness(
+                &binding,
+                &boundary,
+                boundary.occurred_at_unix_ms,
+            ),
+            Err(Error::LocalExecutionJournalPublishedButNotSynced(_))
+        ));
+        assert_eq!(
+            sync_journal_temporary_count(&journal),
+            temporary_after_initial_fault,
+            "exact-final retry must not create a journal temporary before resync"
+        );
+        assert_eq!(
+            store
+                .publish_local_execution_pre_side_effect_witness(
+                    &binding,
+                    &boundary,
+                    boundary.occurred_at_unix_ms,
+                )
+                .expect("identical retry resyncs"),
+            LocalExecutionWitnessPublicationOutcome::AlreadyPublished
+        );
+        assert_eq!(
+            sync_journal_temporary_count(&journal),
+            temporary_after_initial_fault,
+            "successful exact retry must not create a journal temporary"
+        );
+    }
+
+    #[test]
+    fn deterministic_temp_crash_and_reuse_must_cross_file_sync_barrier() {
+        let (fixture, store, binding, boundary) = prepared_journal_attempt();
+        let journal = fixture.journal_directory();
+        let temporary = journal.join(format!(
+            ".sync-execution-witness-{}-{}.pre.tmp",
+            boundary.operation_id, boundary.attempt_number
+        ));
+        let expected = store
+            .exact_execution_witness(&binding, &boundary, boundary.occurred_at_unix_ms)
+            .expect("exact expected witness");
+        let bytes = crate::sync_journal::canonical_pre_bytes_for_test(&expected);
+        fs::write(&temporary, &bytes).expect("install exact deterministic temp");
+        make_private_file(&temporary);
+
+        // An existing exact deterministic temp is not assumed durable.  The
+        // injected barrier must be consumed before rename and leave the bytes
+        // in place for the next exact retry.
+        store.execution_journal.fail_next_file_sync_for_test();
+        assert!(matches!(
+            store.publish_local_execution_pre_side_effect_witness(
+                &binding,
+                &boundary,
+                boundary.occurred_at_unix_ms,
+            ),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::Other
+        ));
+        assert!(store.execution_journal.file_sync_test_faults_consumed());
+        assert!(
+            store
+                .execution_journal
+                .existing_temp_rw_opened_for_sync_for_test(),
+            "exact deterministic temp must use the RW durability opener"
+        );
+        assert_eq!(fs::read(&temporary).expect("preserved exact temp"), bytes);
+        assert_eq!(sync_journal_temporary_count(&journal), 1);
+
+        store
+            .publish_local_execution_pre_side_effect_witness(
+                &binding,
+                &boundary,
+                boundary.occurred_at_unix_ms,
+            )
+            .expect("reused exact temp must sync then publish");
+        assert!(!temporary.exists(), "rename consumes the exact staged file");
+        assert_eq!(
+            store
+                .execution_journal
+                .held_source_liveness_observations_for_test(),
+            0b111,
+            "the exact source handle must stay live before/after rename and through final verification"
+        );
+
+        let (fixture, store, binding, boundary) = prepared_journal_attempt();
+        let journal = fixture.journal_directory();
+        store
+            .execution_journal
+            .fail_before_next_file_sync_for_test();
+        assert!(matches!(
+            store.publish_local_execution_pre_side_effect_witness(
+                &binding,
+                &boundary,
+                boundary.occurred_at_unix_ms,
+            ),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::Other
+        ));
+        assert!(store.execution_journal.file_sync_test_faults_consumed());
+        assert_eq!(sync_journal_temporary_count(&journal), 1);
+        store
+            .publish_local_execution_pre_side_effect_witness(
+                &binding,
+                &boundary,
+                boundary.occurred_at_unix_ms,
+            )
+            .expect("crash-window retry must sync the retained deterministic temp");
+    }
+
+    #[test]
+    fn pre_witness_timestamp_is_boundary_exact_before_publication_and_bridge_reopen() {
+        let (fixture, store, binding, boundary) = prepared_journal_attempt();
+        let pre_path = fixture.journal_directory().join(format!(
+            "{}-{}.pre",
+            boundary.operation_id, boundary.attempt_number
+        ));
+        assert!(matches!(
+            store.publish_local_execution_pre_side_effect_witness(
+                &binding,
+                &boundary,
+                boundary.occurred_at_unix_ms + 1,
+            ),
+            Err(Error::InvalidLocalExecutionEvidence)
+        ));
+        assert!(
+            !pre_path.exists(),
+            "a mismatched timestamp must fail before journal file creation"
+        );
+        drop(store);
+
+        // The same exact-boundary contract remains bridgeable and survives a
+        // process boundary; the R3.5 helper publishes the pre witness with
+        // the boundary timestamp before finalizing the dependency.
+        let bridge_fixture = Fixture::new();
+        let (mut bridged, _, _, _, _, _, _, batch_id) = bridged_r3_5_batch(&bridge_fixture);
+        bridged
+            .commit_r3_change_batch(batch_id, 30)
+            .expect("exact-boundary bridge finalizes");
+        drop(bridged);
+        assert_eq!(
+            bridge_fixture
+                .open()
+                .vault_state()
+                .expect("reopened state")
+                .expect("bound state")
+                .durable_cursor,
+            Some("cursor-2".into())
+        );
+    }
+
+    #[test]
+    fn differing_and_truncated_deterministic_temps_are_preserved_and_fail_closed() {
+        for staged in [b"different witness".as_slice(), b"MVSEJ".as_slice()] {
+            let (fixture, store, binding, boundary) = prepared_journal_attempt();
+            let journal = fixture.journal_directory();
+            let temporary = journal.join(format!(
+                ".sync-execution-witness-{}-{}.pre.tmp",
+                boundary.operation_id, boundary.attempt_number
+            ));
+            let final_path = journal.join(format!(
+                "{}-{}.pre",
+                boundary.operation_id, boundary.attempt_number
+            ));
+            fs::write(&temporary, staged).expect("install corrupt deterministic temp");
+            make_private_file(&temporary);
+            assert!(matches!(
+                store.publish_local_execution_pre_side_effect_witness(
+                    &binding,
+                    &boundary,
+                    boundary.occurred_at_unix_ms,
+                ),
+                Err(Error::LocalExecutionJournalCollision)
+            ));
+            assert!(!final_path.exists(), "no corrupt temp may become final");
+            assert_eq!(fs::read(&temporary).expect("preserved temp"), staged);
+            assert_eq!(sync_journal_temporary_count(&journal), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn insecure_symlink_and_hardlink_deterministic_temps_are_preserved() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+        for kind in 0..3 {
+            let (fixture, store, binding, boundary) = prepared_journal_attempt();
+            let journal = fixture.journal_directory();
+            let temporary = journal.join(format!(
+                ".sync-execution-witness-{}-{}.pre.tmp",
+                boundary.operation_id, boundary.attempt_number
+            ));
+            let final_path = journal.join(format!(
+                "{}-{}.pre",
+                boundary.operation_id, boundary.attempt_number
+            ));
+            let source = journal.join(format!("temp-attack-source-{kind}"));
+            match kind {
+                0 => {
+                    fs::write(&temporary, b"insecure temp").expect("insecure temp");
+                    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o644))
+                        .expect("insecure mode");
+                }
+                1 => {
+                    fs::write(&source, b"symlink target").expect("target");
+                    make_private_file(&source);
+                    symlink(&source, &temporary).expect("temp symlink");
+                }
+                _ => {
+                    fs::write(&source, b"hardlink target").expect("target");
+                    make_private_file(&source);
+                    fs::hard_link(&source, &temporary).expect("temp hardlink");
+                }
+            }
+            assert!(store
+                .publish_local_execution_pre_side_effect_witness(
+                    &binding,
+                    &boundary,
+                    boundary.occurred_at_unix_ms,
+                )
+                .is_err());
+            assert!(!final_path.exists());
+            assert_eq!(sync_journal_temporary_count(&journal), 1);
+            match kind {
+                0 => assert_eq!(
+                    fs::metadata(&temporary)
+                        .expect("preserved insecure temp")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o644
+                ),
+                1 => assert!(fs::symlink_metadata(&temporary)
+                    .expect("preserved symlink")
+                    .file_type()
+                    .is_symlink()),
+                _ => assert_eq!(
+                    fs::metadata(&source).expect("preserved hardlink").nlink(),
+                    2
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn journal_pathname_substitution_never_becomes_publication_or_read_success() {
+        let (fixture, store, binding, boundary) = prepared_journal_attempt();
+        let final_path = fixture.journal_directory().join(format!(
+            "{}-{}.pre",
+            boundary.operation_id, boundary.attempt_number
+        ));
+        store
+            .execution_journal
+            .replace_source_before_next_rename_for_test();
+        assert!(matches!(
+            store.publish_local_execution_pre_side_effect_witness(
+                &binding,
+                &boundary,
+                boundary.occurred_at_unix_ms,
+            ),
+            Err(Error::LocalExecutionJournalMismatch)
+        ));
+        assert!(store.execution_journal.replacement_test_faults_consumed());
+        assert_eq!(
+            fs::read(&final_path).expect("substituted final is preserved for forensics"),
+            b"journal-test-substitution"
+        );
+
+        let (_fixture, store, binding, boundary) = prepared_journal_attempt();
+        store
+            .publish_local_execution_pre_side_effect_witness(
+                &binding,
+                &boundary,
+                boundary.occurred_at_unix_ms,
+            )
+            .expect("publish exact witness");
+        store
+            .execution_journal
+            .replace_named_file_after_next_read_for_test();
+        assert!(matches!(
+            store.inspect_local_execution_recovery(&binding, boundary.attempt_number),
+            Err(Error::LocalExecutionJournalMismatch)
+        ));
+        assert!(store.execution_journal.replacement_test_faults_consumed());
+    }
+
+    #[test]
+    fn journal_rejects_detached_root_topology_before_publication() {
+        let fixture = Fixture::new();
+        let operation_id = Uuid::new_v4();
+        let binding = test_durable_execution_binding(operation_id, fixture.vault_id);
+        let boundary = LocalExecutionAttemptBoundary {
+            operation_id,
+            attempt_number: 0,
+            boundary_id: Uuid::new_v4(),
+            contract_fingerprint: binding.fingerprint(),
+            occurred_at_unix_ms: 11,
+        };
+        let mut store = fixture.open();
+        store
+            .register_local_execution_contract(&binding, 10)
+            .expect("contract");
+        store
+            .append_local_execution_attempt_boundary(&boundary)
+            .expect("boundary");
+
+        let detached = fixture.app_data.with_file_name("detached-private-app-data");
+        fs::rename(&fixture.app_data, &detached).expect("detach configured root");
+        fs::create_dir(&fixture.app_data).expect("replacement root");
+        make_private(&fixture.app_data);
+
+        assert!(matches!(
+            store.publish_local_execution_pre_side_effect_witness(
+                &binding,
+                &boundary,
+                boundary.occurred_at_unix_ms,
+            ),
+            Err(Error::LocalExecutionJournalMismatch)
+        ));
+        assert!(!fixture.journal_directory().exists());
+    }
+
+    #[test]
+    fn exact_retry_creates_no_temp_and_collision_preserves_final_bytes() {
+        let fixture = Fixture::new();
+        let operation_id = Uuid::new_v4();
+        let binding = test_durable_execution_binding(operation_id, fixture.vault_id);
+        let boundary = LocalExecutionAttemptBoundary {
+            operation_id,
+            attempt_number: 0,
+            boundary_id: Uuid::new_v4(),
+            contract_fingerprint: binding.fingerprint(),
+            occurred_at_unix_ms: 11,
+        };
+        let mut store = fixture.open();
+        store
+            .register_local_execution_contract(&binding, 10)
+            .expect("contract");
+        store
+            .append_local_execution_attempt_boundary(&boundary)
+            .expect("boundary");
+        let journal = fixture.journal_directory();
+        let stale = journal.join(".sync-execution-witness-stale.tmp");
+        fs::write(&stale, b"pre-existing stale evidence").expect("stale temp");
+        make_private_file(&stale);
+
+        store
+            .publish_local_execution_pre_side_effect_witness(
+                &binding,
+                &boundary,
+                boundary.occurred_at_unix_ms,
+            )
+            .expect("publish pre");
+        let final_path = journal.join(format!("{operation_id}-0.pre"));
+        let final_bytes = fs::read(&final_path).expect("final witness");
+        let temporary_count_before = sync_journal_temporary_count(&journal);
+        assert_eq!(temporary_count_before, 1);
+        assert_eq!(
+            store
+                .publish_local_execution_pre_side_effect_witness(
+                    &binding,
+                    &boundary,
+                    boundary.occurred_at_unix_ms,
+                )
+                .expect("exact retry"),
+            LocalExecutionWitnessPublicationOutcome::AlreadyPublished
+        );
+        assert_eq!(
+            sync_journal_temporary_count(&journal),
+            temporary_count_before
+        );
+        assert_eq!(
+            fs::read(&stale).expect("preserved stale temp"),
+            b"pre-existing stale evidence"
+        );
+
+        assert!(matches!(
+            store.publish_local_execution_pre_side_effect_witness(&binding, &boundary, 13),
+            Err(Error::InvalidLocalExecutionEvidence)
+        ));
+        assert_eq!(fs::read(final_path).expect("preserved final"), final_bytes);
+    }
+
+    #[test]
+    fn malformed_unsupported_and_oversized_witness_bytes_are_preserved_on_disk() {
+        for corruption in 0..3 {
+            let (fixture, store, binding, boundary) = prepared_journal_attempt();
+            store
+                .publish_local_execution_pre_side_effect_witness(
+                    &binding,
+                    &boundary,
+                    boundary.occurred_at_unix_ms,
+                )
+                .expect("publish valid witness");
+            let final_path = fixture
+                .journal_directory()
+                .join(format!("{}-0.pre", boundary.operation_id));
+            let valid = fs::read(&final_path).expect("valid witness bytes");
+            let corrupted = match corruption {
+                0 => valid[..valid.len() - 1].to_vec(),
+                1 => {
+                    let mut unsupported = valid;
+                    unsupported[6] = unsupported[6].wrapping_add(1);
+                    unsupported
+                }
+                _ => vec![0; 513],
+            };
+            fs::write(&final_path, &corrupted).expect("install corrupt witness");
+            assert!(matches!(
+                store.inspect_local_execution_recovery(&binding, 0),
+                Err(Error::LocalExecutionJournalMalformed)
+            ));
+            assert_eq!(
+                fs::read(&final_path).expect("preserved corrupt witness"),
+                corrupted
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_hardlink_and_insecure_final_witnesses_fail_closed_and_are_preserved() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+        let (fixture, store, binding, boundary) = prepared_journal_attempt();
+        let journal = fixture.journal_directory();
+        let final_path = journal.join(format!("{}-0.pre", boundary.operation_id));
+        let symlink_target = journal.join("attacker-target");
+        fs::write(&symlink_target, b"attacker bytes").expect("symlink target");
+        make_private_file(&symlink_target);
+        symlink(&symlink_target, &final_path).expect("install final symlink");
+        assert!(store
+            .publish_local_execution_pre_side_effect_witness(
+                &binding,
+                &boundary,
+                boundary.occurred_at_unix_ms,
+            )
+            .is_err());
+        assert!(fs::symlink_metadata(&final_path)
+            .expect("preserved symlink")
+            .file_type()
+            .is_symlink());
+
+        let (fixture, store, binding, boundary) = prepared_journal_attempt();
+        let journal = fixture.journal_directory();
+        let final_path = journal.join(format!("{}-0.pre", boundary.operation_id));
+        let hardlink_source = journal.join("attacker-hardlink-source");
+        fs::write(&hardlink_source, b"attacker bytes").expect("hardlink source");
+        make_private_file(&hardlink_source);
+        fs::hard_link(&hardlink_source, &final_path).expect("install final hardlink");
+        assert!(store
+            .publish_local_execution_pre_side_effect_witness(
+                &binding,
+                &boundary,
+                boundary.occurred_at_unix_ms,
+            )
+            .is_err());
+        assert_eq!(
+            fs::metadata(&hardlink_source)
+                .expect("preserved hardlink")
+                .nlink(),
+            2
+        );
+
+        let (fixture, store, binding, boundary) = prepared_journal_attempt();
+        let final_path = fixture
+            .journal_directory()
+            .join(format!("{}-0.pre", boundary.operation_id));
+        fs::write(&final_path, b"attacker bytes").expect("insecure final");
+        fs::set_permissions(&final_path, fs::Permissions::from_mode(0o644)).expect("insecure mode");
+        assert!(store
+            .publish_local_execution_pre_side_effect_witness(
+                &binding,
+                &boundary,
+                boundary.occurred_at_unix_ms,
+            )
+            .is_err());
+        assert_eq!(
+            fs::metadata(&final_path)
+                .expect("preserved insecure final")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn local_execution_v5_to_v6_migration_is_additive_and_empty() {
+        let fixture = Fixture::new();
+        let mut store = fixture.open();
+        let binding =
+            VerifiedRemoteBinding::new("account-a", "remote-root", "account-a", "remote-root")
+                .expect("binding");
+        store
+            .bind_remote_root(&binding, 7)
+            .expect("persist v5 binding fact");
+        let job = QueueJob::new(
+            Uuid::new_v4(),
+            QueueJobKind::Upload,
+            "preserved.md",
+            None,
+            None,
+            None,
+            8,
+        )
+        .expect("queue job");
+        store.enqueue_job(&job).expect("persist v5 queue fact");
+        let expected_state = store.vault_state().expect("state");
+        let database_path = store.database_path().to_owned();
+        drop(store);
+        let connection = Connection::open(&database_path).expect("migration fixture");
+        for (kind, name, _) in LOCAL_EXECUTION_SCHEMA_OBJECTS.iter().rev() {
+            connection
+                .execute_batch(&format!("DROP {} {name};", kind.to_uppercase()))
+                .expect("drop v6 fixture object");
+        }
+        connection
+            .pragma_update(None, "user_version", 5)
+            .expect("downgrade fixture");
+        drop(connection);
+        let migrated = fixture.open();
+        assert_eq!(migrated.schema_version().expect("schema version"), 6);
+        assert_eq!(
+            migrated.vault_state().expect("migrated state"),
+            expected_state
+        );
+        assert_eq!(
+            migrated.job(job.operation_id()).expect("migrated job"),
+            Some(job)
+        );
+        for table in [
+            "local_execution_contracts",
+            "local_execution_identity_evidence",
+            "local_execution_collision_members",
+            "local_execution_contract_completions",
+            "local_execution_attempt_boundaries",
+            "local_execution_attempt_outcomes",
+        ] {
+            assert_eq!(count(migrated.database_path(), table), 0, "{table}");
+        }
+    }
 }

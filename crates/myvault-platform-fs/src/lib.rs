@@ -1,6 +1,7 @@
 //! Isolated operating-system filesystem primitives for myVault.
 
 use std::ffi::OsStr;
+use std::fmt;
 use std::io;
 
 use cap_std::fs::Dir;
@@ -9,18 +10,159 @@ use cap_std::fs::Dir;
 ///
 /// Unix stores the device and inode. Windows stores the volume serial number
 /// and the complete 128-bit file identifier returned by `FileIdInfo`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// This is exact evidence about a *currently held handle*, not restart-stable
+/// durable evidence. Use [`DirectoryIdentity::held_object_identity_token`] to
+/// carry this distinction across a platform boundary.
+#[derive(Clone, Eq, PartialEq)]
 pub struct DirectoryIdentity {
     volume: u64,
     file_id: [u8; 16],
 }
 
 /// Platform-complete identity of an opened regular file handle.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// This is exact evidence about a *currently held handle*, not restart-stable
+/// durable evidence.
+#[derive(Clone, Eq, PartialEq)]
 pub struct FileIdentity {
     volume: u64,
     file_id: [u8; 16],
 }
+
+/// The version of [`HeldObjectIdentityToken`] emitted by this crate.
+pub const HELD_OBJECT_IDENTITY_TOKEN_VERSION: u8 = 1;
+
+const HELD_OBJECT_IDENTITY_TOKEN_BYTES: usize = 26;
+const DIRECTORY_IDENTITY_KIND: u8 = 1;
+const FILE_IDENTITY_KIND: u8 = 2;
+
+/// The held-handle object type encoded in a [`HeldObjectIdentityToken`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeldObjectKind {
+    Directory,
+    File,
+}
+
+impl HeldObjectKind {
+    const fn encoded(self) -> u8 {
+        match self {
+            Self::Directory => DIRECTORY_IDENTITY_KIND,
+            Self::File => FILE_IDENTITY_KIND,
+        }
+    }
+
+    const fn decode(value: u8) -> Result<Self, IdentityTokenError> {
+        match value {
+            DIRECTORY_IDENTITY_KIND => Ok(Self::Directory),
+            FILE_IDENTITY_KIND => Ok(Self::File),
+            _ => Err(IdentityTokenError::UnsupportedKind),
+        }
+    }
+}
+
+/// A canonical, versioned identity token for one currently held object handle.
+///
+/// The token contains every byte of the platform's current object identity in
+/// a deterministic wire form: version, kind, big-endian volume, and the full
+/// 128-bit file identifier. It deliberately makes no restart-stability or
+/// durability claim; a durable contract must obtain independent evidence from
+/// a verifier/provider after this token is captured.
+#[derive(Clone, Eq, PartialEq)]
+pub struct HeldObjectIdentityToken([u8; HELD_OBJECT_IDENTITY_TOKEN_BYTES]);
+
+impl HeldObjectIdentityToken {
+    /// Parses exactly one canonical token and rejects truncated, unsupported,
+    /// or forward-version input rather than weakening the identity proof.
+    ///
+    /// # Errors
+    /// Returns a redacted error when the token is not exactly the supported
+    /// canonical length, version, and kind.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, IdentityTokenError> {
+        let bytes: [u8; HELD_OBJECT_IDENTITY_TOKEN_BYTES] = bytes
+            .try_into()
+            .map_err(|_| IdentityTokenError::InvalidLength)?;
+        if bytes[0] != HELD_OBJECT_IDENTITY_TOKEN_VERSION {
+            return Err(IdentityTokenError::UnsupportedVersion);
+        }
+        HeldObjectKind::decode(bytes[1])?;
+        Ok(Self(bytes))
+    }
+
+    /// Returns the exact canonical token bytes for a trusted boundary.
+    ///
+    /// Callers must treat the bytes as sensitive identity evidence. Normal
+    /// formatting is redacted and never exposes these bytes.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    #[must_use]
+    pub const fn version(&self) -> u8 {
+        self.0[0]
+    }
+
+    #[must_use]
+    ///
+    /// # Panics
+    /// Panics only if this crate's private validated-token invariant is broken.
+    pub fn kind(&self) -> HeldObjectKind {
+        // Construction and parsing validate this byte.
+        HeldObjectKind::decode(self.0[1]).expect("held identity token kind was validated")
+    }
+
+    fn new(kind: HeldObjectKind, volume: u64, file_id: [u8; 16]) -> Self {
+        let mut bytes = [0_u8; HELD_OBJECT_IDENTITY_TOKEN_BYTES];
+        bytes[0] = HELD_OBJECT_IDENTITY_TOKEN_VERSION;
+        bytes[1] = kind.encoded();
+        bytes[2..10].copy_from_slice(&volume.to_be_bytes());
+        bytes[10..].copy_from_slice(&file_id);
+        Self(bytes)
+    }
+}
+
+impl fmt::Debug for HeldObjectIdentityToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HeldObjectIdentityToken")
+            .field("version", &self.version())
+            .field("kind", &self.kind())
+            .field("identity_bytes", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Debug for DirectoryIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DirectoryIdentity(<redacted held-handle identity>)")
+    }
+}
+
+impl fmt::Debug for FileIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FileIdentity(<redacted held-handle identity>)")
+    }
+}
+
+/// Redacted parsing failure for a held identity token.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdentityTokenError {
+    InvalidLength,
+    UnsupportedVersion,
+    UnsupportedKind,
+}
+
+impl fmt::Display for IdentityTokenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidLength => "held identity token has an invalid length",
+            Self::UnsupportedVersion => "held identity token version is unsupported",
+            Self::UnsupportedKind => "held identity token kind is unsupported",
+        })
+    }
+}
+
+impl std::error::Error for IdentityTokenError {}
 
 /// Opaque identity of the mount instance containing a held directory.
 ///
@@ -45,6 +187,24 @@ enum MountIdentityInner {
 impl DirectoryIdentity {
     const fn new(volume: u64, file_id: [u8; 16]) -> Self {
         Self { volume, file_id }
+    }
+
+    /// Exports a canonical token for exact comparison of this held directory.
+    ///
+    /// This token is not independently restart-stable evidence.
+    #[must_use]
+    pub fn held_object_identity_token(&self) -> HeldObjectIdentityToken {
+        HeldObjectIdentityToken::new(HeldObjectKind::Directory, self.volume, self.file_id)
+    }
+}
+
+impl FileIdentity {
+    /// Exports a canonical token for exact comparison of this held file.
+    ///
+    /// This token is not independently restart-stable evidence.
+    #[must_use]
+    pub fn held_object_identity_token(&self) -> HeldObjectIdentityToken {
+        HeldObjectIdentityToken::new(HeldObjectKind::File, self.volume, self.file_id)
     }
 }
 
@@ -74,7 +234,7 @@ pub fn file_identity(file: &cap_std::fs::File) -> io::Result<FileIdentity> {
         use cap_fs_ext::MetadataExt;
         let metadata = file.metadata()?;
         let mut file_id = [0_u8; 16];
-        file_id[..8].copy_from_slice(&metadata.ino().to_ne_bytes());
+        file_id[..8].copy_from_slice(&metadata.ino().to_be_bytes());
         Ok(FileIdentity {
             volume: metadata.dev(),
             file_id,
@@ -204,7 +364,7 @@ mod platform {
     pub(super) fn directory_identity(directory: &Dir) -> io::Result<DirectoryIdentity> {
         let metadata = directory.dir_metadata()?;
         let mut file_id = [0_u8; 16];
-        file_id[..8].copy_from_slice(&metadata.ino().to_ne_bytes());
+        file_id[..8].copy_from_slice(&metadata.ino().to_be_bytes());
         Ok(DirectoryIdentity::new(metadata.dev(), file_id))
     }
 
@@ -223,7 +383,10 @@ mod platform {
 
 #[cfg(test)]
 mod identity_tests {
-    use super::DirectoryIdentity;
+    use super::{
+        DirectoryIdentity, FileIdentity, HeldObjectIdentityToken, HeldObjectKind,
+        IdentityTokenError, HELD_OBJECT_IDENTITY_TOKEN_VERSION,
+    };
 
     #[test]
     fn full_identifier_distinguishes_equal_low_64_bits() {
@@ -238,6 +401,55 @@ mod identity_tests {
         assert_ne!(
             DirectoryIdentity::new(7, first),
             DirectoryIdentity::new(7, second)
+        );
+        assert_ne!(
+            DirectoryIdentity::new(7, first).held_object_identity_token(),
+            DirectoryIdentity::new(7, second).held_object_identity_token()
+        );
+    }
+
+    #[test]
+    fn held_token_is_versioned_kind_separated_and_redacted() {
+        let file_id = [0x5a; 16];
+        let first = DirectoryIdentity::new(7, file_id).held_object_identity_token();
+        let second = DirectoryIdentity::new(7, file_id).held_object_identity_token();
+        let file = FileIdentity { volume: 7, file_id }.held_object_identity_token();
+
+        assert_eq!(first, second);
+        assert_ne!(first, file);
+        assert_eq!(first.version(), HELD_OBJECT_IDENTITY_TOKEN_VERSION);
+        assert_eq!(first.kind(), HeldObjectKind::Directory);
+        assert_eq!(file.kind(), HeldObjectKind::File);
+        assert_eq!(first.canonical_bytes().len(), 26);
+        assert_eq!(&first.canonical_bytes()[2..10], &7_u64.to_be_bytes());
+        assert_eq!(&first.canonical_bytes()[10..], &file_id);
+        assert_ne!(
+            format!("{first:?}"),
+            format!("{:?}", first.canonical_bytes())
+        );
+        assert!(!format!("{first:?}").contains("5a"));
+    }
+
+    #[test]
+    fn held_token_rejects_truncation_and_unsupported_headers() {
+        let token = DirectoryIdentity::new(7, [1; 16]).held_object_identity_token();
+        assert_eq!(
+            HeldObjectIdentityToken::from_canonical_bytes(&token.canonical_bytes()[..25]),
+            Err(IdentityTokenError::InvalidLength)
+        );
+
+        let mut unsupported_version = token.canonical_bytes().to_vec();
+        unsupported_version[0] += 1;
+        assert_eq!(
+            HeldObjectIdentityToken::from_canonical_bytes(&unsupported_version),
+            Err(IdentityTokenError::UnsupportedVersion)
+        );
+
+        let mut unsupported_kind = token.canonical_bytes().to_vec();
+        unsupported_kind[1] = 99;
+        assert_eq!(
+            HeldObjectIdentityToken::from_canonical_bytes(&unsupported_kind),
+            Err(IdentityTokenError::UnsupportedKind)
         );
     }
 }

@@ -12,19 +12,30 @@ use std::{fmt, io};
 use uuid::Uuid;
 
 pub mod conflict;
+pub mod local_identity;
+pub mod local_orchestration;
 mod store;
+mod sync_journal;
 
+pub use local_orchestration::{
+    classify_authoritative_final_outcome, handle_local_execution_echo_hint,
+    AuthoritativeFinalOutcome, EchoHintDisposition, LocalExecutionEchoHint,
+    LocalExecutionEchoSource, PlatformCallFact,
+};
 pub use store::{
     BindOutcome, ChangeBatch, ChangeBatchDependency, ChangeBatchDependencyKind, ConflictEvidence,
-    ConflictEvidenceRegistrationOutcome, EnqueueOutcome, JobState, LocalMutationState,
+    ConflictEvidenceRegistrationOutcome, EnqueueOutcome, JobState, LocalExecutionAttemptBoundary,
+    LocalExecutionAttemptOutcome, LocalExecutionContractRecord, LocalExecutionOutcome,
+    LocalExecutionOutcomeRecord, LocalExecutionRecoveryObservation,
+    LocalExecutionRegistrationOutcome, LocalExecutionWitnessPublicationOutcome, LocalMutationState,
     LocalMutationStatus, MutationDisposition, MutationEvent, MutationEvidenceCapturePhase,
     MutationIntent, MutationOperationKind, MutationOutcomeTransition, MutationPhase,
     MutationRegistrationOutcome, MutationRetryMode, MutationState, MutationVerificationEvidence,
     QueueJob, QueueJobKind, RemoteBaseEvidence, RemoteExistingBlockedInput, RemotePreviewCursor,
     RemotePreviewEntry, RemotePreviewPage, SyncStore, TransferCompletion,
     TransferCompletionOutcome, TransferDirection, TransferMimeClass, TransferPhase, TransferRecord,
-    TransferRegistrationOutcome, TransferSummary, VaultSyncState, MAX_REMOTE_PREVIEW_PAGE_SIZE,
-    SCHEMA_VERSION, SQLITE_OPEN_RESIDUAL_RISK,
+    TransferRegistrationOutcome, TransferSummary, UntrustedLocalExecutionOutcomeClaim,
+    VaultSyncState, MAX_REMOTE_PREVIEW_PAGE_SIZE, SCHEMA_VERSION, SQLITE_OPEN_RESIDUAL_RISK,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -68,6 +79,13 @@ pub enum Error {
     MutationNeedsReconcile,
     MutationNotFound,
     MutationCollision,
+    LocalExecutionCollision,
+    LocalExecutionNotFound,
+    InvalidLocalExecutionEvidence,
+    LocalExecutionJournalCollision,
+    LocalExecutionJournalMalformed,
+    LocalExecutionJournalMismatch,
+    LocalExecutionJournalPublishedButNotSynced(io::Error),
     MutationStateVersionMismatch,
     UnsupportedTransferChange,
     TransferChangeMismatch,
@@ -142,6 +160,24 @@ impl fmt::Display for Error {
             Self::MutationNotFound => formatter.write_str("the durable mutation was not found"),
             Self::MutationCollision => formatter
                 .write_str("the durable mutation identifier has conflicting immutable evidence"),
+            Self::LocalExecutionCollision => formatter
+                .write_str("the local execution identifier has conflicting immutable evidence"),
+            Self::LocalExecutionNotFound => {
+                formatter.write_str("the local execution contract was not found")
+            }
+            Self::InvalidLocalExecutionEvidence => {
+                formatter.write_str("the local execution evidence is invalid")
+            }
+            Self::LocalExecutionJournalCollision => formatter
+                .write_str("the local execution journal name has conflicting immutable evidence"),
+            Self::LocalExecutionJournalMalformed => {
+                formatter.write_str("the local execution journal evidence is invalid")
+            }
+            Self::LocalExecutionJournalMismatch => formatter
+                .write_str("the local execution journal does not match the fresh durable binding"),
+            Self::LocalExecutionJournalPublishedButNotSynced(_) => formatter.write_str(
+                "local execution journal evidence was published but directory sync failed",
+            ),
             Self::MutationStateVersionMismatch => {
                 formatter.write_str("the durable mutation state version changed unexpectedly")
             }
@@ -158,7 +194,9 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(error) => Some(error),
+            Self::Io(error) | Self::LocalExecutionJournalPublishedButNotSynced(error) => {
+                Some(error)
+            }
             Self::PrivateStorage(error) => Some(error),
             Self::Database(error) => Some(error),
             Self::Remote(error) => Some(error),

@@ -136,6 +136,28 @@ pub fn open_private_file(
     Ok(file)
 }
 
+/// Opens an existing private regular file read/write relative to a held parent.
+///
+/// This retains all no-follow, privacy, type, and link-count checks of
+/// [`open_private_file`].  It is intended only for recovery paths that must
+/// durably flush bytes already present in an exact private temp file.
+///
+/// # Errors
+/// Fails for invalid names, symlinks/reparse points, wrong type/privacy, or links.
+pub fn open_private_file_read_write(
+    parent: &Dir,
+    name: impl AsRef<Path>,
+    max_links: u64,
+) -> Result<File, Error> {
+    let name = name.as_ref();
+    validate_child_name(name)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).follow(FollowSymlinks::No);
+    let file = parent.open_with(name, &options)?;
+    verify_private_file(&file, max_links)?;
+    Ok(file)
+}
+
 /// Removes one private regular file only when its original held handle, token,
 /// and the current named handle all still identify the same private file.
 ///
@@ -410,6 +432,22 @@ pub fn open_android_private_file(parent: &Dir, name: impl AsRef<Path>) -> Result
     validate_child_name(name)?;
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
+    let file = parent.open_with(name, &options)?;
+    inspect_android_held_file(&file)?;
+    Ok(file)
+}
+
+/// Opens an existing Android no-backup private file read/write without
+/// following links, for exact-temp durability repair.
+#[cfg(target_os = "android")]
+pub fn open_android_private_file_read_write(
+    parent: &Dir,
+    name: impl AsRef<Path>,
+) -> Result<File, Error> {
+    let name = name.as_ref();
+    validate_child_name(name)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).follow(FollowSymlinks::No);
     let file = parent.open_with(name, &options)?;
     inspect_android_held_file(&file)?;
     Ok(file)

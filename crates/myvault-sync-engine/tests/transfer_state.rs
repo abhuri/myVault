@@ -290,6 +290,7 @@ fn completion() -> TransferCompletion {
 
 fn downgrade_to_v2(database_path: &Path) {
     let connection = rusqlite::Connection::open(database_path).unwrap();
+    drop_local_execution_v6_objects(&connection);
     connection
         .execute_batch(
             "PRAGMA foreign_keys = OFF;
@@ -353,6 +354,7 @@ fn downgrade_to_v2(database_path: &Path) {
 
 fn downgrade_to_v3(database_path: &Path) {
     let connection = rusqlite::Connection::open(database_path).unwrap();
+    drop_local_execution_v6_objects(&connection);
     connection
         .execute_batch(
             "PRAGMA foreign_keys = OFF;
@@ -418,6 +420,7 @@ fn downgrade_to_v3(database_path: &Path) {
 
 fn downgrade_to_v4_with_legacy_remote_base(database_path: &Path) {
     let connection = rusqlite::Connection::open(database_path).unwrap();
+    drop_local_execution_v6_objects(&connection);
     connection
         .execute_batch(
             "PRAGMA foreign_keys = OFF;
@@ -446,6 +449,51 @@ fn downgrade_to_v4_with_legacy_remote_base(database_path: &Path) {
              CREATE INDEX remote_entries_preview_idx ON remote_entries(portable_path COLLATE BINARY, file_id COLLATE BINARY);
              PRAGMA user_version = 4;
              PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+}
+
+fn drop_local_execution_v6_objects(connection: &rusqlite::Connection) {
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TRIGGER local_execution_outcomes_no_delete;
+             DROP TRIGGER local_execution_outcomes_no_update;
+             DROP TRIGGER local_execution_bridge_receipts_no_delete;
+             DROP TRIGGER local_execution_bridge_receipts_no_update;
+             DROP TRIGGER local_execution_consumption_anchors_no_delete;
+             DROP TRIGGER local_execution_consumption_anchors_no_update;
+             DROP TRIGGER mutation_retry_contracts_no_delete;
+             DROP TRIGGER mutation_retry_contracts_no_update;
+             DROP TRIGGER local_execution_boundaries_no_delete;
+             DROP TRIGGER local_execution_boundaries_no_update;
+             DROP TRIGGER local_execution_completions_no_delete;
+             DROP TRIGGER local_execution_completions_no_update;
+             DROP TRIGGER local_execution_members_no_delete;
+             DROP TRIGGER local_execution_members_no_update;
+             DROP TRIGGER local_execution_identities_no_delete;
+             DROP TRIGGER local_execution_identities_no_update;
+             DROP TRIGGER local_execution_contracts_no_delete;
+             DROP TRIGGER local_execution_contracts_no_update;
+             DROP TRIGGER local_execution_outcome_validate;
+             DROP TRIGGER local_execution_boundary_validate;
+             DROP TRIGGER local_execution_member_range;
+             DROP TRIGGER local_execution_completion_validate;
+             DROP INDEX local_execution_boundary_contract_idx;
+             DROP INDEX local_execution_bridge_receipt_operation_idx;
+             DROP INDEX local_execution_consumption_anchor_operation_idx;
+             DROP INDEX mutation_retry_contract_operation_idx;
+             DROP TABLE local_execution_r3_bridge_receipts;
+             DROP TABLE local_execution_r3_consumption_anchors;
+             DROP TABLE mutation_retry_contracts;
+             DROP INDEX local_execution_identity_operation_idx;
+             DROP INDEX local_execution_contracts_vault_idx;
+             DROP TABLE local_execution_attempt_outcomes;
+             DROP TABLE local_execution_attempt_boundaries;
+             DROP TABLE local_execution_contract_completions;
+             DROP TABLE local_execution_collision_members;
+             DROP TABLE local_execution_identity_evidence;
+             DROP TABLE local_execution_contracts;",
         )
         .unwrap();
 }
@@ -1103,15 +1151,9 @@ fn cursor_rejects_a_completion_event_with_a_semantic_version_mismatch() {
             )
             .unwrap();
     }
-    let mut reopened =
-        SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id).unwrap();
     assert!(matches!(
-        reopened.commit_r3_change_dependency(batch_id, dependency, evidence_id),
-        Err(Error::LocalMutationIncomplete)
-    ));
-    assert!(matches!(
-        reopened.commit_r3_change_batch(batch_id, 21),
-        Err(Error::LocalMutationIncomplete)
+        SyncStore::open(&fixture.app_data, &fixture.vault, fixture.vault_id),
+        Err(Error::InvalidSchema)
     ));
 }
 
@@ -1171,7 +1213,7 @@ fn verified_applied_requires_post_verify_evidence_bound_to_the_immutable_intent(
 }
 
 #[test]
-fn r3_1_rejects_retry_scheduled_outcomes_without_exact_revalidation() {
+fn r3_1_retry_scheduling_requires_exact_revalidation_and_reopens() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
     let not_applied_id = Uuid::new_v4();
@@ -1179,7 +1221,7 @@ fn r3_1_rejects_retry_scheduled_outcomes_without_exact_revalidation() {
         .register_mutation_intent(&mutation_intent(not_applied_id, "not-applied-marker"), None)
         .unwrap();
     store.claim_mutation(not_applied_id, 0, 11).unwrap();
-    let not_applied = mutation_evidence(
+    let mut not_applied = mutation_evidence(
         Uuid::new_v4(),
         not_applied_id,
         0,
@@ -1187,17 +1229,18 @@ fn r3_1_rejects_retry_scheduled_outcomes_without_exact_revalidation() {
         Some("verified_not_applied"),
         "not-applied-marker",
     );
-    assert!(matches!(
-        store.record_mutation_outcome(
+    not_applied.forbidden_side_effect = true;
+    not_applied.evidence_fingerprint = not_applied.canonical_fingerprint();
+    let not_applied_scheduled = store
+        .record_mutation_outcome(
             not_applied_id,
             1,
             &not_applied,
             &MutationOutcomeTransition::VerifiedNotApplied {
                 next_attempt_at_unix_ms: 20,
             },
-        ),
-        Err(Error::InvalidStateTransition)
-    ));
+        )
+        .expect("exact restart retry is durable");
 
     let retry_safe_id = Uuid::new_v4();
     store
@@ -1215,8 +1258,8 @@ fn r3_1_rejects_retry_scheduled_outcomes_without_exact_revalidation() {
     retry_safe.resume_reference = Some("resume.abcdef".into());
     retry_safe.verified_received_byte_offset = Some(0);
     retry_safe.evidence_fingerprint = retry_safe.canonical_fingerprint();
-    assert!(matches!(
-        store.record_mutation_outcome(
+    let scheduled = store
+        .record_mutation_outcome(
             retry_safe_id,
             1,
             &retry_safe,
@@ -1224,16 +1267,35 @@ fn r3_1_rejects_retry_scheduled_outcomes_without_exact_revalidation() {
                 next_attempt_at_unix_ms: 20,
                 resume_reference: "resume.abcdef".into(),
             },
-        ),
-        Err(Error::InvalidStateTransition)
-    ));
+        )
+        .expect("exact resumable retry is durable");
+    assert_eq!(scheduled.phase, MutationPhase::RetryScheduled);
+    drop(store);
+    let mut store = fixture.open();
+    let restart_claimed = store
+        .claim_mutation(not_applied_id, not_applied_scheduled.state_version, 20)
+        .expect("reopened due restart-exact retry claim");
+    assert_eq!(restart_claimed.phase, MutationPhase::Running);
+    assert_eq!(restart_claimed.attempt_number, 1);
+    let claimed = store
+        .claim_mutation(retry_safe_id, scheduled.state_version, 20)
+        .expect("due exact retry claim");
+    assert_eq!(claimed.phase, MutationPhase::Running);
+    assert_eq!(claimed.attempt_number, 1);
+    drop(store);
+    let reopened = fixture.open();
+    let recovered = reopened
+        .mutation_state(retry_safe_id)
+        .unwrap()
+        .expect("retry operation survives reopen");
+    assert_eq!(recovered.phase, MutationPhase::NeedsReconcile);
+    assert_eq!(recovered.attempt_number, claimed.attempt_number);
+    assert_eq!(recovered.state_version, claimed.state_version + 1);
 
-    for operation_id in [not_applied_id, retry_safe_id] {
-        let state = store.mutation_state(operation_id).unwrap().unwrap();
-        assert_eq!(state.phase, MutationPhase::Running);
-        assert_eq!(state.state_version, 1);
-        assert_eq!(store.mutation_events(operation_id).unwrap().len(), 2);
-    }
+    let state = reopened.mutation_state(not_applied_id).unwrap().unwrap();
+    assert_eq!(state.phase, MutationPhase::NeedsReconcile);
+    assert_eq!(state.state_version, 4);
+    assert_eq!(reopened.mutation_events(not_applied_id).unwrap().len(), 5);
 }
 
 #[test]
@@ -1418,6 +1480,7 @@ fn r3_typed_batch_commits_mixed_dependencies_and_is_restart_safe() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Exercises the full public blocked-registration matrix.
 fn remote_existing_blocked_is_durable_needs_reconcile_without_running() {
     let fixture = Fixture::new();
     let operation_id = Uuid::new_v4();
@@ -1444,8 +1507,11 @@ fn remote_existing_blocked_is_durable_needs_reconcile_without_running() {
     evidence.observed_path = intent.source_path.clone();
     evidence.observed_local_revision = intent.expected_local_revision.clone();
     evidence.observed_remote_revision = intent.expected_remote_revision.clone();
+    evidence.observed_sha256 = intent.expected_remote_sha256.clone();
+    evidence.observed_byte_length = intent.expected_remote_byte_length;
     evidence.capture_phase = MutationEvidenceCapturePhase::Preflight;
     evidence.forbidden_side_effect = true;
+    evidence.captured_at_unix_ms = intent.registered_at_unix_ms;
     evidence.evidence_fingerprint = evidence.canonical_fingerprint();
     let mut store = fixture.open();
     assert_eq!(
@@ -1503,6 +1569,34 @@ fn remote_existing_blocked_is_durable_needs_reconcile_without_running() {
         store.register_mutation_intent(&side_effect_intent, Some(&side_effect)),
         Err(Error::InvalidTransferEvidence)
     ));
+
+    // These are public-path guards: a remote-existing block is initial
+    // preflight evidence, never a recycled attempt or an observation from
+    // before the immutable intent existed.  Both failures leave the store
+    // reopenable because registration is fully atomic.
+    for (attempt_number, captured_at_unix_ms) in [(1, evidence.captured_at_unix_ms), (0, 9)] {
+        let mut invalid = evidence.clone();
+        let mut other = intent.clone();
+        other.operation_id = Uuid::new_v4();
+        other.operation_marker = format!("blocked-initial-{attempt_number}-{captured_at_unix_ms}");
+        other.intent_fingerprint = other.canonical_fingerprint();
+        invalid.evidence_id = Uuid::new_v4();
+        invalid.operation_id = other.operation_id;
+        invalid.attempt_number = attempt_number;
+        invalid.captured_at_unix_ms = captured_at_unix_ms;
+        invalid.observed_operation_marker = Some(other.operation_marker.clone());
+        invalid.evidence_fingerprint = invalid.canonical_fingerprint();
+        assert!(matches!(
+            store.register_mutation_intent(&other, Some(&invalid)),
+            Err(Error::InvalidTransferEvidence)
+        ));
+    }
+    drop(store);
+    assert!(fixture
+        .open()
+        .mutation_state(intent.operation_id)
+        .unwrap()
+        .is_some());
 }
 
 #[test]
