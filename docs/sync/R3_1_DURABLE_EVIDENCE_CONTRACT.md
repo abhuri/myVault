@@ -4,7 +4,9 @@ Owner: Sunday ค่ะ
 
 Review route: GPT-5.6 Sol High ค่ะ
 
-Status: `FROZEN — R3.1 CLOSURE CANDIDATE — GATE 1 PASSED LOCALLY` ค่ะ
+Status: `FROZEN — R3.1 COMPLETE — GATE 1 PASSED` ค่ะ
+
+Published implementation: `main@c774324` ค่ะ
 
 Canonical checkpoint: `main@9a30ad9763b8a9503484f2a35e559b1c7ee800b6` ค่ะ
 

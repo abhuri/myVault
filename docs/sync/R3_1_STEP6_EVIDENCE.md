@@ -4,14 +4,13 @@ Owner: Sunday ค่ะ
 
 Execution route: GPT-5.6 Terra High ค่ะ
 
-Status: `R3.1 CLOSURE CANDIDATE VALIDATED — GATE 1 PASSED LOCALLY — PUBLISH PENDING` ค่ะ
+Status: `R3.1 COMPLETE — GATE 1 PASSED — IMPLEMENTATION main@c774324` ค่ะ
 
 Canonical baseline: `main@9a30ad9763b8a9503484f2a35e559b1c7ee800b6` ค่ะ
 
-Candidate boundary: validation นี้รันบน working tree ที่ dirty เฉพาะชุดงาน R3.1
-Steps 1–6 ค่ะ ไม่มี commit, push, PR, provider, live Drive หรือ external action
-เกิดขึ้นค่ะ ดังนั้นผลนี้เป็น local candidate evidence และไม่ใช่ exact committed-head
-or CI evidence ค่ะ
+Candidate boundary: validation นี้รันบนชุดงาน R3.1 เดียวกับ implementation ที่ publish
+เป็น `main@c774324` ค่ะ Validation เป็น local evidence ค่ะ ไม่มี provider, live Drive
+หรือ external action เกิดขึ้นค่ะ CI evidence เป็น post-push workflow แยกต่างหากค่ะ
 
 ## 1. Reproducible command record
 

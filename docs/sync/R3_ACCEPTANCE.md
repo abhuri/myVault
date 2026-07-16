@@ -2,7 +2,7 @@
 
 Owner: Sunday ค่ะ
 
-Current status: `R3.1 CLOSURE CANDIDATE — GATE 1 PASSED LOCALLY — PUBLISH PENDING` ค่ะ
+Current status: `R3.1 COMPLETE — GATE 1 PASSED — IMPLEMENTATION main@c774324` ค่ะ
 
 R3 ถือว่า complete เมื่อทุก applicable checkbox ด้านล่างมี evidence จาก exact
 candidate HEAD เดียวค่ะ Mock, compile, emulator, native runtime และ live evidence
@@ -39,8 +39,9 @@ complete แล้วค่ะ Gate 0 activation complete บน canonical check
 
 Step 1 contract/schema decisions ถูก freeze ใน
 [R3_1_DURABLE_EVIDENCE_CONTRACT.md](R3_1_DURABLE_EVIDENCE_CONTRACT.md) ค่ะ
-Checkbox implementation/evidence ด้านล่างผ่านบน source และ tests จาก candidate
-เดียวกันแล้วค่ะ Exact committed-head/CI evidence จะบันทึกหลัง publish ค่ะ
+Checkbox implementation/evidence ด้านล่างผ่านบน implementation commit
+`main@c774324` และ local validation candidate เดียวกันค่ะ CI evidence อยู่ภายใต้
+normal post-push workflow และไม่เปลี่ยน Gate 1 local closure ค่ะ
 
 Step 2 inventory ณ เวลานั้นยืนยันว่า production source ยังเป็น schema v3 ค่ะ Sol
 change-control A/B จำกัด legacy transfer timestamp เป็น reject-only compatibility

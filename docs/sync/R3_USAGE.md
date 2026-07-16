@@ -2,7 +2,7 @@
 
 Owner: Sunday ค่ะ
 
-Status: `MEASUREMENT CONTRACT ACTIVE — R3.1 CLOSURE CANDIDATE RECORDED` ค่ะ
+Status: `MEASUREMENT CONTRACT ACTIVE — R3.1 CLOSURE RECORDED` ค่ะ
 
 Phase routing baseline reviewed 2026-07-16 Asia/Bangkok ค่ะ Runtime availability
 ยังต้องตรวจซ้ำตอนเปิดทุก R3 session ค่ะ
@@ -171,7 +171,7 @@ agy \
 | `r3.1-sol-audit-01` | R3.1 | `interactive-codex` | auditor / GPT-5.6 Sol High ค่ะ | Frozen-contract audit of durable evidence binding, cursor proof and unknown-outcome retry semantics ค่ะ | Exact tokens/quota unavailable ค่ะ | One evidence-binding finding fixed and revalidatedค่ะ One unknown-outcome semantic blocker requires explicit change-controlค่ะ |
 | `r3.1-option-a-terra-01` | R3.1 | `interactive-codex` | integrator / GPT-5.6 Terra High ค่ะ | Implement Sol-approved Option A by rejecting R3.1 retry transitions and adding atomic regression coverage ค่ะ | Exact tokens/quota unavailable ค่ะ | Full final validation passedค่ะ Engine 57 tests, transfer 15 tests, format, strict Clippy และ diff check ผ่านค่ะ |
 | `r3.1-closure-audit-01` | R3.1 | `codex-app-spawn` | reviewer / `runtime-selected/unobservable` ค่ะ | Read-only adversarial closure audit of schema, fingerprints, conflict envelope, cursor semantics and scope drift ค่ะ | Per-child tokens unavailable ค่ะ | Accepted report ค่ะ พบ 3 P1 และ 2 P2 โดยไม่มี P0 ค่ะ |
-| `r3.1-closure-main-01` | R3.1 | `interactive-codex` | integrator / current session ค่ะ | Engine-owned canonical fingerprints, post-destination verification, immutable conflict-envelope API, cursor semantic equality, regression suite and document closure ค่ะ | Exact tokens/quota unavailable ค่ะ | Candidate validated locallyค่ะ Engine 61 tests, transfer 15 tests, format, strict Clippy และ diff check pending final publish runค่ะ |
+| `r3.1-closure-main-01` | R3.1 | `interactive-codex` | integrator / current session ค่ะ | Engine-owned canonical fingerprints, post-destination verification, immutable conflict-envelope API, cursor semantic equality, regression suite and document closure ค่ะ | Exact tokens/quota unavailable ค่ะ | Published implementation `main@c774324` ค่ะ Engine 61 tests, transfer 15 tests, format, strict Clippy และ diff check ผ่านค่ะ |
 
 R3.0 rows ข้างต้นเป็น planning/contract evidence เท่านั้นค่ะ R3.1 agy rows เป็น
 failed bounded inventory attempts และไม่มี accepted work ค่ะ ทุก row ไม่ใช่ R3

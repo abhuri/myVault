@@ -213,8 +213,8 @@ R3 scope เป็น Safe Conflict Core และแยก Provider-safe Remote
 รายละเอียดอยู่ที่ [R3 safety contracts](docs/sync/R3_CONTRACTS.md) ค่ะ
 
 R3 แบ่ง execution เป็น `R3.0 → R3.1 → {R3.2, R3.3 block enforcement, R3.4} → R3.5 →
-R3.6 → R3.7` ค่ะ R3.1 durable mutation and conflict evidence เป็น closure candidate
-ที่ Gate 1 ผ่าน locally แล้วค่ะ รายละเอียด outcome, dependency, owner, exit gate, AI staffing
+R3.6 → R3.7` ค่ะ R3.1 durable mutation and conflict evidence complete ที่
+implementation `main@c774324` พร้อม Gate 1 ผ่านแล้วค่ะ รายละเอียด outcome, dependency, owner, exit gate, AI staffing
 และ usage contract อยู่ที่ [R3 plan](docs/sync/R3_PLAN.md),
 [R3 acceptance](docs/sync/R3_ACCEPTANCE.md) และ
 [R3 usage ledger](docs/sync/R3_USAGE.md) ค่ะ Safety decisions อยู่ที่
