@@ -2,13 +2,13 @@
 
 Owner: Sunday ค่ะ
 
-Planning status: `R3.0 CONTENT FROZEN — CANONICALIZATION AND TRANSITION PENDING` ค่ะ
+Planning status: `R3.0 CLOSED — TRANSITION PENDING` ค่ะ
 
 R2 implementation ถูก merge เข้า `main` ผ่าน PR #27 ที่ `94db388` และ
 post-merge Quality run `29429364407` ผ่านแล้วค่ะ R2 complete ตาม locked
-milestone scope ค่ะ เอกสารปิด R2 บน branch `codex/r2-closure` อยู่ที่
-`f7a0d7c` และยังต้องเข้า canonical `main` พร้อม planning pack นี้หรือ diff
-ที่สืบทอดเนื้อหาเดียวกันค่ะ
+milestone scope ค่ะ R2 documentation closure, R3 planning pack และ Option A
+contracts ถูก merge ผ่าน PR #28 ที่ canonical `main@eb6709c` หลัง Quality run
+`29461969032` ผ่านบน exact source head `f120679` ค่ะ
 
 R3 source implementation ห้ามเริ่มจนกว่า R3.0 gate ผ่านและคุณโออนุมัติ
 transition เข้า R3 อย่างชัดเจนค่ะ คุณโออนุมัติ commit, push และเปิด Draft PR
@@ -130,10 +130,10 @@ mutations จึงคง `BLOCKED` โดยไม่ block R3 Safe Conflict Co
   code และบันทึกข้อจำกัดที่ไม่มี server-enforced precondition ตามจริงค่ะ
 - ขอ explicit approval จากคุณโอเพื่อ transition เข้า R3 ค่ะ
 
-R3.0 content exit คือ Option A scope/dependency, conflict matrix, mutation block,
+R3.0 exit ผ่านแล้วค่ะ Option A scope/dependency, conflict matrix, mutation block,
 fixture/privacy bounds และ unknown-outcome taxonomy ถูก freeze โดยไม่มี
-last-write-wins/permanent delete ค่ะ Gate 0 activation ยังต้องมี canonical
-checkpoint และ explicit transition approval ค่ะ
+last-write-wins/permanent delete และอยู่บน canonical `main@eb6709c` ค่ะ Gate 0
+activation เหลือ explicit transition approval เท่านั้นค่ะ
 
 Preflight revision check + post-verification ห้ามถูกนับเป็น atomic stale-write
 protection ค่ะ การแก้ provider limitation ด้วย generic Drive request, blind retry
