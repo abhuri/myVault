@@ -3,8 +3,11 @@ use crate::{
     FOLDER_MIME_TYPE,
 };
 use reqwest::{
-    blocking::Response,
-    header::{CONTENT_LENGTH, LOCATION, RANGE, RETRY_AFTER},
+    blocking::{Client, Response},
+    header::{
+        ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE,
+        RETRY_AFTER,
+    },
     StatusCode, Url,
 };
 use secrecy::{ExposeSecret, SecretString};
@@ -30,6 +33,68 @@ const MAX_ANCESTRY_DEPTH: usize = 128;
 const MAX_RETRY_AFTER_SECONDS: u64 = 60 * 60;
 const TRANSFER_FILE_FIELDS: &str =
     "id,name,mimeType,parents,trashed,version,size,sha256Checksum,appProperties";
+
+/// Opaque, transfer-module-only transport for the two allowlisted write shapes.
+/// It never exposes a raw authenticated request builder to a sibling module.
+pub(crate) struct TransferTransport {
+    client: Client,
+    authorization: String,
+}
+
+impl TransferTransport {
+    pub(crate) fn new(client: Client, authorization: String) -> Self {
+        Self {
+            client,
+            authorization,
+        }
+    }
+
+    fn post_create(
+        &self,
+        url: Url,
+        fields: &str,
+        mime_type: &str,
+        size: u64,
+        body: Vec<u8>,
+    ) -> Result<Response> {
+        self.client
+            .post(url)
+            .query(&[
+                ("uploadType", "resumable"),
+                ("supportsAllDrives", "true"),
+                ("fields", fields),
+            ])
+            .header(AUTHORIZATION, &self.authorization)
+            .header(ACCEPT, "application/json")
+            .header(CONTENT_TYPE, "application/json; charset=utf-8")
+            .header("X-Upload-Content-Type", mime_type)
+            .header("X-Upload-Content-Length", size)
+            .body(body)
+            .send()
+            .map_err(|error| map_transfer_transport_error(&error))
+    }
+
+    fn put_session(&self, url: Url, body: Vec<u8>, content_range: &str) -> Result<Response> {
+        self.client
+            .put(url)
+            .header(AUTHORIZATION, &self.authorization)
+            .header(CONTENT_LENGTH, body.len())
+            .header(CONTENT_RANGE, content_range)
+            .body(body)
+            .send()
+            .map_err(|error| map_transfer_transport_error(&error))
+    }
+}
+
+fn map_transfer_transport_error(error: &reqwest::Error) -> Error {
+    if error.is_timeout() {
+        Error::new(ErrorCode::Timeout)
+    } else if error.is_redirect() {
+        Error::new(ErrorCode::RedirectRejected)
+    } else {
+        Error::new(ErrorCode::Transport)
+    }
+}
 
 /// One exact request body range for a guarded resumable upload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -392,6 +457,7 @@ impl VerifiedDownload {
 /// generic request method and cannot update an existing remote object.
 pub struct TransferDrive {
     read_only: ReadOnlyDrive,
+    transport: TransferTransport,
     upload_base: Url,
     account_id: String,
     root_id: String,
@@ -465,8 +531,10 @@ impl TransferDrive {
             timeout,
             https_only,
         )?;
+        let transport = read_only.transfer_transport();
         Ok(Self {
             read_only,
+            transport,
             upload_base,
             account_id,
             root_id,
@@ -644,7 +712,7 @@ impl TransferDrive {
             }
         }))
         .map_err(|_| Error::new(ErrorCode::InvalidInput))?;
-        let response = self.read_only.post_resumable_create(
+        let response = self.transport.post_create(
             url,
             TRANSFER_FILE_FIELDS,
             &permit.intent.mime_type,
@@ -966,8 +1034,7 @@ impl TransferDrive {
             .map_err(|_| Error::new(ErrorCode::MalformedResponse))?;
         self.ensure_session_url(&url)?;
         self.ensure_folder_below_root(&session.intent.parent_id)?;
-        self.read_only
-            .put_resumable_session(url, body, content_range)
+        self.transport.put_session(url, body, content_range)
     }
 
     fn decode_upload_response(
@@ -1082,7 +1149,7 @@ impl TransferDrive {
 
     fn ensure_session_url(&self, url: &Url) -> Result<()> {
         self.ensure_upload_origin(url)?;
-        if !url.path().ends_with("/files")
+        if url.path() != format!("{}files", self.upload_base.path())
             || !url
                 .query_pairs()
                 .any(|(key, value)| key == "upload_id" && !value.is_empty() && value.len() <= 4096)
@@ -1665,10 +1732,10 @@ mod tests {
         }
         let post_builder = concat!(".", "post", "(");
         let put_builder = concat!(".", "put", "(");
-        assert_eq!(client_source.matches(post_builder).count(), 1);
-        assert_eq!(client_source.matches(put_builder).count(), 1);
-        assert_eq!(transfer_source.matches(post_builder).count(), 0);
-        assert_eq!(transfer_source.matches(put_builder).count(), 0);
+        assert_eq!(client_source.matches(post_builder).count(), 0);
+        assert_eq!(client_source.matches(put_builder).count(), 0);
+        assert_eq!(transfer_source.matches(post_builder).count(), 1);
+        assert_eq!(transfer_source.matches(put_builder).count(), 1);
     }
 
     #[test]
@@ -2040,7 +2107,7 @@ mod tests {
             .expect(0)
             .create();
         let permission_mutation = server
-            .mock("POST", "/drive/v3/files/file_1/permissions")
+            .mock("POST", concat!("/drive/v3/files/file_1/", "permissions"))
             .expect(0)
             .create();
         server
@@ -2760,6 +2827,8 @@ mod tests {
             "https://attacker.invalid/upload/drive/v3/files?upload_id=x",
             &format!("{}/drive/v3/files?upload_id=x", server.url()),
             &format!("{}/upload/drive/v3/files", server.url()),
+            &format!("{}/upload/drive/v3/other/files?upload_id=x", server.url()),
+            &format!("{}/upload/drive/v3/files/file_1?upload_id=x", server.url()),
         ] {
             let mut session = UploadSession {
                 uri: SecretString::from(uri.to_owned()),

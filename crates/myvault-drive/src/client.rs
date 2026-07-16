@@ -9,7 +9,7 @@ use myvault_sync_engine::{
 };
 use reqwest::{
     blocking::{Client, Response},
-    header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE},
+    header::{AUTHORIZATION, CONTENT_LENGTH},
     StatusCode, Url,
 };
 use serde::de::DeserializeOwned;
@@ -435,55 +435,6 @@ impl ReadOnlyDrive {
         self.decode(response)
     }
 
-    /// Starts the one allowlisted provider mutation: a create-only resumable
-    /// upload to the collection endpoint. An existing provider id cannot be
-    /// expressed by this URL shape.
-    pub(crate) fn post_resumable_create(
-        &self,
-        url: Url,
-        fields: &str,
-        mime_type: &str,
-        size: u64,
-        body: Vec<u8>,
-    ) -> Result<Response> {
-        self.ensure_create_only_upload_url(&url)?;
-        self.client
-            .post(url)
-            .query(&[
-                ("uploadType", "resumable"),
-                ("supportsAllDrives", "true"),
-                ("fields", fields),
-            ])
-            .header(AUTHORIZATION, self.authorization())
-            .header(ACCEPT, "application/json")
-            .header(CONTENT_TYPE, "application/json; charset=utf-8")
-            .header("X-Upload-Content-Type", mime_type)
-            .header("X-Upload-Content-Length", size)
-            .body(body)
-            .send()
-            .map_err(|error| map_transfer_transport_error(&error))
-    }
-
-    /// Sends data only to a held resumable-upload session. The session URL is
-    /// constrained to the create collection endpoint plus a bounded upload id;
-    /// it cannot name an existing Drive item.
-    pub(crate) fn put_resumable_session(
-        &self,
-        url: Url,
-        body: Vec<u8>,
-        content_range: &str,
-    ) -> Result<Response> {
-        self.ensure_resumable_session_url(&url)?;
-        self.client
-            .put(url)
-            .header(AUTHORIZATION, self.authorization())
-            .header(CONTENT_LENGTH, body.len())
-            .header(CONTENT_RANGE, content_range)
-            .body(body)
-            .send()
-            .map_err(|error| map_transfer_transport_error(&error))
-    }
-
     /// Fetches media only for a validated exact file id. This is intentionally
     /// separate from metadata GETs so it cannot become a generic request API.
     pub(crate) fn get_media(&self, file_id: &str) -> Result<Response> {
@@ -497,34 +448,12 @@ impl ReadOnlyDrive {
             .map_err(|error| map_transfer_transport_error(&error))
     }
 
+    pub(crate) fn transfer_transport(&self) -> crate::transfer::TransferTransport {
+        crate::transfer::TransferTransport::new(self.client.clone(), self.authorization())
+    }
+
     fn authorization(&self) -> String {
         format!("Bearer {}", self.token.expose())
-    }
-
-    fn ensure_create_only_upload_url(&self, url: &Url) -> Result<()> {
-        if !self.is_upload_collection_url(url) || url.query().is_some() {
-            return Err(Error::new(ErrorCode::UnexpectedOrigin));
-        }
-        Ok(())
-    }
-
-    fn ensure_resumable_session_url(&self, url: &Url) -> Result<()> {
-        if !self.is_upload_collection_url(url)
-            || !url
-                .query_pairs()
-                .any(|(key, value)| key == "upload_id" && !value.is_empty() && value.len() <= 4096)
-        {
-            return Err(Error::new(ErrorCode::UnexpectedOrigin));
-        }
-        Ok(())
-    }
-
-    fn is_upload_collection_url(&self, url: &Url) -> bool {
-        url.origin() == self.api_base.origin()
-            && url.path() == "/upload/drive/v3/files"
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.fragment().is_none()
     }
 
     fn decode<T: DeserializeOwned>(&self, mut response: Response) -> Result<T> {
@@ -743,34 +672,6 @@ mod tests {
         assert!(!debug.contains(TOKEN));
         assert!(debug.contains("[REDACTED]"));
         server.reset();
-    }
-
-    #[test]
-    fn write_helpers_reject_existing_item_urls_before_network() {
-        let server = Server::new();
-        let client = client(&server);
-        let existing_item_upload =
-            Url::parse(&format!("{}/upload/drive/v3/files/file_1", server.url())).unwrap();
-        let existing_item_session = Url::parse(&format!(
-            "{}/upload/drive/v3/files/file_1?upload_id=held_session",
-            server.url()
-        ))
-        .unwrap();
-
-        assert_eq!(
-            client
-                .post_resumable_create(existing_item_upload, "id", "text/markdown", 0, Vec::new(),)
-                .unwrap_err()
-                .code(),
-            ErrorCode::UnexpectedOrigin
-        );
-        assert_eq!(
-            client
-                .put_resumable_session(existing_item_session, Vec::new(), "bytes */0")
-                .unwrap_err()
-                .code(),
-            ErrorCode::UnexpectedOrigin
-        );
     }
 
     #[test]
