@@ -2546,6 +2546,9 @@ dependencies = [
  "rusqlite",
  "serde",
  "sha2",
+ "similar",
+ "unicode-casefold",
+ "unicode-normalization",
  "uuid",
 ]
 

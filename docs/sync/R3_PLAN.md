@@ -2,7 +2,7 @@
 
 Owner: Sunday ค่ะ
 
-Planning status: `R3.1 COMPLETE — GATE 1 PASSED — IMPLEMENTATION main@c774324` ค่ะ
+Planning status: `R3.2 LOCAL CLOSURE CANDIDATE — GATE 2 PASSED LOCALLY` ค่ะ
 
 R2 implementation ถูก merge เข้า `main` ผ่าน PR #27 ที่ `94db388` และ
 post-merge Quality run `29429364407` ผ่านแล้วค่ะ R2 complete ตาม locked
@@ -228,6 +228,13 @@ invalid/oversized Markdown และ binary pairs ค่ะ
 
 Owner คือ pure conflict lane ค่ะ ห้ามสร้าง crate ใหม่จนกว่าจะพิสูจน์ trust boundary
 หรือ independently testable lifecycle ที่จำเป็นค่ะ
+
+R3.2 implementation ปิด pure classifier C01–C34, bounded Markdown merge,
+versioned conflict identity/naming, sealed replay/semantic proofs, deterministic
+materialization และ R3.1 intent/evidence integration แล้วค่ะ Full engine suite ผ่าน
+113 tests พร้อม strict Clippy/Rustfmt/diff check ค่ะ Terra และ Sol audit findings
+ถูกแก้ครบค่ะ Exact conflict-copy reuse คง `NeedsReconcile` จน R3.5 มี durable
+verification event/dependency ที่พิสูจน์ cursor advancement ได้ค่ะ
 
 ### R3.3 — Remote Mutation Block Enforcement
 

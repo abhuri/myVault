@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{fmt, io};
 use uuid::Uuid;
 
+pub mod conflict;
 mod store;
 
 pub use store::{

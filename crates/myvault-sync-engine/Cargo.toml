@@ -15,7 +15,10 @@ myvault-private-fs = { path = "../myvault-private-fs" }
 rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 sha2 = "=0.10.9"
-uuid = { version = "=1.20.0", features = ["serde", "v4"] }
+similar = "=2.7.0"
+unicode-casefold = "=0.2.0"
+unicode-normalization = "=0.1.25"
+uuid = { version = "=1.20.0", features = ["serde", "v4", "v5"] }
 
 [dev-dependencies]
 tempfile = "=3.23.0"
