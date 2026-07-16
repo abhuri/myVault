@@ -1,8 +1,8 @@
-# R3 — Remote Mutations and Conflict Safety Acceptance
+# R3 — Safe Conflict Core Acceptance
 
 Owner: Sunday ค่ะ
 
-Current status: `PLANNED — NOT ACTIVATED` ค่ะ
+Current status: `R3.0 CONTENT COMPLETE — CANONICALIZATION AND TRANSITION PENDING` ค่ะ
 
 R3 ถือว่า complete เมื่อทุก applicable checkbox ด้านล่างมี evidence จาก exact
 candidate HEAD เดียวค่ะ Mock, compile, emulator, native runtime และ live evidence
@@ -15,14 +15,23 @@ candidate HEAD เดียวค่ะ Mock, compile, emulator, native runtime 
 - [x] Post-merge Quality run `29429364407` ผ่านบน `main@94db388` ค่ะ
 - [ ] R2 documentation closure `f7a0d7c` และ R3 planning pack อยู่บน canonical
   `main` หรือ equivalent approved checkpoint ค่ะ
-- [ ] `R3_PLAN.md`, acceptance, usage contract, Project Plan, README และ Session
+- [x] `R3_PLAN.md`, acceptance, usage contract, Project Plan, README และ Session
   Handoff ผ่าน cross-document review ค่ะ
-- [ ] Conflict matrix, mutation allowlist, folder topology, merge policy,
+- [x] Conflict matrix, mutation allowlist, folder topology, merge policy,
   conflict-copy identity/naming และ unknown-outcome taxonomy ถูก freeze ค่ะ
-- [ ] Official Drive mutation semantics และ precondition limits ถูกบันทึกค่ะ
-- [ ] Disposable account/root และ two-device local fixtures ถูก allowlist โดยไม่
-  เปิดเผย credential หรือ personal path ค่ะ
+- [x] Official Drive mutation semantics และ precondition limits ถูกบันทึกใน
+  [R3_CONTRACTS.md](R3_CONTRACTS.md) ค่ะ
+- [x] Disposable account/root และ two-device fixture schema, aliases, redaction
+  และ privacy bounds ถูก freeze โดยไม่เปิดเผย credential หรือ personal path ค่ะ
+  Exact runtime fingerprints ต้องอนุมัติก่อน R3.6 live regression ค่ะ
 - [ ] คุณโออนุมัติ transition เข้า R3 อย่างชัดเจนค่ะ
+
+คุณโออนุมัติ Option A change-control เมื่อ 2026-07-16 ค่ะ R3 scope จึง freeze เป็น
+Safe Conflict Core และแยก Provider-safe Remote Mutation Gate ออกจาก dependency
+หลักค่ะ Existing Drive item content update, rename, move และ Trash ยังคง blocked
+และ intent จบที่ `NeedsReconcile` ค่ะ Gate 0 content complete แล้วค่ะ Gate 0
+activation ยังรอ planning/contract pack บน canonical checkpoint และ explicit
+`Approve R3 transition` ค่ะ
 
 ## Gate 1 — R3.1 durable mutation and conflict evidence
 
@@ -59,28 +68,23 @@ candidate HEAD เดียวค่ะ Mock, compile, emulator, native runtime 
 - [ ] Conflict copy ไม่ถูกลบอัตโนมัติค่ะ
 - [ ] Merge/materialization วางแผน base publication ใหม่อย่าง explicit ค่ะ
 
-## Gate 3 — R3.3 exact-ID Drive mutation
+## Gate 3 — R3.3 remote mutation block enforcement
 
-- [ ] Production mutation capability แยกจาก read-only และ create-only transfer
-  capability ค่ะ
-- [ ] Existing-content update ใช้ exact file ID, expected remote revision,
-  immutable base hash และ intended hash/size ค่ะ
-- [ ] Existing-content update ทำได้เฉพาะเมื่อ remote ยังตรง base ค่ะ Otherwise
-  ต้องกลับเข้า classifier โดยไม่ overwrite ค่ะ
-- [ ] Rename ใช้ exact file ID ค่ะ Move ใช้ exact file/old-parent/new-parent IDs ค่ะ
-- [ ] Trash ใช้ exact file ID และตั้ง Trash เท่านั้นค่ะ
-- [ ] ทุก request re-verifies account, root, ancestry, parents และ expected remote
-  revision ก่อน side effect ค่ะ
-- [ ] ทุก successful response ถูก post-verify ด้วย exact metadata ค่ะ
-- [ ] Lost response ระหว่าง content/metadata mutation ถูก metadata/hash-reconcile
-  ก่อน retry ค่ะ
+- [ ] `RemoteMutationBlocked` แยกจาก read-only reconciliation และ R2 create-only
+  transfer capability ค่ะ
+- [ ] Existing-item content update, rename, move และ remote Trash intent เก็บ
+  exact identity/base evidence แล้วจบที่ `NeedsReconcile` ค่ะ
+- [ ] Remote content/name/parent/trashed observations เข้า classifier ได้โดยไม่ส่ง
+  `files.update` request ค่ะ
+- [ ] Restart และ repeated Changes page ไม่สร้าง existing-item side effect หรือ
+  duplicate blocked intent ค่ะ
+- [ ] Cursor ไม่ advance ข้าม unresolved blocked intent ค่ะ
 - [ ] Shortcut, Google-native ambiguity, multiple parent, outside-root, malformed
   metadata, redirect และ origin change fail closed ค่ะ
-- [ ] Supporting folder topology ถูกจำกัดตาม R3.0 และไม่กลายเป็น generic folder
-  Sync capability ค่ะ
-- [ ] Captured requests ตรง allowlist และ production surface ไม่มี HTTP `DELETE`,
-  permission mutation หรือ generic request method ค่ะ
-- [ ] 401/403/404/410/429/5xx, timeout และ unknown outcome ทำตาม frozen taxonomy ค่ะ
+- [ ] Captured requests และ static audit พิสูจน์ว่า production surface ไม่มี
+  existing-item update, HTTP `DELETE`, permission mutation หรือ generic request ค่ะ
+- [ ] R1/R2 read/create-only surface ไม่ถูก broaden และ provider-safe research
+  ไม่มี source diff ปนใน Safe Conflict Core ค่ะ
 
 ## Gate 4 — R3.4 guarded local mutation
 
@@ -101,7 +105,8 @@ candidate HEAD เดียวค่ะ Mock, compile, emulator, native runtime 
 
 - [ ] Local rename/move/Trash observation เข้า durable queue โดยไม่ใช้ watcher
   เป็น source of truth ค่ะ
-- [ ] Remote rename/move/removal ผ่าน classifier และ guarded mutation ค่ะ
+- [ ] Remote rename/move/removal ผ่าน classifier และ guarded local materialization
+  หรือ `NeedsReconcile` โดยไม่มี existing-item Drive mutation ค่ะ
 - [ ] Execution order เป็น stage/read → classify → durable intent → side effect
   → post-verify → base publish → completion → cursor commit ค่ะ
 - [ ] Worker หนึ่งตัวต่อ Vault และไม่ถือ app/store lock ข้าม network/large I/O ค่ะ
@@ -109,7 +114,8 @@ candidate HEAD เดียวค่ะ Mock, compile, emulator, native runtime 
 - [ ] Duplicate retry, watcher echo และ repeated Changes page ไม่สร้าง duplicate
   mutation หรือ conflict copy ค่ะ
 - [ ] Safe merge/conflict result converge ด้วย guarded local replacement,
-  guarded exact-ID remote update หรือ create-only conflict-copy upload ค่ะ
+  preserve-both/conflict-copy publication หรือ `NeedsReconcile` ค่ะ R2
+  create-only upload ใช้ได้เฉพาะ contract เดิมและห้าม mutate existing item ค่ะ
 - [ ] Restart ทุก persistent boundary ไม่ทำให้ lost conflict copy หรือ cursor drift ค่ะ
 - [ ] Frontend เห็นเฉพาะ redacted minimum status และไม่มี R4 control-plane scope ค่ะ
 
@@ -118,13 +124,18 @@ candidate HEAD เดียวค่ะ Mock, compile, emulator, native runtime 
 - [ ] `quality:r3:offline` หรือ equivalent frozen aggregate ผ่าน frontend,
   Rustfmt, strict Clippy, unit, integration, migration, property, fault และ doc tests ค่ะ
 - [ ] R1–R2 regression matrix ยังคงผ่านค่ะ
-- [ ] macOS disposable two-device journey ผ่าน rename, move, Trash, safe merge,
-  conflict copy และ recursive byte/hash manifest ค่ะ
-- [ ] Restart ระหว่าง remote/local mutation, merge, conflict copy, base publish
+- [ ] Exact disposable account/root fingerprints และ local Vault A/B aliases
+  ได้รับ approval ก่อน live regression โดยไม่มี credential/personal path ใน repo ค่ะ
+- [ ] macOS disposable two-device journey ผ่าน observation/classification ของ
+  rename, move, Trash, safe merge, preserve both, conflict copy และ recursive
+  byte/hash manifest ค่ะ
+- [ ] Restart ระหว่าง blocked remote intent, guarded local mutation, merge,
+  conflict copy, base publish
   และ pre-cursor commit ผ่านค่ะ
 - [ ] Offline two-sided edits replay ตาม matrix โดยไม่สูญข้อมูลค่ะ
-- [ ] Remote Trash exact identity, no permanent delete และ no auto-delete conflict
-  copy ถูกตรวจทั้ง static และ live ค่ะ
+- [ ] Static/runtime evidence ยืนยันว่าไม่มี existing-item `files.update`, remote
+  Trash, permanent delete หรือ auto-delete conflict copy ค่ะ Live provider
+  regression จำกัดที่ approved R1/R2 read/create-only contract ค่ะ
 - [ ] Android API 36 emulator ผ่านเฉพาะ supported mutation/conflict contract ค่ะ
 - [ ] Ubuntu/Windows compile, test และ packaging ผ่านโดยไม่อ้าง native UAT ค่ะ
 - [ ] Evidence ระบุ source HEAD, dirty state, environment, command, result และ

@@ -21,9 +21,12 @@ The first release targets macOS, Windows, Ubuntu, and Android through Tauri 2 wi
   รับ transition approval ค่ะ
 - R3 planning pack ถูกแบ่งเป็น `R3.0–R3.7` แล้วค่ะ รายละเอียดอยู่ที่
   [R3 plan](docs/sync/R3_PLAN.md), [R3 acceptance](docs/sync/R3_ACCEPTANCE.md)
-  และ [R3 usage ledger](docs/sync/R3_USAGE.md) ค่ะ R3 implementation ยังไม่ active
-  จนกว่า R3.0 planning checkpoint, full safety/provider contract และ fixture bounds
-  ผ่าน review แล้วคุณโออนุมัติ transition ค่ะ
+  [R3 safety contracts](docs/sync/R3_CONTRACTS.md) และ
+  [R3 usage ledger](docs/sync/R3_USAGE.md) ค่ะ คุณโออนุมัติ Option A change-control
+  ให้ R3 ส่งมอบ Safe Conflict Core และ block existing Drive item content update,
+  rename, move และ Trash ค่ะ R3.0 content complete แล้วแต่ implementation ยังไม่
+  active จน planning/contracts อยู่บน canonical checkpoint และมี explicit
+  transition approval ค่ะ
 - Roadmap ถูกล็อกเป็น `R1 → R2 → R3 → R4 → R5 → R6 → R7 → R8` จนถึง Personal First Release โดยรายละเอียด scope และ exit gates อยู่ใน [PROJECT_PLAN.md](PROJECT_PLAN.md) ค่ะ
 
 สถานะโดยประมาณคือ 40–45% ของ personal first release เมื่อวัดจาก user-visible outcome ค่ะ รายละเอียดทิศทางและ capability gaps อยู่ใน [PROJECT_PLAN.md](PROJECT_PLAN.md) ส่วน Git checkpoint, verification ล่าสุด และงานถัดไปอยู่ใน [SESSION_HANDOFF.md](SESSION_HANDOFF.md) ค่ะ
