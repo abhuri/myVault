@@ -4,7 +4,7 @@ Owner: Sunday ค่ะ
 
 Review route: GPT-5.6 Sol High ค่ะ
 
-Status: `OPTION A FROZEN — CANONICALIZATION AND TRANSITION PENDING` ค่ะ
+Status: `R3.0 CLOSED — OPTION A FROZEN — TRANSITION PENDING` ค่ะ
 
 เอกสารนี้เป็น canonical R3.0 contract artifact สำหรับ conflict decisions,
 merge/preserve-both policy, conflict-copy identity, mutation boundary, provider
@@ -258,11 +258,9 @@ review ด้วย Sol High ก่อน code ค่ะ
 Sol High review และ Option A approval ปิด conflict outcomes, merge fallback,
 conflict-copy identity, provider semantics, fail-closed capability boundary,
 fixture schema/privacy bounds และ Safe Conflict Core scope แล้วค่ะ R3.0 content
-freeze complete ค่ะ Gate 0 ยังไม่ผ่านด้วย prerequisites ต่อไปนี้ค่ะ
+freeze และ canonicalization complete ผ่าน PR #28 ที่ `main@eb6709c` ค่ะ Quality
+run `29461969032` ผ่านบน exact source head `f120679` ก่อน merge ค่ะ
 
-1. R2 closure/R3 planning pack และ contract นี้ยังไม่อยู่บน canonical `main`
-   หรือ equivalent approved committed checkpoint ค่ะ
-2. ยังไม่มี explicit `Approve R3 transition` ค่ะ
-
-ห้ามเริ่ม R3.1 จน prerequisites ทั้งหมดถูกปิดและ Gate 0 ถูกประเมินใหม่บน exact
-canonical candidate ค่ะ
+Gate 0 เหลือ prerequisite เดียวคือยังไม่มี explicit `Approve R3 transition`
+ค่ะ ห้ามเริ่ม R3.1 จนได้รับ approval นี้และ Gate 0 ถูกประเมินบน exact canonical
+checkpoint ค่ะ

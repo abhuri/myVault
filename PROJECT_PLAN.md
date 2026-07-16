@@ -118,7 +118,7 @@ Planning range รวมที่เหลือจากผลรวม milesto
 |---|---|---|---|---|
 | R1 — Native Auth + Read-only Binding | แอปเชื่อม account, bind exact root และอ่าน remote state โดยไม่เขียน Drive ค่ะ | Phase 3A | 1–2 weeks | Complete — merged via PR #26 |
 | R2 — Guarded Transfer | Markdown และ attachment upload/download แบบ verified และ restart-safe ค่ะ | R1 | 2–3 weeks | Complete — merged via PR #27 |
-| R3 — Safe Conflict Core | Two-sided conflicts, preserve-both และ guarded local materialization ปลอดภัยโดย existing-item Drive mutation ถูก block ค่ะ | R2 | 2–3 weeks | R3.0 content complete — canonicalization/transition pending |
+| R3 — Safe Conflict Core | Two-sided conflicts, preserve-both และ guarded local materialization ปลอดภัยโดย existing-item Drive mutation ถูก block ค่ะ | R2 | 2–3 weeks | R3.0 closed — transition pending |
 | R4 — Sync Control Plane + Safe Sync Alpha | ผู้ใช้ควบคุมและเข้าใจ Sync ได้ พร้อม end-to-end alpha acceptance ค่ะ | R3 | 1–2 weeks | Locked planned |
 | R5 — Local Product Completion | Local CRUD, attachment และ remaining editor/reader journey เชื่อม UI ครบค่ะ | R4 | 1–2 weeks | Locked planned |
 | R6 — Knowledge Core | Persistent index, search, links, backlinks และ basic graphs ใช้ full-vault truth ค่ะ | R5 | 1–2 weeks | Locked planned |
@@ -431,13 +431,13 @@ Milestone จะถือว่า complete เมื่อครบทุกข
   read-only acceptance, final review, Quality, Android compile, Ubuntu AppImage,
   และ Windows NSIS ผ่านค่ะ
 - R2 ถูก merge เข้า `origin/main` ที่ `94db388` ผ่าน PR #27 ค่ะ
-- R2 documentation closure baseline คือ `f7a0d7c` บน
-  `codex/r2-closure` ค่ะ Baseline นี้ยังต้อง merge เข้า canonical `main` พร้อม
-  planning pack นี้หรือ equivalent reviewed diff ค่ะ `f7a0d7c` เป็น post-merge
-  narrative เท่านั้นค่ะ R2 source checkpoint ยังคงเป็น merge commit `94db388` ค่ะ
-- ไม่มี active implementation milestone ค่ะ R3 — Mutations + Conflict Safety มี
-  planning pack `R3.0–R3.7` แล้ว แต่ implementation ยัง locked จน R3.0 gate
-  ผ่านและคุณโออนุมัติ transition ใหม่ค่ะ
+- R2 documentation closure, R3 planning pack และ Option A contracts ถูก merge
+  ผ่าน PR #28 ที่ canonical `main@eb6709c` ค่ะ Quality run `29461969032` ผ่านบน
+  exact source head `f120679` ก่อน merge ค่ะ R2 source checkpoint เดิมยังคงเป็น
+  merge commit `94db388` ค่ะ
+- ไม่มี active implementation milestone ค่ะ R3 — Safe Conflict Core ปิด R3.0
+  และมี planning pack `R3.0–R3.7` บน canonical checkpoint แล้วค่ะ Implementation
+  ยัง locked จนคุณโออนุมัติ transition ใหม่อย่างชัดเจนค่ะ
 - macOS disposable byte-exact round trip และ Android API 36 live acceptance
   ผ่านแล้วค่ะ macOS restart upload/download, offline pause/resume, credential
   restoration และ disconnect/reconnect ผ่านแล้วค่ะ Final documentation head

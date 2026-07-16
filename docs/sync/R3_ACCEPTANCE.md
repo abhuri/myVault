@@ -2,7 +2,7 @@
 
 Owner: Sunday ค่ะ
 
-Current status: `R3.0 CONTENT COMPLETE — CANONICALIZATION AND TRANSITION PENDING` ค่ะ
+Current status: `R3.0 CLOSED — TRANSITION PENDING` ค่ะ
 
 R3 ถือว่า complete เมื่อทุก applicable checkbox ด้านล่างมี evidence จาก exact
 candidate HEAD เดียวค่ะ Mock, compile, emulator, native runtime และ live evidence
@@ -13,8 +13,9 @@ candidate HEAD เดียวค่ะ Mock, compile, emulator, native runtime 
 
 - [x] R2 source candidate ถูก merge ผ่าน PR #27 ที่ `94db388` ค่ะ
 - [x] Post-merge Quality run `29429364407` ผ่านบน `main@94db388` ค่ะ
-- [ ] R2 documentation closure `f7a0d7c` และ R3 planning pack อยู่บน canonical
-  `main` หรือ equivalent approved checkpoint ค่ะ
+- [x] R2 documentation closure, R3 planning pack และ Option A contracts ถูก merge
+  ผ่าน PR #28 ที่ canonical `main@eb6709c` ค่ะ Quality run `29461969032` ผ่านทั้ง
+  `quality` และ `android-compile` บน exact source head `f120679` ก่อน merge ค่ะ
 - [x] `R3_PLAN.md`, acceptance, usage contract, Project Plan, README และ Session
   Handoff ผ่าน cross-document review ค่ะ
 - [x] Conflict matrix, mutation allowlist, folder topology, merge policy,
@@ -29,9 +30,9 @@ candidate HEAD เดียวค่ะ Mock, compile, emulator, native runtime 
 คุณโออนุมัติ Option A change-control เมื่อ 2026-07-16 ค่ะ R3 scope จึง freeze เป็น
 Safe Conflict Core และแยก Provider-safe Remote Mutation Gate ออกจาก dependency
 หลักค่ะ Existing Drive item content update, rename, move และ Trash ยังคง blocked
-และ intent จบที่ `NeedsReconcile` ค่ะ Gate 0 content complete แล้วค่ะ Gate 0
-activation ยังรอ planning/contract pack บน canonical checkpoint และ explicit
-`Approve R3 transition` ค่ะ
+และ intent จบที่ `NeedsReconcile` ค่ะ R3.0 content freeze และ canonicalization
+complete แล้วค่ะ Gate 0 activation เหลือเพียง explicit `Approve R3 transition`
+ค่ะ
 
 ## Gate 1 — R3.1 durable mutation and conflict evidence
 
