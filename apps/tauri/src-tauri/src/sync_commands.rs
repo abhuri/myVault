@@ -2903,7 +2903,7 @@ mod platform {
         }
 
         #[test]
-        fn incremental_download_publishes_exact_base_before_advancing_cursor() {
+        fn incremental_download_publishes_exact_base_but_legacy_cursor_remains_gated() {
             const SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
             const REMOTE_REVISION: &str =
                 "0000000000000000000000000000000000000000000000000000000000000002";
@@ -3016,9 +3016,10 @@ mod platform {
                 store.transfer(operation_id).unwrap().unwrap().phase,
                 TransferPhase::Pending
             );
-            assert!(store
-                .commit_transfer_change_batch(batch.batch_id, 5)
-                .is_err());
+            assert!(matches!(
+                store.commit_transfer_change_batch(batch.batch_id, 5),
+                Err(myvault_sync_engine::Error::LocalMutationIncomplete)
+            ));
             assert_eq!(
                 store
                     .vault_state()
@@ -3071,9 +3072,10 @@ mod platform {
                 Some("cursor_1")
             );
 
-            store
-                .commit_transfer_change_batch(batch.batch_id, now_unix_ms().unwrap())
-                .expect("advance cursor after verified completion");
+            assert!(matches!(
+                store.commit_transfer_change_batch(batch.batch_id, now_unix_ms().unwrap()),
+                Err(myvault_sync_engine::Error::LocalMutationIncomplete)
+            ));
             assert_eq!(
                 store
                     .vault_state()
@@ -3081,7 +3083,30 @@ mod platform {
                     .unwrap()
                     .durable_cursor
                     .as_deref(),
-                Some("cursor_2")
+                Some("cursor_1")
+            );
+            let retained = store
+                .active_change_batch()
+                .unwrap()
+                .expect("legacy batch remains durable");
+            assert_eq!(retained.batch_id, batch.batch_id);
+            assert_eq!(retained.declared_mutations, 1);
+            assert_eq!(retained.applying_mutations, 0);
+            assert_eq!(retained.committed_mutations, 1);
+            assert_eq!(
+                store.local_mutations(batch.batch_id).unwrap()[0].state,
+                myvault_sync_engine::LocalMutationState::Committed
+            );
+            assert_eq!(std::fs::read(vault_root.join(PATH)).unwrap(), b"abc");
+            let completed_after_gate = store.transfer(operation_id).unwrap().unwrap();
+            assert_eq!(completed_after_gate.phase, TransferPhase::Completed);
+            assert_eq!(
+                completed_after_gate.base_reference.as_deref(),
+                Some(expected_base.as_str())
+            );
+            assert_eq!(
+                store.remote_base("file_1").unwrap(),
+                Some(remote_base.clone())
             );
             about.assert();
             root.assert();

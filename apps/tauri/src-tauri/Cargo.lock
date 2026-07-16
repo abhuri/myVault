@@ -2545,6 +2545,7 @@ dependencies = [
  "myvault-private-fs",
  "rusqlite",
  "serde",
+ "sha2",
  "uuid",
 ]
 
