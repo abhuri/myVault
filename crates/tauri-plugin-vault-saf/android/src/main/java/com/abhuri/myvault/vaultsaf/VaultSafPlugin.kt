@@ -1,9 +1,11 @@
 package com.abhuri.myvault.vaultsaf
 
 import android.app.Activity
+import android.content.pm.PackageManager
 import android.database.ContentObserver
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.util.Base64
@@ -415,6 +417,37 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.reject("Vault permission is unavailable", "VAULT_UNAVAILABLE")
         } catch (_: Exception) {
             invoke.reject("Vault change hint is unavailable", "VAULT_UNAVAILABLE")
+        }
+    }
+
+    /**
+     * Returns read-only evidence for the exact held SAF tree and whether that
+     * evidence matches the (currently empty) R3.4 provider allowlist. This
+     * command never invokes a DocumentsContract mutation API.
+     */
+    @Command
+    fun conflictCapability(invoke: Invoke) {
+        val expectedRootIdentity = try { invoke.parseArgs(RootArgs::class.java).expectedRootIdentityHex }
+        catch (_: Exception) {
+            invoke.reject("Vault capability is invalid", "VAULT_UNAVAILABLE")
+            return
+        }
+        try {
+            val response = synchronized(ioLock) {
+                val root = requireRoot(expectedRootIdentity)
+                val attestation = providerAttestation(root)
+                conflictCapabilityResponse(attestation, decideSafConflictCapability(attestation))
+            }
+            invoke.resolve(response)
+        } catch (_: RootMismatchException) {
+            invoke.reject("Vault capability is stale", "VAULT_UNAVAILABLE")
+        } catch (_: SecurityException) {
+            clearRootIfMatches(expectedRootIdentity)
+            invoke.reject("Vault permission is unavailable", "VAULT_UNAVAILABLE")
+        } catch (_: Exception) {
+            // A partial provider identity is never a capability. Do not
+            // synthesize or cache evidence that cannot be bound exactly.
+            invoke.reject("Vault provider attestation is unavailable", "NATIVE_BRIDGE")
         }
     }
 
@@ -1107,6 +1140,70 @@ class VaultSafPlugin(private val activity: Activity) : Plugin(activity) {
     private fun changeHintResponse(hint: SafChangeHint): JSObject = JSObject().apply {
         put("dirty", hint.dirty)
         put("generation", hint.generation)
+    }
+
+    private fun conflictCapabilityResponse(
+        attestation: SafProviderAttestation,
+        decision: SafConflictCapabilityDecision,
+    ): JSObject = JSObject().apply {
+        put("eligible", decision.eligible)
+        put("denial", decision.denial?.wireValue)
+        put("authority", attestation.authority)
+        put("packageName", attestation.packageName)
+        put("signingCertificateSetSha256", attestation.signingCertificateSetSha256)
+        put("longVersionCode", attestation.longVersionCode)
+        put("sdkInt", attestation.sdkInt)
+        put("buildIdentitySha256", attestation.buildIdentitySha256)
+        put("treeDocumentId", attestation.treeDocumentId)
+        put("persistedReadWrite", attestation.persistedReadWrite)
+    }
+
+    private fun providerAttestation(root: Uri): SafProviderAttestation {
+        val authority = root.authority?.takeIf { it.isNotBlank() }
+            ?: throw SecurityException("SAF tree has no authority")
+        val provider = activity.packageManager.resolveContentProvider(authority, 0)
+            ?: throw SecurityException("SAF authority has no installed provider")
+        val packageName = provider.packageName.takeIf { it.isNotBlank() }
+            ?: throw SecurityException("SAF provider has no package")
+        val packageInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            activity.packageManager.getPackageInfo(packageName, PackageManager.GET_SIGNING_CERTIFICATES)
+        } else {
+            @Suppress("DEPRECATION")
+            activity.packageManager.getPackageInfo(packageName, PackageManager.GET_SIGNATURES)
+        }
+        val signatures = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            packageInfo.signingInfo?.apkContentsSigners
+        } else {
+            @Suppress("DEPRECATION")
+            packageInfo.signatures
+        } ?: throw SecurityException("SAF provider has no signing certificate")
+        if (signatures.isEmpty()) throw SecurityException("SAF provider has no signing certificate")
+        val signingCertificateSetSha256 = digest(
+            signatures
+                .map { digest(it.toByteArray()) }
+                .sorted()
+                .joinToString("\u0000")
+                .toByteArray(StandardCharsets.UTF_8),
+        )
+        val buildIdentitySha256 = digest(
+            ("myvault:saf-platform-build:v1\u0000${Build.VERSION.SDK_INT}\u0000${Build.FINGERPRINT}")
+                .toByteArray(StandardCharsets.UTF_8),
+        )
+        return SafProviderAttestation(
+            authority = authority,
+            packageName = packageName,
+            signingCertificateSetSha256 = signingCertificateSetSha256,
+            longVersionCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                packageInfo.longVersionCode
+            } else {
+                @Suppress("DEPRECATION")
+                packageInfo.versionCode.toLong()
+            },
+            sdkInt = Build.VERSION.SDK_INT,
+            buildIdentitySha256 = buildIdentitySha256,
+            treeDocumentId = DocumentsContract.getTreeDocumentId(root),
+            persistedReadWrite = hasPersistedReadWritePermission(root),
+        )
     }
 
     private fun canonicalNotePath(value: String): String {

@@ -2,6 +2,10 @@
 
 Locked on 2026-07-14 เขตเวลา Asia/Bangkok โดยได้รับ approval จากคุณโอค่ะ
 
+> **Project status: PAUSED ตั้งแต่ 2026-07-18 ค่ะ** Roadmap นี้ถูก freeze เพื่อใช้
+> อ้างอิงเท่านั้นและไม่มี active milestone ค่ะ เหตุผล, source checkpoint และวิธีกลับมา
+> ทำงานต่ออยู่ที่ [PAUSED.md](PAUSED.md) ค่ะ
+
 เอกสารนี้เป็นเจ้าของ North Star, release scope, milestone order, exit gates และ change-control rules ค่ะ สถานะ Git กับ operational checkpoint ล่าสุดอยู่ที่ [SESSION_HANDOFF.md](SESSION_HANDOFF.md) ค่ะ หลักฐานการทดสอบอยู่ใน `docs/*/RESULTS.md` และประวัติการเปลี่ยนแปลงอยู่ที่ [CHANGELOG.md](CHANGELOG.md) ค่ะ
 
 ## 1. North Star
@@ -118,7 +122,7 @@ Planning range รวมที่เหลือจากผลรวม milesto
 |---|---|---|---|---|
 | R1 — Native Auth + Read-only Binding | แอปเชื่อม account, bind exact root และอ่าน remote state โดยไม่เขียน Drive ค่ะ | Phase 3A | 1–2 weeks | Complete — merged via PR #26 |
 | R2 — Guarded Transfer | Markdown และ attachment upload/download แบบ verified และ restart-safe ค่ะ | R1 | 2–3 weeks | Complete — merged via PR #27 |
-| R3 — Safe Conflict Core | Two-sided conflicts, preserve-both และ guarded local materialization ปลอดภัยโดย existing-item Drive mutation ถูก block ค่ะ | R2 | 2–3 weeks | R3.3 complete at `538fb72`; R3.4 open / blocked by R3.5 prerequisites |
+| R3 — Safe Conflict Core | Two-sided conflicts, preserve-both และ guarded local materialization ปลอดภัยโดย existing-item Drive mutation ถูก block ค่ะ | R2 | 2–3 weeks | R3.5 prerequisite candidate `4f0ba27` green on Draft PR #30 but Gate 5 open; R3.4 Gate 4 open with proof-only Option 1 step approved |
 | R4 — Sync Control Plane + Safe Sync Alpha | ผู้ใช้ควบคุมและเข้าใจ Sync ได้ พร้อม end-to-end alpha acceptance ค่ะ | R3 | 1–2 weeks | Locked planned |
 | R5 — Local Product Completion | Local CRUD, attachment และ remaining editor/reader journey เชื่อม UI ครบค่ะ | R4 | 1–2 weeks | Locked planned |
 | R6 — Knowledge Core | Persistent index, search, links, backlinks และ basic graphs ใช้ full-vault truth ค่ะ | R5 | 1–2 weeks | Locked planned |
@@ -217,9 +221,15 @@ R3 แบ่ง execution เป็น `R3.0 → R3.1 → {R3.2, R3.3, R3.4 capa
 R3.5 prerequisites/orchestration → R3.4 completion gate → R3.6 → R3.7` ค่ะ
 R3.1 durable mutation and conflict evidence complete ที่ implementation
 `main@c774324` พร้อม Gate 1 ผ่านแล้วค่ะ R3.2 complete ที่ `6d82b77` และ R3.3
-complete ที่ `538fb72` พร้อม exact-head CI ค่ะ R3.4 capability proof ถูกหยุดแบบ
-fail-closed เพราะ Desktop/Android SAF ยังพิสูจน์ local identity/no-replace/final
-outcome/replay boundary ไม่ครบค่ะ รายละเอียด outcome, dependency, owner, exit gate,
+complete ที่ `538fb72` พร้อม exact-head CI ค่ะ R3.5 prerequisite candidate
+`4f0ba27` ผ่าน bounded Sol audit และ CI บน Draft PR #30 แต่ยังไม่ merged เข้า
+`main` และ Gate 5 ยัง open ค่ะ R3.4 capability proof ยังคง open แบบ fail-closed
+เพราะ Desktop/Android SAF ยังพิสูจน์ local
+identity/no-replace/final outcome/replay boundary ไม่ครบค่ะ คุณโอเลือก Option 1 เมื่อ
+2026-07-18 และอนุมัติ proof-only Android allowlisted SAF provider identity/contract
+layer ค่ะ Focused Rust/Kotlin/Android validation ผ่าน แต่ shipped allowlist ยังว่างและ
+aggregate `pnpm quality:r2:offline` ผ่านค่ะ Shipped allowlist ยังว่างและ Sol High
+disposition คือ `STOP_ADAPTER / GATE_4_OPEN` ค่ะ รายละเอียด outcome, dependency, owner, exit gate,
 AI staffing และ usage contract อยู่ที่ [R3 plan](docs/sync/R3_PLAN.md),
 [R3 acceptance](docs/sync/R3_ACCEPTANCE.md) และ
 [R3 usage ledger](docs/sync/R3_USAGE.md) ค่ะ Safety decisions อยู่ที่
@@ -441,9 +451,13 @@ Milestone จะถือว่า complete เมื่อครบทุกข
   ผ่าน PR #28 ที่ canonical `main@eb6709c` ค่ะ Quality run `29461969032` ผ่านบน
   exact source head `f120679` ก่อน merge ค่ะ R2 source checkpoint เดิมยังคงเป็น
   merge commit `94db388` ค่ะ
-- ไม่มี active implementation milestone ค่ะ R3 — Safe Conflict Core ปิด R3.0
-  และมี planning pack `R3.0–R3.7` บน canonical checkpoint แล้วค่ะ Implementation
-  ยัง locked จนคุณโออนุมัติ transition ใหม่อย่างชัดเจนค่ะ
+- R3 — Safe Conflict Core ปิด R3.0–R3.3 แล้วค่ะ R3.5 prerequisite candidate
+  `4f0ba27` ผ่าน bounded Sol audit และ CI บน Draft PR #30 แต่ยังไม่ merged เข้า
+  `main` และ Gate 5 ยัง 0/9 ค่ะ R3.4 Gate 4 ยังคง open แบบ fail-closed ค่ะ คุณโอเลือก Option 1
+  สำหรับ Android allowlisted SAF provider capability-contract preparation แล้ว
+  และ proof-only provider capability layer ผ่าน focused validation แล้วค่ะ Production
+  allowlist ยังว่าง จึง `STOP_ADAPTER` และ Gate 4 ยัง open ค่ะ Mutation adapter กับ
+  Git/PR action ยัง locked จนมี provider proof และ approval แยกค่ะ
 - macOS disposable byte-exact round trip และ Android API 36 live acceptance
   ผ่านแล้วค่ะ macOS restart upload/download, offline pause/resume, credential
   restoration และ disconnect/reconnect ผ่านแล้วค่ะ Final documentation head

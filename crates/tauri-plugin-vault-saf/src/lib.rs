@@ -187,6 +187,34 @@ struct NativeStatus {
     root_identity_hex: Option<String>,
 }
 
+/// Read-only result of the R3.4 provider-capability probe.
+///
+/// The shipped allowlist is deliberately empty, so this type contains no
+/// writable variant. A future provider-specific mutation contract must add a
+/// separately audited variant only after proving atomic no-replace and an
+/// authoritative final outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SafConflictCapabilityStatus {
+    UnsupportedProvider,
+    InsufficientEvidence,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg(any(target_os = "android", test))]
+struct NativeConflictCapability {
+    eligible: bool,
+    denial: Option<String>,
+    authority: String,
+    package_name: String,
+    signing_certificate_set_sha256: String,
+    long_version_code: i64,
+    sdk_int: i64,
+    build_identity_sha256: String,
+    tree_document_id: String,
+    persisted_read_write: bool,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg(target_os = "android")]
@@ -404,6 +432,24 @@ impl<R: Runtime> VaultSaf<R> {
             .map_err(map_plugin_error)?;
         validate_change_generation(hint.generation)?;
         Ok(hint)
+    }
+
+    /// Reads the exact held-tree/provider attestation and returns a fail-closed
+    /// R3.4 capability status. This does not invoke any document mutation API.
+    pub fn conflict_capability_status(
+        &self,
+        vault: &SafVaultCapability,
+    ) -> Result<SafConflictCapabilityStatus, SafError> {
+        let value: NativeConflictCapability = self
+            .0
+            .run_mobile_plugin(
+                "conflictCapability",
+                RootRequest {
+                    expected_root_identity_hex: vault.expected_root_identity_hex(),
+                },
+            )
+            .map_err(map_plugin_error)?;
+        native_conflict_capability_status(value)
     }
 
     pub fn read_note(&self, vault: &SafVaultCapability, path: &str) -> Result<SafNote, SafError> {
@@ -822,6 +868,46 @@ fn native_capability(
 }
 
 #[cfg(any(target_os = "android", test))]
+fn native_conflict_capability_status(
+    value: NativeConflictCapability,
+) -> Result<SafConflictCapabilityStatus, SafError> {
+    // The native side must send a complete, exact attestation even though the
+    // current allowlist is empty. This keeps a partial/root-substituted report
+    // from becoming evidence that a future adapter could mistakenly reuse.
+    if !is_nonempty_no_control(&value.authority)
+        || !is_nonempty_no_control(&value.package_name)
+        || !is_canonical_digest(&value.signing_certificate_set_sha256)
+        || value.long_version_code < 0
+        || value.sdk_int < 1
+        || !is_canonical_digest(&value.build_identity_sha256)
+        || !is_nonempty_no_control(&value.tree_document_id)
+    {
+        return Err(SafError::NativeBridge);
+    }
+
+    // The Rust surface independently enforces the shipped empty allowlist:
+    // an unexpected writable claim from the mobile bridge is never trusted.
+    if value.eligible {
+        return Err(SafError::NativeBridge);
+    }
+    match value.denial.as_deref() {
+        Some("unsupportedProvider") if value.persisted_read_write => {
+            Ok(SafConflictCapabilityStatus::UnsupportedProvider)
+        }
+        Some("missingPersistedReadWrite") if !value.persisted_read_write => {
+            Ok(SafConflictCapabilityStatus::InsufficientEvidence)
+        }
+        Some("invalidAttestation") => Ok(SafConflictCapabilityStatus::InsufficientEvidence),
+        _ => Err(SafError::NativeBridge),
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn is_nonempty_no_control(value: &str) -> bool {
+    !value.is_empty() && !value.chars().any(char::is_control)
+}
+
+#[cfg(any(target_os = "android", test))]
 fn decode_root_identity(value: &str) -> Option<[u8; 32]> {
     if !is_canonical_digest(value) {
         return None;
@@ -1001,6 +1087,97 @@ mod transfer_tests {
             assert!(native_capability(true, malformed).is_err());
         }
         assert!(native_capability(false, Some("ab".repeat(32))).is_err());
+    }
+
+    #[test]
+    fn conflict_capability_transport_requires_complete_held_tree_evidence() {
+        let valid = || NativeConflictCapability {
+            eligible: false,
+            denial: Some("unsupportedProvider".to_owned()),
+            authority: "com.example.documents".to_owned(),
+            package_name: "com.example.provider".to_owned(),
+            signing_certificate_set_sha256: "a".repeat(64),
+            long_version_code: 42,
+            sdk_int: 36,
+            build_identity_sha256: "b".repeat(64),
+            tree_document_id: "primary:Vault".to_owned(),
+            persisted_read_write: true,
+        };
+
+        assert_eq!(
+            native_conflict_capability_status(valid()).unwrap(),
+            SafConflictCapabilityStatus::UnsupportedProvider,
+        );
+        for invalid in [
+            NativeConflictCapability {
+                authority: String::new(),
+                ..valid()
+            },
+            NativeConflictCapability {
+                package_name: "\u{0000}".to_owned(),
+                ..valid()
+            },
+            NativeConflictCapability {
+                signing_certificate_set_sha256: "A".repeat(64),
+                ..valid()
+            },
+            NativeConflictCapability {
+                long_version_code: -1,
+                ..valid()
+            },
+            NativeConflictCapability {
+                sdk_int: 0,
+                ..valid()
+            },
+            NativeConflictCapability {
+                build_identity_sha256: "g".repeat(64),
+                ..valid()
+            },
+            NativeConflictCapability {
+                tree_document_id: String::new(),
+                ..valid()
+            },
+        ] {
+            assert!(native_conflict_capability_status(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn conflict_capability_transport_cannot_turn_the_empty_allowlist_writable() {
+        let base = NativeConflictCapability {
+            eligible: false,
+            denial: Some("missingPersistedReadWrite".to_owned()),
+            authority: "com.example.documents".to_owned(),
+            package_name: "com.example.provider".to_owned(),
+            signing_certificate_set_sha256: "a".repeat(64),
+            long_version_code: 42,
+            sdk_int: 36,
+            build_identity_sha256: "b".repeat(64),
+            tree_document_id: "primary:Vault".to_owned(),
+            persisted_read_write: false,
+        };
+        assert_eq!(
+            native_conflict_capability_status(base).unwrap(),
+            SafConflictCapabilityStatus::InsufficientEvidence,
+        );
+        assert!(native_conflict_capability_status(NativeConflictCapability {
+            eligible: true,
+            denial: None,
+            persisted_read_write: true,
+            ..NativeConflictCapability {
+                eligible: false,
+                denial: Some("unsupportedProvider".to_owned()),
+                authority: "com.example.documents".to_owned(),
+                package_name: "com.example.provider".to_owned(),
+                signing_certificate_set_sha256: "a".repeat(64),
+                long_version_code: 42,
+                sdk_int: 36,
+                build_identity_sha256: "b".repeat(64),
+                tree_document_id: "primary:Vault".to_owned(),
+                persisted_read_write: true,
+            }
+        })
+        .is_err());
     }
 
     #[test]

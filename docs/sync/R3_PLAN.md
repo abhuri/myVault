@@ -276,13 +276,24 @@ Owner คือ Drive/block-enforcement lane ภายใต้ `crates/myvault-
 Outcome คือ Desktop และ Android ใช้ typed result contract เดียวกันแม้ durability
 guarantees ต่างกันค่ะ
 
-**Status: open / blocked by prerequisites** ค่ะ Bounded capability proof และ Sol
-High change-control ยืนยันว่าไม่มี patch ที่ปลอดภัยภายใต้ frozen contract ปัจจุบันค่ะ
+**Status: open / controlled Option 1 proof-only execution** ค่ะ R3.5 prerequisite
+candidate `4f0ba27711ea26f0a38b7dcfcc7d94ae1f439b40` ผ่าน bounded Sol audit และ CI บน Draft PR
+[#30](https://github.com/abhuri/myVault/pull/30) แล้ว แต่ยังไม่ merged เข้า `main` ค่ะ
+คุณโอเลือก Option 1 และอนุมัติ controlled plan เมื่อ 2026-07-18 ค่ะ Phase B เปิด
+เฉพาะ truth correction, Gate 5 inventory และ proof-only Android provider identity/
+allowlist layer ค่ะ ห้ามเพิ่มหรือเรียก mutation primitive และไม่มี R3.4 item ใด complete ค่ะ
 Desktop ยังไม่มี durable exact source identity, atomic/no-replace replacement,
 final-outcome proof หรือ durable watcher/replay echo suppression ค่ะ Android SAF ยัง
 ไม่มี provable held destination-parent identity, complete collision set, atomic
 no-replace publication หรือ final outcome ค่ะ Android unavailable → `NeedsReconcile`
 เป็น fail-closed capability outcome แต่ไม่ใช่ Gate 4 closure ค่ะ
+
+**Proof-only result:** Terra High เพิ่ม exact provider/root attestation transport และ
+empty shipped allowlist ใน `tauri-plugin-vault-saf` โดยไม่มี mutation primitive ค่ะ
+Rust 12 tests, strict Clippy/Rustfmt, Android aarch64 check และ Kotlin generated-host
+unit task ผ่านค่ะ Aggregate `pnpm quality:r2:offline` ผ่านด้วยค่ะ Rust reject
+`eligible=true` จาก mobile bridge อย่างอิสระค่ะ ไม่มี
+provider member ผ่าน no-replace/final-outcome proof จึง `STOP_ADAPTER` และ Gate 4 ยัง open ค่ะ
 
 งานหลักมีดังนี้ค่ะ
 
@@ -307,15 +318,31 @@ unsupported provider และ unknown-outcome preservation ค่ะ
 
 Owner คือ local-platform lane โดยแยก Desktop และ Android file ownership ค่ะ
 
-**Completion sequencing:** ห้ามเปิด adapter หรือ check Gate 4 item ใดจนกว่า R3.5
-prerequisite gate จะ provide durable identity, journal/recovery semantics,
-no-replace/final-outcome proof และ echo/replay idempotency ที่ audit ได้ค่ะ R3.4
-completion จะกลับมาเป็น bounded platform matrix หลัง prerequisite นั้นผ่านเท่านั้นค่ะ
+**Completion sequencing:** Proof-only provider identity/allowlist layer ทำได้ก่อน merge
+โดยห้าม mutation ค่ะ R3.5 candidate ต้องถูก merge/integrate เป็น baseline ที่อนุมัติ
+ก่อนเปิด adapter ค่ะ Sol High ต้อง freeze Option 1 contract ให้จำกัดเฉพาะ provider
+allowlist และพิสูจน์ held root/document/parent identity, complete collision recheck,
+no-replace/final outcome และ unknown-outcome handling ก่อน Terra High ทำ mutation
+implementation ค่ะ Generic SAF, unsupported provider หรือ outcome ที่พิสูจน์ไม่ได้
+ต้องคืน `WriteOutcomeUnknown` หรือ `NeedsReconcile` และห้าม advance cursor ค่ะ
+R3.4 completion จะกลับมาเป็น bounded Desktop/Android platform matrix หลังหลักฐานนี้
+ผ่านเท่านั้นค่ะ
 
 ### R3.5 — Safe Conflict Core Orchestration
 
 Outcome คือ remote observation, local observation, classify, mutation, merge,
 conflict copy, base publication และ cursor commit เป็น durable state machine เดียวค่ะ
+
+**Status: prerequisite candidate green / Gate 5 open** ค่ะ Candidate `4f0ba27`
+เพิ่ม schema v6, durable exact local identity, Sync journal, final-outcome classifier
+และ echo/replay substrate พร้อม exact-head CI ค่ะ Candidate ไม่มี production platform
+verifier/adapter call site และ checklist Gate 5 ยัง 0/9 ค่ะ การ merge candidate อย่างเดียว
+จึงไม่ใช่ R3.5 completion ค่ะ
+
+Production call-site inventory ยืนยันว่า local observation ingestion, remote event to
+guarded materialization, ordered execution runner, R3.5 per-Vault worker, taxonomy binding,
+echo/replay consumer, convergence adapter, restart runner และ redacted R3.5 status projection
+ยังไม่มี evidence ที่ check ได้ค่ะ
 
 **Entry prerequisite gate:** R3.5 ต้องเริ่มด้วย Sol High change-control ของ durable
 exact local identity, journal/recovery extension, unknown final outcome และ

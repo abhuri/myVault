@@ -221,6 +221,42 @@ Documentation closeout approval อย่างเดียวไม่เปิ
 ก่อน completion gate ของ R3.4 ทุก unknown/unsupported result ต้องเป็น
 `WriteOutcomeUnknown` หรือ `NeedsReconcile` ตาม evidence และห้าม advance cursor ค่ะ
 
+### 7.4 R3.4 Option 1 Android capability-contract preparation
+
+คุณโอเลือก Option 1 เมื่อ 2026-07-18 ค่ะ คือกำหนด Android SAF capability contract
+เฉพาะ **provider allowlist ที่พิสูจน์ได้** แทนการอ้าง generic SAF capability ค่ะ
+คุณโออนุมัติ controlled plan เมื่อ 2026-07-18 ให้เปิด source เฉพาะ proof-only provider
+identity/allowlist decision กับ tests ค่ะ Approval ไม่เปิด mutation primitive หรือ adapter ค่ะ
+
+Sol High change-control ปัจจุบันกำหนดให้ proof ตัดสิน exact provider identity/allowlist,
+held tree root กับ source/destination document และ destination-parent identity, complete
+collision enumeration/recheck, supported no-replace behavior, local rename/move/Vault-local
+Trash/conflict-copy primitive และ authoritative final outcome ค่ะ หากข้อใดพิสูจน์ไม่ได้
+operation ต้องไม่ execute; ผล unknown หรือ unsupported ต้องเป็น
+`WriteOutcomeUnknown` หรือ `NeedsReconcile` โดยไม่ advance cursor ค่ะ
+
+Option 1 ไม่อนุญาต generic Android SAF, provider mutation, live Drive/credential action
+หรือการ check Gate 4 ค่ะ Current Sol High disposition ยังไม่มี production provider member
+ที่พิสูจน์ครบค่ะ Android `DocumentsProvider` อนุญาตให้ provider เปลี่ยนชื่อเพื่อหลีกเลี่ยง
+collision และ AOSP `ExternalStorageProvider` ที่ตรวจใช้ existence check ก่อน `renameTo`
+จึงยังไม่เป็น atomic no-replace proof ภายใต้ concurrent collision ค่ะ Allowlist ต้องคงว่าง
+และ operation ต้องไม่ execute จน exact provider semantics ผ่าน adversarial proof ค่ะ
+
+Terra High proof-only implementation เก็บ attestation tuple เป็น authority, resolved
+package, canonical signing-certificate-set SHA-256, long version, SDK/build fingerprint
+digest, exact tree document ID และ persisted read/write grant ค่ะ Native command revalidate
+held root ก่อนออก attestation และ Rust transport validate complete tuple พร้อม reject
+`eligible=true` จาก bridge ค่ะ Shipped `R34_PROVIDER_ALLOWLIST` เป็น empty set และ public
+status ไม่มี writable variant ค่ะ
+
+Focused evidence ผ่าน Rust 12 tests, strict Clippy/Rustfmt, Android aarch64 check,
+generated-host Kotlin unit task และ aggregate `pnpm quality:r2:offline` ค่ะ Static scan
+ไม่พบ `renameDocument`, `moveDocument`,
+`deleteDocument` หรือ `trashDocument` ใน source scope ค่ะ Evidence นี้อนุญาตเพียง
+`UnsupportedProvider`/`InsufficientEvidence` capability status และไม่ใช่ authority ให้
+issue R3 mutation outcome, execute side effect หรือ advance cursor ค่ะ Sol High final
+disposition คือ `STOP_ADAPTER / GATE_4_OPEN` ค่ะ
+
 ## 8. Provider semantics record
 
 Official references ที่ review มีดังนี้ค่ะ
