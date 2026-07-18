@@ -60,7 +60,8 @@ cd myVault
 git fetch --tags origin
 git checkout codex/r3-4-completion
 git status --short --branch
-git tag --verify paused-2026-07-18-r3-4
+git show --no-patch --decorate paused-2026-07-18-r3-4
+test "$(git rev-parse paused-2026-07-18-r3-4^{})" = "$(git rev-parse codex/r3-4-completion)"
 ```
 
 จากนั้นให้อ่านไฟล์นี้และ `SESSION_HANDOFF.md` ก่อนทำงานค่ะ หากต้องการ baseline ที่
